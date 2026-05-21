@@ -18,6 +18,8 @@ struct Args {
     key: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    debug: bool,
     prompt: String,
 }
 
@@ -61,6 +63,9 @@ async fn main() -> Result<()> {
 
     let run_id = Uuid::new_v4().to_string();
     let trace_path = trace_path(&run_id)?;
+    let debug_run_id = run_id.clone();
+    let debug_provider_url = url.clone();
+    let debug_model = model.clone();
     let trace = TraceLogger::new(run_id.clone(), trace_path.clone());
     let provider = ProviderClient::new(ProviderConfig {
         url,
@@ -85,7 +90,12 @@ async fn main() -> Result<()> {
         .await?;
 
     println!("{}", response.content);
-    eprintln!("trace: {}", trace_path.display());
+    if args.debug {
+        eprintln!("run_id: {debug_run_id}");
+        eprintln!("model: {debug_model}");
+        eprintln!("provider: {debug_provider_url}");
+        eprintln!("trace: {}", trace_path.display());
+    }
     Ok(())
 }
 
