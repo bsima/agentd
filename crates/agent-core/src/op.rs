@@ -68,8 +68,41 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseToolCall {
     pub id: String,
+    #[serde(rename = "type", default = "tool_call_type")]
+    pub kind: String,
+    pub function: ResponseToolFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponseToolFunction {
     pub name: String,
-    pub arguments: Value,
+    pub arguments: String,
+}
+
+impl ResponseToolCall {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            id: id.into(),
+            kind: tool_call_type(),
+            function: ResponseToolFunction {
+                name: name.into(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.function.name
+    }
+
+    pub fn arguments(&self) -> Value {
+        serde_json::from_str(&self.function.arguments)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": self.function.arguments }))
+    }
+}
+
+fn tool_call_type() -> String {
+    "function".into()
 }
 
 pub enum OpF<S, A> {
@@ -215,7 +248,7 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
                 for call in calls {
                     program = program.and_then(move |mut acc| {
                         let id = call.id.clone();
-                        tool(call.name.clone(), call.arguments.clone()).map(move |result| {
+                        tool(call.name().to_string(), call.arguments()).map(move |result| {
                             acc.push(ChatMessage::tool(id, result.to_string()));
                             acc
                         })

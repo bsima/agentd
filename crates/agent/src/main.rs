@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -73,7 +74,7 @@ async fn main() -> Result<()> {
         model: agent_core::Model(model),
     });
     let config = SeqConfig {
-        provider: provider.clone(),
+        provider: Arc::new(provider.clone()),
         tools: standard_tools(),
         trace: trace.clone(),
     };

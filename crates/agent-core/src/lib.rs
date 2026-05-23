@@ -9,6 +9,6 @@ pub use op::{
     agent_loop, emit, get, infer, par, put, tool, ChatMessage, Model, Op, OpF, Prompt, Response,
     ResponseToolCall, ToolName,
 };
-pub use provider::{ProviderClient, ProviderConfig};
+pub use provider::{ChatProvider, ProviderClient, ProviderConfig};
 pub use tools::standard_tools;
 pub use trace::{Event, TraceLogger};

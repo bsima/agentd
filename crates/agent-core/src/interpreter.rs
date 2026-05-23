@@ -1,5 +1,5 @@
 use crate::op::{Op, OpF};
-use crate::provider::{ProviderClient, ToolFunctionSpec, ToolSpec};
+use crate::provider::{ChatProvider, ToolFunctionSpec, ToolSpec};
 use crate::trace::{Event, TraceLogger};
 use anyhow::{anyhow, Result};
 use async_recursion::async_recursion;
@@ -20,7 +20,7 @@ pub trait Tool: Send + Sync {
 }
 
 pub struct SeqConfig {
-    pub provider: ProviderClient,
+    pub provider: Arc<dyn ChatProvider>,
     pub tools: ToolMap,
     pub trace: TraceLogger,
 }
@@ -121,5 +121,185 @@ where
             }
             run_sequential(config, current_state, next(values)).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::op::{agent_loop, ChatMessage, Model, Prompt, Response, ResponseToolCall};
+    use crate::provider::ToolSpec;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    struct MockProvider {
+        responses: Mutex<Vec<Response>>,
+        prompts: Mutex<Vec<Prompt>>,
+    }
+
+    impl MockProvider {
+        fn new(mut responses: Vec<Response>) -> Self {
+            responses.reverse();
+            Self {
+                responses: Mutex::new(responses),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompt_count(&self) -> usize {
+            self.prompts.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for MockProvider {
+        async fn chat(
+            &self,
+            _model: &Model,
+            _tools: &[ToolSpec],
+            messages: &[ChatMessage],
+        ) -> Result<Response> {
+            self.prompts.lock().unwrap().push(messages.to_vec());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| anyhow!("mock provider exhausted"))
+        }
+    }
+
+    struct EchoTool {
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echo test args"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(&self, args: Value) -> Result<Value> {
+            self.calls.lock().unwrap().push(args.clone());
+            Ok(json!({ "echoed": args }))
+        }
+    }
+
+    fn response(content: &str, tool_calls: Vec<ResponseToolCall>) -> Response {
+        Response {
+            content: content.into(),
+            tool_calls,
+            tokens: 7,
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: Value) -> ResponseToolCall {
+        ResponseToolCall::new(id, name, arguments)
+    }
+
+    fn test_trace() -> TraceLogger {
+        let path = std::env::temp_dir().join(format!("agent-core-test-{}.jsonl", Uuid::new_v4()));
+        TraceLogger::new(Uuid::new_v4().to_string(), path)
+    }
+
+    #[tokio::test]
+    async fn agent_loop_executes_tool_and_feeds_result_back() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![tool_call("call-1", "echo", json!({ "value": "hello" }))],
+            ),
+            response("done", vec![]),
+        ]));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolMap::new();
+        tools.insert(
+            "echo".into(),
+            Arc::new(EchoTool {
+                calls: calls.clone(),
+            }),
+        );
+        let config = SeqConfig {
+            provider: provider.clone(),
+            tools,
+            trace: test_trace(),
+        };
+        let prompt = vec![ChatMessage::user("use echo")];
+
+        let (result, state) = run_sequential(
+            &config,
+            prompt.clone(),
+            agent_loop(Model("mock".into()), prompt, 4),
+        )
+        .await?;
+
+        assert_eq!(result.content, "done");
+        assert_eq!(provider.prompt_count(), 2);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(state.iter().any(|msg| msg.role == "tool"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_supports_multiple_tool_turns() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response("", vec![tool_call("call-1", "echo", json!({ "step": 1 }))]),
+            response("", vec![tool_call("call-2", "echo", json!({ "step": 2 }))]),
+            response("finished", vec![]),
+        ]));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolMap::new();
+        tools.insert(
+            "echo".into(),
+            Arc::new(EchoTool {
+                calls: calls.clone(),
+            }),
+        );
+        let config = SeqConfig {
+            provider: provider.clone(),
+            tools,
+            trace: test_trace(),
+        };
+        let prompt = vec![ChatMessage::user("do two steps")];
+
+        let (result, state) = run_sequential(
+            &config,
+            prompt.clone(),
+            agent_loop(Model("mock".into()), prompt, 4),
+        )
+        .await?;
+
+        assert_eq!(result.content, "finished");
+        assert_eq!(provider.prompt_count(), 3);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(state.iter().filter(|msg| msg.role == "tool").count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_put_and_par_are_interpreted_sequentially() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let config = SeqConfig {
+            provider,
+            tools: ToolMap::new(),
+            trace: test_trace(),
+        };
+        let program = crate::op::put(1)
+            .and_then(|_| crate::op::par(vec![crate::op::put(2), crate::op::put(3)]))
+            .and_then(|_| crate::op::get());
+
+        let (result, state) = run_sequential(&config, 0, program).await?;
+
+        assert_eq!(result, 3);
+        assert_eq!(state, 3);
+        Ok(())
     }
 }

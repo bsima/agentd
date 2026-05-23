@@ -1,5 +1,6 @@
 use crate::op::{ChatMessage, Model, Response, ResponseToolCall};
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,6 +10,16 @@ pub struct ProviderConfig {
     pub url: String,
     pub api_key: String,
     pub model: Model,
+}
+
+#[async_trait]
+pub trait ChatProvider: Send + Sync {
+    async fn chat(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+    ) -> Result<Response>;
 }
 
 #[derive(Clone)]
@@ -28,8 +39,11 @@ impl ProviderClient {
     pub fn model(&self) -> Model {
         self.config.model.clone()
     }
+}
 
-    pub async fn chat(
+#[async_trait]
+impl ChatProvider for ProviderClient {
+    async fn chat(
         &self,
         model: &Model,
         tools: &[ToolSpec],
@@ -72,11 +86,10 @@ impl ProviderClient {
                 .tool_calls
                 .unwrap_or_default()
                 .into_iter()
-                .map(|call| ResponseToolCall {
-                    id: call.id,
-                    name: call.function.name,
-                    arguments: serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| json!({ "raw": call.function.arguments })),
+                .map(|call| {
+                    let arguments: Value = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| json!({ "raw": call.function.arguments }));
+                    ResponseToolCall::new(call.id, call.function.name, arguments)
                 })
                 .collect(),
             tokens,
