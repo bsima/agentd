@@ -23,6 +23,15 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long)]
     debug: bool,
+    /// Stable run id used for traces/checkpoints.
+    #[arg(long, env = "AGENT_RUN_ID")]
+    run_id: Option<String>,
+    /// Accepted for agentd compatibility; JSON event output is not yet emitted on stdout.
+    #[arg(long)]
+    json: bool,
+    /// Accepted for agentd compatibility; compaction is handled by future PromptIR work.
+    #[arg(long)]
+    enable_compaction: bool,
     /// Read NUL-terminated session turns from this FIFO path.
     #[arg(long, env = "AGENT_FIFO")]
     fifo: Option<PathBuf>,
@@ -105,6 +114,7 @@ async fn main() -> Result<()> {
     let run_id = checkpoint
         .as_ref()
         .map(|cp| cp.run_id.clone())
+        .or(args.run_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let trace_path = trace_path(&run_id)?;
     let trace = TraceLogger::new(run_id.clone(), trace_path.clone());
@@ -145,6 +155,7 @@ async fn main() -> Result<()> {
         eprintln!("provider: {url}");
         eprintln!("trace: {}", trace_path.display());
     }
+    emit_session_status(&mut runtime, "agent_start", None).await?;
 
     match (args.prompt, args.fifo) {
         (Some(prompt), None) => run_one_shot(&mut runtime, prompt).await,
@@ -164,6 +175,7 @@ async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
         })
         .await?;
     println!("{}", response.content);
+    emit_result(runtime, &response.content).await?;
     Ok(())
 }
 
@@ -214,6 +226,7 @@ async fn write_session_response(runtime: &mut Runtime, message: String) -> Resul
     stdout.write_all(response.content.as_bytes()).await?;
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
+    emit_result(runtime, &response.content).await?;
     Ok(())
 }
 
@@ -251,7 +264,8 @@ where
     ))
 }
 
-async fn emit_done(runtime: &Runtime) -> Result<()> {
+async fn emit_done(runtime: &mut Runtime) -> Result<()> {
+    emit_session_status(runtime, "agent_complete", None).await?;
     runtime
         .trace
         .emit(&Event::AgentDone {
@@ -259,6 +273,41 @@ async fn emit_done(runtime: &Runtime) -> Result<()> {
             timestamp: Utc::now(),
         })
         .await
+}
+
+async fn emit_session_status(
+    _runtime: &mut Runtime,
+    custom_type: &str,
+    content: Option<&str>,
+) -> Result<()> {
+    let line = serde_json::json!({
+        "type": "custom",
+        "custom_type": custom_type,
+        "content": content.unwrap_or(""),
+        "timestamp": Utc::now(),
+    });
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(serde_json::to_string(&line)?.as_bytes())
+        .await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn emit_result(runtime: &mut Runtime, content: &str) -> Result<()> {
+    let line = serde_json::json!({
+        "type": "result",
+        "content": content,
+        "timestamp": Utc::now(),
+    });
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(serde_json::to_string(&line)?.as_bytes())
+        .await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    emit_session_status(runtime, "agent_complete", Some(content)).await
 }
 
 async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
@@ -282,7 +331,8 @@ async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
         checkpoint.sequence, runtime.run_id
     ));
     tokio::fs::write(&path, &bytes).await?;
-    tokio::fs::write(dir.join("latest.json"), bytes).await?;
+    tokio::fs::write(dir.join("latest.json"), &bytes).await?;
+    tokio::fs::write(dir.join("session-latest.json"), bytes).await?;
     if runtime.debug {
         eprintln!("checkpoint: {}", path.display());
     }
