@@ -1,6 +1,6 @@
 use agent_core::{
-    agent_loop, standard_tools, ChatMessage, Event, ProviderClient, ProviderConfig, SeqConfig,
-    TraceLogger,
+    agent_loop, standard_tools, ChatMessage, Event, ModelRegistry, ProviderClient, ProviderConfig,
+    SeqConfig, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -86,25 +86,29 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let file_config = read_config(args.config.as_ref()).await?;
     let provider_file = file_config.provider.unwrap_or_default();
+    let registry = ModelRegistry::load_default().await?;
 
+    let requested_model = args
+        .model
+        .or(provider_file.model)
+        .or_else(|| std::env::var("AGENT_MODEL").ok());
+    let resolved_model = registry.resolve(requested_model.as_deref())?;
     let url = args
         .provider
         .or(provider_file.url)
+        .or(resolved_model.base_url.clone())
         .or_else(|| std::env::var("AGENT_PROVIDER").ok())
         .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
         .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
-    let model = args
-        .model
-        .or(provider_file.model)
-        .or_else(|| std::env::var("AGENT_MODEL").ok())
-        .unwrap_or_else(|| "openai/gpt-4o-mini".into());
+    let model = resolved_model.api_id.clone();
     let api_key = args
         .key
         .or(provider_file.api_key)
+        .or(resolved_model.api_key.clone())
         .or_else(|| std::env::var("AGENT_API_KEY").ok())
         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
         .ok_or_else(|| {
-            anyhow!("missing API key: pass --key or set AGENT_API_KEY/OPENROUTER_API_KEY")
+            anyhow!("missing API key: pass --key, set AGENT_API_KEY/OPENROUTER_API_KEY, or configure api_key in models.yaml")
         })?;
 
     let checkpoint = match args.resume.as_ref() {
