@@ -50,7 +50,8 @@ impl ModelRegistry {
         let content = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("reading model registry {}", path.display()))?;
-        Self::from_yaml_str(&content).with_context(|| format!("loading model registry {}", path.display()))
+        Self::from_yaml_str(&content)
+            .with_context(|| format!("loading model registry {}", path.display()))
     }
 
     pub fn resolve(&self, requested: Option<&str>) -> Result<ResolvedModel> {
@@ -81,7 +82,9 @@ fn expand_api_key(value: Option<&str>) -> Result<Option<String>> {
         Some(raw) if raw.starts_with('$') => {
             let name = raw.trim_start_matches('$');
             if name.is_empty() {
-                return Err(anyhow!("empty environment variable reference in model api_key"));
+                return Err(anyhow!(
+                    "empty environment variable reference in model api_key"
+                ));
             }
             std::env::var(name)
                 .map(Some)
@@ -131,7 +134,10 @@ models:
 
         assert_eq!(resolved.alias, "parasail/qwen3-235b");
         assert_eq!(resolved.api_id, "parasail-qwen3-235b-a22b-instruct-2507");
-        assert_eq!(resolved.base_url.as_deref(), Some("https://api.parasail.io/v1"));
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://api.parasail.io/v1")
+        );
         assert_eq!(resolved.api_key.as_deref(), Some("literal-key"));
         Ok(())
     }
@@ -139,8 +145,14 @@ models:
     #[test]
     fn default_model_and_unknown_alias_are_supported() -> Result<()> {
         let registry = ModelRegistry::from_yaml_str(MODELS)?;
-        assert_eq!(registry.resolve(None)?.api_id, "parasail-qwen3-235b-a22b-instruct-2507");
-        assert_eq!(registry.resolve(Some("unknown/model"))?.api_id, "unknown/model");
+        assert_eq!(
+            registry.resolve(None)?.api_id,
+            "parasail-qwen3-235b-a22b-instruct-2507"
+        );
+        assert_eq!(
+            registry.resolve(Some("unknown/model"))?.api_id,
+            "unknown/model"
+        );
         assert_eq!(registry.resolve(Some("direct-name"))?.api_id, "direct-name");
         Ok(())
     }

@@ -367,7 +367,7 @@ async fn shutdown_signal() {
 }
 
 fn initial_history() -> Vec<ChatMessage> {
-    vec![ChatMessage::system("You are a standalone agent runner. Use tools when needed. For filesystem listing or shell tasks, call the bash tool. When finished, answer concisely.")]
+    vec![ChatMessage::system("You are a standalone agent runner. Use the shell tool when you need to inspect or change the environment. The shell tool executes command strings with the SHELL environment variable inside the sandboxed PATH. When finished, answer concisely.")]
 }
 
 async fn read_config(path: Option<&PathBuf>) -> Result<FileConfig> {

@@ -8,9 +8,10 @@ use tokio::process::Command;
 
 pub fn standard_tools() -> ToolMap {
     let mut tools: ToolMap = HashMap::new();
-    insert(&mut tools, BashTool);
-    insert(&mut tools, ReadFileTool);
-    insert(&mut tools, WriteFileTool);
+    insert(&mut tools, ShellTool);
+    insert(&mut tools, SkillTool);
+    insert(&mut tools, NotifyTool);
+    insert(&mut tools, StopTool);
     tools
 }
 
@@ -18,18 +19,19 @@ fn insert<T: Tool + 'static>(tools: &mut ToolMap, tool: T) {
     tools.insert(tool.name().into(), Arc::new(tool));
 }
 
-struct BashTool;
-struct ReadFileTool;
-struct WriteFileTool;
+struct ShellTool;
+struct SkillTool;
+struct NotifyTool;
+struct StopTool;
 
 #[async_trait]
-impl Tool for BashTool {
+impl Tool for ShellTool {
     fn name(&self) -> &str {
-        "bash"
+        "shell"
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the current working directory."
+        "Execute a command string using the SHELL environment variable."
     }
 
     fn parameters(&self) -> Value {
@@ -44,12 +46,11 @@ impl Tool for BashTool {
         let command = args
             .get("command")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("bash.command must be a string"))?;
-        let output = Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(command)
-            .output()
-            .await?;
+            .ok_or_else(|| anyhow!("shell.command must be a string"))?;
+        let shell = std::env::var("SHELL").map_err(|_| {
+            anyhow!("SHELL is not set; agentd must provide a shell in the sandbox environment")
+        })?;
+        let output = Command::new(shell).arg("-c").arg(command).output().await?;
         Ok(json!({
             "status": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout),
@@ -59,69 +60,130 @@ impl Tool for BashTool {
 }
 
 #[async_trait]
-impl Tool for ReadFileTool {
+impl Tool for SkillTool {
     fn name(&self) -> &str {
-        "read_file"
+        "skill"
     }
 
     fn description(&self) -> &str {
-        "Read a UTF-8 text file."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"]
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("read_file.path must be a string"))?;
-        let content = tokio::fs::read_to_string(path).await?;
-        Ok(json!({ "content": content }))
-    }
-}
-
-#[async_trait]
-impl Tool for WriteFileTool {
-    fn name(&self) -> &str {
-        "write_file"
-    }
-
-    fn description(&self) -> &str {
-        "Write UTF-8 text content to a file, creating parent directories if needed."
+        "agentd integration hook stub for skill discovery/loading."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
-                "content": { "type": "string" }
-            },
-            "required": ["path", "content"]
+                "operation": { "type": "string" },
+                "query": { "type": "string" }
+            }
         })
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("write_file.path must be a string"))?;
-        let content = args
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("write_file.content must be a string"))?;
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        Ok(json!({ "ok": false, "stub": true, "tool": "skill", "args": args }))
+    }
+}
+
+#[async_trait]
+impl Tool for NotifyTool {
+    fn name(&self) -> &str {
+        "notify"
+    }
+
+    fn description(&self) -> &str {
+        "agentd integration hook stub for progress notifications."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string" },
+                "level": { "type": "string" }
+            },
+            "required": ["text"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        Ok(json!({ "ok": true, "stub": true, "tool": "notify", "args": args }))
+    }
+}
+
+#[async_trait]
+impl Tool for StopTool {
+    fn name(&self) -> &str {
+        "stop"
+    }
+
+    fn description(&self) -> &str {
+        "agentd integration hook stub for explicit done/waiting/blocked stop signals."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "reason": { "type": "string" },
+                "message": { "type": "string" }
+            },
+            "required": ["reason"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        Ok(json!({ "ok": true, "stub": true, "tool": "stop", "args": args }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn shell_requires_shell_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_shell = std::env::var_os("SHELL");
+        std::env::remove_var("SHELL");
+
+        let result = ShellTool.execute(json!({ "command": "echo hi" })).await;
+
+        if let Some(value) = old_shell {
+            std::env::set_var("SHELL", value);
         }
-        tokio::fs::write(path, content).await?;
-        Ok(json!({ "ok": true }))
+        assert!(result.unwrap_err().to_string().contains("SHELL is not set"));
+    }
+
+    #[tokio::test]
+    async fn shell_executes_configured_shell() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/bin/sh");
+
+        let result = ShellTool
+            .execute(json!({ "command": "printf tool-ok" }))
+            .await?;
+
+        if let Some(value) = old_shell {
+            std::env::set_var("SHELL", value);
+        } else {
+            std::env::remove_var("SHELL");
+        }
+        assert_eq!(
+            result.get("stdout").and_then(Value::as_str),
+            Some("tool-ok")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standard_tools_are_shell_plus_agentd_hooks() {
+        let tools = standard_tools();
+        let mut names = tools.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["notify", "shell", "skill", "stop"]);
     }
 }
