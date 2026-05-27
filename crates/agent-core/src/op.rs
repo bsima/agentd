@@ -5,7 +5,6 @@ use std::pin::Pin;
 
 pub type BoxFutureOp<S, A> = Pin<Box<dyn Future<Output = Op<S, A>> + Send>>;
 pub type Prompt = Vec<ChatMessage>;
-pub type ToolName = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model(pub String);
@@ -111,16 +110,17 @@ pub enum OpF<S, A> {
         prompt: Prompt,
         next: Box<dyn FnOnce(Response) -> Op<S, A> + Send>,
     },
-    Tool {
-        name: ToolName,
-        args: Value,
+    Eval {
+        command: String,
         next: Box<dyn FnOnce(Value) -> Op<S, A> + Send>,
     },
     Get {
-        next: Box<dyn FnOnce(S) -> Op<S, A> + Send>,
+        key: String,
+        next: Box<dyn FnOnce(Value) -> Op<S, A> + Send>,
     },
     Put {
-        state: S,
+        key: String,
+        value: Value,
         next: Op<S, A>,
     },
     Emit {
@@ -157,16 +157,17 @@ impl<S: Send + 'static, A: Send + 'static> Op<S, A> {
                 prompt,
                 next: Box::new(move |r| next(r).and_then(f)),
             })),
-            OpF::Tool { name, args, next } => Op(Box::new(OpF::Tool {
-                name,
-                args,
+            OpF::Eval { command, next } => Op(Box::new(OpF::Eval {
+                command,
                 next: Box::new(move |v| next(v).and_then(f)),
             })),
-            OpF::Get { next } => Op(Box::new(OpF::Get {
-                next: Box::new(move |s| next(s).and_then(f)),
+            OpF::Get { key, next } => Op(Box::new(OpF::Get {
+                key,
+                next: Box::new(move |v| next(v).and_then(f)),
             })),
-            OpF::Put { state, next } => Op(Box::new(OpF::Put {
-                state,
+            OpF::Put { key, value, next } => Op(Box::new(OpF::Put {
+                key,
+                value,
                 next: next.and_then(f),
             })),
             OpF::Emit { event, next } => Op(Box::new(OpF::Emit {
@@ -197,23 +198,24 @@ pub fn infer<S: Send + 'static>(model: Model, prompt: Prompt) -> Op<S, Response>
     }))
 }
 
-pub fn tool<S: Send + 'static>(name: impl Into<ToolName>, args: Value) -> Op<S, Value> {
-    Op(Box::new(OpF::Tool {
-        name: name.into(),
-        args,
+pub fn eval<S: Send + 'static>(command: impl Into<String>) -> Op<S, Value> {
+    Op(Box::new(OpF::Eval {
+        command: command.into(),
         next: Box::new(Op::pure),
     }))
 }
 
-pub fn get<S: Clone + Send + 'static>() -> Op<S, S> {
+pub fn get<S: Send + 'static>(key: impl Into<String>) -> Op<S, Value> {
     Op(Box::new(OpF::Get {
+        key: key.into(),
         next: Box::new(Op::pure),
     }))
 }
 
-pub fn put<S: Send + 'static>(state: S) -> Op<S, ()> {
+pub fn put<S: Send + 'static>(key: impl Into<String>, value: Value) -> Op<S, ()> {
     Op(Box::new(OpF::Put {
-        state,
+        key: key.into(),
+        value,
         next: Op::pure(()),
     }))
 }
@@ -233,12 +235,14 @@ pub fn par<S: Send + 'static>(ops: Vec<Op<S, ()>>) -> Op<S, Vec<()>> {
 }
 
 pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, Response> {
-    infer(model.clone(), prompt).and_then(move |response| {
+    infer(model.clone(), prompt.clone()).and_then(move |response| {
         if response.tool_calls.is_empty() || max_turns == 0 {
             Op::pure(response)
         } else {
             let calls = response.tool_calls.clone();
-            get().and_then(move |mut history: Prompt| {
+            get("temporal:history").and_then(move |value| {
+                let mut history: Prompt =
+                    serde_json::from_value(value).unwrap_or_else(|_| prompt.clone());
                 history.push(ChatMessage::assistant(
                     (!response.content.is_empty()).then_some(response.content.clone()),
                     response.tool_calls.clone(),
@@ -248,7 +252,8 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
                 for call in calls {
                     program = program.and_then(move |mut acc| {
                         let id = call.id.clone();
-                        tool(call.name().to_string(), call.arguments()).map(move |result| {
+                        let command = command_from_tool_call(&call);
+                        eval(command).map(move |result| {
                             acc.push(ChatMessage::tool(id, result.to_string()));
                             acc
                         })
@@ -256,10 +261,152 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
                 }
 
                 program.and_then(move |history| {
-                    put(history.clone())
+                    let value = serde_json::to_value(&history).unwrap_or(Value::Null);
+                    put("temporal:history", value)
                         .and_then(move |_| agent_loop(model, history, max_turns - 1))
                 })
             })
         }
     })
+}
+
+fn command_from_tool_call(call: &ResponseToolCall) -> String {
+    call.arguments()
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
+    use crate::interpreter::{run_sequential, SeqConfig};
+    use crate::provider::{ChatProvider, ToolSpec};
+    use crate::trace::TraceLogger;
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    struct NoopProvider;
+
+    #[async_trait]
+    impl ChatProvider for NoopProvider {
+        async fn chat(
+            &self,
+            _model: &Model,
+            _tools: &[ToolSpec],
+            _messages: &[ChatMessage],
+        ) -> Result<Response> {
+            Err(anyhow!(
+                "noop provider should not be called by pure Op tests"
+            ))
+        }
+    }
+
+    fn seq_config() -> SeqConfig {
+        let path =
+            std::env::temp_dir().join(format!("agent-core-op-test-{}.jsonl", Uuid::new_v4()));
+        SeqConfig {
+            provider: Arc::new(NoopProvider),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: TraceLogger::new(Uuid::new_v4().to_string(), path),
+        }
+    }
+
+    async fn observe(op: Op<i32, i32>, state: i32) -> Result<(i32, i32)> {
+        run_sequential(&seq_config(), state, op).await
+    }
+
+    #[tokio::test]
+    async fn monad_left_identity_holds_for_pure() -> Result<()> {
+        fn f(value: i32) -> Op<i32, i32> {
+            Op::pure(value + 1)
+        }
+
+        let left = observe(Op::pure(41).and_then(f), 0).await?;
+        let right = observe(f(41), 0).await?;
+
+        assert_eq!(left, right);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn monad_right_identity_holds_for_pure() -> Result<()> {
+        let left = observe(Op::pure(42).and_then(Op::pure), 7).await?;
+        let right = observe(Op::pure(42), 7).await?;
+
+        assert_eq!(left, right);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn monad_associativity_holds_for_pure() -> Result<()> {
+        fn f(value: i32) -> Op<i32, i32> {
+            Op::pure(value + 2)
+        }
+        fn g(value: i32) -> Op<i32, i32> {
+            Op::pure(value * 3)
+        }
+
+        let left = observe(Op::pure(10).and_then(f).and_then(g), 0).await?;
+        let right = observe(Op::pure(10).and_then(|a| f(a).and_then(g)), 0).await?;
+
+        assert_eq!(left, right);
+        Ok(())
+    }
+
+    #[test]
+    fn infer_wraps_in_infer_node() {
+        let prompt = vec![ChatMessage::user("hello")];
+        match *infer::<()>(Model("model".into()), prompt.clone()).0 {
+            OpF::Infer {
+                model,
+                prompt: actual,
+                ..
+            } => {
+                assert_eq!(model, Model("model".into()));
+                assert_eq!(actual, prompt);
+            }
+            _ => panic!("infer() did not create OpF::Infer"),
+        }
+    }
+
+    #[test]
+    fn eval_wraps_in_eval_node() {
+        match *eval::<()>("printf ok").0 {
+            OpF::Eval { command, .. } => assert_eq!(command, "printf ok"),
+            _ => panic!("eval() did not create OpF::Eval"),
+        }
+    }
+
+    #[test]
+    fn par_wraps_in_par_node() {
+        match *par::<()>(vec![Op::pure(())]).0 {
+            OpF::Par { ops, .. } => assert_eq!(ops.len(), 1),
+            _ => panic!("par() did not create OpF::Par"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_put_and_emit_round_trip_through_sequential_interpreter() -> Result<()> {
+        let event = crate::trace::Event::AgentDone {
+            run_id: "op-test".into(),
+            timestamp: chrono::Utc::now(),
+        };
+        let program = get::<i32>("temporal:history").and_then(move |value| {
+            let state: i32 = serde_json::from_value(value).unwrap();
+            put("temporal:history", serde_json::json!(state + 1))
+                .and_then(move |_| emit(event).and_then(move |_| get::<i32>("temporal:history")))
+                .map(|value| serde_json::from_value(value).unwrap())
+        });
+
+        let observed = run_sequential(&seq_config(), 41, program).await?;
+        assert_eq!(observed, (42, 42));
+        Ok(())
+    }
 }

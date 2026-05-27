@@ -1,5 +1,5 @@
 {
-  description = "Rust development shell for agentd";
+  description = "Rust development shell for agent";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

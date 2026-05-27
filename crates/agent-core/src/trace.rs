@@ -18,15 +18,14 @@ pub enum Event {
         tokens: u32,
         timestamp: DateTime<Utc>,
     },
-    ToolCall {
+    EvalCall {
         run_id: String,
-        name: String,
-        args: Value,
+        command: String,
         timestamp: DateTime<Utc>,
     },
-    ToolResult {
+    EvalResult {
         run_id: String,
-        name: String,
+        command: String,
         result: Value,
         timestamp: DateTime<Utc>,
     },

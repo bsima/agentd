@@ -1,7 +1,17 @@
-# agentd Rust Port — M1 Scope: `agent` binary
+# Rust Agent — M1 Scope: `agent` binary
+
+## Status
+
+M1 implementation status:
+
+- Free monad core is live in `crates/agent-core/src/op.rs`: `OpF`, `Op`, `and_then`, `map`, and effect constructors are implemented.
+- Sequential reference interpreter is live in `crates/agent-core/src/interpreter.rs`: it walks the `OpF` tree and executes provider/tool/state/trace effects.
+- `Par` is represented in `OpF` and interpreted sequentially for M1 by design; future interpreters can provide concurrent semantics.
+- Tool-call loop is represented as data by `agent_loop` in `crates/agent-core/src/op.rs` and executed by `run_sequential` in `crates/agent-core/src/interpreter.rs`.
+- Unit tests cover monad laws, Op combinator shape, state/emit round-trips, and agent loop/tool-call behavior.
 
 **Status:** Scoping
-**Target:** `~/src/bsima/agentd` (private repo, not yet public)
+**Target:** private Rust agent workspace
 
 ## Goal
 
@@ -43,7 +53,6 @@ The interpreter (Sequential for M1) walks this tree and executes IO.
 ## Architecture Docs to Read
 
 Before coding, read:
-- `/home/ben/agentd-architecture.md` — trigger/hydration/memory layers
 - `/home/ben/omni/live/Omni/Agent/ARCHITECTURE.md` — Op design rationale
 - `/home/ben/omni/live/Omni/Agent/README.md` — API surface and usage patterns
 - `/home/ben/omni/live/Omni/Agent/DESIGN.md` — hydration/emission model (north star)
@@ -54,7 +63,7 @@ Before coding, read:
 
 ### Included
 
-1. **Cargo workspace** at `~/src/bsima/agentd`
+1. **Cargo workspace**
    - `crates/agent-core/` — Op types, interpreter, provider client
    - `crates/agent/` — CLI binary
 
@@ -95,7 +104,7 @@ Before coding, read:
 
 ### Excluded from M1
 
-- `agentd` daemon (scheduling, systemd, FIFO sessions)
+- Daemon scheduling, systemd integration, FIFO session orchestration
 - OAuth providers (claude-code, openai-codex)
 - Memory/hydration system (PromptIR)
 - Subagent fan-out
@@ -126,4 +135,3 @@ Before coding, read:
 - Existing Op.hs: `/home/ben/omni/live/Omni/Agent/Op.hs`
 - Sequential interpreter: `/home/ben/omni/live/Omni/Agent/Interpreter/Sequential.hs`
 - Provider.hs (for API shape): `/home/ben/omni/live/Omni/Agent/Provider.hs`
-- agentd architecture: `/home/ben/agentd-architecture.md`

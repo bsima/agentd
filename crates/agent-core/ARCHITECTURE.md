@@ -17,8 +17,8 @@ The free monad gives the Rust port the same architectural boundary as the Haskel
 
 - `Infer` asks a chat provider for a model response.
 - `Tool` executes a named tool with JSON arguments.
-- `Get` reads interpreter state.
-- `Put` replaces interpreter state.
+- `Get` reads keyed interpreter/source data such as `session:state`, `semantic:*`, or `temporal:*`.
+- `Put` writes keyed interpreter/source data such as `session:state` checkpoints or temporal state.
 - `Emit` writes a trace event.
 - `Par` describes multiple child operations that can be interpreted together.
 - `Pure` contains a completed value with no remaining effects.
@@ -52,12 +52,15 @@ The loop is therefore reusable across interpreters: all runtime behavior comes f
 
 `run_sequential` is the M1 reference interpreter. It pattern matches the `OpF` tree and executes effects directly:
 
-- `Infer` calls the configured `ChatProvider`.
+- `Infer` builds configured passive hydration into the prompt, then calls the configured `ChatProvider`.
 - `Tool` dispatches through the configured tool map.
-- `Get` and `Put` manipulate interpreter state.
+- `Get` dispatches explicit keys through interpreter state, checkpoint storage, or the configured hydration backend.
+- `Put` writes explicit keys through interpreter state or checkpoint storage.
 - `Emit` writes to the trace logger.
 - `Par` intentionally runs child operations sequentially in M1.
 - `Pure` returns the value and current state.
+
+Passive hydration is interpreter-owned context construction. `SeqConfig::passive_hydration` selects the passive sources that are assembled before each `Infer`; agent programs do not need to emit a `Get` for those sources. Active reads remain explicit `Get(key)` operations, for example `Get("semantic:topic")` through the hydration backend or `Get("session:state")` through checkpoint storage.
 
 `Par` being sequential is deliberate for M1. Later milestones can add async or distributed interpreters that preserve the same `Op` program shape while changing scheduling semantics.
 

@@ -31,6 +31,7 @@ pub struct ModelRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModel {
     pub alias: String,
+    pub provider: Option<String>,
     pub api_id: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -59,12 +60,14 @@ impl ModelRegistry {
         match self.models.iter().find(|entry| entry.name == alias) {
             Some(entry) => Ok(ResolvedModel {
                 alias: entry.name.clone(),
+                provider: Some(entry.provider.clone()),
                 api_id: entry.api_id.clone().unwrap_or_else(|| entry.name.clone()),
                 base_url: entry.base_url.clone(),
                 api_key: expand_api_key(entry.api_key.as_deref())?,
             }),
             None => Ok(ResolvedModel {
                 alias: alias.to_string(),
+                provider: None,
                 api_id: alias.to_string(),
                 base_url: None,
                 api_key: None,
