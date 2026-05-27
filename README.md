@@ -16,7 +16,7 @@ agentd is built on this premise. It provides:
 - A **process supervisor** for long-lived agent sessions
 - A **free monad runtime** that treats Infer and Eval as first-class operations
 - A **FIFO-based turn protocol** — as Unix-native as it gets
-- A **hydration source registry** for typed context injection
+- A **unified Get/Put interface** for all hydration and state sources
 - A **checkpoint/trace system** for resumability and replay
 
 It does not provide: a web dashboard, a plugin marketplace, a YAML pipeline language, or opinions about which tools your agent should have. Those are your problem. agentd is the runtime substrate; the agent wields Linux.
@@ -31,44 +31,55 @@ agentd makes this structural with a free monad over `OpF`:
 
 ```rust
 pub enum OpF<S, A> {
-    Infer  { model, prompt, next },  // LLM call
-    Tool   { name, args, next },     // environment eval
-    Get    { next },                 // state read
-    Put    { state, next },          // state write
-    Emit   { event, next },          // trace
-    Par    { ops, next },            // parallel effects
+    Infer { model, prompt, next },  // LLM call: infer(unstructured)
+    Eval  { command, next },        // process call: eval(structured) — currently $SHELL -c
+    Get   { key, next },            // state/context read
+    Put   { key, value, next },     // state/context write
+    Emit  { event, next },          // trace
+    Par   { ops, next },            // parallel effects
     Pure(A),
 }
 ```
 
 The agent is a *program*. The runtime is an *interpreter*. This boundary is what makes the system testable, replaceable, and compositional. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full reasoning.
 
+### Meta-Circular: Infer Calling Infer
+
+All `OpF` variants are available to agent programs — including `Infer`. An agent that can emit `Infer` ops can construct sub-agents with different models, different prompts, different context windows. Multi-agent orchestration is not a special layer built on top: it is just an agent program that contains multiple `Infer` calls. The outer agent *is* the orchestrator.
+
+This is the SICP meta-circular insight applied to agents: `eval` calling `eval` collapses the interpreter/object-language boundary. The same structure that enables agent programs to compose is the structure that enables multi-agent systems — no additional abstraction needed.
+
 ### Free Monad: Effects as Data
 
 Programs built with `Op` constructors are pure data — they can be inspected, composed, replayed, or run against a mock interpreter before any IO happens. Every new capability is a new `OpF` variant with a new interpreter branch. No async spaghetti.
 
-The free monad implementation was first proved out as a Haskell program in a private repo (`~/omni/live/Omni/Agent/Op.hs`) and used extensively in anger. This port to Rust is basically a directy copy, with some cleanup and simplifications, for public release.
+The free monad implementation was first proved out as a Haskell program in a private repo (`Omni/Agent/Op.hs`) and used extensively at production scale. This Rust port is a direct translation, with some cleanup, for public release.
 
-### Hydration Sources: Typed Context Injection
+### Get/Put: The Unified Hydration Interface
 
-Most systems treat context as an append-only log: strings are appended to a prompt in order to build up a useful context for the agent. RAG extends this with an on-demand filter and injection, but the content is still untyped and appended.
-
-agentd models context injection as a typed registry that gets dynamically rehydrated on every agentic request:
+Most systems treat context as an append-only log. agentd models all context injection — temporal history, semantic recall, workspace files, session state — as `Get`/`Put` operations over named keys. The interpreter decides what each key means:
 
 ```
-Temporal  — recent history, time-indexed events
-Semantic  — embedding-retrieved memory, RAG
-Knowledge — static workspace files, configs
+Get("temporal-passive")   →  inject recent chat history
+Get("semantic:topic")     →  vector similarity search
+Get("session:state")      →  read current checkpoint
+Put("session:state", v)   →  write checkpoint
 ```
 
-On each agentic turn, the context is built up into a datastructure that the LLM can parse. If anything is missing from the context, runtime tools are available to the agent so that it can search for more information in the sources. This is the right abstraction for a runtime that needs to scale context management as models get larger windows and smarter retrieval.
+This creates a clean 2×2 taxonomy:
+
+|                | **Passive** (interpreter auto-emits before turn) | **Active** (agent-emitted)              |
+|----------------|---------------------------------------------------|-----------------------------------------|
+| **Temporal**   | Recent chat history, recent events                | `Get("temporal:search query")`          |
+| **Semantic**   | Similarity-based RAG, static workspace            | `Get("semantic:topic")`                 |
+
+Passive sources fire automatically — the runtime assembles the context window before the model ever sees the request. Active sources are available to the agent program on demand, via the same `Get` op. One interface, all sources.
 
 ### Linux-Native Session Model
 
-Each agent session is a process, managed by systemd or whatever other supervisor you want. Turns arrive via a FIFO (named pipe). Message are NUL-terminated. After each turn, a checkpoints is written. The entire protocol is pipes and files.
+Each agent session is a process, managed by systemd or whatever other supervisor you want. Turns arrive via a FIFO (named pipe). Messages are NUL-terminated. After each turn, a checkpoint is written. The entire protocol is pipes and files.
 
 ```sh
-# TODO: replace this with an example of `agent`, not `agentd`
 agentd start myagent
 agentd send myagent "go build the thing"
 agentd logs myagent
@@ -100,7 +111,7 @@ crates/
   agent-oauth/  — OAuth flows for claude-code / openai-codex providers
 ```
 
-`agent-core` has no IO of its own except through the `ChatProvider` and `Tool` traits. It is the pure kernel. The `agent` binary is the shell around it. This boundary is intentional and load-bearing.
+`agent-core` has no IO of its own except through the `ChatProvider` trait and the `Eval` op interpreter. It is the pure kernel. The `agent` binary is the shell around it. This boundary is intentional and load-bearing.
 
 ## Status
 
@@ -112,7 +123,7 @@ M1 (single-agent, sequential interpreter) is implemented. Active development:
 
 ## Prior Art
 
-The design originates in `Omni/Agent/Op.hs`, a Haskell prototype that first demonstrated the free monad Op abstraction at production scale. This Rust port is a faithful translation, not a rewrite. The Haskell codebase remains the reference for Op semantics.
+The design originates in `Omni/Agent/Op.hs`, a Haskell prototype that first demonstrated the free monad Op abstraction at production scale. This Rust port is a faithful translation, not a rewrite. The Haskell codebase remains the reference for Op semantics. The meta-circular Infer-emitting-Infer pattern has direct precedent in the SICP meta-circular evaluator.
 
 ## License
 
