@@ -7,7 +7,9 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-oauth",
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "dirs",
@@ -32,6 +34,22 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "agent-oauth"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]
