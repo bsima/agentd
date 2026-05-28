@@ -305,7 +305,7 @@ pub async fn run_ir_steps_with_store_and_replay(
                     Value::Bool(false) => else_block,
                     other => return Err(anyhow!("AgentIR If condition must be bool, got {other}")),
                 };
-                goto_block(&mut machine, target, vec![]).await?;
+                branch_to_block(&mut machine, target).await?;
             }
             Terminator::Match {
                 value,
@@ -316,7 +316,7 @@ pub async fn run_ir_steps_with_store_and_replay(
                 let target = match_match_arms(&value, &arms).or(default).ok_or_else(|| {
                     anyhow!("AgentIR Match had no matching arm and no default for {value}")
                 })?;
-                goto_block(&mut machine, target, vec![]).await?;
+                branch_to_block(&mut machine, target).await?;
             }
             Terminator::Par { .. } => {
                 return Err(anyhow!(
@@ -502,6 +502,24 @@ async fn execute_instr(
     Ok(())
 }
 
+async fn branch_to_block(machine: &mut Machine, block_id: BlockId) -> Result<()> {
+    let target = machine
+        .program
+        .blocks
+        .get(&block_id)
+        .with_context(|| format!("unknown AgentIR block {block_id:?}"))?;
+    if !target.params.is_empty() {
+        return Err(anyhow!(
+            "AgentIR branch to {:?} expected target with no params, got {}",
+            block_id,
+            target.params.len()
+        ));
+    }
+    machine.block = block_id;
+    machine.pc = 0;
+    Ok(())
+}
+
 async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -> Result<()> {
     let target = machine
         .program
@@ -561,6 +579,72 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
                 .cloned()
                 .ok_or_else(|| anyhow!("AgentIR field {field:?} not found on {value}"))
         }
+        Expr::Index { base, index } => {
+            let value = env
+                .get(base)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", base))?;
+            let index = usize_expr(env, index, "Index.index")?;
+            value
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("AgentIR index {index} not found on {value}"))
+        }
+        Expr::Len { base } => {
+            let value = env
+                .get(base)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", base))?;
+            match value {
+                Value::Array(items) => Ok(Value::Number(items.len().into())),
+                Value::String(text) => Ok(Value::Number(text.chars().count().into())),
+                other => Err(anyhow!("AgentIR Len expected array or string, got {other}")),
+            }
+        }
+        Expr::IsEmpty { base } => {
+            let value = env
+                .get(base)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", base))?;
+            match value {
+                Value::Array(items) => Ok(Value::Bool(items.is_empty())),
+                Value::String(text) => Ok(Value::Bool(text.is_empty())),
+                other => Err(anyhow!(
+                    "AgentIR IsEmpty expected array or string, got {other}"
+                )),
+            }
+        }
+        Expr::Eq { left, right } => {
+            Ok(Value::Bool(eval_expr(env, left)? == eval_expr(env, right)?))
+        }
+        Expr::Lt { left, right } => Ok(Value::Bool(
+            number_expr(env, left, "Lt.left")? < number_expr(env, right, "Lt.right")?,
+        )),
+        Expr::Or { left, right } => Ok(Value::Bool(
+            bool_expr(env, left, "Or.left")? || bool_expr(env, right, "Or.right")?,
+        )),
+        Expr::Add { left, right } => Ok(Value::Number(
+            (number_expr(env, left, "Add.left")? + number_expr(env, right, "Add.right")?).into(),
+        )),
+        Expr::Sub { left, right } => Ok(Value::Number(
+            (number_expr(env, left, "Sub.left")? - number_expr(env, right, "Sub.right")?).into(),
+        )),
+        Expr::Push { base, value } => {
+            let array = env
+                .get(base)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", base))?;
+            let mut array = array
+                .as_array()
+                .cloned()
+                .ok_or_else(|| anyhow!("AgentIR Push expected array, got {array}"))?;
+            array.push(eval_expr(env, value)?);
+            Ok(Value::Array(array))
+        }
+        Expr::JsonParse { value } => {
+            let text = string_expr(env, value, "JsonParse.value")?;
+            serde_json::from_str(&text).context("AgentIR JsonParse failed")
+        }
+        Expr::ToString { value } => {
+            let value = eval_expr(env, value)?;
+            Ok(Value::String(value.to_string()))
+        }
         Expr::Array(items) => items
             .iter()
             .map(|item| eval_expr(env, item))
@@ -581,6 +665,27 @@ fn string_expr(env: &BTreeMap<Var, Value>, expr: &Expr, label: &str) -> Result<S
         Value::String(value) => Ok(value),
         other => Err(anyhow!("AgentIR {label} must be string, got {other}")),
     }
+}
+
+fn bool_expr(env: &BTreeMap<Var, Value>, expr: &Expr, label: &str) -> Result<bool> {
+    match eval_expr(env, expr)? {
+        Value::Bool(value) => Ok(value),
+        other => Err(anyhow!("AgentIR {label} must be bool, got {other}")),
+    }
+}
+
+fn number_expr(env: &BTreeMap<Var, Value>, expr: &Expr, label: &str) -> Result<i64> {
+    match eval_expr(env, expr)? {
+        Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| anyhow!("AgentIR {label} must be i64-compatible, got {value}")),
+        other => Err(anyhow!("AgentIR {label} must be number, got {other}")),
+    }
+}
+
+fn usize_expr(env: &BTreeMap<Var, Value>, expr: &Expr, label: &str) -> Result<usize> {
+    let value = number_expr(env, expr, label)?;
+    usize::try_from(value).map_err(|_| anyhow!("AgentIR {label} must be non-negative, got {value}"))
 }
 
 fn resolve_prompt(env: &BTreeMap<Var, Value>, prompt: PromptRef) -> Result<Prompt> {
