@@ -2,17 +2,152 @@ use crate::hydration::{
     PassiveHydrationConfig, PassiveSource, SourceParams, SourceRegistry, SEMANTIC_PREFIX,
     SESSION_STATE_KEY, TEMPORAL_PREFIX,
 };
-use crate::op::{ChatMessage, Op, OpF, Prompt};
+use crate::op::{ChatMessage, Op, OpF, Prompt, Response};
 use crate::provider::{ChatProvider, ToolFunctionSpec, ToolSpec};
-use crate::trace::{Event, TraceLogger};
+use crate::trace::{preview, Event, TraceLogger};
 use anyhow::{anyhow, Result};
 use async_recursion::async_recursion;
 use chrono::Utc;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnvPolicy {
+    Inherit,
+    Clean {
+        vars: BTreeMap<String, String>,
+    },
+    AllowList {
+        names: Vec<String>,
+        extra: BTreeMap<String, String>,
+    },
+}
+
+impl EnvPolicy {
+    fn label(&self) -> String {
+        match self {
+            Self::Inherit => "inherit".into(),
+            Self::Clean { .. } => "clean".into(),
+            Self::AllowList { .. } => "allowlist".into(),
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        match self {
+            Self::Inherit => {}
+            Self::Clean { vars } => {
+                command.env_clear();
+                command.envs(vars);
+            }
+            Self::AllowList { names, extra } => {
+                command.env_clear();
+                for name in names {
+                    if let Ok(value) = std::env::var(name) {
+                        command.env(name, value);
+                    }
+                }
+                command.envs(extra);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalConfig {
+    pub shell: String,
+    pub cwd: Option<PathBuf>,
+    pub timeout: Duration,
+    pub max_stdout_bytes: usize,
+    pub max_stderr_bytes: usize,
+    pub env: EnvPolicy,
+}
+
+impl Default for EvalConfig {
+    fn default() -> Self {
+        Self {
+            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            cwd: None,
+            timeout: Duration::from_secs(120),
+            max_stdout_bytes: 1024 * 1024,
+            max_stderr_bytes: 1024 * 1024,
+            env: EnvPolicy::Inherit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReplayTrace {
+    infer_calls: BTreeMap<u64, String>,
+    infer_results: BTreeMap<u64, Response>,
+    eval_calls: BTreeMap<u64, String>,
+    eval_results: BTreeMap<u64, Value>,
+}
+
+impl ReplayTrace {
+    pub fn from_events(events: &[Event]) -> Self {
+        let mut replay = Self::default();
+        for event in events {
+            match event {
+                Event::InferCall { op_id, model, .. } => {
+                    replay.infer_calls.insert(*op_id, model.clone());
+                }
+                Event::InferResult {
+                    op_id,
+                    response: Some(response),
+                    ..
+                } => {
+                    replay.infer_results.insert(*op_id, response.clone());
+                }
+                Event::EvalCall { op_id, command, .. } => {
+                    replay.eval_calls.insert(*op_id, command.clone());
+                }
+                Event::EvalResult { op_id, result, .. } => {
+                    replay.eval_results.insert(*op_id, result.clone());
+                }
+                _ => {}
+            }
+        }
+        replay
+    }
+
+    pub async fn load(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let events = TraceLogger::read_events(path).await?;
+        Ok(Self::from_events(&events))
+    }
+
+    fn infer_result(&self, op_id: u64, model: &str) -> Result<Response> {
+        if let Some(recorded_model) = self.infer_calls.get(&op_id) {
+            if recorded_model != model {
+                return Err(anyhow!(
+                    "replay diverged at Infer op {op_id}: recorded model '{recorded_model}', requested '{model}'"
+                ));
+            }
+        }
+        self.infer_results
+            .get(&op_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("replay trace has no InferResult for op {op_id}"))
+    }
+
+    fn eval_result(&self, op_id: u64, command: &str) -> Result<Value> {
+        if let Some(recorded_command) = self.eval_calls.get(&op_id) {
+            if recorded_command != command {
+                return Err(anyhow!(
+                    "replay diverged at Eval op {op_id}: recorded command '{recorded_command}', requested '{command}'"
+                ));
+            }
+        }
+        self.eval_results
+            .get(&op_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("replay trace has no EvalResult for op {op_id}"))
+    }
+}
 
 pub struct SeqConfig {
     pub provider: Arc<dyn ChatProvider>,
@@ -20,6 +155,8 @@ pub struct SeqConfig {
     pub passive_hydration: PassiveHydrationConfig,
     pub checkpoint_path: Option<PathBuf>,
     pub trace: TraceLogger,
+    pub eval: EvalConfig,
+    pub replay: Option<ReplayTrace>,
 }
 
 impl SeqConfig {
@@ -28,8 +165,7 @@ impl SeqConfig {
             kind: "function".into(),
             function: ToolFunctionSpec {
                 name: "shell".into(),
-                description: "Execute a command string using the SHELL environment variable."
-                    .into(),
+                description: "Execute a command string using the configured shell.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": { "command": { "type": "string" } },
@@ -54,63 +190,139 @@ where
             next,
         } => {
             let prompt = hydrate_infer_prompt(config, &state, prompt).await?;
+            let op_id = config.trace.next_op_id();
             config
                 .trace
-                .emit(&Event::InferStart {
+                .emit(&Event::InferCall {
                     run_id: config.trace.run_id().into(),
+                    op_id,
                     model: model.0.clone(),
+                    prompt: Some(prompt.clone()),
+                    prompt_preview: prompt_preview(&prompt),
                     timestamp: Utc::now(),
                 })
                 .await?;
-            let response = config
-                .provider
-                .chat(&model, &config.tool_specs(), &prompt)
-                .await?;
+            let started = Instant::now();
+            let response = match &config.replay {
+                Some(replay) => replay.infer_result(op_id, &model.0)?,
+                None => {
+                    config
+                        .provider
+                        .chat(&model, &config.tool_specs(), &prompt)
+                        .await?
+                }
+            };
             config
                 .trace
-                .emit(&Event::InferEnd {
+                .emit(&Event::InferResult {
                     run_id: config.trace.run_id().into(),
+                    op_id,
+                    response: Some(response.clone()),
+                    response_preview: response_preview(&response),
                     tokens: response.tokens,
+                    duration_ms: millis_u64(started.elapsed()),
                     timestamp: Utc::now(),
                 })
                 .await?;
             run_sequential(config, state, next(response)).await
         }
         OpF::Eval { command, next } => {
+            let op_id = config.trace.next_op_id();
             config
                 .trace
                 .emit(&Event::EvalCall {
                     run_id: config.trace.run_id().into(),
+                    op_id,
                     command: command.clone(),
+                    cwd: config
+                        .eval
+                        .cwd
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    env_policy: config.eval.env.label(),
+                    timeout_ms: millis_u64(config.eval.timeout),
                     timestamp: Utc::now(),
                 })
                 .await?;
-            let shell = std::env::var("SHELL").map_err(|_| {
-                anyhow!("SHELL is not set; set it to the shell used for command execution")
-            })?;
-            let output = Command::new(shell).arg("-c").arg(&command).output().await?;
-            let result = serde_json::json!({
-                "status": output.status.code(),
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "stderr": String::from_utf8_lossy(&output.stderr)
-            });
+            let result = match &config.replay {
+                Some(replay) => replay.eval_result(op_id, &command)?,
+                None => run_eval(&config.eval, &command).await?,
+            };
+            let truncated_stdout = result
+                .get("stdout_truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let truncated_stderr = result
+                .get("stderr_truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let duration_ms = result
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
             config
                 .trace
                 .emit(&Event::EvalResult {
                     run_id: config.trace.run_id().into(),
+                    op_id,
                     command,
                     result: result.clone(),
+                    duration_ms,
+                    truncated_stdout,
+                    truncated_stderr,
                     timestamp: Utc::now(),
                 })
                 .await?;
             run_sequential(config, state, next(result)).await
         }
         OpF::Get { key, next } => {
+            let op_id = config.trace.next_op_id();
+            config
+                .trace
+                .emit(&Event::GetCall {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    key: key.clone(),
+                    timestamp: Utc::now(),
+                })
+                .await?;
             let value = dispatch_get(config, &state, &key).await?;
+            config
+                .trace
+                .emit(&Event::GetResult {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    key,
+                    source_count: value.as_array().map(Vec::len).unwrap_or(0),
+                    value_preview: preview(&value.to_string(), 512),
+                    value: value.clone(),
+                    timestamp: Utc::now(),
+                })
+                .await?;
             run_sequential(config, state, next(value)).await
         }
         OpF::Put { key, value, next } => {
+            let op_id = config.trace.next_op_id();
+            config
+                .trace
+                .emit(&Event::PutCall {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    key: key.clone(),
+                    value_preview: preview(&value.to_string(), 512),
+                    timestamp: Utc::now(),
+                })
+                .await?;
             let state = dispatch_put(config, state, &key, value).await?;
+            config
+                .trace
+                .emit(&Event::PutResult {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    key,
+                    timestamp: Utc::now(),
+                })
+                .await?;
             run_sequential(config, state, next).await
         }
         OpF::Emit { event, next } => {
@@ -118,16 +330,113 @@ where
             run_sequential(config, state, next).await
         }
         OpF::Par { ops, next } => {
-            let mut values = Vec::with_capacity(ops.len());
+            let op_id = config.trace.next_op_id();
+            let started = Instant::now();
+            config
+                .trace
+                .emit(&Event::ParStart {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    branch_count: ops.len(),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            let branch_count = ops.len();
+            let mut values = Vec::with_capacity(branch_count);
             let mut current_state = state;
             for op in ops {
                 let (value, new_state) = run_sequential(config, current_state, op).await?;
                 values.push(value);
                 current_state = new_state;
             }
+            config
+                .trace
+                .emit(&Event::ParEnd {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    branch_count,
+                    duration_ms: millis_u64(started.elapsed()),
+                    timestamp: Utc::now(),
+                })
+                .await?;
             run_sequential(config, current_state, next(values)).await
         }
     }
+}
+
+async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value> {
+    let started = Instant::now();
+    let mut process = Command::new(&config.shell);
+    process.arg("-c").arg(command);
+    if let Some(cwd) = &config.cwd {
+        process.current_dir(cwd);
+    }
+    config.env.apply(&mut process);
+    process.kill_on_drop(true);
+
+    let output = tokio::time::timeout(config.timeout, process.output()).await;
+    let duration_ms = millis_u64(started.elapsed());
+
+    match output {
+        Ok(output) => {
+            let output = output?;
+            let (stdout, stdout_truncated) = decode_capped(&output.stdout, config.max_stdout_bytes);
+            let (stderr, stderr_truncated) = decode_capped(&output.stderr, config.max_stderr_bytes);
+            let status = output.status.code();
+            Ok(serde_json::json!({
+                "ok": status == Some(0),
+                "status": status,
+                "timed_out": false,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "duration_ms": duration_ms,
+            }))
+        }
+        Err(_) => Ok(serde_json::json!({
+            "ok": false,
+            "status": null,
+            "timed_out": true,
+            "stdout": "",
+            "stderr": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "duration_ms": duration_ms,
+        })),
+    }
+}
+
+fn millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn decode_capped(bytes: &[u8], max_bytes: usize) -> (String, bool) {
+    let truncated = bytes.len() > max_bytes;
+    let take = bytes.len().min(max_bytes);
+    (
+        String::from_utf8_lossy(&bytes[..take]).into_owned(),
+        truncated,
+    )
+}
+
+fn prompt_preview(prompt: &Prompt) -> String {
+    let rendered = prompt
+        .iter()
+        .map(|message| {
+            format!(
+                "{}: {}",
+                message.role,
+                message.content.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    preview(&rendered, 1024)
+}
+
+fn response_preview(response: &Response) -> String {
+    preview(&response.content, 1024)
 }
 
 async fn hydrate_infer_prompt<S>(
@@ -142,7 +451,27 @@ where
         return Ok(prompt);
     }
 
+    let op_id = config.trace.next_op_id();
+    let sources = config
+        .passive_hydration
+        .sources
+        .iter()
+        .map(|source| format!("{source:?}"))
+        .collect::<Vec<_>>();
+    config
+        .trace
+        .emit(&Event::HydrationStart {
+            run_id: config.trace.run_id().into(),
+            op_id,
+            sources,
+            max_bytes: config.passive_hydration.max_bytes,
+            timestamp: Utc::now(),
+        })
+        .await?;
+
     let mut sections = Vec::new();
+    let mut section_count = 0;
+    let mut total_bytes = 0;
     for source in &config.passive_hydration.sources {
         match source {
             PassiveSource::TemporalHistory => {
@@ -156,7 +485,23 @@ where
                         }
                     }
                 } else if value != Value::Null {
-                    sections.push(format!("## temporal history\n{}", value));
+                    let content = value.to_string();
+                    total_bytes += content.len();
+                    section_count += 1;
+                    config
+                        .trace
+                        .emit(&Event::HydrationSection {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            source: "temporal-history".into(),
+                            kind: "Temporal".into(),
+                            bytes: content.len(),
+                            content_preview: preview(&content, 512),
+                            metadata: serde_json::json!({}),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    sections.push(format!("## temporal history\n{}", content));
                 }
             }
             PassiveSource::SessionContext => {
@@ -165,6 +510,21 @@ where
                     max_bytes: config.passive_hydration.max_bytes,
                 };
                 for result in config.hydration.retrieve_session_context(params).await? {
+                    total_bytes += result.content.len();
+                    section_count += 1;
+                    config
+                        .trace
+                        .emit(&Event::HydrationSection {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            source: result.source.clone(),
+                            kind: format!("{:?}", result.kind),
+                            bytes: result.content.len(),
+                            content_preview: preview(&result.content, 512),
+                            metadata: result.metadata.clone(),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
                     sections.push(format!(
                         "## {} ({:?})\n{}",
                         result.source, result.kind, result.content
@@ -173,6 +533,17 @@ where
             }
         }
     }
+
+    config
+        .trace
+        .emit(&Event::HydrationEnd {
+            run_id: config.trace.run_id().into(),
+            op_id,
+            section_count,
+            total_bytes,
+            timestamp: Utc::now(),
+        })
+        .await?;
 
     if !sections.is_empty() {
         inject_context_sections(&mut prompt, sections.join("\n\n"));
@@ -318,7 +689,11 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             response(
                 "",
-                vec![tool_call("call-1", "echo", json!({ "value": "hello" }))],
+                vec![tool_call(
+                    "call-1",
+                    "shell",
+                    json!({ "command": "printf hello" }),
+                )],
             ),
             response("done", vec![]),
         ]));
@@ -328,6 +703,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: None,
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
         let prompt = vec![ChatMessage::user("use echo")];
 
@@ -347,8 +724,22 @@ mod tests {
     #[tokio::test]
     async fn agent_loop_supports_multiple_tool_turns() -> Result<()> {
         let provider = Arc::new(MockProvider::new(vec![
-            response("", vec![tool_call("call-1", "echo", json!({ "step": 1 }))]),
-            response("", vec![tool_call("call-2", "echo", json!({ "step": 2 }))]),
+            response(
+                "",
+                vec![tool_call(
+                    "call-1",
+                    "shell",
+                    json!({ "command": "printf 1" }),
+                )],
+            ),
+            response(
+                "",
+                vec![tool_call(
+                    "call-2",
+                    "shell",
+                    json!({ "command": "printf 2" }),
+                )],
+            ),
             response("finished", vec![]),
         ]));
         let config = SeqConfig {
@@ -357,6 +748,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: None,
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
         let prompt = vec![ChatMessage::user("do two steps")];
 
@@ -382,6 +775,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: None,
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
         let program = crate::op::put("temporal:history", json!(1))
             .and_then(|_| {
@@ -442,6 +837,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: Some(path),
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
 
         let (value, state) = run_sequential(
@@ -466,6 +863,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: Some(path.clone()),
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
 
         let (_, state) = run_sequential(
@@ -499,6 +898,8 @@ mod tests {
             ]),
             checkpoint_path: None,
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
         let prompt = vec![ChatMessage::user("answer")];
 
@@ -519,6 +920,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eval_timeout_output_cap_cwd_and_clean_env_are_enforced() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let cwd = std::env::temp_dir().join(format!("agent-core-eval-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&cwd).await?;
+        std::env::set_var("AGENT_CORE_EVAL_SECRET", "leaked");
+        let mut clean_vars = std::collections::BTreeMap::new();
+        if let Ok(path) = std::env::var("PATH") {
+            clean_vars.insert("PATH".into(), path);
+        }
+        let config = SeqConfig {
+            provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: test_trace(),
+            eval: EvalConfig {
+                shell: "/bin/sh".into(),
+                cwd: Some(cwd.clone()),
+                timeout: std::time::Duration::from_millis(50),
+                max_stdout_bytes: 4,
+                max_stderr_bytes: 4,
+                env: EnvPolicy::Clean { vars: clean_vars },
+            },
+            replay: None,
+        };
+
+        let (timeout_result, _) = run_sequential(&config, (), crate::op::eval("sleep 1")).await?;
+        assert_eq!(timeout_result["timed_out"], json!(true));
+
+        let (cap_result, _) = run_sequential(&config, (), crate::op::eval("printf 123456")).await?;
+        assert_eq!(cap_result["stdout"], json!("1234"));
+        assert_eq!(cap_result["stdout_truncated"], json!(true));
+
+        let _ = run_sequential(&config, (), crate::op::eval("printf cwd > marker")).await?;
+        assert_eq!(tokio::fs::read_to_string(cwd.join("marker")).await?, "cwd");
+
+        let (env_result, _) = run_sequential(
+            &config,
+            (),
+            crate::op::eval("printf ${AGENT_CORE_EVAL_SECRET-unset}"),
+        )
+        .await?;
+        assert_eq!(env_result["stdout"], json!("unse"));
+        assert_eq!(env_result["stdout_truncated"], json!(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trace_can_be_read_back_and_summarized() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("ok", vec![])]));
+        let trace = test_trace();
+        let path = trace.path().clone();
+        let config = SeqConfig {
+            provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+        };
+
+        let _ = run_sequential(
+            &config,
+            vec![ChatMessage::user("hello")],
+            infer(Model("mock".into()), vec![ChatMessage::user("hello")]),
+        )
+        .await?;
+        let events = TraceLogger::read_events(path).await?;
+        let summary = crate::trace::TraceSummary::from_events(&events);
+        assert_eq!(summary.infer_calls, 1);
+        assert_eq!(summary.total_tokens, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_trace_feeds_recorded_infer_and_eval_results() -> Result<()> {
+        let record_provider = Arc::new(MockProvider::new(vec![response("recorded", vec![])]));
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let record_config = SeqConfig {
+            provider: record_provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: record_trace,
+            eval: EvalConfig::default(),
+            replay: None,
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
+            .and_then(|_| crate::op::eval("printf replayed"));
+        let (recorded, _) = run_sequential(&record_config, (), program).await?;
+        assert_eq!(recorded["stdout"], json!("replayed"));
+
+        let replay = ReplayTrace::load(record_path).await?;
+        let replay_config = SeqConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: Some(replay),
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
+            .and_then(|_| crate::op::eval("printf replayed"));
+        let (replayed, _) = run_sequential(&replay_config, (), program).await?;
+        assert_eq!(replayed, recorded);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn active_semantic_get_uses_query_capable_backend() -> Result<()> {
         let provider = Arc::new(MockProvider::new(vec![]));
         let queries = Arc::new(Mutex::new(Vec::new()));
@@ -534,6 +1047,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: None,
             trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
         };
 
         let (value, _) = run_sequential(&config, (), crate::op::get("semantic:topic")).await?;

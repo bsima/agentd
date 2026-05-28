@@ -1,15 +1,17 @@
 use agent_core::{
-    agent_loop, ChatMessage, Event, HydrationSource, ModelRegistry, PassiveHydrationConfig,
-    PassiveSource, ProviderClient, ProviderConfig, SeqConfig, SourceCapability, SourceKind,
-    SourceParams, SourceRegistry, SourceResult, TraceLogger,
+    agent_loop, ChatMessage, EnvPolicy, EvalConfig, Event, HydrationSource, ModelRegistry,
+    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayTrace,
+    ResolvedModel, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
+    SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
@@ -40,9 +42,24 @@ struct Args {
     /// Resume conversation history from a checkpoint JSON.
     #[arg(long, env = "AGENT_RESUME")]
     resume: Option<PathBuf>,
-    /// Directory to read into startup hydration context.
+    /// Replay recorded Infer/Eval results from a trace JSONL instead of calling providers or shell.
+    #[arg(long, env = "AGENT_REPLAY_TRACE")]
+    replay_trace: Option<PathBuf>,
+    /// Directory to read into passive hydration context.
     #[arg(long, env = "AGENT_HYDRATION_DIR")]
     hydration_dir: Option<PathBuf>,
+    /// Timeout for each Eval shell command.
+    #[arg(long, default_value_t = 120)]
+    eval_timeout_seconds: u64,
+    /// Maximum bytes captured from stdout and stderr for each Eval command.
+    #[arg(long)]
+    eval_max_output_bytes: Option<usize>,
+    /// Working directory for Eval shell commands.
+    #[arg(long)]
+    eval_cwd: Option<PathBuf>,
+    /// Environment policy for Eval shell commands.
+    #[arg(long, value_enum, default_value_t = EvalEnvMode::Inherit)]
+    eval_env: EvalEnvMode,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -50,6 +67,12 @@ struct Args {
     prompt: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EvalEnvMode {
+    Inherit,
+    Clean,
 }
 
 #[derive(Debug, Subcommand)]
@@ -91,6 +114,22 @@ struct Checkpoint {
     timestamp: DateTime<Utc>,
 }
 
+struct ReplayOnlyProvider;
+
+#[async_trait]
+impl agent_core::ChatProvider for ReplayOnlyProvider {
+    async fn chat(
+        &self,
+        _model: &agent_core::Model,
+        _tools: &[agent_core::provider::ToolSpec],
+        _messages: &[ChatMessage],
+    ) -> Result<agent_core::Response> {
+        Err(anyhow!(
+            "replay provider was called; trace is missing a recorded InferResult for this op"
+        ))
+    }
+}
+
 struct Runtime {
     config: SeqConfig,
     trace: TraceLogger,
@@ -113,13 +152,21 @@ async fn main() -> Result<()> {
     }
     let file_config = read_config(args.config.as_ref()).await?;
     let provider_file = file_config.provider.unwrap_or_default();
-    let registry = ModelRegistry::load_default().await?;
 
-    let requested_model = args
-        .model
-        .or(provider_file.model)
-        .or_else(|| std::env::var("AGENT_MODEL").ok());
-    let resolved_model = registry.resolve(requested_model.as_deref())?;
+    let resolved_model = resolve_model(args.model, provider_file.model).await?;
+    let eval_config = EvalConfig {
+        cwd: args.eval_cwd.clone(),
+        timeout: Duration::from_secs(args.eval_timeout_seconds),
+        max_stdout_bytes: args.eval_max_output_bytes.unwrap_or(1024 * 1024),
+        max_stderr_bytes: args.eval_max_output_bytes.unwrap_or(1024 * 1024),
+        env: match args.eval_env {
+            EvalEnvMode::Inherit => EnvPolicy::Inherit,
+            EvalEnvMode::Clean => EnvPolicy::Clean {
+                vars: Default::default(),
+            },
+        },
+        ..EvalConfig::default()
+    };
     let url = args
         .provider
         .or(provider_file.url)
@@ -127,19 +174,25 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("AGENT_PROVIDER").ok())
         .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
         .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+    let replay = match args.replay_trace.as_ref() {
+        Some(path) => Some(ReplayTrace::load(path).await?),
+        None => None,
+    };
     let model = resolved_model.api_id.clone();
     let oauth_provider = resolved_model
         .provider
         .as_deref()
         .filter(|provider| matches!(*provider, "codex-oauth" | "claude-code-oauth"));
     #[cfg(not(feature = "oauth"))]
-    if let Some(provider) = oauth_provider {
-        return Err(anyhow!(
-            "model '{}' requires OAuth provider '{provider}', but this agent was built without the 'oauth' feature",
-            resolved_model.alias
-        ));
+    if replay.is_none() {
+        if let Some(provider) = oauth_provider {
+            return Err(anyhow!(
+                "model '{}' requires OAuth provider '{provider}', but this agent was built without the 'oauth' feature",
+                resolved_model.alias
+            ));
+        }
     }
-    let api_key = if oauth_provider.is_some() {
+    let api_key = if oauth_provider.is_some() || replay.is_some() {
         None
     } else {
         Some(
@@ -165,24 +218,28 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let trace_path = trace_path(&run_id)?;
     let trace = TraceLogger::new(run_id.clone(), trace_path.clone());
-    let provider: Arc<dyn agent_core::ChatProvider> = match oauth_provider {
-        Some(tag) => {
-            #[cfg(feature = "oauth")]
-            {
-                agent_oauth::provider_for_tag(tag, agent_core::Model(model.clone()))?
-                    .map(Arc::from)
-                    .ok_or_else(|| anyhow!("unsupported OAuth provider tag: {tag}"))?
+    let provider: Arc<dyn agent_core::ChatProvider> = if replay.is_some() {
+        Arc::new(ReplayOnlyProvider)
+    } else {
+        match oauth_provider {
+            Some(tag) => {
+                #[cfg(feature = "oauth")]
+                {
+                    agent_oauth::provider_for_tag(tag, agent_core::Model(model.clone()))?
+                        .map(Arc::from)
+                        .ok_or_else(|| anyhow!("unsupported OAuth provider tag: {tag}"))?
+                }
+                #[cfg(not(feature = "oauth"))]
+                {
+                    return Err(anyhow!("unsupported OAuth provider tag: {tag}"));
+                }
             }
-            #[cfg(not(feature = "oauth"))]
-            {
-                return Err(anyhow!("unsupported OAuth provider tag: {tag}"));
-            }
+            None => Arc::new(ProviderClient::new(ProviderConfig {
+                url: url.clone(),
+                api_key: api_key.expect("api_key is set for non-OAuth providers"),
+                model: agent_core::Model(model.clone()),
+            })),
         }
-        None => Arc::new(ProviderClient::new(ProviderConfig {
-            url: url.clone(),
-            api_key: api_key.expect("api_key is set for non-OAuth providers"),
-            model: agent_core::Model(model.clone()),
-        })),
     };
     let checkpoint_path = args
         .checkpoint_dir
@@ -194,7 +251,7 @@ async fn main() -> Result<()> {
     };
     let (history, checkpoint_sequence) = match checkpoint {
         Some(cp) => (cp.messages, cp.sequence),
-        None => (initial_history(&hydration).await?, 0),
+        None => (initial_history(), 0),
     };
     let config = SeqConfig {
         provider,
@@ -205,6 +262,8 @@ async fn main() -> Result<()> {
         ]),
         checkpoint_path: checkpoint_path.clone(),
         trace: trace.clone(),
+        eval: eval_config,
+        replay: replay.clone(),
     };
     let mut runtime = Runtime {
         config,
@@ -233,6 +292,31 @@ async fn main() -> Result<()> {
         (Some(_), None, true) => Err(anyhow!("provide either a prompt or --session, not both")),
         (None, Some(path), _) => run_fifo_session(&mut runtime, path).await,
         (None, None, _) => run_stdin_session(&mut runtime).await,
+    }
+}
+
+async fn resolve_model(
+    args_model: Option<String>,
+    file_model: Option<String>,
+) -> Result<ResolvedModel> {
+    let requested = args_model
+        .or(file_model)
+        .or_else(|| std::env::var("AGENT_MODEL").ok());
+    match ModelRegistry::load_default().await {
+        Ok(registry) => registry.resolve(requested.as_deref()),
+        Err(_err) if requested.is_some() => {
+            let model = requested.expect("requested model checked above");
+            Ok(ResolvedModel {
+                alias: model.clone(),
+                provider: None,
+                api_id: model,
+                base_url: None,
+                api_key: None,
+            })
+        }
+        Err(err) => Err(err.context(
+            "loading default model registry; create ~/.config/agent/models.yaml or pass --model with a raw model id",
+        )),
     }
 }
 
@@ -488,6 +572,8 @@ async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
         passive_hydration: PassiveHydrationConfig::default(),
         checkpoint_path: Some(path),
         trace: runtime.trace.clone(),
+        eval: runtime.config.eval.clone(),
+        replay: runtime.config.replay.clone(),
     };
     let _ = agent_core::run_sequential(
         &config,
@@ -521,6 +607,15 @@ async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
     tokio::fs::write(&path, &bytes).await?;
     tokio::fs::write(dir.join("latest.json"), &bytes).await?;
     tokio::fs::write(dir.join("session-latest.json"), bytes).await?;
+    runtime
+        .trace
+        .emit(&Event::Checkpoint {
+            run_id: runtime.run_id.clone(),
+            name: format!("checkpoint-{:06}", checkpoint.sequence),
+            path: Some(path.display().to_string()),
+            timestamp: Utc::now(),
+        })
+        .await?;
     if runtime.debug {
         eprintln!("checkpoint: {}", path.display());
     }
@@ -551,24 +646,11 @@ async fn shutdown_signal() {
 }
 
 fn base_system_prompt() -> &'static str {
-    "You are a standalone agent runner. Use the shell tool when you need to inspect or change the environment. The shell tool executes command strings with the SHELL environment variable inside the sandboxed PATH. When finished, answer concisely."
+    "You are a standalone agent runner. Use the shell tool when you need to inspect or change the environment. The shell tool executes command strings with the configured shell inside the current process environment. When finished, answer concisely."
 }
 
-async fn initial_history(sources: &SourceRegistry) -> Result<Vec<ChatMessage>> {
-    let mut prompt = base_system_prompt().to_string();
-    let hydration = sources.retrieve_all(SourceParams::default()).await?;
-
-    if !hydration.is_empty() {
-        prompt.push_str("\n\nHydrated context:\n");
-        for result in hydration {
-            prompt.push_str(&format!(
-                "\n## {} ({:?})\n{}\n",
-                result.source, result.kind, result.content
-            ));
-        }
-    }
-
-    Ok(vec![ChatMessage::system(prompt)])
+fn initial_history() -> Vec<ChatMessage> {
+    vec![ChatMessage::system(base_system_prompt())]
 }
 
 struct LocalFileSource {
@@ -604,24 +686,33 @@ impl HydrationSource for LocalFileSource {
             .await
             .with_context(|| format!("reading hydration directory {}", self.root.display()))?;
         let max_bytes = params.max_bytes.unwrap_or(self.max_bytes);
-        let mut remaining = max_bytes;
-        let mut files = Vec::new();
+        let mut paths = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+
+        let mut remaining = max_bytes;
+        let mut files = Vec::new();
+        let mut included_paths = Vec::new();
+        for path in paths {
             if remaining == 0 {
                 break;
             }
-            let path = entry.path();
-            if !entry.file_type().await?.is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
             let bytes = tokio::fs::read(&path)
                 .await
                 .with_context(|| format!("reading hydration file {}", path.display()))?;
             let take = remaining.min(bytes.len());
             let content = String::from_utf8_lossy(&bytes[..take]);
             files.push(format!("### {name}\n{content}"));
+            included_paths.push(path.display().to_string());
             remaining -= take;
         }
 
@@ -629,7 +720,11 @@ impl HydrationSource for LocalFileSource {
             source: self.name().into(),
             kind: self.kind(),
             content: files.join("\n\n"),
-            metadata: serde_json::json!({ "root": self.root, "max_bytes": max_bytes }),
+            metadata: serde_json::json!({
+                "root": self.root,
+                "max_bytes": max_bytes,
+                "paths": included_paths,
+            }),
         })
     }
 }
@@ -652,4 +747,27 @@ fn trace_path(run_id: &str) -> Result<PathBuf> {
     Ok(home
         .join(".local/share/agent/traces")
         .join(format!("{run_id}.jsonl")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn raw_model_is_resolved_without_model_registry() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("agent-main-config-{}", Uuid::new_v4()));
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let resolved = resolve_model(Some("openrouter/auto".into()), None).await;
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let resolved = resolved?;
+        assert_eq!(resolved.alias, "openrouter/auto");
+        assert_eq!(resolved.api_id, "openrouter/auto");
+        assert_eq!(resolved.provider, None);
+        Ok(())
+    }
 }

@@ -252,11 +252,16 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
                 for call in calls {
                     program = program.and_then(move |mut acc| {
                         let id = call.id.clone();
-                        let command = command_from_tool_call(&call);
-                        eval(command).map(move |result| {
-                            acc.push(ChatMessage::tool(id, result.to_string()));
-                            acc
-                        })
+                        match command_from_tool_call(&call) {
+                            Ok(command) => eval(command).map(move |result| {
+                                acc.push(ChatMessage::tool(id, result.to_string()));
+                                acc
+                            }),
+                            Err(error) => Op::pure({
+                                acc.push(ChatMessage::tool(id, error.to_string()));
+                                acc
+                            }),
+                        }
                     });
                 }
 
@@ -270,12 +275,25 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
     })
 }
 
-fn command_from_tool_call(call: &ResponseToolCall) -> String {
-    call.arguments()
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+fn command_from_tool_call(call: &ResponseToolCall) -> std::result::Result<String, Value> {
+    if call.name() != "shell" {
+        return Err(serde_json::json!({
+            "ok": false,
+            "error": "unknown_tool",
+            "tool": call.name(),
+            "message": "unknown tool; available tools: shell"
+        }));
+    }
+
+    let args = call.arguments();
+    match args.get("command").and_then(Value::as_str) {
+        Some(command) if !command.trim().is_empty() => Ok(command.to_string()),
+        _ => Err(serde_json::json!({
+            "ok": false,
+            "error": "invalid_arguments",
+            "message": "shell requires non-empty string argument: command"
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +333,8 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: None,
             trace: TraceLogger::new(Uuid::new_v4().to_string(), path),
+            eval: crate::interpreter::EvalConfig::default(),
+            replay: None,
         }
     }
 
@@ -390,6 +410,39 @@ mod tests {
             OpF::Par { ops, .. } => assert_eq!(ops.len(), 1),
             _ => panic!("par() did not create OpF::Par"),
         }
+    }
+
+    #[test]
+    fn shell_tool_call_parser_accepts_only_non_empty_shell_command() {
+        let valid = ResponseToolCall::new(
+            "call-1",
+            "shell",
+            serde_json::json!({ "command": "printf ok" }),
+        );
+        assert_eq!(command_from_tool_call(&valid).unwrap(), "printf ok");
+
+        let unknown = ResponseToolCall::new(
+            "call-2",
+            "echo",
+            serde_json::json!({ "command": "printf bad" }),
+        );
+        assert_eq!(
+            command_from_tool_call(&unknown).unwrap_err()["error"],
+            serde_json::json!("unknown_tool")
+        );
+
+        let missing = ResponseToolCall::new("call-3", "shell", serde_json::json!({}));
+        assert_eq!(
+            command_from_tool_call(&missing).unwrap_err()["error"],
+            serde_json::json!("invalid_arguments")
+        );
+
+        let empty =
+            ResponseToolCall::new("call-4", "shell", serde_json::json!({ "command": "   " }));
+        assert_eq!(
+            command_from_tool_call(&empty).unwrap_err()["error"],
+            serde_json::json!("invalid_arguments")
+        );
     }
 
     #[tokio::test]
