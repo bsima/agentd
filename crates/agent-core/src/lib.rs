@@ -1,6 +1,8 @@
 pub mod anthropic;
 pub mod hydration;
 pub mod interpreter;
+pub mod ir;
+pub mod ir_interpreter;
 pub mod models;
 pub mod op;
 pub mod provider;
@@ -13,6 +15,11 @@ pub use hydration::{
     TEMPORAL_PREFIX,
 };
 pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, ReplayTrace, SeqConfig};
+pub use ir::{
+    validate_program, Block, BlockId, Budgets, EvalPolicy, EvalRequest, Expr, Frame, InferPolicy,
+    Instr, Machine, MatchArm, Pattern, Program, ProgramId, PromptRef, Terminator, Var,
+};
+pub use ir_interpreter::{run_ir_sequential, run_ir_sequential_with_store, InMemoryStore};
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
     agent_loop, emit, eval, get, infer, par, put, ChatMessage, Model, Op, OpF, Prompt, Response,
