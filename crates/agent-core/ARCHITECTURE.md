@@ -20,7 +20,7 @@ The bigger lever is interpretation. Change the interpreter and the execution mod
 `OpF<S, A>` is one layer of the program tree. Each variant is either an effect or a completed value:
 
 - `Infer` asks a chat provider for a model response
-- `Eval` executes a command string, currently through `$SHELL -c`
+- `Eval` executes a command string through the configured shell under interpreter policy
 - `Get` reads keyed interpreter/source data such as `session:state`, `semantic:*`, or `temporal:*`
 - `Put` writes keyed interpreter/source data such as `session:state` checkpoints or temporal state
 - `Emit` writes a trace event
@@ -59,7 +59,7 @@ Runtime behavior comes from the interpreter, not from `agent_loop`.
 `run_sequential` is the M1 reference interpreter. It pattern matches the `OpF` tree and executes effects directly:
 
 - `Infer` builds configured passive hydration into the prompt, then calls the configured `ChatProvider`
-- `Eval` runs the command through the configured shell
+- `Eval` runs the command through the configured shell with timeout, output caps, cwd, and env policy
 - `Get` dispatches explicit keys through interpreter state, checkpoint storage, or the hydration backend
 - `Put` writes explicit keys through interpreter state or checkpoint storage
 - `Emit` writes to the trace logger
@@ -83,7 +83,7 @@ Examples:
 - a parallel interpreter that executes `Par` branches concurrently
 - a race interpreter that tries multiple inference providers and uses the fastest response
 - a merge interpreter that asks multiple models and combines the answers
-- a replay interpreter that reads prior trace events instead of calling providers
+- replay mode that reads prior trace events instead of calling providers or executing shell commands
 - a dry-run interpreter that validates model and command requests without executing them
 - a distributed interpreter that schedules effects across workers
 

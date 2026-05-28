@@ -20,7 +20,7 @@ This repo currently provides:
 - an `agent` CLI for one-shot prompts and NUL-framed session loops
 - FIFO-compatible turn delivery
 - a unified `Get`/`Put` interface for context and session state
-- traces and checkpoints for replay, debugging, and resumability
+- structured traces, checkpoints, and trace replay for `Infer`/`Eval` debugging
 
 The full `agentd` process supervisor exists today in the original Haskell system under `Omni/Agentd`. Porting that daemon layer to Rust is future work. This repo is the Rust runtime and CLI foundation.
 
@@ -72,9 +72,9 @@ This is the SICP meta-circular idea applied to agents. `eval` calling `eval` col
 
 ### Effects are data
 
-Programs built with `Op` constructors do not perform IO immediately. They are data. You can inspect them, transform them, replay them, or run them against a mock interpreter.
+Programs built with `Op` constructors do not perform IO immediately. They are data at the interpreter boundary. You can inspect them, transform them, replay them by re-execution, or run them against a mock interpreter.
 
-That is the bigger lever. Instead of hiding work inside arbitrary async functions, the runtime keeps model calls, process calls, state reads, state writes, trace events, and parallel branches visible as data.
+That is the bigger lever. Instead of hiding work inside arbitrary async functions, the runtime keeps model calls, process calls, state reads, state writes, trace events, and parallel branches visible as data. The current Rust DSL uses closure continuations, so it is not a fully serializable AST.
 
 Adding a capability means adding an `OpF` variant and teaching interpreters what it means.
 
@@ -140,7 +140,7 @@ No broker is required. No gRPC protocol is required. If you can write NUL-termin
 
 **Bring your own sandbox.** `agentd` does not enforce isolation. Run it in the container, VM, jail, or remote worker you trust. Inside that boundary, the agent gets Linux.
 
-**Security warning:** `Eval` currently runs model-requested commands with `$SHELL -c`. Do not point it at a workspace, home directory, network, or credential environment you are not willing to hand to the model. Trace logs record commands and output, which may contain secrets.
+**Security warning:** `Eval` runs model-requested commands with the configured shell. The default has a timeout and output caps, but it is not a security sandbox. Do not point it at a workspace, home directory, network, or credential environment you are not willing to hand to the model. Trace logs record prompts, commands, and output, which may contain secrets.
 
 ## Quickstart
 
@@ -171,6 +171,18 @@ cargo run -- --model openrouter/auto "say hello"
 ```
 
 You can also skip the registry and pass a raw model id. Then the CLI uses `OPENROUTER_BASE_URL` or `https://openrouter.ai/api/v1`, and `AGENT_API_KEY` or `OPENROUTER_API_KEY`.
+
+Useful execution controls:
+
+```sh
+agent --eval-timeout-seconds 10 --eval-max-output-bytes 65536 --eval-env clean "inspect this repo"
+```
+
+Replay recorded `Infer` and `Eval` results without an API key or shell execution:
+
+```sh
+agent --replay-trace ~/.local/share/agent/traces/<run-id>.jsonl --model ignored "same prompt"
+```
 
 ## Running safely
 
@@ -214,7 +226,7 @@ crates/
 
 ## Status
 
-M1 is implemented: single-agent CLI, sequential interpreter, shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, traces, checkpoints, hydration registry, and model registry loading.
+M1 is implemented: single-agent CLI, sequential interpreter, bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces, `Infer`/`Eval` replay, checkpoints, hydration registry, and optional model registry loading.
 
 Active development:
 

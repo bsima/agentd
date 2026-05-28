@@ -44,12 +44,14 @@ The free monad preserves the structure of effects.
 
 That is the bigger lever. If the agent is just an `async fn`, you cannot know what it will do without running it. You cannot replay it cleanly. You cannot swap in a dry-run interpreter without plumbing mock objects through everything.
 
-With `Op`, the program is data. It can be:
+With `Op`, the program is data at the interpreter boundary. It can be:
 
 - interpreted by a sequential, parallel, replay, dry-run, sandboxed, or distributed runtime
 - inspected before any IO happens
 - tested against a mock provider or no-op evaluator
 - transformed with `and_then` and `map`
+
+The Rust DSL still uses closure continuations, so this is not a fully serializable AST. Replay works by re-running the same program and feeding recorded operation results back at matching op IDs.
 
 Adding a capability means adding an `OpF` variant and teaching interpreters how to handle it. Effects stay explicit.
 
@@ -69,7 +71,7 @@ A tool eventually becomes process execution, file IO, an HTTP call, or some othe
 
 So `Eval` is the primitive.
 
-Today `Eval` forks `$SHELL -c <command>`. That keeps the shell parameterizable: `SHELL=bash`, `SHELL=nushell`, etc. The agent program does not care.
+Today `Eval` forks the configured shell with `-c <command>`. The default shell is `$SHELL`, falling back to `/bin/sh`. `Eval` also has interpreter-owned policy: timeout, stdout/stderr caps, cwd, and environment mode. The agent program does not care.
 
 It also gives one sandboxing hook. You do not sandbox each tool. You sandbox the evaluator. The interpreter can wrap every `Eval` with `bwrap`, a container, a VM, a remote worker, or a hermetic PATH.
 
@@ -170,19 +172,19 @@ One governance hook. Both operations.
 
 ## Trace log
 
-Every op execution appends JSONL events:
+Every op execution appends JSONL events with a run id and operation id:
 
 ```json
-{"ts": "...", "turn": 3, "op": "EvalCall",   "command": "rg TODO src/"}
-{"ts": "...", "turn": 3, "op": "EvalResult", "exit": 0, "stdout": "..."}
-{"ts": "...", "turn": 3, "op": "InferCall",  "model": "...", "tokens": 1200}
-{"ts": "...", "turn": 3, "op": "InferResult", "tokens": 340}
-{"ts": "...", "turn": 3, "op": "GetCall",    "key": "semantic:prior decisions"}
-{"ts": "...", "turn": 3, "op": "GetResult",  "chunks": 3}
-{"ts": "...", "turn": 3, "op": "PutCall",    "key": "session:state"}
+{"event":"EvalCall", "run_id":"...", "op_id":2, "command":"rg TODO src/"}
+{"event":"EvalResult", "run_id":"...", "op_id":2, "result":{"status":0,"stdout":"..."}}
+{"event":"InferCall", "run_id":"...", "op_id":3, "model":"...", "prompt_preview":"..."}
+{"event":"InferResult", "run_id":"...", "op_id":3, "tokens":340, "response_preview":"..."}
+{"event":"GetCall", "run_id":"...", "op_id":4, "key":"semantic:prior decisions"}
+{"event":"GetResult", "run_id":"...", "op_id":4, "source_count":3}
+{"event":"PutCall", "run_id":"...", "op_id":5, "key":"session:state"}
 ```
 
-The log is for debugging and replay. A replay interpreter can feed logged `Eval` and `Infer` results back into the program instead of executing them again.
+The log is for debugging and replay. Replay mode re-runs the same program and feeds logged `Eval` and `Infer` results back at matching op IDs instead of calling providers or executing shell commands.
 
 ## Non-goals
 
