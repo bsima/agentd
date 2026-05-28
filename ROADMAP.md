@@ -104,7 +104,7 @@ Acceptance:
 
 ## M2: Rust `agentd` supervisor
 
-Status: future Rust port. Working in the Haskell system today.
+Status: future Rust port. Working in the Haskell system today (`~/omni/live/Omni/Agentd`).
 
 The supervisor will manage named long-running sessions around the existing `agent` process model:
 
