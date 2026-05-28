@@ -29,7 +29,7 @@ pub enum EnvPolicy {
 }
 
 impl EnvPolicy {
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Inherit => "inherit".into(),
             Self::Clean { .. } => "clean".into(),
@@ -120,7 +120,7 @@ impl ReplayTrace {
         Ok(Self::from_events(&events))
     }
 
-    fn infer_result(&self, op_id: u64, model: &str) -> Result<Response> {
+    pub(crate) fn infer_result(&self, op_id: u64, model: &str) -> Result<Response> {
         if let Some(recorded_model) = self.infer_calls.get(&op_id) {
             if recorded_model != model {
                 return Err(anyhow!(
@@ -134,7 +134,7 @@ impl ReplayTrace {
             .ok_or_else(|| anyhow!("replay trace has no InferResult for op {op_id}"))
     }
 
-    fn eval_result(&self, op_id: u64, command: &str) -> Result<Value> {
+    pub(crate) fn eval_result(&self, op_id: u64, command: &str) -> Result<Value> {
         if let Some(recorded_command) = self.eval_calls.get(&op_id) {
             if recorded_command != command {
                 return Err(anyhow!(
@@ -364,7 +364,7 @@ where
     }
 }
 
-async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value> {
+pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value> {
     let started = Instant::now();
     let mut process = Command::new(&config.shell);
     process.arg("-c").arg(command);
@@ -407,7 +407,7 @@ async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value> {
     }
 }
 
-fn millis_u64(duration: Duration) -> u64 {
+pub(crate) fn millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
@@ -420,7 +420,7 @@ fn decode_capped(bytes: &[u8], max_bytes: usize) -> (String, bool) {
     )
 }
 
-fn prompt_preview(prompt: &Prompt) -> String {
+pub(crate) fn prompt_preview(prompt: &Prompt) -> String {
     let rendered = prompt
         .iter()
         .map(|message| {
@@ -435,11 +435,11 @@ fn prompt_preview(prompt: &Prompt) -> String {
     preview(&rendered, 1024)
 }
 
-fn response_preview(response: &Response) -> String {
+pub(crate) fn response_preview(response: &Response) -> String {
     preview(&response.content, 1024)
 }
 
-async fn hydrate_infer_prompt<S>(
+pub(crate) async fn hydrate_infer_prompt<S>(
     config: &SeqConfig,
     state: &S,
     mut prompt: Prompt,
@@ -566,7 +566,7 @@ fn inject_context_sections(prompt: &mut Prompt, context: String) {
     }
 }
 
-async fn dispatch_get<S>(config: &SeqConfig, state: &S, key: &str) -> Result<Value>
+pub(crate) async fn dispatch_get<S>(config: &SeqConfig, state: &S, key: &str) -> Result<Value>
 where
     S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
 {
@@ -595,7 +595,12 @@ where
     }
 }
 
-async fn dispatch_put<S>(config: &SeqConfig, state: S, key: &str, value: Value) -> Result<S>
+pub(crate) async fn dispatch_put<S>(
+    config: &SeqConfig,
+    state: S,
+    key: &str,
+    value: Value,
+) -> Result<S>
 where
     S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
 {
