@@ -2,6 +2,7 @@ use crate::op::ChatMessage;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -12,6 +13,55 @@ pub struct BlockId(pub u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Var(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProgramHash(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EffectSite {
+    pub block: BlockId,
+    pub instruction_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DynamicPath(pub Vec<DynamicPathSegment>);
+
+impl DynamicPath {
+    pub fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn with_visit(site: EffectSite, visit: u64) -> Self {
+        Self(vec![DynamicPathSegment::Visit { site, visit }])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DynamicPathSegment {
+    Visit { site: EffectSite, visit: u64 },
+    Branch { index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EffectId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum EffectKind {
+    Infer,
+    Eval,
+    Get,
+    Put,
+    Emit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectLocation {
+    pub program_hash: ProgramHash,
+    pub effect_id: EffectId,
+    pub kind: EffectKind,
+    pub site: EffectSite,
+    pub dynamic_path: DynamicPath,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Program {
@@ -172,6 +222,29 @@ pub struct Frame {
 pub struct Budgets {
     pub max_infer_calls: Option<u64>,
     pub max_eval_calls: Option<u64>,
+}
+
+pub fn program_hash(program: &Program) -> Result<ProgramHash> {
+    let bytes = serde_json::to_vec(program)?;
+    let digest = Sha256::digest(bytes);
+    Ok(ProgramHash(format!("sha256:{digest:x}")))
+}
+
+pub fn effect_location(
+    program_hash: ProgramHash,
+    kind: EffectKind,
+    site: EffectSite,
+    dynamic_path: DynamicPath,
+) -> Result<EffectLocation> {
+    let bytes = serde_json::to_vec(&(&program_hash, kind, site, &dynamic_path))?;
+    let digest = Sha256::digest(bytes);
+    Ok(EffectLocation {
+        program_hash,
+        effect_id: EffectId(format!("sha256:{digest:x}")),
+        kind,
+        site,
+        dynamic_path,
+    })
 }
 
 pub fn validate_program(program: &Program) -> Result<()> {
@@ -426,6 +499,56 @@ mod tests {
         let decoded: Program = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(decoded, program);
+    }
+
+    #[test]
+    fn stable_effect_ids_are_deterministic_and_visit_sensitive() {
+        let program = Program {
+            id: ProgramId("ids".into()),
+            entry: BlockId(0),
+            blocks: BTreeMap::from([(
+                BlockId(0),
+                Block {
+                    params: vec![],
+                    instructions: vec![Instr::Get {
+                        out: Var("x".into()),
+                        key: Expr::Value(Value::String("k".into())),
+                    }],
+                    terminator: Terminator::Return {
+                        value: Expr::Var(Var("x".into())),
+                    },
+                },
+            )]),
+        };
+        let hash = program_hash(&program).unwrap();
+        let site = EffectSite {
+            block: BlockId(0),
+            instruction_index: 0,
+        };
+        let first = effect_location(
+            hash.clone(),
+            EffectKind::Get,
+            site,
+            DynamicPath::with_visit(site, 0),
+        )
+        .unwrap();
+        let first_again = effect_location(
+            hash.clone(),
+            EffectKind::Get,
+            site,
+            DynamicPath::with_visit(site, 0),
+        )
+        .unwrap();
+        let second_visit = effect_location(
+            hash,
+            EffectKind::Get,
+            site,
+            DynamicPath::with_visit(site, 1),
+        )
+        .unwrap();
+
+        assert_eq!(first.effect_id, first_again.effect_id);
+        assert_ne!(first.effect_id, second_visit.effect_id);
     }
 
     #[test]

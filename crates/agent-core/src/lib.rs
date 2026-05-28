@@ -14,8 +14,10 @@ pub use hydration::{
 };
 pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, ReplayTrace, SeqConfig};
 pub use ir::{
-    validate_program, Block, BlockId, Budgets, EvalPolicy, EvalRequest, Expr, Frame, InferPolicy,
-    Instr, Machine, MatchArm, Pattern, Program, ProgramId, PromptRef, Terminator, Var,
+    effect_location, program_hash, validate_program, Block, BlockId, Budgets, DynamicPath,
+    DynamicPathSegment, EffectId, EffectKind, EffectLocation, EffectSite, EvalPolicy, EvalRequest,
+    Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program, ProgramHash, ProgramId,
+    PromptRef, Terminator, Var,
 };
 pub use ir_interpreter::{run_ir_sequential, run_ir_sequential_with_store, InMemoryStore};
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};

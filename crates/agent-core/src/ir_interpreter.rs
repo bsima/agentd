@@ -2,15 +2,16 @@ use crate::interpreter::{
     hydrate_infer_prompt, millis_u64, prompt_preview, response_preview, run_eval, SeqConfig,
 };
 use crate::ir::{
-    validate_program, BlockId, EvalRequest, Expr, Instr, Machine, MatchArm, Pattern, PromptRef,
-    Terminator, Var,
+    effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectKind,
+    EffectLocation, EffectSite, EvalRequest, Expr, Instr, Machine, MatchArm, Pattern, ProgramHash,
+    PromptRef, Terminator, Var,
 };
 use crate::op::{ChatMessage, Model, Prompt};
 use crate::trace::Event;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -43,6 +44,8 @@ pub async fn run_ir_sequential_with_store(
     store: &mut InMemoryStore,
 ) -> Result<(Value, Machine)> {
     validate_program(&machine.program)?;
+    let program_hash = program_hash(&machine.program)?;
+    let mut site_visits = HashMap::<EffectSite, u64>::new();
 
     loop {
         let block = machine
@@ -53,8 +56,22 @@ pub async fn run_ir_sequential_with_store(
             .clone();
 
         if machine.pc < block.instructions.len() {
+            let site = EffectSite {
+                block: machine.block,
+                instruction_index: machine.pc,
+            };
+            let dynamic_path = DynamicPath::with_visit(site, next_visit(&mut site_visits, site));
             let instr = block.instructions[machine.pc].clone();
-            execute_instr(config, &mut machine, store, instr).await?;
+            execute_instr(
+                config,
+                &mut machine,
+                store,
+                &program_hash,
+                site,
+                dynamic_path,
+                instr,
+            )
+            .await?;
             machine.pc += 1;
             continue;
         }
@@ -104,6 +121,9 @@ async fn execute_instr(
     config: &SeqConfig,
     machine: &mut Machine,
     store: &mut InMemoryStore,
+    program_hash: &ProgramHash,
+    site: EffectSite,
+    dynamic_path: DynamicPath,
     instr: Instr,
 ) -> Result<()> {
     match instr {
@@ -117,6 +137,13 @@ async fn execute_instr(
             prompt,
             policy: _,
         } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Infer,
+                site,
+                dynamic_path.clone(),
+            )?;
+            emit_ir_effect(config, &location).await?;
             let model = string_expr(&machine.env, &model, "Infer.model")?;
             let prompt = resolve_prompt(&machine.env, prompt)?;
             let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
@@ -161,6 +188,13 @@ async fn execute_instr(
             request,
             policy: _,
         } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Eval,
+                site,
+                dynamic_path.clone(),
+            )?;
+            emit_ir_effect(config, &location).await?;
             let command = match request {
                 EvalRequest::Shell { command } => {
                     string_expr(&machine.env, &command, "Eval.command")?
@@ -215,16 +249,33 @@ async fn execute_instr(
             machine.env.insert(out, result);
         }
         Instr::Get { out, key } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Get,
+                site,
+                dynamic_path.clone(),
+            )?;
+            emit_ir_effect(config, &location).await?;
             let key = string_expr(&machine.env, &key, "Get.key")?;
             let value = store.get(&key);
             machine.env.insert(out, value);
         }
         Instr::Put { key, value } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Put,
+                site,
+                dynamic_path.clone(),
+            )?;
+            emit_ir_effect(config, &location).await?;
             let key = string_expr(&machine.env, &key, "Put.key")?;
             let value = eval_expr(&machine.env, &value)?;
             store.put(key, value);
         }
         Instr::Emit { event } => {
+            let location =
+                effect_location(program_hash.clone(), EffectKind::Emit, site, dynamic_path)?;
+            emit_ir_effect(config, &location).await?;
             let value = eval_expr(&machine.env, &event)?;
             let event: Event =
                 serde_json::from_value(value).context("decoding AgentIR Emit event")?;
@@ -256,6 +307,25 @@ async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -
     machine.pc = 0;
     machine.env = env;
     Ok(())
+}
+
+fn next_visit(site_visits: &mut HashMap<EffectSite, u64>, site: EffectSite) -> u64 {
+    let visit = site_visits.entry(site).or_insert(0);
+    let current = *visit;
+    *visit += 1;
+    current
+}
+
+async fn emit_ir_effect(config: &SeqConfig, location: &EffectLocation) -> Result<()> {
+    config
+        .trace
+        .emit(&Event::Custom {
+            run_id: config.trace.run_id().into(),
+            name: "ir_effect".into(),
+            data: serde_json::to_value(location)?,
+            timestamp: Utc::now(),
+        })
+        .await
 }
 
 fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
@@ -406,6 +476,18 @@ mod tests {
         }
     }
 
+    fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
+        SeqConfig {
+            provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+        }
+    }
+
     #[tokio::test]
     async fn ir_runs_infer_then_infer_without_rust_continuations() -> Result<()> {
         let provider = Arc::new(MockProvider::new(vec![
@@ -472,6 +554,57 @@ mod tests {
         let prompts = provider.prompts();
         assert_eq!(prompts.len(), 2);
         assert_eq!(prompts[1][0].content.as_deref(), Some("first"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ir_effect_metadata_is_stable_and_visit_sensitive() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![Instr::Get {
+                    out: Var("a".into()),
+                    key: Expr::Value(Value::String("missing".into())),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("a".into())),
+                },
+            },
+        );
+        let machine = Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("effect-ids".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        };
+
+        let _ = run_ir_sequential(&config_with_trace(provider, trace), machine).await?;
+        let events = TraceLogger::read_events(trace_path).await?;
+        let locations = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "ir_effect" => {
+                    Some(serde_json::from_value::<EffectLocation>(data.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].kind, EffectKind::Get);
+        assert_eq!(locations[0].site.block, BlockId(0));
+        assert_eq!(locations[0].site.instruction_index, 0);
         Ok(())
     }
 
