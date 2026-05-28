@@ -23,7 +23,8 @@ pub use ir::{
 };
 pub use ir_interpreter::{
     run_ir_sequential, run_ir_sequential_with_store, run_ir_sequential_with_store_and_replay,
-    InMemoryStore, IrReplayTrace,
+    run_ir_steps, run_ir_steps_with_store_and_replay, InMemoryStore, IrCheckpoint, IrReplayTrace,
+    IrStepOutcome,
 };
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{

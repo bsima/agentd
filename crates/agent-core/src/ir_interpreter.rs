@@ -10,6 +10,7 @@ use crate::op::{ChatMessage, Model, Prompt};
 use crate::trace::Event;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -165,7 +166,19 @@ fn take_location(
     Ok(location)
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrCheckpoint {
+    pub machine: Machine,
+    pub store: InMemoryStore,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrStepOutcome {
+    Complete { value: Value, machine: Machine },
+    Suspended { checkpoint: IrCheckpoint },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InMemoryStore {
     values: BTreeMap<String, Value>,
 }
@@ -194,20 +207,55 @@ pub async fn run_ir_sequential_with_store(
     machine: Machine,
     store: &mut InMemoryStore,
 ) -> Result<(Value, Machine)> {
-    run_ir_sequential_with_store_and_replay(config, machine, store, None).await
+    match run_ir_steps_with_store_and_replay(config, machine, store, None, None).await? {
+        IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
+        IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
+    }
 }
 
 pub async fn run_ir_sequential_with_store_and_replay(
     config: &SeqConfig,
-    mut machine: Machine,
+    machine: Machine,
     store: &mut InMemoryStore,
     ir_replay: Option<&IrReplayTrace>,
 ) -> Result<(Value, Machine)> {
+    match run_ir_steps_with_store_and_replay(config, machine, store, ir_replay, None).await? {
+        IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
+        IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
+    }
+}
+
+pub async fn run_ir_steps(
+    config: &SeqConfig,
+    machine: Machine,
+    max_instructions: usize,
+) -> Result<IrStepOutcome> {
+    let mut store = InMemoryStore::new();
+    run_ir_steps_with_store_and_replay(config, machine, &mut store, None, Some(max_instructions))
+        .await
+}
+
+pub async fn run_ir_steps_with_store_and_replay(
+    config: &SeqConfig,
+    mut machine: Machine,
+    store: &mut InMemoryStore,
+    ir_replay: Option<&IrReplayTrace>,
+    max_instructions: Option<usize>,
+) -> Result<IrStepOutcome> {
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
     let mut site_visits = HashMap::<EffectSite, u64>::new();
+    let mut instructions_executed = 0usize;
 
     loop {
+        if max_instructions.is_some_and(|max| instructions_executed >= max) {
+            return Ok(IrStepOutcome::Suspended {
+                checkpoint: IrCheckpoint {
+                    machine,
+                    store: store.clone(),
+                },
+            });
+        }
         let block = machine
             .program
             .blocks
@@ -234,13 +282,14 @@ pub async fn run_ir_sequential_with_store_and_replay(
             )
             .await?;
             machine.pc += 1;
+            instructions_executed += 1;
             continue;
         }
 
         match block.terminator {
             Terminator::Return { value } => {
                 let value = eval_expr(&machine.env, &value)?;
-                return Ok((value, machine));
+                return Ok(IrStepOutcome::Complete { value, machine });
             }
             Terminator::Goto { block, args } => {
                 goto_block(&mut machine, block, args).await?;
@@ -853,6 +902,89 @@ mod tests {
         Machine {
             program: crate::ir::Program {
                 id: crate::ir::ProgramId("single-infer".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ir_checkpoint_resumes_without_replaying_completed_effects() -> Result<()> {
+        let first_provider = Arc::new(MockProvider::new(vec![response("first")]));
+        let machine = infer_then_infer_machine();
+        let outcome = run_ir_steps(&config(first_provider.clone()), machine, 1).await?;
+        let checkpoint = match outcome {
+            IrStepOutcome::Suspended { checkpoint } => checkpoint,
+            IrStepOutcome::Complete { .. } => panic!("expected suspension after one instruction"),
+        };
+        assert_eq!(first_provider.prompt_count(), 1);
+
+        let encoded = serde_json::to_value(&checkpoint)?;
+        let checkpoint: IrCheckpoint = serde_json::from_value(encoded)?;
+        let second_provider = Arc::new(MockProvider::new(vec![response("second")]));
+        let mut store = checkpoint.store;
+        let (value, _machine) = run_ir_sequential_with_store(
+            &config(second_provider.clone()),
+            checkpoint.machine,
+            &mut store,
+        )
+        .await?;
+
+        assert_eq!(value, Value::String("second".into()));
+        assert_eq!(second_provider.prompt_count(), 1);
+        Ok(())
+    }
+
+    fn infer_then_infer_machine() -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Infer {
+                        out: Var("a".into()),
+                        model: Expr::Value(Value::String("mock".into())),
+                        prompt: PromptRef::Inline(vec![ChatMessage::user("first prompt")]),
+                        policy: Default::default(),
+                    },
+                    Instr::Let {
+                        out: Var("a_content".into()),
+                        expr: Expr::Field {
+                            base: Var("a".into()),
+                            field: "content".into(),
+                        },
+                    },
+                    Instr::Let {
+                        out: Var("second_prompt".into()),
+                        expr: Expr::Array(vec![Expr::Object(BTreeMap::from([
+                            ("role".into(), Expr::Value(Value::String("user".into()))),
+                            ("content".into(), Expr::Var(Var("a_content".into()))),
+                        ]))]),
+                    },
+                    Instr::Infer {
+                        out: Var("b".into()),
+                        model: Expr::Value(Value::String("mock".into())),
+                        prompt: PromptRef::Var(Var("second_prompt".into())),
+                        policy: Default::default(),
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Expr::Field {
+                        base: Var("b".into()),
+                        field: "content".into(),
+                    },
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("infer-infer".into()),
                 entry: BlockId(0),
                 blocks,
             },
