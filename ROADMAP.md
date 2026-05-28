@@ -45,7 +45,7 @@ Planned work:
 
 Status: required for the next stable release.
 
-The current `Op` free monad uses Rust closure continuations. That is useful for an M1 runtime, but it is not the final interpreter representation. The next stable release should introduce a serializable AgentIR and make the runtime IR-first.
+The current `Op` free monad uses Rust closure continuations. That is useful for an M1 runtime, but it is not the final interpreter representation. The next stable release should introduce a serializable AgentIR and make the runtime IR-first. The concrete AST/CFG design is captured in [docs/AGENT_IR.md](./docs/AGENT_IR.md).
 
 Planned work:
 
