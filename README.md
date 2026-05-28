@@ -130,6 +130,27 @@ Run a one-shot prompt:
 cargo run -- --model openrouter/auto "say hello"
 ```
 
+You can also run a markdown file as the prompt:
+
+```sh
+cargo run -- ./task.md
+cat input.json | cargo run -- ./task.md
+```
+
+Markdown prompts may include YAML frontmatter for fields the CLI applies directly: `provider`, `model`, `max_iterations`, and `system_prompt`.
+
+```md
+---
+model: openrouter/auto
+max_iterations: 8
+system_prompt: ./system.md
+---
+
+Inspect this repo and summarize it.
+```
+
+`system_prompt` may be inline text or a path resolved relative to the markdown file.
+
 You can also skip the registry and pass a raw model id.
 Then the CLI uses `OPENROUTER_BASE_URL` or `https://openrouter.ai/api/v1`, and `AGENT_API_KEY` or `OPENROUTER_API_KEY`.
 

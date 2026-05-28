@@ -9,11 +9,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
+
+mod frontmatter;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -63,7 +66,7 @@ struct Args {
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
-    /// One-shot prompt. Omit when using --fifo or NUL-framed stdin sessions.
+    /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -142,6 +145,7 @@ struct Runtime {
     checkpoint_sequence: u64,
     history: Vec<ChatMessage>,
     debug: bool,
+    max_turns: usize,
 }
 
 #[tokio::main]
@@ -153,7 +157,37 @@ async fn main() -> Result<()> {
     let file_config = read_config(args.config.as_ref()).await?;
     let provider_file = file_config.provider.unwrap_or_default();
 
-    let resolved_model = resolve_model(args.model, provider_file.model).await?;
+    let loaded_prompt = match args.prompt.as_ref() {
+        Some(prompt) => Some(frontmatter::MarkdownPrompt::from_arg(prompt).await?),
+        None => None,
+    };
+    let frontmatter = loaded_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.frontmatter.as_ref());
+    let requested_model = args
+        .model
+        .clone()
+        .or_else(|| frontmatter.and_then(|meta| meta.model.clone()));
+    let requested_provider = args
+        .provider
+        .clone()
+        .or_else(|| frontmatter.and_then(|meta| meta.provider.clone()));
+    let max_turns = frontmatter
+        .and_then(|meta| meta.max_iterations)
+        .unwrap_or(16);
+    let system_prompt_override = match loaded_prompt.as_ref() {
+        Some(prompt) => {
+            frontmatter::resolve_system_prompt(
+                &prompt.base_dir,
+                frontmatter.and_then(|meta| meta.system_prompt.as_deref()),
+            )
+            .await?
+        }
+        None => None,
+    };
+    let system_prompt = build_system_prompt(system_prompt_override).await?;
+
+    let resolved_model = resolve_model(requested_model, provider_file.model.clone()).await?;
     let eval_config = EvalConfig {
         cwd: args.eval_cwd.clone(),
         timeout: Duration::from_secs(args.eval_timeout_seconds),
@@ -167,8 +201,7 @@ async fn main() -> Result<()> {
         },
         ..EvalConfig::default()
     };
-    let url = args
-        .provider
+    let url = requested_provider
         .or(provider_file.url)
         .or(resolved_model.base_url.clone())
         .or_else(|| std::env::var("AGENT_PROVIDER").ok())
@@ -253,7 +286,7 @@ async fn main() -> Result<()> {
     };
     let (history, checkpoint_sequence) = match checkpoint {
         Some(cp) => (cp.messages, cp.sequence),
-        None => (initial_history(), 0),
+        None => (initial_history(system_prompt), 0),
     };
     let config = SeqConfig {
         provider,
@@ -279,6 +312,7 @@ async fn main() -> Result<()> {
         checkpoint_sequence,
         history,
         debug: args.debug,
+        max_turns,
     };
 
     if args.debug {
@@ -288,8 +322,11 @@ async fn main() -> Result<()> {
         eprintln!("trace: {}", trace_path.display());
     }
 
-    match (args.prompt, args.fifo, args.session) {
-        (Some(prompt), None, false) => run_one_shot(&mut runtime, prompt).await,
+    match (loaded_prompt, args.fifo, args.session) {
+        (Some(prompt), None, false) => {
+            let prompt = prompt_with_optional_stdin(prompt.body)?;
+            run_one_shot(&mut runtime, prompt).await
+        }
         (Some(_), Some(_), _) => Err(anyhow!("provide either a prompt or --fifo, not both")),
         (Some(_), None, true) => Err(anyhow!("provide either a prompt or --session, not both")),
         (None, Some(path), _) => run_fifo_session(&mut runtime, path).await,
@@ -454,7 +491,7 @@ async fn run_turn_with_status(
 async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::Response> {
     runtime.history.push(ChatMessage::user(message));
     let prompt = runtime.history.clone();
-    let program = agent_loop(runtime.model.clone(), prompt.clone(), 16);
+    let program = agent_loop(runtime.model.clone(), prompt.clone(), runtime.max_turns);
     let (response, mut new_history) =
         agent_core::run_sequential(&runtime.config, prompt, program).await?;
     if !response.content.is_empty() || response.tool_calls.is_empty() {
@@ -651,8 +688,36 @@ fn base_system_prompt() -> &'static str {
     "You are a standalone agent runner. Use the shell tool when you need to inspect or change the environment. The shell tool executes command strings with the configured shell inside the current process environment. When finished, answer concisely."
 }
 
-fn initial_history() -> Vec<ChatMessage> {
-    vec![ChatMessage::system(base_system_prompt())]
+async fn build_system_prompt(override_prompt: Option<String>) -> Result<String> {
+    let base = override_prompt.unwrap_or_else(|| base_system_prompt().to_string());
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    Ok(format!(
+        "{base}\n\nCurrent date and time: {}\nCurrent working directory: {}",
+        Utc::now().to_rfc3339(),
+        cwd.display()
+    ))
+}
+
+fn initial_history(system_prompt: String) -> Vec<ChatMessage> {
+    vec![ChatMessage::system(system_prompt)]
+}
+
+fn prompt_with_optional_stdin(prompt: String) -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        return Ok(prompt);
+    }
+
+    let mut stdin = String::new();
+    std::io::stdin()
+        .read_to_string(&mut stdin)
+        .context("reading stdin")?;
+    if stdin.trim().is_empty() {
+        Ok(prompt)
+    } else if prompt.trim().is_empty() {
+        Ok(stdin)
+    } else {
+        Ok(format!("{prompt}\n\n--- Input Data ---\n{stdin}"))
+    }
 }
 
 struct LocalFileSource {
