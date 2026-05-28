@@ -125,6 +125,7 @@ These should stay separate. AgentIR says when effects happen. PromptIR says what
 
 - Existing CLI behavior is preserved.
 - Existing release evals pass with the AgentIR interpreter.
+- A gated online eval demonstrates model-visible `infer` tool behavior: an agent can request a second `Infer` effect directly, use its result, and produce a correct final answer without routing through shell or a nested agent process.
 - Agent programs can be serialized and deserialized before execution.
 - Replay is keyed by stable effect IDs, not incidental sequence numbers.
 - Mid-turn checkpoints can resume without replaying completed effects.

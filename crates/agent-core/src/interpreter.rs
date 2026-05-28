@@ -767,6 +767,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn infer_can_call_infer_from_its_continuation() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response("first-infer-result", vec![]),
+            response("second-infer-result", vec![]),
+        ]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = SeqConfig {
+            provider: provider.clone(),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+        };
+
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("first")]).and_then(
+            |first_response| {
+                infer(
+                    Model("mock".into()),
+                    vec![ChatMessage::user(format!(
+                        "second saw: {}",
+                        first_response.content
+                    ))],
+                )
+            },
+        );
+
+        let (result, _) = run_sequential(&config, (), program).await?;
+
+        assert_eq!(result.content, "second-infer-result");
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0][0].content.as_deref(), Some("first"));
+        assert_eq!(
+            prompts[1][0].content.as_deref(),
+            Some("second saw: first-infer-result")
+        );
+        let events = TraceLogger::read_events(trace_path).await?;
+        let infer_calls = events
+            .iter()
+            .filter(|event| matches!(event, Event::InferCall { .. }))
+            .count();
+        let infer_results = events
+            .iter()
+            .filter(|event| matches!(event, Event::InferResult { .. }))
+            .count();
+        assert_eq!(infer_calls, 2);
+        assert_eq!(infer_results, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn get_put_and_par_are_interpreted_sequentially() -> Result<()> {
         let provider = Arc::new(MockProvider::new(vec![]));
         let config = SeqConfig {
