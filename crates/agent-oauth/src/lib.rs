@@ -232,7 +232,7 @@ struct OAuthChatProvider {
 impl OAuthChatProvider {
     fn new(kind: OAuthProviderKind, _model: Model) -> Result<Self> {
         let base_url = match kind {
-            OAuthProviderKind::Codex => "https://api.openai.com/v1",
+            OAuthProviderKind::Codex => "https://chatgpt.com/backend-api",
             OAuthProviderKind::ClaudeCode => "https://api.anthropic.com/v1",
         };
         Ok(Self {
@@ -378,6 +378,24 @@ impl ChatProvider for OAuthChatProvider {
         messages: &[ChatMessage],
     ) -> Result<Response> {
         let token = self.access_token().await?;
+        match self.kind {
+            OAuthProviderKind::Codex => self.chat_codex(&token, model, tools, messages).await,
+            OAuthProviderKind::ClaudeCode => {
+                self.chat_openai_compatible(&token, model, tools, messages)
+                    .await
+            }
+        }
+    }
+}
+
+impl OAuthChatProvider {
+    async fn chat_openai_compatible(
+        &self,
+        token: &str,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+    ) -> Result<Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = json!({
             "model": model.0,
@@ -398,6 +416,38 @@ impl ChatProvider for OAuthChatProvider {
             return Err(anyhow!("OAuth provider returned {status}: {text}"));
         }
         parse_chat_response(&text)
+    }
+
+    async fn chat_codex(
+        &self,
+        token: &str,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+    ) -> Result<Response> {
+        let account_id = extract_codex_account_id(token).ok_or_else(|| {
+            anyhow!("failed to extract chatgpt_account_id from OpenAI Codex token")
+        })?;
+        let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
+        let body = build_codex_request(model, tools, messages);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("chatgpt-account-id", account_id)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!("Codex OAuth provider returned {status}: {text}"));
+        }
+        parse_codex_sse_response(&text)
     }
 }
 
@@ -591,6 +641,323 @@ struct Usage {
     total_tokens: u32,
 }
 
+const CODEX_DEFAULT_INSTRUCTIONS: &str =
+    "You are Codex, based on GPT-5. You are running as a coding agent in a CLI harness.";
+
+fn build_codex_request(model: &Model, tools: &[ToolSpec], messages: &[ChatMessage]) -> Value {
+    let mut input = Vec::new();
+    let mut system = Vec::new();
+    for message in messages {
+        if message.role == "system" {
+            if let Some(content) = message
+                .content
+                .as_deref()
+                .filter(|content| !content.is_empty())
+            {
+                system.push(content);
+            }
+        }
+    }
+    if !system.is_empty() {
+        input.extend(codex_message("developer", &system.join("\n\n")));
+    }
+    for message in messages {
+        if message.role != "system" {
+            input.extend(message_to_codex_input(message));
+        }
+    }
+
+    let mut body = json!({
+        "model": model.0,
+        "instructions": CODEX_DEFAULT_INSTRUCTIONS,
+        "input": input,
+        "stream": true,
+        "store": false,
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.iter().map(tool_spec_to_codex).collect());
+    }
+    body
+}
+
+fn message_to_codex_input(message: &ChatMessage) -> Vec<Value> {
+    match message.role.as_str() {
+        "user" => codex_message("user", message.content.as_deref().unwrap_or_default()),
+        "assistant" => {
+            let mut items =
+                codex_message("assistant", message.content.as_deref().unwrap_or_default());
+            for call in message.tool_calls.as_deref().unwrap_or_default() {
+                items.push(json!({
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                }));
+            }
+            items
+        }
+        "tool" => message
+            .tool_call_id
+            .as_ref()
+            .map(|call_id| {
+                vec![json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": message.content.as_deref().unwrap_or_default(),
+                })]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn codex_message(role: &str, content: &str) -> Vec<Value> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let content_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    vec![json!({
+        "type": "message",
+        "role": role,
+        "content": [{ "type": content_type, "text": content }]
+    })]
+}
+
+fn tool_spec_to_codex(tool: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "parameters": tool.function.parameters,
+        "strict": null,
+    })
+}
+
+fn parse_codex_sse_response(text: &str) -> Result<Response> {
+    let mut content = String::new();
+    let mut current_tool: Option<CodexToolAccum> = None;
+    let mut tool_calls = Vec::new();
+    let mut tokens = 0u32;
+
+    for event_text in parse_sse_events(text) {
+        let Some(event) = parse_sse_event_json(event_text) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    content.push_str(delta);
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let (Some(tool), Some(delta)) = (
+                    &mut current_tool,
+                    event.get("delta").and_then(Value::as_str),
+                ) {
+                    tool.arguments.push_str(delta);
+                }
+            }
+            Some("response.output_item.added") => {
+                if let Some(item) = event.get("item").filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call")
+                }) {
+                    current_tool = Some(CodexToolAccum::from_item(item));
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("function_call") => {
+                            let mut accum = CodexToolAccum::from_item(item);
+                            if accum.arguments.is_empty() {
+                                if let Some(current) = current_tool.take() {
+                                    accum.arguments = current.arguments;
+                                }
+                            } else {
+                                current_tool = None;
+                            }
+                            tool_calls.push(accum.into_tool_call());
+                        }
+                        Some("message") if content.is_empty() => {
+                            content.push_str(&extract_codex_output_text(item));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("response.completed" | "response.done") => {
+                if let Some(total) = event
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+                    .and_then(codex_total_tokens)
+                {
+                    tokens = total;
+                }
+            }
+            Some("error" | "response.failed") => {
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("Codex error");
+                return Err(anyhow!(message.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(current) = current_tool {
+        tool_calls.push(current.into_tool_call());
+    }
+
+    Ok(Response {
+        content,
+        tool_calls,
+        tokens,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CodexToolAccum {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl CodexToolAccum {
+    fn from_item(item: &Value) -> Self {
+        Self {
+            id: item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: item
+                .get("arguments")
+                .map(|arguments| match arguments {
+                    Value::String(s) => s.clone(),
+                    value => value.to_string(),
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn into_tool_call(self) -> ResponseToolCall {
+        let arguments = serde_json::from_str(&self.arguments)
+            .unwrap_or_else(|_| json!({ "raw": self.arguments }));
+        ResponseToolCall::new(self.id, self.name, arguments)
+    }
+}
+
+fn parse_sse_events(text: &str) -> impl Iterator<Item = &str> {
+    text.split("\n\n")
+}
+
+fn parse_sse_event_json(event_text: &str) -> Option<Value> {
+    let json_text = event_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if json_text.is_empty() || json_text == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(&json_text).ok()
+}
+
+fn extract_codex_output_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn codex_total_tokens(usage: &Value) -> Option<u32> {
+    usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            let input = usage.get("input_tokens").and_then(Value::as_u64)?;
+            let output = usage.get("output_tokens").and_then(Value::as_u64)?;
+            Some(input + output)
+        })
+        .and_then(|tokens| u32::try_from(tokens).ok())
+}
+
+fn extract_codex_account_id(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64_url_decode(payload)?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    value
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut normalized = input.replace('-', "+").replace('_', "/");
+    let pad_len = (4 - (normalized.len() % 4)) % 4;
+    normalized.extend(std::iter::repeat_n('=', pad_len));
+    base64_decode(&normalized)
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let a = base64_value(chunk[0])?;
+        let b = base64_value(chunk[1])?;
+        let c = base64_value(chunk[2])?;
+        let d = base64_value(chunk[3])?;
+        if a < 0 || b < 0 {
+            return None;
+        }
+        out.push(((a << 2) | (b >> 4)) as u8);
+        if c >= 0 {
+            out.push((((b & 0x0f) << 4) | (c >> 2)) as u8);
+        }
+        if c >= 0 && d >= 0 {
+            out.push((((c & 0x03) << 6) | d) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn base64_value(byte: u8) -> Option<i16> {
+    match byte {
+        b'A'..=b'Z' => Some(i16::from(byte - b'A')),
+        b'a'..=b'z' => Some(i16::from(byte - b'a') + 26),
+        b'0'..=b'9' => Some(i16::from(byte - b'0') + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        b'=' => Some(-1),
+        _ => None,
+    }
+}
+
 fn parse_chat_response(text: &str) -> Result<Response> {
     let completion: ChatCompletion =
         serde_json::from_str(text).context("parsing OAuth provider response")?;
@@ -661,6 +1028,51 @@ mod tests {
             "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
         ));
         assert!(!url.contains("redirect_uri=https://console.anthropic.com/oauth/code/callback"));
+    }
+
+    #[test]
+    fn extracts_codex_account_id_from_token() {
+        let payload = serde_json::to_vec(&json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_123" }
+        }))
+        .unwrap();
+        let token = format!("header.{}.sig", base64url_no_pad(&payload));
+        assert_eq!(
+            extract_codex_account_id(&token).as_deref(),
+            Some("acct_123")
+        );
+    }
+
+    #[test]
+    fn parses_codex_sse_text_and_tool_calls() -> Result<()> {
+        let sse = r#"data: {"type":"response.output_text.delta","delta":"hello "}
+
+
+data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"shell","arguments":""}}
+
+
+data: {"type":"response.function_call_arguments.delta","delta":"{\"command\":"}
+
+
+data: {"type":"response.function_call_arguments.delta","delta":"\"printf ok\"}"}
+
+
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"shell"}}
+
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}
+
+"#;
+        let response = parse_codex_sse_response(sse)?;
+        assert_eq!(response.content, "hello ");
+        assert_eq!(response.tokens, 5);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name(), "shell");
+        assert_eq!(
+            response.tool_calls[0].arguments()["command"],
+            json!("printf ok")
+        );
+        Ok(())
     }
 
     #[test]
