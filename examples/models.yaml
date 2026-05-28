@@ -1,0 +1,48 @@
+# Copy this file to ~/.config/agent/models.yaml and edit for your providers.
+# API keys can be literal strings, but env var references are safer.
+
+# Used when --model is omitted.
+default_model: openrouter/auto
+
+models:
+  - name: openrouter/auto
+    provider: openai-compatible
+    base_url: https://openrouter.ai/api/v1
+    api_key: $OPENROUTER_API_KEY
+    api_id: openrouter/auto
+    input: 0
+    output: 0
+    context: 200000
+    thinking: false
+    vision: false
+    display: OpenRouter Auto
+
+  - name: openai/gpt-4o-mini
+    provider: openai-compatible
+    base_url: https://api.openai.com/v1
+    api_key: $OPENAI_API_KEY
+    api_id: gpt-4o-mini
+    input: 0.15
+    output: 0.60
+    context: 128000
+    thinking: false
+    vision: true
+    display: GPT-4o mini
+
+  # Experimental. Requires the default "oauth" feature and `agent auth login codex`.
+  - name: codex/gpt-5
+    provider: codex-oauth
+    api_id: gpt-5
+    context: 200000
+    thinking: true
+    vision: false
+    display: GPT-5 via Codex OAuth
+
+  # Experimental. Requires the default "oauth" feature and `agent auth login claude-code`.
+  - name: claude/sonnet-oauth
+    provider: claude-code-oauth
+    api_id: claude-sonnet-4-5
+    context: 200000
+    thinking: true
+    vision: true
+    display: Claude Sonnet via Claude Code OAuth

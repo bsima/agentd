@@ -95,27 +95,28 @@ Sources are still registered at startup as interpreters for specific key prefixe
 
 ## Hydration Sources: Implementation
 
-The interpreter maps `Get`/`Put` keys to `HydrationSource` implementations:
+The interpreter maps passive hydration and active `Get` keys to registered `HydrationSource` implementations:
 
 ```rust
 pub trait HydrationSource: Send + Sync {
     fn name(&self) -> &str;
-    fn key_prefix(&self) -> &str;     // e.g. "temporal", "semantic", "session"
-    fn mode(&self) -> SourceMode;     // Passive | Active
-    async fn get(&self, params: SourceParams) -> Result<SourceResult>;
-    async fn put(&self, key: &str, value: Value) -> Result<()>;
+    fn kind(&self) -> SourceKind;                 // Temporal | Semantic | Knowledge
+    fn capabilities(&self) -> SourceCapability;   // SESSION_CONTEXT | QUERY | WORKSPACE
+    async fn retrieve(&self, params: SourceParams) -> Result<SourceResult>;
 }
 ```
 
-Before the first `Infer` each turn, `SourceRegistry::run_passive` assembles context by emitting `Get` ops for all passive sources. Active sources are available to the agent program on demand.
+`SeqConfig::passive_hydration` selects which passive sources are assembled before each `Infer`. `PassiveSource::TemporalHistory` injects current interpreter state/history. `PassiveSource::SessionContext` calls registered sources with `SourceCapability::SESSION_CONTEXT`.
 
-**Why this matters:** Most agent systems have no principled model of _what goes into the context window and why_. The `Get`/`Put` model makes the provenance of every context chunk traceable: every chunk came from a `Get` op with a specific key and a specific source implementation. The interpreter that handled it is logged. The result is auditable.
+Active reads use the same `Get` op shape. Today `Get("semantic:topic")` dispatches to sources with `SourceCapability::QUERY`; `Get("session:state")` reads checkpoint JSON; `Get("temporal:...")` returns interpreter state. `Put("session:state", value)` writes checkpoint JSON and `Put("temporal:...", value)` replaces interpreter state.
+
+**Why this matters:** Most agent systems have no principled model of _what goes into the context window and why_. The `Get`/`Put` model gives every context chunk a source and key. The interpreter decides whether that source is passive, active, local, remote, replayed, or sandboxed.
 
 ## Session Model: FIFO + Checkpoints
 
 agentd agents run as long-lived processes. Turn delivery is via a FIFO (named pipe). Each turn is NUL-terminated on the pipe. The agent reads a turn, runs the `agent_loop`, writes a JSONL event, and loops. The session is the process; the FIFO is the IPC mechanism.
 
-Checkpoints are written after each turn via a passive `Put("session:state", ...)`. A crashed agent restarts from the last checkpoint with full history intact. No broker, no coordinator, no special protocol.
+Checkpoints are written after each turn via `Put("session:state", ...)` and mirrored to checkpoint files by the CLI. A crashed agent can restart from the last checkpoint with full history intact. No broker, no coordinator, no special protocol.
 
 ### Why FIFO?
 
