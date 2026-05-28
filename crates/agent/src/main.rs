@@ -69,7 +69,7 @@ struct Args {
     #[arg(long)]
     enable_compaction: bool,
     /// Experimental runtime backend.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::Op, hide = true)]
+    #[arg(long, value_enum, default_value_t = RuntimeMode::Ir, hide = true)]
     runtime: RuntimeMode,
     /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
