@@ -460,10 +460,9 @@ fn terminator_successors(
                     args.len()
                 ));
             }
-            Ok(vec![(
-                *block,
-                target_block.params.iter().cloned().collect(),
-            )])
+            let mut inherited = defined.clone();
+            inherited.extend(target_block.params.iter().cloned());
+            Ok(vec![(*block, inherited)])
         }
         Terminator::If {
             then_block,

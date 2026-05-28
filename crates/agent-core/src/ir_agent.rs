@@ -12,6 +12,9 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let tool_loop = BlockId(3);
     let tool_body = BlockId(4);
     let next_turn = BlockId(5);
+    let shell_tool = BlockId(6);
+    let infer_tool = BlockId(7);
+    let append_tool = BlockId(8);
 
     let history = Var("history".into());
     let turns_left = Var("turns_left".into());
@@ -27,8 +30,15 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let function = Var("function".into());
     let raw_arguments = Var("raw_arguments".into());
     let arguments = Var("arguments".into());
+    let function_name = Var("function_name".into());
+    let is_infer_tool = Var("is_infer_tool".into());
     let command = Var("command".into());
     let eval_result = Var("eval_result".into());
+    let infer_model = Var("infer_model".into());
+    let infer_prompt_text = Var("infer_prompt_text".into());
+    let infer_prompt = Var("infer_prompt".into());
+    let infer_result = Var("infer_result".into());
+    let tool_content = Var("tool_content".into());
     let tool_message = Var("tool_message".into());
     let next_history = Var("next_history".into());
     let next_i = Var("next_i".into());
@@ -181,6 +191,13 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     },
                 },
                 Instr::Let {
+                    out: function_name.clone(),
+                    expr: Expr::Field {
+                        base: function.clone(),
+                        field: "name".into(),
+                    },
+                },
+                Instr::Let {
                     out: raw_arguments.clone(),
                     expr: Expr::Field {
                         base: function.clone(),
@@ -194,9 +211,30 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     },
                 },
                 Instr::Let {
+                    out: is_infer_tool.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(function_name)),
+                        right: Box::new(Expr::Value(Value::String("infer".into()))),
+                    },
+                },
+            ],
+            terminator: Terminator::If {
+                cond: Expr::Var(is_infer_tool),
+                then_block: infer_tool,
+                else_block: shell_tool,
+            },
+        },
+    );
+
+    blocks.insert(
+        shell_tool,
+        Block {
+            params: vec![],
+            instructions: vec![
+                Instr::Let {
                     out: command.clone(),
                     expr: Expr::Field {
-                        base: arguments,
+                        base: arguments.clone(),
                         field: "command".into(),
                     },
                 },
@@ -208,6 +246,71 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     policy: Default::default(),
                 },
                 Instr::Let {
+                    out: tool_content.clone(),
+                    expr: Expr::ToString {
+                        value: Box::new(Expr::Var(eval_result)),
+                    },
+                },
+            ],
+            terminator: Terminator::Goto {
+                block: append_tool,
+                args: vec![Expr::Var(tool_content.clone())],
+            },
+        },
+    );
+
+    blocks.insert(
+        infer_tool,
+        Block {
+            params: vec![],
+            instructions: vec![
+                Instr::Let {
+                    out: infer_model.clone(),
+                    expr: Expr::Field {
+                        base: arguments.clone(),
+                        field: "model".into(),
+                    },
+                },
+                Instr::Let {
+                    out: infer_prompt_text.clone(),
+                    expr: Expr::Field {
+                        base: arguments.clone(),
+                        field: "prompt".into(),
+                    },
+                },
+                Instr::Let {
+                    out: infer_prompt.clone(),
+                    expr: Expr::Array(vec![Expr::Object(BTreeMap::from([
+                        ("role".into(), Expr::Value(Value::String("user".into()))),
+                        ("content".into(), Expr::Var(infer_prompt_text)),
+                    ]))]),
+                },
+                Instr::Infer {
+                    out: infer_result.clone(),
+                    model: Expr::Var(infer_model),
+                    prompt: PromptRef::Var(infer_prompt),
+                    policy: Default::default(),
+                },
+                Instr::Let {
+                    out: tool_content.clone(),
+                    expr: Expr::ToString {
+                        value: Box::new(Expr::Var(infer_result)),
+                    },
+                },
+            ],
+            terminator: Terminator::Goto {
+                block: append_tool,
+                args: vec![Expr::Var(tool_content.clone())],
+            },
+        },
+    );
+
+    blocks.insert(
+        append_tool,
+        Block {
+            params: vec![tool_content.clone()],
+            instructions: vec![
+                Instr::Let {
                     out: tool_message.clone(),
                     expr: Expr::Object(BTreeMap::from([
                         ("role".into(), Expr::Value(Value::String("tool".into()))),
@@ -218,12 +321,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                                 field: "id".into(),
                             },
                         ),
-                        (
-                            "content".into(),
-                            Expr::ToString {
-                                value: Box::new(Expr::Var(eval_result)),
-                            },
-                        ),
+                        ("content".into(), Expr::Var(tool_content)),
                     ])),
                 },
                 Instr::Let {
@@ -371,6 +469,36 @@ mod tests {
             4,
         );
         validate_program(&machine.program).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_executes_infer_tool_directly() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ResponseToolCall::new(
+                    "call-1",
+                    "infer",
+                    serde_json::json!({ "model": "mock", "prompt": "sub question" }),
+                )],
+            ),
+            response("sub answer", vec![]),
+            response("done", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("use infer"),
+            ],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value["content"], Value::String("done".into()));
+        Ok(())
     }
 
     #[tokio::test]

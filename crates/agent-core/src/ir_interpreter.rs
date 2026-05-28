@@ -378,7 +378,7 @@ async fn execute_instr(
                     None => {
                         config
                             .provider
-                            .chat(&Model(model), &config.tool_specs(), &prompt)
+                            .chat(&Model(model), &ir_tool_specs(), &prompt)
                             .await?
                     }
                 },
@@ -534,7 +534,7 @@ async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -
             args.len()
         ));
     }
-    let mut env = BTreeMap::new();
+    let mut env = machine.env.clone();
     for (param, arg) in target.params.iter().cloned().zip(args) {
         env.insert(param, eval_expr(&machine.env, &arg)?);
     }
@@ -542,6 +542,38 @@ async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -
     machine.pc = 0;
     machine.env = env;
     Ok(())
+}
+
+fn ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
+    vec![
+        crate::provider::ToolSpec {
+            kind: "function".into(),
+            function: crate::provider::ToolFunctionSpec {
+                name: "shell".into(),
+                description: "Execute a command string using the configured shell.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                }),
+            },
+        },
+        crate::provider::ToolSpec {
+            kind: "function".into(),
+            function: crate::provider::ToolFunctionSpec {
+                name: "infer".into(),
+                description: "Ask the model a focused sub-question and return its response.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "model": { "type": "string" },
+                        "prompt": { "type": "string" }
+                    },
+                    "required": ["model", "prompt"]
+                }),
+            },
+        },
+    ]
 }
 
 fn next_visit(site_visits: &mut HashMap<EffectSite, u64>, site: EffectSite) -> u64 {
