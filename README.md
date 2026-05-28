@@ -8,7 +8,7 @@ This repo currently contains:
 - `agent`: CLI for oneshot and persistent agents, this follows the Unix philosophy of "do one thing well", all it does is run an agentic loop
 - `agent-oauth`: experimental support for using codex/claude-code subscription
 
-This was originally written in Haskell in my provate monorepo of projects, I'm in the process of porting it to Rust and releasing it here.
+This was originally written in Haskell in my private monorepo of projects, I'm in the process of porting it to Rust and releasing it here.
 There's also an `agentd` process supervisor, eventually I will port that to Rust too.
 
 ## Core ideas
