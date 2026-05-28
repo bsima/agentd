@@ -1,40 +1,55 @@
 # agentd
 
-A Rust runtime for long-running AI agents. Built on a simple thesis: **Linux is the harness.**
+A Rust runtime for long-running AI agents.
 
-## The Problem with Agent Frameworks
+The thesis is simple: **Linux is the harness.**
 
-The current landscape — Claude Code, OpenCode, Hermes, Pi, and their kin — wraps models in elaborate scaffolding: tool registries, guardrail layers, prompt templating, orchestration DSLs. The implicit assumption is that the model needs help knowing what to do.
+## Why this exists
 
-This is a temporary condition. Models are improving fast. The guardrails and affordances these harnesses provide are necessities today, but they're technical debt on the trajectory toward more capable models. A framework that's useful now because the model can't figure out its environment becomes dead weight once it can.
+Most agent frameworks wrap the model in scaffolding: tool registries, prompt templates, orchestration DSLs, guardrail layers, plugin systems. That makes sense today. Models still need help navigating their environment.
 
-The durable layer is not the harness. It's the substrate: **Linux**.
+I think that is temporary. As models improve, a lot of framework machinery becomes dead weight. The durable layer is not the harness. It is the substrate: Linux.
 
-Sandboxes have always been necessary for secure computing — that predates AI by decades. What changes is everything built on top of the sandbox. The model should wield the full power of a Unix environment directly: files, pipes, processes, the shell, the compiler, the network. These are not tools to be wrapped in JSON schemas. They are the computing environment. The agent lives in it.
+The model should get a real Unix environment. Files. Pipes. Processes. The shell. The compiler. The network, if the sandbox allows it. These are not JSON-schema tools. They are the computing environment.
 
-agentd is built on this premise. The open-core Rust port currently provides:
-- A **free monad runtime** that treats Infer and Eval as first-class operations
-- An `agent` CLI for one-shot prompts and NUL-framed session loops
-- A **FIFO-compatible turn protocol** — as Unix-native as it gets
-- A **unified Get/Put interface** for hydration and session state
-- A **checkpoint/trace system** for resumability and debugging
+`agentd` is built around that model.
 
-The full `agentd` process supervisor exists today in the original Haskell system under `Omni/Agentd`. Porting that daemon/scheduler layer to Rust is future work. This repository is the Rust runtime and CLI foundation it will sit on.
+This repo currently provides:
 
-It does not provide: a web dashboard, a plugin marketplace, a YAML pipeline language, built-in sandboxing, or opinions about which Unix tools your agent should have. Those are your problem. agentd is the runtime substrate; the agent wields Linux.
+- a free monad runtime where `Infer` and `Eval` are first-class operations
+- an `agent` CLI for one-shot prompts and NUL-framed session loops
+- FIFO-compatible turn delivery
+- a unified `Get`/`Put` interface for context and session state
+- traces and checkpoints for replay, debugging, and resumability
 
-## Core Ideas
+The full `agentd` process supervisor exists today in the original Haskell system under `Omni/Agentd`. Porting that daemon layer to Rust is future work. This repo is the Rust runtime and CLI foundation.
 
-### Infer/Eval as the Agentic Loop
+It does not provide a dashboard, plugin marketplace, YAML pipeline language, built-in sandbox, or curated tool universe. Bring those yourself if you want them. The point here is the runtime substrate.
 
-Traditional computing can be reduced to a single operation: `eval(structured_data)`. Modern AI is `infer(unstructured_data)`. The agentic runtime is how both of these become integrated: a loop where model inference and environment evaluation alternate indefinitely.
+## Core ideas
 
-agentd makes this structural with a free monad over `OpF`:
+### The agent is the loop
+
+Traditional computing is:
+
+```text
+eval(structured_data)
+```
+
+Modern ML is:
+
+```text
+infer(unstructured_data)
+```
+
+An agent alternates between the two. It infers from context, evaluates effects against the environment, reads the result, then infers again.
+
+`agentd` makes that structure explicit with a free monad over `OpF`:
 
 ```rust
 pub enum OpF<S, A> {
     Infer { model, prompt, next },  // LLM call: infer(unstructured)
-    Eval  { command, next },        // process call: eval(structured) — currently $SHELL -c
+    Eval  { command, next },        // process call: eval(structured), currently $SHELL -c
     Get   { key, next },            // state/context read
     Put   { key, value, next },     // state/context write
     Emit  { event, next },          // trace
@@ -43,43 +58,51 @@ pub enum OpF<S, A> {
 }
 ```
 
-The agent is a *program*. The runtime is an *interpreter*. This boundary is what makes the system testable, replaceable, and compositional. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full reasoning.
+The agent is a program. The runtime is an interpreter. That boundary is load-bearing. It makes the system testable, replayable, and replaceable.
 
-### Meta-Circular: Infer Calling Infer
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the longer version.
 
-All `OpF` variants are available to agent programs — including `Infer`. An agent that can emit `Infer` ops can construct sub-agents with different models, different prompts, different context windows. Multi-agent orchestration is not a special layer built on top: it is just an agent program that contains multiple `Infer` calls. The outer agent *is* the orchestrator.
+### Infer can call Infer
 
-This is the SICP meta-circular insight applied to agents: `eval` calling `eval` collapses the interpreter/object-language boundary. The same structure that enables agent programs to compose is the structure that enables multi-agent systems — no additional abstraction needed.
+All `OpF` variants are available to agent programs, including `Infer`.
 
-### Free Monad: Effects as Data
+So a multi-agent system is not a special framework layer. It is just an agent program that emits multiple `Infer` calls, maybe with different models, prompts, budgets, or context windows. The outer agent is the orchestrator.
 
-Programs built with `Op` constructors are pure data — they can be inspected, composed, replayed, or run against a mock interpreter before any IO happens. Every new capability is a new `OpF` variant with a new interpreter branch. No async spaghetti.
+This is the SICP meta-circular idea applied to agents. `eval` calling `eval` collapses the interpreter/object-language boundary. `Infer` calling `Infer` does the same thing for agents.
 
-The free monad implementation was first proved out as a Haskell program in a private repo (`Omni/Agent/Op.hs`) and used extensively at production scale. This Rust port is a direct translation, with some cleanup, for public release.
+### Effects are data
 
-### Get/Put: The Unified Hydration Interface
+Programs built with `Op` constructors do not perform IO immediately. They are data. You can inspect them, transform them, replay them, or run them against a mock interpreter.
 
-Most systems treat context as an append-only log. agentd models all context injection — temporal history, semantic recall, workspace files, session state — as `Get`/`Put` operations over named keys. The interpreter decides what each key means:
+That is the bigger lever. Instead of hiding work inside arbitrary async functions, the runtime keeps model calls, process calls, state reads, state writes, trace events, and parallel branches visible as data.
 
+Adding a capability means adding an `OpF` variant and teaching interpreters what it means.
+
+### Get/Put is the hydration interface
+
+Most systems treat context as an append-only prompt log. `agentd` models context as keyed reads and writes.
+
+```text
+Get("temporal-passive")   -> recent chat history
+Get("semantic:topic")     -> vector search or other recall
+Get("session:state")      -> current checkpoint
+Put("session:state", v)   -> write checkpoint
 ```
-Get("temporal-passive")   →  inject recent chat history
-Get("semantic:topic")     →  vector similarity search
-Get("session:state")      →  read current checkpoint
-Put("session:state", v)   →  write checkpoint
-```
 
-This creates a clean 2×2 taxonomy:
+The interpreter decides what each key means.
 
-|                | **Passive** (interpreter auto-emits before turn) | **Active** (agent-emitted)              |
-|----------------|---------------------------------------------------|-----------------------------------------|
-| **Temporal**   | Recent chat history, recent events                | `Get("temporal:search query")`          |
-| **Semantic**   | Similarity-based RAG, static workspace            | `Get("semantic:topic")`                 |
+That gives one interface for passive context injection, active recall, workspace context, and session state.
 
-Passive sources fire automatically — the runtime assembles the context window before the model ever sees the request. Active sources are available to the agent program on demand, via the same `Get` op. One interface, all sources.
+|                | Passive, interpreter-owned | Active, agent-emitted |
+|----------------|----------------------------|------------------------|
+| Temporal       | recent events/history       | `Get("temporal:query")` |
+| Semantic       | RAG/static workspace        | `Get("semantic:topic")` |
 
-### Linux-Native Session Model
+Passive sources run before the model sees a turn. Active sources are available when the agent decides it needs them.
 
-The Rust CLI runs an agent loop as a normal process. It can handle one prompt, read NUL-terminated turns from stdin, or read NUL-terminated turns from a FIFO path. After each turn, it can write checkpoints. The entire protocol is pipes and files.
+### Sessions are Unix processes
+
+The Rust CLI runs an agent loop as a normal process. It can take one prompt, read NUL-terminated turns from stdin, or read NUL-terminated turns from a FIFO path. After each turn it can write checkpoints. The protocol is pipes and files.
 
 ```sh
 # One-shot prompt
@@ -94,7 +117,7 @@ agent --fifo .agent.fifo --checkpoint-dir .agent-checkpoints &
 printf 'run cargo test\0' > .agent.fifo
 ```
 
-The future Rust `agentd` supervisor will wrap this process model with commands like:
+The future Rust supervisor will wrap this with commands like:
 
 ```sh
 agentd start myagent
@@ -103,19 +126,21 @@ agentd logs myagent
 agentd stop myagent
 ```
 
-Those supervisor commands work in the Haskell implementation today. They are not part of this Rust repo yet. No message broker, no gRPC, no special protocol is required. If you can write NUL-terminated bytes to stdin or a FIFO, you can steer your agent.
+Those commands work in the Haskell implementation today. They are not in this Rust repo yet.
 
-## Design Philosophy
+No broker is required. No gRPC protocol is required. If you can write NUL-terminated bytes to stdin or a FIFO, you can steer the agent.
 
-**The model is not the agent. The loop is the agent.** An agent is a process that persists, reads its environment, acts, and recurs. The LLM is one effect inside that loop — the most important one, but structurally no different from a shell command.
+## Design philosophy
 
-**Guardrails are scaffolding, not architecture.** As models improve, the value of framework-level guardrails approaches zero. The durable value is in the runtime substrate: process model, IO semantics, context hygiene, trace/replay.
+**The model is not the agent. The loop is the agent.** The LLM is one effect inside the loop. It is the important effect, but structurally it is still an effect.
 
-**Follow the Unix design principle.** Every hard problem in agent infrastructure has an analogue in operating systems: scheduling, isolation, IPC, persistence, logging. Before reaching for a new abstraction, check if the Unix answer already works.
+**Guardrails are scaffolding, not architecture.** Framework-level guardrails are useful now. They should not define the system boundary.
 
-**Bring your own sandbox.** agentd does not enforce isolation — that's the job of the container or VM you run it in. Sandboxing is a deployment concern, not a framework concern. The agent inside the sandbox gets the full Linux environment.
+**Use the Unix answer first.** Scheduling, isolation, IPC, persistence, logging, process supervision: operating systems already have models for these.
 
-**Security warning:** `Eval` currently runs model-requested commands with `$SHELL -c`. Do not run this against a workspace, home directory, network, or credential environment you are not willing to give to the model. Run it in a container, VM, or other sandbox. Trace logs also record commands and command output, which may contain secrets.
+**Bring your own sandbox.** `agentd` does not enforce isolation. Run it in the container, VM, jail, or remote worker you trust. Inside that boundary, the agent gets Linux.
+
+**Security warning:** `Eval` currently runs model-requested commands with `$SHELL -c`. Do not point it at a workspace, home directory, network, or credential environment you are not willing to hand to the model. Trace logs record commands and output, which may contain secrets.
 
 ## Quickstart
 
@@ -126,14 +151,14 @@ cargo test
 cargo build --release
 ```
 
-Configure a model registry at `~/.config/agent/models.yaml`, or copy the example:
+Configure a model registry:
 
 ```sh
 mkdir -p ~/.config/agent
 cp examples/models.yaml ~/.config/agent/models.yaml
 ```
 
-Set an API key for the provider you configured:
+Set the provider key:
 
 ```sh
 export OPENROUTER_API_KEY=...
@@ -145,11 +170,11 @@ Run a one-shot prompt:
 cargo run -- --model openrouter/auto "say hello"
 ```
 
-You can also skip the registry and pass a raw model id. In that case the CLI uses `OPENROUTER_BASE_URL` or `https://openrouter.ai/api/v1`, and `AGENT_API_KEY` or `OPENROUTER_API_KEY`.
+You can also skip the registry and pass a raw model id. Then the CLI uses `OPENROUTER_BASE_URL` or `https://openrouter.ai/api/v1`, and `AGENT_API_KEY` or `OPENROUTER_API_KEY`.
 
-## Running Safely
+## Running safely
 
-The default interpreter gives the model direct shell execution. The safest default is to run it inside a disposable workspace with only the files and credentials needed for that task.
+The default interpreter gives the model direct shell execution. The sane default is a disposable workspace with only the files and credentials needed for the task.
 
 A minimal container pattern:
 
@@ -170,36 +195,39 @@ podman run --rm -it \
   agent --model openrouter/auto "inspect this project"
 ```
 
-For real use, prefer a purpose-built image that contains `agent`, your allowed toolchain, and no ambient secrets. Add network access only when the task requires it; model providers usually require it. Mount source code read-only unless the agent is supposed to edit it. Keep trace and checkpoint directories outside your main home directory if command output may contain secrets.
+For real use, prefer a purpose-built image with `agent`, the allowed toolchain, and no ambient secrets. Add network only when the task needs it. Mount source read-only unless the agent is supposed to edit it. Keep traces and checkpoints outside your main home directory if command output may contain secrets.
 
 ## Architecture
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for a full walkthrough of the free monad design, hydration sources, session model, and interpreter extensibility. See [ROADMAP.md](./ROADMAP.md) for the Rust port plan, including the future `agentd` supervisor.
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the free monad design, hydration model, session model, and interpreter story. See [ROADMAP.md](./ROADMAP.md) for the Rust port plan.
 
-## Crate Structure
+## Crate structure
 
-```
+```text
 crates/
-  agent-core/   — Op, OpF, interpreter, hydration, provider traits
-  agent/        — CLI binary, one-shot prompts, NUL/FIFO sessions
-  agent-oauth/  — experimental OAuth flows for claude-code / openai-codex providers
+  agent-core/   -- Op, OpF, interpreter, hydration, provider traits
+  agent/        -- CLI binary, one-shot prompts, NUL/FIFO sessions
+  agent-oauth/  -- experimental OAuth flows for claude-code / openai-codex providers
 ```
 
-`agent-core` defines the Op language, provider traits, hydration model, trace logger, and sequential interpreter. The current sequential interpreter performs IO for `Infer`, `Eval`, trace writes, and checkpoint reads/writes. The `agent` binary is the CLI shell around it. This boundary is intentional and load-bearing.
+`agent-core` defines the Op language, provider traits, hydration model, trace logger, and sequential interpreter. `agent` is the CLI shell around it. This boundary is intentional.
 
 ## Status
 
 M1 is implemented: single-agent CLI, sequential interpreter, shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, traces, checkpoints, hydration registry, and model registry loading.
 
 Active development:
+
 - M2: Rust `agentd` supervisor/daemon port from the working Haskell implementation
-- M3: hermetic PATH, stronger sandbox integration, richer HydrationSource implementations
+- M3: hermetic PATH, stronger sandbox integration, richer `HydrationSource` implementations
 - M4: parallel interpreter with real `Par` execution
 - M5: distributed interpreter, multi-VM campaigns
 
-## Prior Art
+## Prior art
 
-The design originates in `Omni/Agent/Op.hs`, a Haskell prototype that first demonstrated the free monad Op abstraction at production scale. This Rust port is a faithful translation, not a rewrite. The Haskell codebase remains the reference for Op semantics. The meta-circular Infer-emitting-Infer pattern has direct precedent in the SICP meta-circular evaluator.
+The design comes from `Omni/Agent/Op.hs`, a Haskell prototype that proved the free monad Op abstraction in production use. This Rust port is a translation, not a rewrite. The Haskell codebase remains the reference for Op semantics.
+
+The meta-circular `Infer`-emitting-`Infer` pattern has direct precedent in the SICP meta-circular evaluator.
 
 ## License
 
