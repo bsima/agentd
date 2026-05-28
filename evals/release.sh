@@ -18,6 +18,7 @@ cargo test
 
 # Optional/gated evals. They skip unless their RUN_* env vars are set.
 ./evals/online-shell.sh
+./evals/online-infer-tool.sh
 ./evals/agentd-persistent.sh
 
 echo "ok: release eval passed"
