@@ -3,12 +3,13 @@ use agent_core::{ChatMessage, ChatProvider, Model, Response, ResponseToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthProviderKind {
@@ -471,12 +472,13 @@ pub struct PkcePair {
 }
 
 pub fn generate_pkce() -> PkcePair {
-    let verifier = base64url_no_pad(Uuid::new_v4().as_bytes());
-    let mut challenge_bytes = *Uuid::new_v4().as_bytes();
-    challenge_bytes[0] ^= verifier.as_bytes()[0];
+    let mut verifier_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+    let verifier = base64url_no_pad(&verifier_bytes);
+    let challenge = base64url_no_pad(&Sha256::digest(verifier.as_bytes()));
     PkcePair {
-        verifier: fixed_43(verifier),
-        challenge: fixed_43(base64url_no_pad(&challenge_bytes)),
+        verifier,
+        challenge,
     }
 }
 
@@ -487,14 +489,6 @@ pub fn anthropic_auth_url(pkce: &PkcePair) -> String {
         percent_encode(redirect),
         pkce.challenge
     )
-}
-
-fn fixed_43(mut value: String) -> String {
-    while value.len() < 43 {
-        value.push('A');
-    }
-    value.truncate(43);
-    value
 }
 
 fn base64url_no_pad(bytes: &[u8]) -> String {
@@ -634,6 +628,14 @@ mod tests {
         assert_eq!(pkce.verifier.len(), 43);
         assert_eq!(pkce.challenge.len(), 43);
         assert_ne!(pkce.verifier, pkce.challenge);
+        assert!(pkce
+            .verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+        assert!(pkce
+            .challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
     }
 
     #[test]
