@@ -1,8 +1,8 @@
 use agent_core::{
-    agent_loop, ChatMessage, EnvPolicy, EvalConfig, Event, HydrationSource, ModelRegistry,
-    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayTrace,
-    ResolvedModel, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
-    SourceResult, TraceLogger,
+    agent_loop, agent_loop_ir, ChatMessage, EnvPolicy, EvalConfig, Event, HydrationSource,
+    ModelRegistry, PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig,
+    ReplayTrace, ResolvedModel, SeqConfig, SourceCapability, SourceKind, SourceParams,
+    SourceRegistry, SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -66,6 +66,9 @@ struct Args {
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
+    /// Experimental runtime backend.
+    #[arg(long, value_enum, default_value_t = RuntimeMode::Op, hide = true)]
+    runtime: RuntimeMode,
     /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
     #[command(subcommand)]
@@ -76,6 +79,12 @@ struct Args {
 enum EvalEnvMode {
     Inherit,
     Clean,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RuntimeMode {
+    Op,
+    Ir,
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +155,7 @@ struct Runtime {
     history: Vec<ChatMessage>,
     debug: bool,
     max_turns: usize,
+    runtime_mode: RuntimeMode,
 }
 
 #[tokio::main]
@@ -313,6 +323,7 @@ async fn main() -> Result<()> {
         history,
         debug: args.debug,
         max_turns,
+        runtime_mode: args.runtime,
     };
 
     if args.debug {
@@ -491,9 +502,25 @@ async fn run_turn_with_status(
 async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::Response> {
     runtime.history.push(ChatMessage::user(message));
     let prompt = runtime.history.clone();
-    let program = agent_loop(runtime.model.clone(), prompt.clone(), runtime.max_turns);
-    let (response, mut new_history) =
-        agent_core::run_sequential(&runtime.config, prompt, program).await?;
+    let (response, mut new_history) = match runtime.runtime_mode {
+        RuntimeMode::Op => {
+            let program = agent_loop(runtime.model.clone(), prompt.clone(), runtime.max_turns);
+            agent_core::run_sequential(&runtime.config, prompt, program).await?
+        }
+        RuntimeMode::Ir => {
+            let machine = agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
+            let (value, machine) = agent_core::run_ir_sequential(&runtime.config, machine).await?;
+            let response: agent_core::Response =
+                serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
+            let history = machine
+                .env
+                .get(&agent_core::Var("history".into()))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or(prompt);
+            (response, history)
+        }
+    };
     if !response.content.is_empty() || response.tool_calls.is_empty() {
         new_history.push(ChatMessage::assistant(
             (!response.content.is_empty()).then_some(response.content.clone()),
