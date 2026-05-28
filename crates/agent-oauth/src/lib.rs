@@ -460,8 +460,10 @@ pub async fn status_all() -> Result<Vec<TokenStatus>> {
 
 pub fn provider_for_tag(tag: &str, model: Model) -> Result<Option<Box<dyn ChatProvider>>> {
     match tag {
-        "codex-oauth" => Ok(Some(Box::new(CodexOAuthProvider::new(model)?))),
-        "claude-code-oauth" => Ok(Some(Box::new(ClaudeCodeOAuthProvider::new(model)?))),
+        "openai-codex" | "codex-oauth" => Ok(Some(Box::new(CodexOAuthProvider::new(model)?))),
+        "claude-code" | "claude-code-oauth" => {
+            Ok(Some(Box::new(ClaudeCodeOAuthProvider::new(model)?)))
+        }
         _ => Ok(None),
     }
 }
@@ -659,6 +661,16 @@ mod tests {
             "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
         ));
         assert!(!url.contains("redirect_uri=https://console.anthropic.com/oauth/code/callback"));
+    }
+
+    #[test]
+    fn provider_for_tag_accepts_haskell_and_rust_oauth_tags() -> Result<()> {
+        assert!(provider_for_tag("openai-codex", Model("gpt-5".into()))?.is_some());
+        assert!(provider_for_tag("codex-oauth", Model("gpt-5".into()))?.is_some());
+        assert!(provider_for_tag("claude-code", Model("claude".into()))?.is_some());
+        assert!(provider_for_tag("claude-code-oauth", Model("claude".into()))?.is_some());
+        assert!(provider_for_tag("openai-compatible", Model("model".into()))?.is_none());
+        Ok(())
     }
 
     #[test]
