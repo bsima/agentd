@@ -160,6 +160,17 @@ pub enum Expr {
     Value(Value),
     Var(Var),
     Field { base: Var, field: String },
+    Index { base: Var, index: Box<Expr> },
+    Len { base: Var },
+    IsEmpty { base: Var },
+    Eq { left: Box<Expr>, right: Box<Expr> },
+    Lt { left: Box<Expr>, right: Box<Expr> },
+    Or { left: Box<Expr>, right: Box<Expr> },
+    Add { left: Box<Expr>, right: Box<Expr> },
+    Sub { left: Box<Expr>, right: Box<Expr> },
+    Push { base: Var, value: Box<Expr> },
+    JsonParse { value: Box<Expr> },
+    ToString { value: Box<Expr> },
     Array(Vec<Expr>),
     Object(BTreeMap<String, Expr>),
 }
@@ -257,26 +268,64 @@ pub fn validate_program(program: &Program) -> Result<()> {
 
     for (block_id, block) in &program.blocks {
         validate_unique_vars(&block.params, "block params", *block_id)?;
-        let mut defined = block
+        validate_local_shadowing(block, *block_id)?;
+        validate_terminator_block_refs(program, &block.terminator)?;
+    }
+
+    let mut inputs = BTreeMap::<BlockId, std::collections::BTreeSet<Var>>::new();
+    inputs.insert(
+        program.entry,
+        program
+            .blocks
+            .get(&program.entry)
+            .expect("entry checked")
             .params
             .iter()
             .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect(),
+    );
+    let mut worklist = vec![program.entry];
+    while let Some(block_id) = worklist.pop() {
+        let block = program.blocks.get(&block_id).expect("queued block exists");
+        let mut defined = inputs.get(&block_id).cloned().unwrap_or_default();
+        defined.extend(block.params.iter().cloned());
         for instr in &block.instructions {
-            validate_instr_vars(instr, &defined, *block_id)?;
+            validate_instr_vars(instr, &defined, block_id)?;
             if let Some(out) = instr_out(instr) {
-                if !defined.insert(out.clone()) {
-                    return Err(anyhow!(
-                        "AgentIR variable {:?} is shadowed in block {:?}",
-                        out,
-                        block_id
-                    ));
-                }
+                defined.insert(out.clone());
             }
         }
-        validate_terminator(program, *block_id, &block.terminator, &defined)?;
+        validate_terminator_vars(&block.terminator, &defined, block_id)?;
+        for (target, inherited) in terminator_successors(program, &block.terminator, &defined)? {
+            let entry = inputs.entry(target).or_default();
+            let old_len = entry.len();
+            entry.extend(inherited);
+            if entry.len() != old_len {
+                worklist.push(target);
+            }
+        }
     }
 
+    Ok(())
+}
+
+fn validate_local_shadowing(block: &Block, block_id: BlockId) -> Result<()> {
+    let mut defined = block
+        .params
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for instr in &block.instructions {
+        if let Some(out) = instr_out(instr) {
+            if !defined.insert(out.clone()) {
+                return Err(anyhow!(
+                    "AgentIR variable {:?} is shadowed in block {:?}",
+                    out,
+                    block_id
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -346,32 +395,18 @@ fn validate_eval_request_vars(
     }
 }
 
-fn validate_terminator(
-    program: &Program,
-    block_id: BlockId,
-    terminator: &Terminator,
-    defined: &std::collections::BTreeSet<Var>,
-) -> Result<()> {
+fn validate_terminator_block_refs(program: &Program, terminator: &Terminator) -> Result<()> {
     match terminator {
-        Terminator::Goto { block, args } => {
-            validate_block_ref(program, *block)?;
-            validate_goto_args(program, *block, args, defined, block_id)
-        }
+        Terminator::Goto { block, .. } => validate_block_ref(program, *block),
         Terminator::If {
-            cond,
             then_block,
             else_block,
+            ..
         } => {
-            validate_expr_vars(cond, defined, block_id)?;
             validate_block_ref(program, *then_block)?;
             validate_block_ref(program, *else_block)
         }
-        Terminator::Match {
-            value,
-            arms,
-            default,
-        } => {
-            validate_expr_vars(value, defined, block_id)?;
+        Terminator::Match { arms, default, .. } => {
             for arm in arms {
                 validate_block_ref(program, arm.block)?;
             }
@@ -380,12 +415,82 @@ fn validate_terminator(
             }
             Ok(())
         }
-        Terminator::Return { value } => validate_expr_vars(value, defined, block_id),
+        Terminator::Return { .. } => Ok(()),
         Terminator::Par { branches, join } => {
             for branch in branches {
                 validate_block_ref(program, *branch)?;
             }
             validate_block_ref(program, *join)
+        }
+    }
+}
+
+fn validate_terminator_vars(
+    terminator: &Terminator,
+    defined: &std::collections::BTreeSet<Var>,
+    block_id: BlockId,
+) -> Result<()> {
+    match terminator {
+        Terminator::Goto { args, .. } => {
+            for arg in args {
+                validate_expr_vars(arg, defined, block_id)?;
+            }
+            Ok(())
+        }
+        Terminator::If { cond, .. } => validate_expr_vars(cond, defined, block_id),
+        Terminator::Match { value, .. } => validate_expr_vars(value, defined, block_id),
+        Terminator::Return { value } => validate_expr_vars(value, defined, block_id),
+        Terminator::Par { .. } => Ok(()),
+    }
+}
+
+fn terminator_successors(
+    program: &Program,
+    terminator: &Terminator,
+    defined: &std::collections::BTreeSet<Var>,
+) -> Result<Vec<(BlockId, std::collections::BTreeSet<Var>)>> {
+    match terminator {
+        Terminator::Goto { block, args } => {
+            let target_block = program.blocks.get(block).expect("block ref checked");
+            if target_block.params.len() != args.len() {
+                return Err(anyhow!(
+                    "AgentIR Goto to {:?} expected {} args, got {}",
+                    block,
+                    target_block.params.len(),
+                    args.len()
+                ));
+            }
+            Ok(vec![(
+                *block,
+                target_block.params.iter().cloned().collect(),
+            )])
+        }
+        Terminator::If {
+            then_block,
+            else_block,
+            ..
+        } => Ok(vec![
+            (*then_block, defined.clone()),
+            (*else_block, defined.clone()),
+        ]),
+        Terminator::Match { arms, default, .. } => {
+            let mut out = arms
+                .iter()
+                .map(|arm| (arm.block, defined.clone()))
+                .collect::<Vec<_>>();
+            if let Some(default) = default {
+                out.push((*default, defined.clone()));
+            }
+            Ok(out)
+        }
+        Terminator::Return { .. } => Ok(vec![]),
+        Terminator::Par { branches, join } => {
+            let mut out = branches
+                .iter()
+                .map(|branch| (*branch, defined.clone()))
+                .collect::<Vec<_>>();
+            out.push((*join, defined.clone()));
+            Ok(out)
         }
     }
 }
@@ -401,32 +506,6 @@ fn validate_block_ref(program: &Program, block_id: BlockId) -> Result<()> {
     }
 }
 
-fn validate_goto_args(
-    program: &Program,
-    target: BlockId,
-    args: &[Expr],
-    defined: &std::collections::BTreeSet<Var>,
-    source: BlockId,
-) -> Result<()> {
-    let target_block = program
-        .blocks
-        .get(&target)
-        .expect("block ref checked before goto args");
-    if target_block.params.len() != args.len() {
-        return Err(anyhow!(
-            "AgentIR Goto from {:?} to {:?} expected {} args, got {}",
-            source,
-            target,
-            target_block.params.len(),
-            args.len()
-        ));
-    }
-    for arg in args {
-        validate_expr_vars(arg, defined, source)?;
-    }
-    Ok(())
-}
-
 fn validate_expr_vars(
     expr: &Expr,
     defined: &std::collections::BTreeSet<Var>,
@@ -435,7 +514,28 @@ fn validate_expr_vars(
     match expr {
         Expr::Value(_) => Ok(()),
         Expr::Var(var) => validate_var(var, defined, block_id),
-        Expr::Field { base, .. } => validate_var(base, defined, block_id),
+        Expr::Field { base, .. } | Expr::Len { base } | Expr::IsEmpty { base } => {
+            validate_var(base, defined, block_id)
+        }
+        Expr::Index { base, index } => {
+            validate_var(base, defined, block_id)?;
+            validate_expr_vars(index, defined, block_id)
+        }
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Or { left, right }
+        | Expr::Add { left, right }
+        | Expr::Sub { left, right } => {
+            validate_expr_vars(left, defined, block_id)?;
+            validate_expr_vars(right, defined, block_id)
+        }
+        Expr::Push { base, value } => {
+            validate_var(base, defined, block_id)?;
+            validate_expr_vars(value, defined, block_id)
+        }
+        Expr::JsonParse { value } | Expr::ToString { value } => {
+            validate_expr_vars(value, defined, block_id)
+        }
         Expr::Array(items) => {
             for item in items {
                 validate_expr_vars(item, defined, block_id)?;
