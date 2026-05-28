@@ -1,5 +1,7 @@
 # agentd
 
+[![CI](https://github.com/bsima/agentd/actions/workflows/ci.yml/badge.svg)](https://github.com/bsima/agentd/actions/workflows/ci.yml)
+
 A Rust runtime for long-running AI agents. The main idea is that **Linux is the harness**.
 
 This repo currently contains:
