@@ -30,8 +30,9 @@ models:
     display: GPT-4o mini
 
   # Experimental. Requires the default "oauth" feature and `agent auth login codex`.
+  # Uses the same provider tag as the Haskell agent registry.
   - name: codex/gpt-5
-    provider: codex-oauth
+    provider: openai-codex
     api_id: gpt-5
     context: 200000
     thinking: true
@@ -39,8 +40,9 @@ models:
     display: GPT-5 via Codex OAuth
 
   # Experimental. Requires the default "oauth" feature and `agent auth login claude-code`.
+  # Uses the same provider tag as the Haskell agent registry.
   - name: claude/sonnet-oauth
-    provider: claude-code-oauth
+    provider: claude-code
     api_id: claude-sonnet-4-5
     context: 200000
     thinking: true

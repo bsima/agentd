@@ -179,10 +179,12 @@ async fn main() -> Result<()> {
         None => None,
     };
     let model = resolved_model.api_id.clone();
-    let oauth_provider = resolved_model
-        .provider
-        .as_deref()
-        .filter(|provider| matches!(*provider, "codex-oauth" | "claude-code-oauth"));
+    let oauth_provider = resolved_model.provider.as_deref().filter(|provider| {
+        matches!(
+            *provider,
+            "openai-codex" | "codex-oauth" | "claude-code" | "claude-code-oauth"
+        )
+    });
     #[cfg(not(feature = "oauth"))]
     if replay.is_none() {
         if let Some(provider) = oauth_provider {
