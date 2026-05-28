@@ -15,6 +15,157 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct IrReplayTrace {
+    infer_calls: BTreeMap<String, IrInferCall>,
+    infer_results: BTreeMap<String, crate::op::Response>,
+    eval_calls: BTreeMap<String, IrEvalCall>,
+    eval_results: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IrInferCall {
+    location: EffectLocation,
+    model: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IrEvalCall {
+    location: EffectLocation,
+    command: String,
+}
+
+impl IrReplayTrace {
+    pub async fn load(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let events = crate::trace::TraceLogger::read_events(path).await?;
+        Self::from_events(&events)
+    }
+
+    pub fn from_events(events: &[Event]) -> Result<Self> {
+        let mut replay = Self::default();
+        let mut last_location: Option<EffectLocation> = None;
+        let mut last_infer_id: Option<String> = None;
+        let mut last_eval_id: Option<String> = None;
+
+        for event in events {
+            match event {
+                Event::Custom { name, data, .. } if name == "ir_effect" => {
+                    last_location = Some(serde_json::from_value(data.clone())?);
+                }
+                Event::InferCall { model, .. } => {
+                    let location = take_location(&mut last_location, EffectKind::Infer)?;
+                    let effect_id = location.effect_id.0.clone();
+                    replay.infer_calls.insert(
+                        effect_id.clone(),
+                        IrInferCall {
+                            location,
+                            model: model.clone(),
+                        },
+                    );
+                    last_infer_id = Some(effect_id);
+                }
+                Event::InferResult {
+                    response: Some(response),
+                    ..
+                } => {
+                    if let Some(effect_id) = last_infer_id.take() {
+                        replay.infer_results.insert(effect_id, response.clone());
+                    }
+                }
+                Event::EvalCall { command, .. } => {
+                    let location = take_location(&mut last_location, EffectKind::Eval)?;
+                    let effect_id = location.effect_id.0.clone();
+                    replay.eval_calls.insert(
+                        effect_id.clone(),
+                        IrEvalCall {
+                            location,
+                            command: command.clone(),
+                        },
+                    );
+                    last_eval_id = Some(effect_id);
+                }
+                Event::EvalResult { result, .. } => {
+                    if let Some(effect_id) = last_eval_id.take() {
+                        replay.eval_results.insert(effect_id, result.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(replay)
+    }
+
+    fn infer_result(&self, location: &EffectLocation, model: &str) -> Result<crate::op::Response> {
+        let effect_id = &location.effect_id.0;
+        let call = self.infer_calls.get(effect_id).ok_or_else(|| {
+            anyhow!(
+                "AgentIR replay missing InferCall for effect {} at block {:?} instruction {}",
+                effect_id,
+                location.site.block,
+                location.site.instruction_index
+            )
+        })?;
+        if call.model != model {
+            return Err(anyhow!(
+                "AgentIR replay diverged at effect {}: expected Infer model {:?} at block {:?} instruction {}, observed {:?}",
+                effect_id,
+                call.model,
+                call.location.site.block,
+                call.location.site.instruction_index,
+                model
+            ));
+        }
+        self.infer_results
+            .get(effect_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("AgentIR replay missing InferResult for effect {effect_id}"))
+    }
+
+    fn eval_result(&self, location: &EffectLocation, command: &str) -> Result<Value> {
+        let effect_id = &location.effect_id.0;
+        let call = self.eval_calls.get(effect_id).ok_or_else(|| {
+            anyhow!(
+                "AgentIR replay missing EvalCall for effect {} at block {:?} instruction {}",
+                effect_id,
+                location.site.block,
+                location.site.instruction_index
+            )
+        })?;
+        if call.command != command {
+            return Err(anyhow!(
+                "AgentIR replay diverged at effect {}: expected Eval command {:?} at block {:?} instruction {}, observed {:?}",
+                effect_id,
+                call.command,
+                call.location.site.block,
+                call.location.site.instruction_index,
+                command
+            ));
+        }
+        self.eval_results
+            .get(effect_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("AgentIR replay missing EvalResult for effect {effect_id}"))
+    }
+}
+
+fn take_location(
+    location: &mut Option<EffectLocation>,
+    expected: EffectKind,
+) -> Result<EffectLocation> {
+    let location = location.take().ok_or_else(|| {
+        anyhow!("AgentIR replay trace missing ir_effect metadata before {expected:?}")
+    })?;
+    if location.kind != expected {
+        return Err(anyhow!(
+            "AgentIR replay expected {expected:?} metadata, got {:?} at block {:?} instruction {}",
+            location.kind,
+            location.site.block,
+            location.site.instruction_index
+        ));
+    }
+    Ok(location)
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct InMemoryStore {
     values: BTreeMap<String, Value>,
 }
@@ -40,8 +191,17 @@ pub async fn run_ir_sequential(config: &SeqConfig, machine: Machine) -> Result<(
 
 pub async fn run_ir_sequential_with_store(
     config: &SeqConfig,
+    machine: Machine,
+    store: &mut InMemoryStore,
+) -> Result<(Value, Machine)> {
+    run_ir_sequential_with_store_and_replay(config, machine, store, None).await
+}
+
+pub async fn run_ir_sequential_with_store_and_replay(
+    config: &SeqConfig,
     mut machine: Machine,
     store: &mut InMemoryStore,
+    ir_replay: Option<&IrReplayTrace>,
 ) -> Result<(Value, Machine)> {
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
@@ -69,6 +229,7 @@ pub async fn run_ir_sequential_with_store(
                 &program_hash,
                 site,
                 dynamic_path,
+                ir_replay,
                 instr,
             )
             .await?;
@@ -124,6 +285,7 @@ async fn execute_instr(
     program_hash: &ProgramHash,
     site: EffectSite,
     dynamic_path: DynamicPath,
+    ir_replay: Option<&IrReplayTrace>,
     instr: Instr,
 ) -> Result<()> {
     match instr {
@@ -160,14 +322,17 @@ async fn execute_instr(
                 })
                 .await?;
             let started = Instant::now();
-            let response = match &config.replay {
-                Some(replay) => replay.infer_result(op_id, &model)?,
-                None => {
-                    config
-                        .provider
-                        .chat(&Model(model), &config.tool_specs(), &prompt)
-                        .await?
-                }
+            let response = match ir_replay {
+                Some(replay) => replay.infer_result(&location, &model)?,
+                None => match &config.replay {
+                    Some(replay) => replay.infer_result(op_id, &model)?,
+                    None => {
+                        config
+                            .provider
+                            .chat(&Model(model), &config.tool_specs(), &prompt)
+                            .await?
+                    }
+                },
             };
             config
                 .trace
@@ -217,9 +382,12 @@ async fn execute_instr(
                     timestamp: Utc::now(),
                 })
                 .await?;
-            let result = match &config.replay {
-                Some(replay) => replay.eval_result(op_id, &command)?,
-                None => run_eval(&config.eval, &command).await?,
+            let result = match ir_replay {
+                Some(replay) => replay.eval_result(&location, &command)?,
+                None => match &config.replay {
+                    Some(replay) => replay.eval_result(op_id, &command)?,
+                    None => run_eval(&config.eval, &command).await?,
+                },
             };
             let truncated_stdout = result
                 .get("stdout_truncated")
@@ -606,6 +774,94 @@ mod tests {
         assert_eq!(locations[0].site.block, BlockId(0));
         assert_eq!(locations[0].site.instruction_index, 0);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn ir_replay_uses_stable_effect_ids() -> Result<()> {
+        let record_provider = Arc::new(MockProvider::new(vec![response("recorded")]));
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let machine = single_infer_machine("mock");
+        let (recorded, _) = run_ir_sequential(
+            &config_with_trace(record_provider, record_trace),
+            machine.clone(),
+        )
+        .await?;
+        assert_eq!(recorded["content"], Value::String("recorded".into()));
+
+        let replay = IrReplayTrace::load(record_path).await?;
+        let replay_provider = Arc::new(MockProvider::new(vec![]));
+        let mut store = InMemoryStore::new();
+        let (replayed, _) = run_ir_sequential_with_store_and_replay(
+            &config(replay_provider.clone()),
+            machine,
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+
+        assert_eq!(replayed, recorded);
+        assert_eq!(replay_provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ir_replay_divergence_reports_effect_location() -> Result<()> {
+        let record_provider = Arc::new(MockProvider::new(vec![response("recorded")]));
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let _ = run_ir_sequential(
+            &config_with_trace(record_provider, record_trace),
+            single_infer_machine("mock"),
+        )
+        .await?;
+        let replay = IrReplayTrace::load(record_path).await?;
+        let mut store = InMemoryStore::new();
+
+        let err = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            single_infer_machine("other-model"),
+            &mut store,
+            Some(&replay),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("AgentIR replay missing InferCall"));
+        assert!(err.contains("block BlockId(0) instruction 0"));
+        Ok(())
+    }
+
+    fn single_infer_machine(model: &str) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![Instr::Infer {
+                    out: Var("response".into()),
+                    model: Expr::Value(Value::String(model.into())),
+                    prompt: PromptRef::Inline(vec![ChatMessage::user("hello")]),
+                    policy: Default::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("response".into())),
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("single-infer".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
     }
 
     #[tokio::test]

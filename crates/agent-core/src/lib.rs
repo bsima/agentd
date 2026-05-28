@@ -21,7 +21,10 @@ pub use ir::{
     Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program, ProgramHash, ProgramId,
     PromptRef, Terminator, Var,
 };
-pub use ir_interpreter::{run_ir_sequential, run_ir_sequential_with_store, InMemoryStore};
+pub use ir_interpreter::{
+    run_ir_sequential, run_ir_sequential_with_store, run_ir_sequential_with_store_and_replay,
+    InMemoryStore, IrReplayTrace,
+};
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
     agent_loop, emit, eval, get, infer, par, put, ChatMessage, Model, Op, OpF, Prompt, Response,
