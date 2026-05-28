@@ -2,7 +2,7 @@
 
 `agent-core` keeps agent programs separate from the runtime that executes them.
 
-The core representation is a free monad. Programs are data until an interpreter walks the tree and performs effects.
+The M1 compatibility representation is a free monad. The stable runtime representation is AgentIR: a serializable control/effect IR with explicit machine state. Programs are data until an interpreter walks them and performs effects.
 
 ## Why a free monad
 
@@ -87,4 +87,4 @@ Examples:
 - a dry-run interpreter that validates model and command requests without executing them
 - a distributed interpreter that schedules effects across workers
 
-The free monad is the core architectural constraint. Future ports should preserve it.
+The effect algebra is the core architectural constraint. Future runtimes should preserve explicit `Infer`, `Eval`, `Get`, `Put`, `Emit`, and `Par` effects even if the authoring layer is not the closure-based free monad.
