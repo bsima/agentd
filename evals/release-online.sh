@@ -69,49 +69,35 @@ for model in models:
 PY
 
 ran=0
-failed=0
-skipped=0
 
 while IFS=$'\t' read -r name provider api_id api_key; do
   case "$provider" in
     openai-codex|codex-oauth|claude-code|claude-code-oauth)
-      echo "skip: $name uses OAuth provider $provider; release CI omits OAuth evals"
-      skipped=$((skipped + 1))
-      continue
+      echo "error: $name uses OAuth provider $provider; release CI omits OAuth evals, so remove it from $models_file" >&2
+      exit 1
       ;;
   esac
 
   if [[ "$api_key" == \$* ]]; then
     var="${api_key#\$}"
     if [[ -z "${!var:-}" ]]; then
-      echo "skip: $name needs env var $var"
-      skipped=$((skipped + 1))
-      continue
+      echo "error: $name needs env var $var from $models_file" >&2
+      exit 1
     fi
   fi
 
   echo "[online] shell: $name ($provider / $api_id)"
-  if RUN_AGENT_ONLINE_EVAL=1 AGENT_ONLINE_MODEL="$name" "$repo_root/evals/online-shell.sh"; then
-    ran=$((ran + 1))
-  else
-    failed=$((failed + 1))
-  fi
+  RUN_AGENT_ONLINE_EVAL=1 AGENT_ONLINE_MODEL="$name" "$repo_root/evals/online-shell.sh"
+  ran=$((ran + 1))
 
   echo "[online] infer-tool: $name ($provider / $api_id)"
-  if RUN_AGENT_ONLINE_EVAL=1 AGENT_ONLINE_MODEL="$name" AGENT_ONLINE_INFER_MODEL="$api_id" "$repo_root/evals/online-infer-tool.sh"; then
-    ran=$((ran + 1))
-  else
-    failed=$((failed + 1))
-  fi
+  RUN_AGENT_ONLINE_EVAL=1 AGENT_ONLINE_MODEL="$name" AGENT_ONLINE_INFER_MODEL="$api_id" "$repo_root/evals/online-infer-tool.sh"
+  ran=$((ran + 1))
 done <"$models_tsv"
 
 if [[ "$ran" -eq 0 ]]; then
-  echo "error: no online evals ran (skipped: $skipped)" >&2
-  exit 1
-fi
-if [[ "$failed" -ne 0 ]]; then
-  echo "error: $failed online eval(s) failed; ran: $ran, skipped: $skipped" >&2
+  echo "error: no online evals ran from $models_file" >&2
   exit 1
 fi
 
-echo "ok: online release evals passed (ran: $ran, skipped: $skipped)"
+echo "ok: online release evals passed (ran: $ran)"
