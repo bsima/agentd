@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Read};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -443,10 +445,14 @@ async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
 
 async fn run_stdin_session(runtime: &mut Runtime) -> Result<()> {
     let reader = BufReader::new(tokio::io::stdin());
-    run_nul_delimited_prompt_loop(runtime, reader).await
+    run_nul_delimited_prompt_loop(runtime, reader).await?;
+    emit_done(runtime).await
 }
 
 async fn run_fifo_session(runtime: &mut Runtime, path: PathBuf) -> Result<()> {
+    validate_fifo_path(&path).await?;
+
+    let mut consecutive_empty_sessions = 0_u32;
     loop {
         let file = tokio::fs::OpenOptions::new()
             .read(true)
@@ -454,28 +460,63 @@ async fn run_fifo_session(runtime: &mut Runtime, path: PathBuf) -> Result<()> {
             .await
             .with_context(|| format!("opening fifo {}", path.display()))?;
         let reader = BufReader::new(file);
-        run_nul_delimited_prompt_loop(runtime, reader).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let handled_messages = run_nul_delimited_prompt_loop(runtime, reader).await?;
+        if handled_messages {
+            consecutive_empty_sessions = 0;
+            emit_done(runtime).await?;
+        } else {
+            consecutive_empty_sessions = consecutive_empty_sessions.saturating_add(1);
+        }
+
+        let backoff = if consecutive_empty_sessions == 0 {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(50 * 2_u64.pow(consecutive_empty_sessions.min(5)))
+        };
+        tokio::time::sleep(backoff).await;
     }
 }
 
-async fn run_nul_delimited_prompt_loop<R>(runtime: &mut Runtime, mut reader: R) -> Result<()>
+#[cfg(unix)]
+async fn validate_fifo_path(path: &Path) -> Result<()> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("checking fifo {}", path.display()))?;
+    if !metadata.file_type().is_fifo() {
+        return Err(anyhow!(
+            "path {} is not a named pipe; create it with mkfifo or use stdin/--session",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn validate_fifo_path(_path: &Path) -> Result<()> {
+    Err(anyhow!("--fifo is only supported on Unix platforms"))
+}
+
+async fn run_nul_delimited_prompt_loop<R>(runtime: &mut Runtime, mut reader: R) -> Result<bool>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    let mut handled_messages = false;
     loop {
         tokio::select! {
             frame = read_nul_frame(&mut reader) => {
                 match frame? {
                     Some(message) if message.is_empty() => break,
-                    Some(message) => write_session_response(runtime, message).await?,
+                    Some(message) => {
+                        handled_messages = true;
+                        write_session_response(runtime, message).await?;
+                    }
                     None => break,
                 }
             }
             _ = shutdown_signal() => break,
         }
     }
-    emit_done(runtime).await
+    Ok(handled_messages)
 }
 
 async fn write_session_response(runtime: &mut Runtime, message: String) -> Result<()> {
