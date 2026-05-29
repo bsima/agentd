@@ -261,7 +261,7 @@ async fn main() -> Result<()> {
         .or(args.run_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let trace_path = trace_path(&run_id)?;
-    let trace = TraceLogger::new(run_id.clone(), trace_path.clone());
+    let trace = TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug);
     let provider: Arc<dyn agent_core::ChatProvider> = if replay.is_some() {
         Arc::new(ReplayOnlyProvider)
     } else {
@@ -329,11 +329,12 @@ async fn main() -> Result<()> {
         max_turns,
     };
 
-    if args.debug {
-        eprintln!("run_id: {run_id}");
-        eprintln!("model: {model}");
-        eprintln!("provider: {url}");
-        eprintln!("trace: {}", trace_path.display());
+    eprintln!("model: {model}");
+    eprintln!("trace: {}", trace_path.display());
+    eprintln!("run_id: {run_id}");
+    eprintln!("provider: {url}");
+    if let Some(prompt) = loaded_prompt.as_ref() {
+        eprintln!("prompt: {}", prompt.body);
     }
 
     match (loaded_prompt, args.fifo, args.session) {
@@ -434,7 +435,9 @@ async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
             timestamp: Utc::now(),
         })
         .await?;
-    println!("{}", response.content);
+    if !runtime.debug {
+        println!("{}", response.content);
+    }
     Ok(())
 }
 
@@ -477,10 +480,12 @@ where
 
 async fn write_session_response(runtime: &mut Runtime, message: String) -> Result<()> {
     let response = run_turn_with_status(runtime, message).await?;
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(response.content.as_bytes()).await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
+    if !runtime.debug {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(response.content.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+    }
     Ok(())
 }
 

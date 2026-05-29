@@ -139,6 +139,7 @@ pub struct TraceLogger {
     run_id: String,
     path: PathBuf,
     next_op_id: Arc<AtomicU64>,
+    mirror_stdout: bool,
 }
 
 impl TraceLogger {
@@ -147,7 +148,13 @@ impl TraceLogger {
             run_id: run_id.into(),
             path,
             next_op_id: Arc::new(AtomicU64::new(1)),
+            mirror_stdout: false,
         }
+    }
+
+    pub fn mirror_stdout(mut self, mirror_stdout: bool) -> Self {
+        self.mirror_stdout = mirror_stdout;
+        self
     }
 
     pub fn run_id(&self) -> &str {
@@ -171,9 +178,15 @@ impl TraceLogger {
             .append(true)
             .open(&self.path)
             .await?;
-        file.write_all(serde_json::to_string(event)?.as_bytes())
-            .await?;
+        let line = serde_json::to_string(event)?;
+        file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
+        if self.mirror_stdout {
+            let mut stdout = tokio::io::stdout();
+            stdout.write_all(line.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
         Ok(())
     }
 
