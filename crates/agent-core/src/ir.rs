@@ -168,6 +168,10 @@ pub enum Expr {
         field: String,
         default: Box<Expr>,
     },
+    StringOr {
+        value: Box<Expr>,
+        default: Box<Expr>,
+    },
     Index {
         base: Var,
         index: Box<Expr>,
@@ -222,15 +226,9 @@ pub enum PromptRef {
     Var(Var),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferPolicy {
     pub max_turns: Option<usize>,
-}
-
-impl Default for InferPolicy {
-    fn default() -> Self {
-        Self { max_turns: None }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,15 +236,9 @@ pub enum EvalRequest {
     Shell { command: Expr },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalPolicy {
     pub timeout_ms: Option<u64>,
-}
-
-impl Default for EvalPolicy {
-    fn default() -> Self {
-        Self { timeout_ms: None }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -561,6 +553,10 @@ fn validate_expr_vars(
         }
         Expr::FieldOr { base, default, .. } => {
             validate_var(base, defined, block_id)?;
+            validate_expr_vars(default, defined, block_id)
+        }
+        Expr::StringOr { value, default } => {
+            validate_expr_vars(value, defined, block_id)?;
             validate_expr_vars(default, defined, block_id)
         }
         Expr::Index { base, index } => {
