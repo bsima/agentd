@@ -52,6 +52,9 @@ struct Args {
     /// Replay recorded Infer/Eval results from a trace JSONL instead of calling providers or shell.
     #[arg(long, env = "AGENT_REPLAY_TRACE")]
     replay_trace: Option<PathBuf>,
+    /// Store full PromptIR section content in traces instead of previews/hashes only.
+    #[arg(long, env = "AGENT_TRACE_FULL_PROMPT_IR")]
+    trace_full_prompt_ir: bool,
     /// Directory to read into passive hydration context.
     #[arg(long, env = "AGENT_HYDRATION_DIR")]
     hydration_dir: Option<PathBuf>,
@@ -331,6 +334,7 @@ async fn main() -> Result<()> {
         trace: trace.clone(),
         eval: eval_config,
         replay: replay.clone(),
+        trace_full_prompt_ir: args.trace_full_prompt_ir,
     };
     let mut runtime = Runtime {
         config,
@@ -747,6 +751,7 @@ async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
         trace: runtime.trace.clone(),
         eval: runtime.config.eval.clone(),
         replay: runtime.config.replay.clone(),
+        trace_full_prompt_ir: runtime.config.trace_full_prompt_ir,
     };
     let _ = agent_core::run_sequential(
         &config,

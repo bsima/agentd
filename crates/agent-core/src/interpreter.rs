@@ -3,6 +3,7 @@ use crate::hydration::{
     SESSION_STATE_KEY, TEMPORAL_PREFIX,
 };
 use crate::op::{ChatMessage, Op, OpF, Prompt, Response};
+use crate::prompt_ir::{compile_prompt_ir, PromptIR, RetrievalTiming, Section};
 use crate::provider::{ChatProvider, ToolFunctionSpec, ToolSpec};
 use crate::trace::{preview, Event, TraceLogger};
 use anyhow::{anyhow, Result};
@@ -157,6 +158,7 @@ pub struct SeqConfig {
     pub trace: TraceLogger,
     pub eval: EvalConfig,
     pub replay: Option<ReplayTrace>,
+    pub trace_full_prompt_ir: bool,
 }
 
 impl SeqConfig {
@@ -469,7 +471,7 @@ where
         })
         .await?;
 
-    let mut sections = Vec::new();
+    let mut prompt_ir_sections = Vec::new();
     let mut section_count = 0;
     let mut total_bytes = 0;
     for source in &config.passive_hydration.sources {
@@ -501,7 +503,11 @@ where
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    sections.push(format!("## temporal history\n{}", content));
+                    prompt_ir_sections.push(Section::passive_temporal(
+                        "passive-temporal-history",
+                        "temporal history",
+                        content,
+                    ));
                 }
             }
             PassiveSource::SessionContext => {
@@ -525,13 +531,30 @@ where
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    sections.push(format!(
-                        "## {} ({:?})\n{}",
-                        result.source, result.kind, result.content
+                    let id = format!("passive-source-{}", section_count);
+                    prompt_ir_sections.push(Section::from_source_result(
+                        id,
+                        result,
+                        RetrievalTiming::Passive,
+                        None,
                     ));
                 }
             }
         }
+    }
+
+    if !prompt_ir_sections.is_empty() {
+        let prompt_ir = PromptIR::new(prompt, prompt_ir_sections)?;
+        config
+            .trace
+            .emit(&Event::Custom {
+                run_id: config.trace.run_id().into(),
+                name: "prompt_ir".into(),
+                data: serde_json::to_value(prompt_ir.trace(config.trace_full_prompt_ir))?,
+                timestamp: Utc::now(),
+            })
+            .await?;
+        prompt = compile_prompt_ir(&prompt_ir);
     }
 
     config
@@ -545,25 +568,7 @@ where
         })
         .await?;
 
-    if !sections.is_empty() {
-        inject_context_sections(&mut prompt, sections.join("\n\n"));
-    }
     Ok(prompt)
-}
-
-fn inject_context_sections(prompt: &mut Prompt, context: String) {
-    let block = format!("Hydrated context:\n\n{context}");
-    if let Some(system) = prompt.iter_mut().find(|message| message.role == "system") {
-        match &mut system.content {
-            Some(content) if !content.is_empty() => {
-                content.push_str("\n\n");
-                content.push_str(&block);
-            }
-            _ => system.content = Some(block),
-        }
-    } else {
-        prompt.insert(0, ChatMessage::system(block));
-    }
 }
 
 pub(crate) async fn dispatch_get<S>(config: &SeqConfig, state: &S, key: &str) -> Result<Value>
@@ -710,6 +715,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
         let prompt = vec![ChatMessage::user("use echo")];
 
@@ -755,6 +761,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
         let prompt = vec![ChatMessage::user("do two steps")];
 
@@ -787,6 +794,7 @@ mod tests {
             trace,
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
 
         let program = infer(Model("mock".into()), vec![ChatMessage::user("first")]).and_then(
@@ -836,6 +844,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
         let program = crate::op::put("temporal:history", json!(1))
             .and_then(|_| {
@@ -898,6 +907,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
 
         let (value, state) = run_sequential(
@@ -924,6 +934,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
 
         let (_, state) = run_sequential(
@@ -959,6 +970,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
         let prompt = vec![ChatMessage::user("answer")];
 
@@ -1003,6 +1015,7 @@ mod tests {
                 env: EnvPolicy::Clean { vars: clean_vars },
             },
             replay: None,
+            trace_full_prompt_ir: false,
         };
 
         let (timeout_result, _) = run_sequential(&config, (), crate::op::eval("sleep 1")).await?;
@@ -1039,6 +1052,7 @@ mod tests {
             trace,
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
 
         let _ = run_sequential(
@@ -1067,6 +1081,7 @@ mod tests {
             trace: record_trace,
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
             .and_then(|_| crate::op::eval("printf replayed"));
@@ -1082,6 +1097,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: Some(replay),
+            trace_full_prompt_ir: false,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
             .and_then(|_| crate::op::eval("printf replayed"));
@@ -1108,6 +1124,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         };
 
         let (value, _) = run_sequential(&config, (), crate::op::get("semantic:topic")).await?;

@@ -605,6 +605,7 @@ mod tests {
             ),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         }
     }
 

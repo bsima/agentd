@@ -335,6 +335,7 @@ mod tests {
             trace: TraceLogger::new(Uuid::new_v4().to_string(), path),
             eval: crate::interpreter::EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         }
     }
 

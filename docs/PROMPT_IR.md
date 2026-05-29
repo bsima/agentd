@@ -195,7 +195,7 @@ sections: [
 ]
 ```
 
-The trace should not need to store full section content by default. It should store hashes and previews. Full snapshots can be gated by debug/config.
+The trace should not need to store full section content by default. It should store hashes and previews. Full snapshots should be available for debugging through a flag/config setting. The CLI setting is `--trace-full-prompt-ir` / `AGENT_TRACE_FULL_PROMPT_IR`.
 
 ## Compilation
 

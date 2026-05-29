@@ -912,6 +912,7 @@ mod tests {
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         }
     }
 
@@ -924,6 +925,7 @@ mod tests {
             trace,
             eval: EvalConfig::default(),
             replay: None,
+            trace_full_prompt_ir: false,
         }
     }
 

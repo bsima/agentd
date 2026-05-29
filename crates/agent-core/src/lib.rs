@@ -6,6 +6,7 @@ pub mod ir_agent;
 pub mod ir_interpreter;
 pub mod models;
 pub mod op;
+pub mod prompt_ir;
 pub mod provider;
 pub mod trace;
 
@@ -32,6 +33,12 @@ pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
     agent_loop, emit, eval, get, infer, par, put, ChatMessage, Model, Op, OpF, Prompt, Response,
     ResponseToolCall,
+};
+pub use prompt_ir::{
+    compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash, ContextRequest,
+    ContextStrategy, Observation, Priority, PromptIR, PromptIRTrace, PromptId, RetrievalMode,
+    RetrievalTiming, Section, SectionId, SectionOrigin, SectionRole, SectionSource, SectionSummary,
+    TokenBudget, TokenEstimate, ToolDef,
 };
 pub use provider::{ChatProvider, ProviderClient, ProviderConfig};
 pub use trace::{Event, TraceLogger, TraceSummary};
