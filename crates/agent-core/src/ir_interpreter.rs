@@ -9,6 +9,7 @@ use crate::ir::{
 use crate::op::{ChatMessage, Model, Prompt};
 use crate::trace::Event;
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,6 +181,12 @@ pub enum IrStepOutcome {
     Suspended { checkpoint: IrCheckpoint },
 }
 
+#[async_trait]
+pub trait IrStore: Send {
+    async fn get(&mut self, config: &SeqConfig, key: &str) -> Result<Value>;
+    async fn put(&mut self, config: &SeqConfig, key: &str, value: Value) -> Result<()>;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InMemoryStore {
     values: BTreeMap<String, Value>,
@@ -190,12 +197,55 @@ impl InMemoryStore {
         Self::default()
     }
 
-    pub fn get(&self, key: &str) -> Value {
+    pub fn get_local(&self, key: &str) -> Value {
         self.values.get(key).cloned().unwrap_or(Value::Null)
     }
 
-    pub fn put(&mut self, key: impl Into<String>, value: Value) {
+    pub fn put_local(&mut self, key: impl Into<String>, value: Value) {
         self.values.insert(key.into(), value);
+    }
+}
+
+#[async_trait]
+impl IrStore for InMemoryStore {
+    async fn get(&mut self, config: &SeqConfig, key: &str) -> Result<Value> {
+        if let Some(value) = self.values.get(key) {
+            return Ok(value.clone());
+        }
+        if key.starts_with(crate::SEMANTIC_PREFIX) {
+            let query = key.trim_start_matches(crate::SEMANTIC_PREFIX);
+            return serde_json::to_value(
+                config
+                    .hydration
+                    .retrieve_query(crate::SourceParams::new(query))
+                    .await?,
+            )
+            .map_err(Into::into);
+        }
+        if key == crate::SESSION_STATE_KEY {
+            let Some(path) = &config.checkpoint_path else {
+                return Ok(Value::Null);
+            };
+            return match tokio::fs::read_to_string(path).await {
+                Ok(content) => serde_json::from_str(&content).map_err(Into::into),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+                Err(err) => Err(err.into()),
+            };
+        }
+        Ok(Value::Null)
+    }
+
+    async fn put(&mut self, config: &SeqConfig, key: &str, value: Value) -> Result<()> {
+        if key == crate::SESSION_STATE_KEY {
+            if let Some(path) = &config.checkpoint_path {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(path, serde_json::to_vec_pretty(&value)?).await?;
+            }
+        }
+        self.values.insert(key.to_string(), value);
+        Ok(())
     }
 }
 
@@ -331,7 +381,7 @@ pub async fn run_ir_steps_with_store_and_replay(
 async fn execute_instr(
     config: &SeqConfig,
     machine: &mut Machine,
-    store: &mut InMemoryStore,
+    store: &mut dyn IrStore,
     program_hash: &ProgramHash,
     site: EffectSite,
     dynamic_path: DynamicPath,
@@ -475,7 +525,7 @@ async fn execute_instr(
             )?;
             emit_ir_effect(config, &location).await?;
             let key = string_expr(&machine.env, &key, "Get.key")?;
-            let value = store.get(&key);
+            let value = store.get(config, &key).await?;
             machine.env.insert(out, value);
         }
         Instr::Put { key, value } => {
@@ -488,7 +538,7 @@ async fn execute_instr(
             emit_ir_effect(config, &location).await?;
             let key = string_expr(&machine.env, &key, "Put.key")?;
             let value = eval_expr(&machine.env, &value)?;
-            store.put(key, value);
+            store.put(config, &key, value).await?;
         }
         Instr::Emit { event } => {
             let location =
@@ -1181,7 +1231,7 @@ mod tests {
             run_ir_sequential_with_store(&config(provider), machine, &mut store).await?;
 
         assert_eq!(value, Value::Number(42.into()));
-        assert_eq!(store.get("answer"), Value::Number(42.into()));
+        assert_eq!(store.get_local("answer"), Value::Number(42.into()));
         Ok(())
     }
 
