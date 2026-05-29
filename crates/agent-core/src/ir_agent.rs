@@ -387,6 +387,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                 Value::Number((max_turns as u64).into()),
             ),
         ]),
+        effect_visits: BTreeMap::new(),
         continuation_stack: vec![],
         budgets: Default::default(),
     }
