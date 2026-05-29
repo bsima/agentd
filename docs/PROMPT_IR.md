@@ -57,20 +57,43 @@ The important invariant is that every piece of model-visible context has a secti
 
 ## Section source
 
-PromptIR should use the same source concepts as hydration.
+PromptIR should preserve the context model from the README: agents build context in two ways, temporal lookup and semantic lookup. Everything else is a backend/corpus plugged into one or both modes.
 
 ```rust
-pub enum SectionSource {
+pub enum RetrievalMode {
+    Temporal,
+    Semantic,
+}
+
+pub enum RetrievalTiming {
+    Passive,
+    Active,
+}
+
+pub struct SectionSource {
+    pub origin: SectionOrigin,
+    pub timing: RetrievalTiming,
+    pub metadata: serde_json::Value,
+}
+
+pub enum SectionOrigin {
     Static { name: String },
-    Temporal { key: Option<String> },
-    Semantic { query: String, score: Option<f32> },
-    Knowledge { name: String },
-    Workspace { path: Option<PathBuf> },
+    Retrieval {
+        backend: String,
+        mode: RetrievalMode,
+        query: Option<String>,
+        key: Option<String>,
+        score: Option<f32>,
+    },
     State { key: String },
     User,
     ToolResult,
 }
 ```
+
+A backend can support temporal lookup, semantic lookup, or both. For example, a workspace backend can expose recent edits temporally and file/symbol search semantically. A memory backend can expose chronological events temporally and remembered facts semantically.
+
+Workspace, knowledge, docs, issue trackers, and long-term memory should not become top-level source kinds. They are backend names or metadata on `SectionOrigin::Retrieval`.
 
 `SourceResult -> Section` should be the main adapter between current hydration and PromptIR. The source registry remains the backend boundary.
 
@@ -132,8 +155,7 @@ pub struct ContextStrategy {
     pub temporal_window: usize,
     pub semantic_limit: usize,
     pub semantic_threshold: f32,
-    pub include_workspace: bool,
-    pub include_knowledge: bool,
+    pub enabled_backends: Vec<String>,
 }
 
 pub struct ContextRequest {
@@ -145,6 +167,8 @@ pub struct ContextRequest {
 ```
 
 For v1, token counts can be approximate. The point is to make budget choices visible and stable in traces.
+
+`enabled_backends` selects corpora/backends, not retrieval semantics. The retrieval semantics remain temporal and semantic. If empty, the interpreter can use its configured default backends.
 
 ## Trace shape
 
@@ -238,5 +262,6 @@ Those should come after PromptIR is stable as a traceable context representation
 - Existing release evals pass with PromptIR-enabled hydration.
 - Flat compiled prompts are semantically equivalent to current prompts.
 - Every hydrated context section has source provenance in the trace.
+- PromptIR provenance preserves temporal-vs-semantic lookup mode and passive-vs-active timing.
 - Every `InferCall` can be linked to a PromptIR hash and section summaries.
 - The source registry remains the swappable hydration backend.
