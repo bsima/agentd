@@ -1,3 +1,7 @@
 /target
 .envrc.local
 .direnv
+
+# local agent cruft
+*.fifo
+*.chk
