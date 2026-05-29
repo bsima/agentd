@@ -216,6 +216,8 @@ pub struct Machine {
     #[serde(default)]
     pub env: BTreeMap<Var, Value>,
     #[serde(default)]
+    pub effect_visits: BTreeMap<String, u64>,
+    #[serde(default)]
     pub continuation_stack: Vec<Frame>,
     #[serde(default)]
     pub budgets: Budgets,
@@ -672,6 +674,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::from([(Var("x".into()), Value::String("y".into()))]),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Budgets::default(),
         };

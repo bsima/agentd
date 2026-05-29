@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -50,7 +50,9 @@ impl IrReplayTrace {
         for event in events {
             match event {
                 Event::Custom { name, data, .. } if name == "ir_effect" => {
-                    last_location = Some(serde_json::from_value(data.clone())?);
+                    let location: EffectLocation = serde_json::from_value(data.clone())?;
+                    last_location = matches!(location.kind, EffectKind::Infer | EffectKind::Eval)
+                        .then_some(location);
                 }
                 Event::InferCall { model, .. } => {
                     let location = take_location(&mut last_location, EffectKind::Infer)?;
@@ -244,7 +246,6 @@ pub async fn run_ir_steps_with_store_and_replay(
 ) -> Result<IrStepOutcome> {
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
-    let mut site_visits = HashMap::<EffectSite, u64>::new();
     let mut instructions_executed = 0usize;
 
     loop {
@@ -268,7 +269,7 @@ pub async fn run_ir_steps_with_store_and_replay(
                 block: machine.block,
                 instruction_index: machine.pc,
             };
-            let dynamic_path = DynamicPath::with_visit(site, next_visit(&mut site_visits, site));
+            let dynamic_path = DynamicPath::with_visit(site, next_visit(&mut machine, site));
             let instr = block.instructions[machine.pc].clone();
             execute_instr(
                 config,
@@ -576,8 +577,9 @@ fn ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
     ]
 }
 
-fn next_visit(site_visits: &mut HashMap<EffectSite, u64>, site: EffectSite) -> u64 {
-    let visit = site_visits.entry(site).or_insert(0);
+fn next_visit(machine: &mut Machine, site: EffectSite) -> u64 {
+    let key = format!("{}:{}", site.block.0, site.instruction_index);
+    let visit = machine.effect_visits.entry(key).or_insert(0);
     let current = *visit;
     *visit += 1;
     current
@@ -898,6 +900,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -939,6 +942,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -1045,6 +1049,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Default::default(),
         }
@@ -1128,6 +1133,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Default::default(),
         }
@@ -1165,6 +1171,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -1206,6 +1213,7 @@ mod tests {
             block: BlockId(0),
             pc: 0,
             env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
