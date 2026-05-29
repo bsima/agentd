@@ -1,8 +1,8 @@
 use agent_core::{
-    agent_loop, ChatMessage, EnvPolicy, EvalConfig, Event, HydrationSource, ModelRegistry,
-    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayTrace,
-    ResolvedModel, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
-    SourceResult, TraceLogger,
+    agent_loop, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy, EvalConfig, Event,
+    HydrationSource, ModelRegistry, PassiveHydrationConfig, PassiveSource, ProviderClient,
+    ProviderConfig, ReplayTrace, ResolvedModel, SeqConfig, SourceCapability, SourceKind,
+    SourceParams, SourceRegistry, SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -201,18 +201,26 @@ async fn main() -> Result<()> {
         },
         ..EvalConfig::default()
     };
+    let provider_tag = resolved_model.provider.as_deref();
+    let is_anthropic_provider = provider_tag == Some("anthropic");
     let url = requested_provider
         .or(provider_file.url)
         .or(resolved_model.base_url.clone())
         .or_else(|| std::env::var("AGENT_PROVIDER").ok())
         .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
-        .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+        .unwrap_or_else(|| {
+            if is_anthropic_provider {
+                "https://api.anthropic.com/v1".into()
+            } else {
+                "https://openrouter.ai/api/v1".into()
+            }
+        });
     let replay = match args.replay_trace.as_ref() {
         Some(path) => Some(ReplayTrace::load(path).await?),
         None => None,
     };
     let model = resolved_model.api_id.clone();
-    let oauth_provider = resolved_model.provider.as_deref().filter(|provider| {
+    let oauth_provider = provider_tag.filter(|provider| {
         matches!(
             *provider,
             "openai-codex" | "codex-oauth" | "claude-code" | "claude-code-oauth"
@@ -235,9 +243,10 @@ async fn main() -> Result<()> {
                 .or(provider_file.api_key)
                 .or(resolved_model.api_key.clone())
                 .or_else(|| std::env::var("AGENT_API_KEY").ok())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .ok_or_else(|| {
-                    anyhow!("missing API key: pass --key, set AGENT_API_KEY/OPENROUTER_API_KEY, or configure api_key in models.yaml")
+                    anyhow!("missing API key: pass --key, set AGENT_API_KEY/ANTHROPIC_API_KEY/OPENROUTER_API_KEY, or configure api_key in models.yaml")
                 })?,
         )
     };
@@ -269,6 +278,11 @@ async fn main() -> Result<()> {
                     return Err(anyhow!("unsupported OAuth provider tag: {tag}"));
                 }
             }
+            None if is_anthropic_provider => Arc::new(AnthropicProvider::new(AnthropicConfig {
+                base_url: url.clone(),
+                api_key: api_key.expect("api_key is set for non-OAuth providers"),
+                model: agent_core::Model(model.clone()),
+            })),
             None => Arc::new(ProviderClient::new(ProviderConfig {
                 url: url.clone(),
                 api_key: api_key.expect("api_key is set for non-OAuth providers"),

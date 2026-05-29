@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod hydration;
 pub mod interpreter;
 pub mod models;
@@ -5,6 +6,7 @@ pub mod op;
 pub mod provider;
 pub mod trace;
 
+pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use hydration::{
     HydrationSource, PassiveHydrationConfig, PassiveSource, SourceCapability, SourceKind,
     SourceParams, SourceRegistry, SourceResult, SEMANTIC_PREFIX, SESSION_STATE_KEY,
