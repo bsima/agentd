@@ -23,6 +23,7 @@ cat >"$fixture" <<'JSONL'
 JSONL
 
 env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
+  --runtime op \
   --run-id "$run_id" \
   --hydration-dir "$hydration_dir" \
   --replay-trace "$fixture" \
