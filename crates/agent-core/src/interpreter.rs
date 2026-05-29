@@ -11,6 +11,7 @@ use async_recursion::async_recursion;
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -441,6 +442,13 @@ pub(crate) fn response_preview(response: &Response) -> String {
     preview(&response.content, 1024)
 }
 
+fn stable_section_id(prefix: &str, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    format!("{}-{}", prefix, &hash[..12])
+}
+
 pub(crate) async fn hydrate_infer_prompt<S>(
     config: &SeqConfig,
     state: &S,
@@ -503,8 +511,9 @@ where
                             timestamp: Utc::now(),
                         })
                         .await?;
+                    let id = stable_section_id("passive-temporal-history", &content);
                     prompt_ir_sections.push(Section::passive_temporal(
-                        "passive-temporal-history",
+                        id,
                         "temporal history",
                         content,
                     ));
@@ -531,7 +540,10 @@ where
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    let id = format!("passive-source-{}", section_count);
+                    let id = stable_section_id(
+                        &format!("passive-source-{}-{:?}", result.source, result.kind),
+                        &result.content,
+                    );
                     prompt_ir_sections.push(Section::from_source_result(
                         id,
                         result,

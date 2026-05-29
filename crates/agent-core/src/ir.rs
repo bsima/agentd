@@ -1,4 +1,5 @@
 use crate::op::ChatMessage;
+use crate::prompt_ir::PromptIR;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -224,6 +225,8 @@ pub enum Expr {
 pub enum PromptRef {
     Inline(Vec<ChatMessage>),
     Var(Var),
+    PromptIr(Box<PromptIR>),
+    PromptIrVar(Var),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,8 +418,8 @@ fn validate_prompt_ref_vars(
     block_id: BlockId,
 ) -> Result<()> {
     match prompt {
-        PromptRef::Inline(_) => Ok(()),
-        PromptRef::Var(var) => validate_var(var, defined, block_id),
+        PromptRef::Inline(_) | PromptRef::PromptIr(_) => Ok(()),
+        PromptRef::Var(var) | PromptRef::PromptIrVar(var) => validate_var(var, defined, block_id),
     }
 }
 

@@ -7,6 +7,7 @@ use crate::ir::{
     PromptRef, Terminator, Var,
 };
 use crate::op::{ChatMessage, Model, Prompt};
+use crate::prompt_ir::{compile_prompt_ir, PromptIR};
 use crate::trace::Event;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -814,6 +815,16 @@ fn resolve_prompt(env: &BTreeMap<Var, Value>, prompt: PromptRef) -> Result<Promp
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown AgentIR prompt var {:?}", var))?;
             serde_json::from_value::<Vec<ChatMessage>>(value).context("decoding AgentIR prompt")
+        }
+        PromptRef::PromptIr(prompt_ir) => Ok(compile_prompt_ir(&prompt_ir)),
+        PromptRef::PromptIrVar(var) => {
+            let value = env
+                .get(&var)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown AgentIR PromptIR var {:?}", var))?;
+            let prompt_ir =
+                serde_json::from_value::<PromptIR>(value).context("decoding AgentIR PromptIR")?;
+            Ok(compile_prompt_ir(&prompt_ir))
         }
     }
 }

@@ -229,7 +229,9 @@ impl PromptIR {
                 .sum::<usize>()
                 + estimate_prompt_tokens(&base_messages),
         );
-        let prompt_hash = prompt_hash_parts(&base_messages, &sections)?;
+        let budget = TokenBudget::default();
+        let strategy = ContextStrategy::default();
+        let prompt_hash = prompt_hash_parts(&base_messages, &sections, &budget, &strategy)?;
         Ok(Self {
             id: PromptId(prompt_hash.0.clone()),
             base_messages,
@@ -238,8 +240,8 @@ impl PromptIR {
             observation: None,
             meta: PromptMeta {
                 total_tokens,
-                budget: TokenBudget::default(),
-                strategy: ContextStrategy::default(),
+                budget,
+                strategy,
                 timestamp: Utc::now(),
                 prompt_hash,
             },
@@ -428,10 +430,27 @@ fn inject_context_sections(prompt: &mut Prompt, context: String) {
     }
 }
 
-fn prompt_hash_parts(base_messages: &Prompt, sections: &[Section]) -> Result<ContentHash> {
+fn prompt_hash_parts(
+    base_messages: &Prompt,
+    sections: &[Section],
+    budget: &TokenBudget,
+    strategy: &ContextStrategy,
+) -> Result<ContentHash> {
+    #[derive(Serialize)]
+    struct StablePromptHash<'a> {
+        base_messages: &'a Prompt,
+        sections: &'a [Section],
+        budget: &'a TokenBudget,
+        strategy: &'a ContextStrategy,
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(base_messages)?);
-    hasher.update(serde_json::to_vec(sections)?);
+    hasher.update(serde_json::to_vec(&StablePromptHash {
+        base_messages,
+        sections,
+        budget,
+        strategy,
+    })?);
     Ok(ContentHash(format!("sha256:{:x}", hasher.finalize())))
 }
 
