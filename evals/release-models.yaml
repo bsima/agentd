@@ -1,0 +1,18 @@
+# Standard agent models.yaml schema used by release-online.sh.
+# Keep this small and stable for CI. Use RELEASE_MODELS_FILE or pass a path to
+# release-online.sh for a larger local/provider-specific matrix.
+
+default_model: parasail/qwen3-235b
+
+models:
+  - name: parasail/qwen3-235b
+    provider: openai-compatible
+    base_url: https://api.parasail.io/v1
+    api_key: $PARASAIL_API_KEY
+    api_id: parasail-qwen3-235b-a22b-instruct-2507
+    input: 0.5
+    output: 2.0
+    context: 131072
+    thinking: false
+    vision: false
+    display: Qwen3 235B (parasail release smoke)

@@ -1,0 +1,27 @@
+name: Release evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      models_file:
+        description: Path to a standard models.yaml file to use for online evals
+        required: true
+        default: evals/release-models.yaml
+
+jobs:
+  online:
+    runs-on: ubuntu-latest
+    environment: release-evals
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: ./evals/release.sh
+      - run: ./evals/release-online.sh "${{ inputs.models_file }}"
+        env:
+          PARASAIL_API_KEY: ${{ secrets.PARASAIL_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
