@@ -663,6 +663,19 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
                 .cloned()
                 .ok_or_else(|| anyhow!("AgentIR field {field:?} not found on {value}"))
         }
+        Expr::FieldOr {
+            base,
+            field,
+            default,
+        } => {
+            let value = env
+                .get(base)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", base))?;
+            match value.get(field).cloned() {
+                Some(value) => Ok(value),
+                None => eval_expr(env, default),
+            }
+        }
         Expr::Index { base, index } => {
             let value = env
                 .get(base)
@@ -724,6 +737,13 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
         Expr::JsonParse { value } => {
             let text = string_expr(env, value, "JsonParse.value")?;
             serde_json::from_str(&text).context("AgentIR JsonParse failed")
+        }
+        Expr::JsonParseOr { value, default } => {
+            let text = string_expr(env, value, "JsonParseOr.value")?;
+            match serde_json::from_str(&text) {
+                Ok(value) => Ok(value),
+                Err(_) => eval_expr(env, default),
+            }
         }
         Expr::ToString { value } => {
             let value = eval_expr(env, value)?;

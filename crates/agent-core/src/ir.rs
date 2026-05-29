@@ -159,18 +159,59 @@ pub enum Pattern {
 pub enum Expr {
     Value(Value),
     Var(Var),
-    Field { base: Var, field: String },
-    Index { base: Var, index: Box<Expr> },
-    Len { base: Var },
-    IsEmpty { base: Var },
-    Eq { left: Box<Expr>, right: Box<Expr> },
-    Lt { left: Box<Expr>, right: Box<Expr> },
-    Or { left: Box<Expr>, right: Box<Expr> },
-    Add { left: Box<Expr>, right: Box<Expr> },
-    Sub { left: Box<Expr>, right: Box<Expr> },
-    Push { base: Var, value: Box<Expr> },
-    JsonParse { value: Box<Expr> },
-    ToString { value: Box<Expr> },
+    Field {
+        base: Var,
+        field: String,
+    },
+    FieldOr {
+        base: Var,
+        field: String,
+        default: Box<Expr>,
+    },
+    Index {
+        base: Var,
+        index: Box<Expr>,
+    },
+    Len {
+        base: Var,
+    },
+    IsEmpty {
+        base: Var,
+    },
+    Eq {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Lt {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Or {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Add {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Sub {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Push {
+        base: Var,
+        value: Box<Expr>,
+    },
+    JsonParse {
+        value: Box<Expr>,
+    },
+    JsonParseOr {
+        value: Box<Expr>,
+        default: Box<Expr>,
+    },
+    ToString {
+        value: Box<Expr>,
+    },
     Array(Vec<Expr>),
     Object(BTreeMap<String, Expr>),
 }
@@ -518,6 +559,10 @@ fn validate_expr_vars(
         Expr::Field { base, .. } | Expr::Len { base } | Expr::IsEmpty { base } => {
             validate_var(base, defined, block_id)
         }
+        Expr::FieldOr { base, default, .. } => {
+            validate_var(base, defined, block_id)?;
+            validate_expr_vars(default, defined, block_id)
+        }
         Expr::Index { base, index } => {
             validate_var(base, defined, block_id)?;
             validate_expr_vars(index, defined, block_id)
@@ -533,6 +578,10 @@ fn validate_expr_vars(
         Expr::Push { base, value } => {
             validate_var(base, defined, block_id)?;
             validate_expr_vars(value, defined, block_id)
+        }
+        Expr::JsonParseOr { value, default } => {
+            validate_expr_vars(value, defined, block_id)?;
+            validate_expr_vars(default, defined, block_id)
         }
         Expr::JsonParse { value } | Expr::ToString { value } => {
             validate_expr_vars(value, defined, block_id)

@@ -192,22 +192,25 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                 },
                 Instr::Let {
                     out: function_name.clone(),
-                    expr: Expr::Field {
+                    expr: Expr::FieldOr {
                         base: function.clone(),
                         field: "name".into(),
+                        default: Box::new(Expr::Value(Value::String("".into()))),
                     },
                 },
                 Instr::Let {
                     out: raw_arguments.clone(),
-                    expr: Expr::Field {
+                    expr: Expr::FieldOr {
                         base: function.clone(),
                         field: "arguments".into(),
+                        default: Box::new(Expr::Value(Value::String("{}".into()))),
                     },
                 },
                 Instr::Let {
                     out: arguments.clone(),
-                    expr: Expr::JsonParse {
+                    expr: Expr::JsonParseOr {
                         value: Box::new(Expr::Var(raw_arguments)),
+                        default: Box::new(Expr::Object(BTreeMap::new())),
                     },
                 },
                 Instr::Let {
@@ -233,9 +236,10 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
             instructions: vec![
                 Instr::Let {
                     out: command.clone(),
-                    expr: Expr::Field {
+                    expr: Expr::FieldOr {
                         base: arguments.clone(),
                         field: "command".into(),
+                        default: Box::new(Expr::Value(Value::String("".into()))),
                     },
                 },
                 Instr::Eval {
@@ -266,16 +270,18 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
             instructions: vec![
                 Instr::Let {
                     out: infer_model.clone(),
-                    expr: Expr::Field {
+                    expr: Expr::FieldOr {
                         base: arguments.clone(),
                         field: "model".into(),
+                        default: Box::new(Expr::Value(Value::String("".into()))),
                     },
                 },
                 Instr::Let {
                     out: infer_prompt_text.clone(),
-                    expr: Expr::Field {
+                    expr: Expr::FieldOr {
                         base: arguments.clone(),
                         field: "prompt".into(),
+                        default: Box::new(Expr::Value(Value::String("".into()))),
                     },
                 },
                 Instr::Let {
@@ -499,6 +505,32 @@ mod tests {
             crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
 
         assert_eq!(value["content"], Value::String("done".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_malformed_tool_call_does_not_abort_turn() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ResponseToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({}),
+                )],
+            ),
+            response("recovered", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("bad tool")],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value["content"], Value::String("recovered".into()));
         Ok(())
     }
 
