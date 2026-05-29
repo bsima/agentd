@@ -41,9 +41,10 @@ The task may be supplied directly in this markdown file, as the prompt argument,
 
 - Check `git status --short` before editing and before finishing.
 - Do not overwrite unrelated user changes.
-- Do not commit unless the user explicitly asks you to commit.
+- When finished and verified, commit your change.
+- In the commit message body, briefly state what you changed and why you made these design decisions.
 
-## Verification expectations
+## Verification expectations - IMPORTANT
 
 Run commands that match the change. Examples:
 
