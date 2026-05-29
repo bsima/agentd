@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -158,6 +159,7 @@ struct Runtime {
     runtime_mode: RuntimeMode,
     ir_store: InMemoryStore,
     ir_replay: Option<IrReplayTrace>,
+    ir_effect_visits: BTreeMap<String, u64>,
 }
 
 #[tokio::main]
@@ -333,6 +335,7 @@ async fn main() -> Result<()> {
         runtime_mode: args.runtime,
         ir_store: InMemoryStore::new(),
         ir_replay,
+        ir_effect_visits: BTreeMap::new(),
     };
 
     if args.debug {
@@ -517,7 +520,9 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             agent_core::run_sequential(&runtime.config, prompt, program).await?
         }
         RuntimeMode::Ir => {
-            let machine = agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
+            let mut machine =
+                agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
+            machine.effect_visits = runtime.ir_effect_visits.clone();
             let (value, machine) = agent_core::run_ir_sequential_with_store_and_replay(
                 &runtime.config,
                 machine,
@@ -525,6 +530,7 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
                 runtime.ir_replay.as_ref(),
             )
             .await?;
+            runtime.ir_effect_visits = machine.effect_visits.clone();
             let response: agent_core::Response =
                 serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
             let history = machine

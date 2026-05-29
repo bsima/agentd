@@ -185,6 +185,10 @@ pub enum IrStepOutcome {
 pub trait IrStore: Send {
     async fn get(&mut self, config: &SeqConfig, key: &str) -> Result<Value>;
     async fn put(&mut self, config: &SeqConfig, key: &str, value: Value) -> Result<()>;
+
+    fn in_memory_snapshot(&self) -> Option<InMemoryStore> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -208,6 +212,10 @@ impl InMemoryStore {
 
 #[async_trait]
 impl IrStore for InMemoryStore {
+    fn in_memory_snapshot(&self) -> Option<InMemoryStore> {
+        Some(self.clone())
+    }
+
     async fn get(&mut self, config: &SeqConfig, key: &str) -> Result<Value> {
         if let Some(value) = self.values.get(key) {
             return Ok(value.clone());
@@ -257,7 +265,7 @@ pub async fn run_ir_sequential(config: &SeqConfig, machine: Machine) -> Result<(
 pub async fn run_ir_sequential_with_store(
     config: &SeqConfig,
     machine: Machine,
-    store: &mut InMemoryStore,
+    store: &mut dyn IrStore,
 ) -> Result<(Value, Machine)> {
     match run_ir_steps_with_store_and_replay(config, machine, store, None, None).await? {
         IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
@@ -268,7 +276,7 @@ pub async fn run_ir_sequential_with_store(
 pub async fn run_ir_sequential_with_store_and_replay(
     config: &SeqConfig,
     machine: Machine,
-    store: &mut InMemoryStore,
+    store: &mut dyn IrStore,
     ir_replay: Option<&IrReplayTrace>,
 ) -> Result<(Value, Machine)> {
     match run_ir_steps_with_store_and_replay(config, machine, store, ir_replay, None).await? {
@@ -290,7 +298,7 @@ pub async fn run_ir_steps(
 pub async fn run_ir_steps_with_store_and_replay(
     config: &SeqConfig,
     mut machine: Machine,
-    store: &mut InMemoryStore,
+    store: &mut dyn IrStore,
     ir_replay: Option<&IrReplayTrace>,
     max_instructions: Option<usize>,
 ) -> Result<IrStepOutcome> {
@@ -300,11 +308,11 @@ pub async fn run_ir_steps_with_store_and_replay(
 
     loop {
         if max_instructions.is_some_and(|max| instructions_executed >= max) {
+            let store = store.in_memory_snapshot().ok_or_else(|| {
+                anyhow!("AgentIR instruction-limit checkpoints require an in-memory store snapshot")
+            })?;
             return Ok(IrStepOutcome::Suspended {
-                checkpoint: IrCheckpoint {
-                    machine,
-                    store: store.clone(),
-                },
+                checkpoint: IrCheckpoint { machine, store },
             });
         }
         let block = machine
@@ -378,6 +386,7 @@ pub async fn run_ir_steps_with_store_and_replay(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_instr(
     config: &SeqConfig,
     machine: &mut Machine,
@@ -676,6 +685,10 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
                 None => eval_expr(env, default),
             }
         }
+        Expr::StringOr { value, default } => match eval_expr(env, value)? {
+            Value::String(value) => Ok(Value::String(value)),
+            _ => eval_expr(env, default),
+        },
         Expr::Index { base, index } => {
             let value = env
                 .get(base)
