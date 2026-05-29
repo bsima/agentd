@@ -205,6 +205,7 @@ async fn main() -> Result<()> {
     };
     let provider_tag = resolved_model.provider.as_deref();
     let is_anthropic_provider = provider_tag == Some("anthropic");
+    let oauth_provider = provider_tag.filter(|provider| is_oauth_provider_tag(provider));
     let url = requested_provider
         .or(provider_file.url)
         .or(resolved_model.base_url.clone())
@@ -217,17 +218,12 @@ async fn main() -> Result<()> {
                 "https://openrouter.ai/api/v1".into()
             }
         });
+    let reported_provider_url = reported_provider_url(oauth_provider, &url);
     let replay = match args.replay_trace.as_ref() {
         Some(path) => Some(ReplayTrace::load(path).await?),
         None => None,
     };
     let model = resolved_model.api_id.clone();
-    let oauth_provider = provider_tag.filter(|provider| {
-        matches!(
-            *provider,
-            "openai-codex" | "codex-oauth" | "claude-code" | "claude-code-oauth"
-        )
-    });
     #[cfg(not(feature = "oauth"))]
     if replay.is_none() {
         if let Some(provider) = oauth_provider {
@@ -321,7 +317,7 @@ async fn main() -> Result<()> {
         trace,
         run_id: run_id.clone(),
         model: agent_core::Model(model.clone()),
-        provider_url: url.clone(),
+        provider_url: reported_provider_url.clone(),
         trace_path: trace_path.clone(),
         checkpoint_dir: args.checkpoint_dir,
         checkpoint_path,
@@ -334,7 +330,7 @@ async fn main() -> Result<()> {
     eprintln!("model: {model}");
     eprintln!("trace: {}", trace_path.display());
     eprintln!("run_id: {run_id}");
-    eprintln!("provider: {url}");
+    eprintln!("provider: {reported_provider_url}");
     if let Some(prompt) = loaded_prompt.as_ref() {
         eprintln!("prompt: {}", prompt.body);
     }
@@ -349,6 +345,35 @@ async fn main() -> Result<()> {
         (None, Some(path), _) => run_fifo_session(&mut runtime, path).await,
         (None, None, _) => run_stdin_session(&mut runtime).await,
     }
+}
+
+fn is_oauth_provider_tag(provider: &str) -> bool {
+    matches!(
+        provider,
+        "openai-codex" | "codex-oauth" | "claude-code" | "claude-code-oauth"
+    )
+}
+
+fn oauth_provider_base_url(provider: &str) -> Option<&'static str> {
+    #[cfg(feature = "oauth")]
+    {
+        agent_oauth::provider_base_url_for_tag(provider)
+    }
+    #[cfg(not(feature = "oauth"))]
+    {
+        match provider {
+            "openai-codex" | "codex-oauth" => Some("https://chatgpt.com/backend-api"),
+            "claude-code" | "claude-code-oauth" => Some("https://api.anthropic.com/v1"),
+            _ => None,
+        }
+    }
+}
+
+fn reported_provider_url(oauth_provider: Option<&str>, resolved_url: &str) -> String {
+    oauth_provider
+        .and_then(oauth_provider_base_url)
+        .map(str::to_string)
+        .unwrap_or_else(|| resolved_url.to_string())
 }
 
 async fn resolve_model(
@@ -879,6 +904,26 @@ fn trace_path(run_id: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_oauth_provider_base_url_instead_of_fallback() {
+        assert_eq!(
+            reported_provider_url(Some("openai-codex"), "https://openrouter.ai/api/v1"),
+            "https://chatgpt.com/backend-api"
+        );
+        assert_eq!(
+            reported_provider_url(Some("claude-code"), "https://openrouter.ai/api/v1"),
+            "https://api.anthropic.com/v1"
+        );
+    }
+
+    #[test]
+    fn reports_resolved_url_for_non_oauth_provider() {
+        assert_eq!(
+            reported_provider_url(None, "https://api.example.test/v1"),
+            "https://api.example.test/v1"
+        );
+    }
 
     #[tokio::test]
     async fn raw_model_is_resolved_without_model_registry() -> Result<()> {

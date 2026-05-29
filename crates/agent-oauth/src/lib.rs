@@ -508,6 +508,14 @@ pub async fn status_all() -> Result<Vec<TokenStatus>> {
     Ok(statuses)
 }
 
+pub fn provider_base_url_for_tag(tag: &str) -> Option<&'static str> {
+    match tag {
+        "openai-codex" | "codex-oauth" => Some("https://chatgpt.com/backend-api"),
+        "claude-code" | "claude-code-oauth" => Some("https://api.anthropic.com/v1"),
+        _ => None,
+    }
+}
+
 pub fn provider_for_tag(tag: &str, model: Model) -> Result<Option<Box<dyn ChatProvider>>> {
     match tag {
         "openai-codex" | "codex-oauth" => Ok(Some(Box::new(CodexOAuthProvider::new(model)?))),
