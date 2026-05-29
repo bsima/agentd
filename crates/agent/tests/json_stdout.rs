@@ -15,7 +15,8 @@ fn json_mode_stdout_is_parseable_jsonl() {
     let replay_path = root.join("replay.jsonl");
     let timestamp = "2026-05-29T00:00:00Z";
     let replay = format!(
-        r#"{{"event":"InferCall","run_id":"replay","op_id":2,"model":"test-model","prompt_preview":"","timestamp":"{timestamp}"}}
+        r#"{{"event":"Custom","run_id":"replay","op_id":0,"name":"ir_effect","data":{{"program_hash":"sha256:5c71cc50336006d39c93cda3a28e2e5806f39985adfa1388ac267c0d0f7872f4","effect_id":"sha256:2d2746e54d1d7a94aa1580f358faea32b94d6c7e3af6156aea1db4dcb561b47d","kind":"Infer","site":{{"block":0,"instruction_index":0}},"dynamic_path":[{{"Visit":{{"site":{{"block":0,"instruction_index":0}},"visit":0}}}}]}},"timestamp":"{timestamp}"}}
+{{"event":"InferCall","run_id":"replay","op_id":2,"model":"test-model","prompt_preview":"","timestamp":"{timestamp}"}}
 {{"event":"InferResult","run_id":"replay","op_id":2,"response":{{"content":"hello human","tool_calls":[],"tokens":7}},"response_preview":"hello human","tokens":7,"duration_ms":1,"timestamp":"{timestamp}"}}
 "#
     );
