@@ -67,7 +67,7 @@ Acceptance:
 
 Status: separate major initiative.
 
-PromptIR is the structured payload for `Infer`. It should represent context as labeled, sourced, budgeted sections that can later be optimized with DSPy-style or rate-distortion-style passes.
+PromptIR is the structured payload for `Infer`. It should represent context as labeled, sourced, budgeted sections that can later be optimized with DSPy-style or rate-distortion-style passes. The concrete design is captured in [docs/PROMPT_IR.md](./docs/PROMPT_IR.md).
 
 Planned work:
 
