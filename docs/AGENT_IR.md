@@ -65,6 +65,8 @@ pub enum Terminator {
 }
 ```
 
+The first version uses an environment-carrying CFG rather than strict SSA block scope. `Goto` binds target params, but the runtime environment is carried across block transitions so loop builders can keep durable locals without threading every variable through every block. This is simpler for the first interpreter. A later normalization pass can tighten this into stricter SSA if that becomes valuable.
+
 The first version can use `serde_json::Value` for runtime values. A richer type system can come later.
 
 ## Validation and normalization
