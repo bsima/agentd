@@ -14,6 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -375,6 +376,10 @@ pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value
         process.current_dir(cwd);
     }
     config.env.apply(&mut process);
+    // Detach the child's stdin so interactive commands (e.g. `git rebase -i`,
+    // `git commit` with no -m, `ssh`, prompts) get immediate EOF instead of
+    // consuming the agent's own control channel (NUL-framed session/fifo input).
+    process.stdin(Stdio::null());
     process.kill_on_drop(true);
 
     let output = tokio::time::timeout(config.timeout, process.output()).await;
@@ -1048,6 +1053,47 @@ mod tests {
         .await?;
         assert_eq!(env_result["stdout"], json!("unse"));
         assert_eq!(env_result["stdout_truncated"], json!(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eval_child_stdin_is_detached() -> Result<()> {
+        // Regression: the child of an Eval op must not inherit the agent's stdin.
+        // Otherwise an interactive `read` (or `git rebase -i`, `ssh`, etc.) would
+        // consume the agent's own NUL-framed session/fifo control channel. With
+        // stdin detached to /dev/null, `read` sees immediate EOF and returns
+        // non-zero without blocking or stealing any input.
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let config = SeqConfig {
+            provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: test_trace(),
+            eval: EvalConfig {
+                shell: "/bin/sh".into(),
+                cwd: None,
+                // Generous timeout: if stdin were inherited and blocked, the test
+                // process has no stdin attached under cargo test so it would also
+                // EOF -- but a real inherited terminal would hang. The key assertion
+                // is that `read` reports failure (EOF), not success.
+                timeout: std::time::Duration::from_secs(5),
+                max_stdout_bytes: 64,
+                max_stderr_bytes: 64,
+                env: EnvPolicy::Inherit,
+            },
+            replay: None,
+            trace_full_prompt_ir: false,
+        };
+
+        let (result, _) = run_sequential(
+            &config,
+            (),
+            crate::op::eval("if read _x; then echo GOT; else echo EOF; fi"),
+        )
+        .await?;
+        assert_eq!(result["timed_out"], json!(false));
+        assert_eq!(result["stdout"], json!("EOF\n"));
         Ok(())
     }
 
