@@ -82,25 +82,25 @@ Acceptance:
 - flat provider prompts are byte-for-byte or semantically equivalent to current prompts before optimization is enabled
 - hydration provenance survives in traces as section IDs, sources, priorities, and hashes
 
-## Intent track: verifiable Eval payload
+## M3: Sandboxing and richer hydration
 
-Status: separate major initiative and potential commercial add-on.
-
-Intent is the structured/verifiable payload for `Eval`. Shell remains the compatibility backend. Intent is the high-assurance backend for deterministic, inspectable, and eventually commercial agentic workloads.
+The bigger issue after PromptIR is control and context quality. The runtime can already execute effects. Next it needs better boundaries around those effects and better sources for model context.
 
 Planned work:
 
-- generalize `Eval` from a command string to an `EvalRequest`
-- support `EvalRequest::Shell` for current behavior
-- add `EvalRequest::Intent` once the Intent compiler/runtime boundary is ready
-- record eval request hashes, verification status, structured errors, counterexamples, and result hashes in traces
-- use Intent structured failures as training/eval signal for PromptIR optimization and agent retry loops
+- hermetic PATH construction for `Eval`
+- first-class sandbox runner integration: `bwrap`, containers, VMs, or remote workers
+- safer default `Eval` policy for cwd, environment, filesystem, and network access
+- more `HydrationSource` implementations for workspace context, semantic recall, and temporal search
+- active `Get("semantic:...")` and passive PromptIR sections backed by the same source registry
+- better trace provenance for passive context injection, including section IDs, sources, priorities, and hashes
+- richer runtime budgets for `Infer`, recursively emitted `Infer` calls, and `Eval`
 
 Acceptance:
 
-- shell-backed `Eval` behavior remains compatible with existing workflows
-- Intent-backed `Eval` can typecheck/verify/compile/run without changing AgentIR control flow
-- failed Intent verification returns structured observations that can be fed back into `Infer`
+- shell-backed `Eval` can run inside a documented sandbox profile
+- hydration sources preserve provenance through PromptIR and traces
+- existing workflows keep working with explicit opt-outs for stricter sandbox defaults where needed
 
 ## M2: Rust `agentd` supervisor
 
@@ -123,17 +123,25 @@ Planned work:
 - log and checkpoint discovery by session name
 - restart/resume from latest checkpoint
 
-## M3: Safer execution and richer hydration
+## Intent track: verifiable Eval payload
 
-The bigger issue after M2 is control. The runtime can already execute effects. Next it needs better boundaries around those effects.
+Status: separate major initiative and potential commercial add-on.
+
+Intent is the structured/verifiable payload for `Eval`. Shell remains the compatibility backend. Intent is the high-assurance backend for deterministic, inspectable, and eventually commercial agentic workloads.
 
 Planned work:
 
-- hermetic PATH construction for `Eval`
-- first-class sandbox runner integration: `bwrap`, containers, VMs, or remote workers
-- more `HydrationSource` implementations for workspace context, semantic recall, and temporal search
-- better trace provenance for passive context injection
-- richer configurable budgets for `Infer` and recursively emitted `Infer` calls
+- generalize `Eval` from a command string to an `EvalRequest`
+- support `EvalRequest::Shell` for current behavior
+- add `EvalRequest::Intent` once the Intent compiler/runtime boundary is ready
+- record eval request hashes, verification status, structured errors, counterexamples, and result hashes in traces
+- use Intent structured failures as training/eval signal for PromptIR optimization and agent retry loops
+
+Acceptance:
+
+- shell-backed `Eval` behavior remains compatible with existing workflows
+- Intent-backed `Eval` can typecheck/verify/compile/run without changing AgentIR control flow
+- failed Intent verification returns structured observations that can be fed back into `Infer`
 
 ## M4: Parallel interpreter
 
