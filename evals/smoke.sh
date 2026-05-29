@@ -32,6 +32,7 @@ cat >"$trace" <<'JSONL'
 JSONL
 
 output="$({ env -u AGENT_API_KEY -u OPENROUTER_API_KEY "$agent_bin" \
+  --runtime op \
   --replay-trace "$trace" \
   --model ignored \
   "smoke"; } 2>"$workdir/replay.stderr")"

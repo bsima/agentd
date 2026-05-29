@@ -22,6 +22,7 @@ JSONL
 
 output="$(env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
   --session \
+  --runtime op \
   --replay-trace "$trace_fixture" \
   --model ignored \
   < <(printf 'first\0second\0\0'))"

@@ -30,6 +30,7 @@ stdout_log="$workdir/stdout.log"
 stderr_log="$workdir/stderr.log"
 env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
   --fifo "$fifo" \
+  --runtime op \
   --replay-trace "$trace_fixture" \
   --model ignored \
   >"$stdout_log" 2>"$stderr_log" &

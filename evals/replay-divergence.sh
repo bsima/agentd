@@ -18,6 +18,7 @@ JSONL
 
 set +e
 env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
+  --runtime op \
   --replay-trace "$fixture" \
   --model bar \
   "diverge" >"$workdir/stdout" 2>"$workdir/stderr"

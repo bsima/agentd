@@ -1,8 +1,8 @@
 use agent_core::{
     agent_loop, agent_loop_ir, ChatMessage, EnvPolicy, EvalConfig, Event, HydrationSource,
-    ModelRegistry, PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig,
-    ReplayTrace, ResolvedModel, SeqConfig, SourceCapability, SourceKind, SourceParams,
-    SourceRegistry, SourceResult, TraceLogger,
+    InMemoryStore, IrReplayTrace, ModelRegistry, PassiveHydrationConfig, PassiveSource,
+    ProviderClient, ProviderConfig, ReplayTrace, ResolvedModel, SeqConfig, SourceCapability,
+    SourceKind, SourceParams, SourceRegistry, SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -156,6 +156,8 @@ struct Runtime {
     debug: bool,
     max_turns: usize,
     runtime_mode: RuntimeMode,
+    ir_store: InMemoryStore,
+    ir_replay: Option<IrReplayTrace>,
 }
 
 #[tokio::main]
@@ -217,9 +219,14 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("AGENT_PROVIDER").ok())
         .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
         .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
-    let replay = match args.replay_trace.as_ref() {
-        Some(path) => Some(ReplayTrace::load(path).await?),
-        None => None,
+    let replay_enabled = args.replay_trace.is_some();
+    let replay = match (args.runtime, args.replay_trace.as_ref()) {
+        (RuntimeMode::Op, Some(path)) => Some(ReplayTrace::load(path).await?),
+        _ => None,
+    };
+    let ir_replay = match (args.runtime, args.replay_trace.as_ref()) {
+        (RuntimeMode::Ir, Some(path)) => Some(IrReplayTrace::load(path).await?),
+        _ => None,
     };
     let model = resolved_model.api_id.clone();
     let oauth_provider = resolved_model.provider.as_deref().filter(|provider| {
@@ -229,7 +236,7 @@ async fn main() -> Result<()> {
         )
     });
     #[cfg(not(feature = "oauth"))]
-    if replay.is_none() {
+    if !replay_enabled {
         if let Some(provider) = oauth_provider {
             return Err(anyhow!(
                 "model '{}' requires OAuth provider '{provider}', but this agent was built without the 'oauth' feature",
@@ -237,7 +244,7 @@ async fn main() -> Result<()> {
             ));
         }
     }
-    let api_key = if oauth_provider.is_some() || replay.is_some() {
+    let api_key = if oauth_provider.is_some() || replay_enabled {
         None
     } else {
         Some(
@@ -263,7 +270,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let trace_path = trace_path(&run_id)?;
     let trace = TraceLogger::new(run_id.clone(), trace_path.clone());
-    let provider: Arc<dyn agent_core::ChatProvider> = if replay.is_some() {
+    let provider: Arc<dyn agent_core::ChatProvider> = if replay_enabled {
         Arc::new(ReplayOnlyProvider)
     } else {
         match oauth_provider {
@@ -324,6 +331,8 @@ async fn main() -> Result<()> {
         debug: args.debug,
         max_turns,
         runtime_mode: args.runtime,
+        ir_store: InMemoryStore::new(),
+        ir_replay,
     };
 
     if args.debug {
@@ -509,7 +518,13 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
         }
         RuntimeMode::Ir => {
             let machine = agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
-            let (value, machine) = agent_core::run_ir_sequential(&runtime.config, machine).await?;
+            let (value, machine) = agent_core::run_ir_sequential_with_store_and_replay(
+                &runtime.config,
+                machine,
+                &mut runtime.ir_store,
+                runtime.ir_replay.as_ref(),
+            )
+            .await?;
             let response: agent_core::Response =
                 serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
             let history = machine
