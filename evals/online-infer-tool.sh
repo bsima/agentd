@@ -14,6 +14,7 @@ trap cleanup EXIT
 cargo build --manifest-path "$repo_root/Cargo.toml" --quiet
 agent_bin="$repo_root/target/debug/agent"
 model="${AGENT_ONLINE_MODEL:-openrouter/auto}"
+infer_model="${AGENT_ONLINE_INFER_MODEL:-$model}"
 run_id="online-infer-tool-smoke-$$"
 
 output="$(HOME="$workdir/home" "$agent_bin" \
@@ -21,7 +22,7 @@ output="$(HOME="$workdir/home" "$agent_bin" \
   --run-id "$run_id" \
   --model "$model" \
   --eval-timeout-seconds 10 \
-  'Use the infer tool, not the shell tool. Ask it: what exact token should I return if the secret token is agentd-infer-smoke? Then reply with exactly agentd-infer-smoke.' )"
+  "Use the infer tool, not the shell tool. In the infer tool call set model to exactly ${infer_model}. Ask it: what exact token should I return if the secret token is agentd-infer-smoke? Then reply with exactly agentd-infer-smoke." )"
 
 if [[ "$output" != *"agentd-infer-smoke"* ]]; then
   echo "error: online output missing infer smoke marker" >&2
