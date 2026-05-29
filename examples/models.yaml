@@ -1,4 +1,13 @@
-# Copy this file to ~/.config/agent/models.yaml and edit for your providers.
+# Example model registry for agentd and Omni Ava.
+#
+# Safe setup for a fresh machine:
+#   mkdir -p ~/.config/agent
+#   cp -n examples/models.yaml ~/.config/agent/models.yaml
+#
+# Do NOT blindly overwrite an existing ~/.config/agent/models.yaml. That file is
+# user-specific runtime configuration and may contain aliases used by deployed
+# services such as Ava.
+#
 # API keys can be literal strings, but env var references are safer.
 
 # Used when --model is omitted.
@@ -29,9 +38,53 @@ models:
     vision: true
     display: GPT-4o mini
 
+  # Ava/Omni-compatible Claude Code OAuth aliases.
+  # Requires `agent auth login claude-code`.
+  - name: anthropic/claude-sonnet-4.6
+    provider: claude-code
+    api_id: claude-sonnet-4-6
+    input: 3.0
+    output: 15.0
+    context: 1000000
+    thinking: true
+    vision: true
+    display: Claude Sonnet 4.6 via Claude Code OAuth
+
+  - name: anthropic/claude-opus-4.8
+    provider: claude-code
+    api_id: claude-opus-4-8
+    input: 15.0
+    output: 75.0
+    context: 1000000
+    thinking: true
+    vision: true
+    display: Claude Opus 4.8 via Claude Code OAuth
+
+  - name: anthropic/claude-opus-4.7
+    provider: claude-code
+    api_id: claude-opus-4-7
+    input: 15.0
+    output: 75.0
+    context: 1000000
+    thinking: true
+    vision: true
+    display: Claude Opus 4.7 via Claude Code OAuth
+
+  - name: group-engage-classifier
+    provider: claude-code
+    api_id: claude-sonnet-4-6
+    input: 3.0
+    output: 15.0
+    context: 200000
+    thinking: false
+    vision: false
+    display: Group engagement classifier
+
+  # Direct Anthropic API-key example.
   - name: anthropic-api/claude-opus-4.8
     provider: anthropic
     base_url: https://api.anthropic.com/v1
+    api_key: $ANTHROPIC_API_KEY
     api_id: claude-opus-4-8
     input: 15.0
     output: 75.0
@@ -50,11 +103,18 @@ models:
     vision: false
     display: GPT-5 via Codex OAuth
 
-  # Experimental. Requires the default "oauth" feature and `agent auth login claude-code`.
-  # Uses the same provider tag as the Haskell agent registry.
+  - name: openai/gpt-5.5
+    provider: openai-codex
+    api_id: gpt-5.5
+    context: 200000
+    thinking: true
+    vision: false
+    display: GPT-5.5 via Codex OAuth
+
+  # Backward-compatible alias.
   - name: claude/sonnet-oauth
     provider: claude-code
-    api_id: claude-sonnet-4-5
+    api_id: claude-sonnet-4-6
     context: 200000
     thinking: true
     vision: true

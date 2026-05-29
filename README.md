@@ -115,8 +115,10 @@ Configure a model registry:
 
 ```sh
 mkdir -p ~/.config/agent
-cp examples/models.yaml ~/.config/agent/models.yaml
+cp -n examples/models.yaml ~/.config/agent/models.yaml
 ```
+
+Do not overwrite an existing `~/.config/agent/models.yaml`; it is runtime configuration and may contain local aliases used by deployed services.
 
 Set the provider key:
 
