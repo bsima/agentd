@@ -91,6 +91,9 @@ impl AnthropicProvider {
                 context: "reading Anthropic response",
             })?;
         if !status.is_success() {
+            if is_context_overflow(status, &text) {
+                return Err(ProviderError::ContextOverflow { status, text });
+            }
             return Err(ProviderError::Http {
                 status,
                 text,
@@ -232,6 +235,10 @@ enum ProviderError {
         text: String,
         retry_after: Option<Duration>,
     },
+    ContextOverflow {
+        status: StatusCode,
+        text: String,
+    },
     Other(anyhow::Error),
 }
 
@@ -249,6 +256,7 @@ impl ProviderError {
             Self::Http { status, .. } => {
                 *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
+            Self::ContextOverflow { .. } => false,
             Self::Other(_) => false,
         }
     }
@@ -264,9 +272,25 @@ impl ProviderError {
         match self {
             Self::Transport { source, context } => anyhow::Error::new(source).context(context),
             Self::Http { status, text, .. } => anyhow!("Anthropic returned {status}: {text}"),
+            Self::ContextOverflow { status, text } => {
+                anyhow!("context_length_exceeded: Anthropic returned {status}: {text}")
+            }
             Self::Other(err) => err,
         }
     }
+}
+
+fn is_context_overflow(status: StatusCode, text: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || (lower.contains("context")
+            && (lower.contains("limit")
+                || lower.contains("length")
+                || lower.contains("too long")
+                || lower.contains("maximum")))
 }
 
 fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {

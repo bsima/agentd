@@ -595,6 +595,9 @@ async fn run_turn_with_status(
         }
         Err(err) => {
             let message = err.to_string();
+            if is_context_overflow_error(&message) {
+                emit_context_overflow(runtime, &message).await?;
+            }
             emit_agent_error(runtime, &message).await?;
             Err(err)
         }
@@ -693,6 +696,19 @@ async fn emit_agent_complete(runtime: &mut Runtime, response: &str) -> Result<()
         runtime,
         "agent_complete",
         serde_json::json!({ "response": response }),
+    )
+    .await
+}
+
+fn is_context_overflow_error(message: &str) -> bool {
+    message.starts_with("context_length_exceeded")
+}
+
+async fn emit_context_overflow(runtime: &mut Runtime, message: &str) -> Result<()> {
+    emit_custom_event(
+        runtime,
+        "context_overflow",
+        serde_json::json!({ "message": message }),
     )
     .await
 }
