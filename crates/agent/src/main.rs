@@ -1,8 +1,8 @@
 use agent_core::{
     agent_loop, agent_loop_ir, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
-    EvalConfig, Event, HydrationSource, InMemoryStore, IrReplayTrace, ModelRegistry,
+    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, ModelRegistry,
     PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayTrace,
-    ResolvedModel, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
+    ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
     SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
@@ -70,6 +70,18 @@ struct Args {
     /// Environment policy for Eval shell commands.
     #[arg(long, value_enum, default_value_t = EvalEnvMode::Inherit)]
     eval_env: EvalEnvMode,
+    /// Context GC strategy.
+    #[arg(long, value_enum, default_value_t = GcArg::Ring)]
+    gc: GcArg,
+    /// Trigger GC at this fraction of the model context budget.
+    #[arg(long, default_value_t = 0.85)]
+    gc_threshold: f32,
+    /// Emit gc_collect trace events.
+    #[arg(long)]
+    gc_log: bool,
+    /// Prompt-cache policy for GC (parsed for future support).
+    #[arg(long, value_enum, default_value_t = GcCacheArg::Preserve)]
+    gc_cache: GcCacheArg,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -80,6 +92,18 @@ struct Args {
     prompt: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GcArg {
+    None,
+    Ring,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GcCacheArg {
+    Preserve,
+    Ignore,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -166,6 +190,8 @@ struct Runtime {
     ir_store: InMemoryStore,
     ir_replay: Option<IrReplayTrace>,
     ir_effect_visits: BTreeMap<String, u64>,
+    gc_threshold: f32,
+    context_budget: usize,
 }
 
 #[tokio::main]
@@ -246,6 +272,7 @@ async fn main() -> Result<()> {
         (RuntimeMode::Ir, Some(path)) => Some(IrReplayTrace::load(path).await?),
         _ => None,
     };
+    let context_budget = resolved_model.context;
     let model = resolved_model.api_id.clone();
     #[cfg(not(feature = "oauth"))]
     if !replay_enabled {
@@ -335,6 +362,13 @@ async fn main() -> Result<()> {
         eval: eval_config,
         replay: replay.clone(),
         trace_full_prompt_ir: args.trace_full_prompt_ir,
+        gc: match args.gc {
+            GcArg::None => GcMode::None,
+            GcArg::Ring => GcMode::Ring(RingGc),
+        },
+        gc_threshold: args.gc_threshold,
+        gc_log: args.gc_log,
+        context_budget,
     };
     let mut runtime = Runtime {
         config,
@@ -353,6 +387,8 @@ async fn main() -> Result<()> {
         ir_store: InMemoryStore::new(),
         ir_replay,
         ir_effect_visits: BTreeMap::new(),
+        gc_threshold: args.gc_threshold,
+        context_budget,
     };
 
     eprintln!("model: {model}");
@@ -421,6 +457,7 @@ async fn resolve_model(
                 api_id: model,
                 base_url: None,
                 api_key: None,
+                context: 200_000,
             })
         }
         Err(err) => Err(err.context(
@@ -768,6 +805,10 @@ async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
         eval: runtime.config.eval.clone(),
         replay: runtime.config.replay.clone(),
         trace_full_prompt_ir: runtime.config.trace_full_prompt_ir,
+        gc: GcMode::None,
+        gc_threshold: runtime.gc_threshold,
+        gc_log: false,
+        context_budget: runtime.context_budget,
     };
     let _ = agent_core::run_sequential(
         &config,

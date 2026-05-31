@@ -299,6 +299,7 @@ fn command_from_tool_call(call: &ResponseToolCall) -> std::result::Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::GcMode;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{run_sequential, SeqConfig};
     use crate::provider::{ChatProvider, ToolSpec};
@@ -336,6 +337,10 @@ mod tests {
             eval: crate::interpreter::EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         }
     }
 

@@ -1,3 +1,4 @@
+use crate::gc::{estimate_tokens, truncate_oversized_message, GcMode, GcState};
 use crate::hydration::{
     PassiveHydrationConfig, PassiveSource, SourceParams, SourceRegistry, SEMANTIC_PREFIX,
     SESSION_STATE_KEY, TEMPORAL_PREFIX,
@@ -161,6 +162,10 @@ pub struct SeqConfig {
     pub eval: EvalConfig,
     pub replay: Option<ReplayTrace>,
     pub trace_full_prompt_ir: bool,
+    pub gc: GcMode,
+    pub gc_threshold: f32,
+    pub gc_log: bool,
+    pub context_budget: usize,
 }
 
 impl SeqConfig {
@@ -186,6 +191,21 @@ where
     S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     A: Send + 'static,
 {
+    let mut gc_state = GcState::default();
+    run_sequential_inner(config, state, op, &mut gc_state).await
+}
+
+#[async_recursion]
+async fn run_sequential_inner<S, A>(
+    config: &SeqConfig,
+    state: S,
+    op: Op<S, A>,
+    gc_state: &mut GcState,
+) -> Result<(A, S)>
+where
+    S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    A: Send + 'static,
+{
     match *op.0 {
         OpF::Pure(value) => Ok((value, state)),
         OpF::Infer {
@@ -194,6 +214,7 @@ where
             next,
         } => {
             let prompt = hydrate_infer_prompt(config, &state, prompt).await?;
+            let prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -228,7 +249,7 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential(config, state, next(response)).await
+            run_sequential_inner(config, state, next(response), gc_state).await
         }
         OpF::Eval { command, next } => {
             let op_id = config.trace.next_op_id();
@@ -277,7 +298,7 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential(config, state, next(result)).await
+            run_sequential_inner(config, state, next(result), gc_state).await
         }
         OpF::Get { key, next } => {
             let op_id = config.trace.next_op_id();
@@ -303,7 +324,7 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential(config, state, next(value)).await
+            run_sequential_inner(config, state, next(value), gc_state).await
         }
         OpF::Put { key, value, next } => {
             let op_id = config.trace.next_op_id();
@@ -327,11 +348,11 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential(config, state, next).await
+            run_sequential_inner(config, state, next, gc_state).await
         }
         OpF::Emit { event, next } => {
             config.trace.emit(&event).await?;
-            run_sequential(config, state, next).await
+            run_sequential_inner(config, state, next, gc_state).await
         }
         OpF::Par { ops, next } => {
             let op_id = config.trace.next_op_id();
@@ -349,7 +370,8 @@ where
             let mut values = Vec::with_capacity(branch_count);
             let mut current_state = state;
             for op in ops {
-                let (value, new_state) = run_sequential(config, current_state, op).await?;
+                let (value, new_state) =
+                    run_sequential_inner(config, current_state, op, gc_state).await?;
                 values.push(value);
                 current_state = new_state;
             }
@@ -363,9 +385,45 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential(config, current_state, next(values)).await
+            run_sequential_inner(config, current_state, next(values), gc_state).await
         }
     }
+}
+
+async fn maybe_collect_prompt(
+    config: &SeqConfig,
+    mut prompt: Prompt,
+    gc_state: &mut GcState,
+) -> Result<Prompt> {
+    if !config.gc.enabled() {
+        return Ok(prompt);
+    }
+    let before_tokens = estimate_tokens(&prompt);
+    let threshold = ((config.context_budget as f32) * config.gc_threshold) as usize;
+    if before_tokens <= threshold {
+        return Ok(prompt);
+    }
+    truncate_oversized_message(&mut prompt, config.context_budget);
+    let collected = config.gc.collect(prompt, config.context_budget, gc_state);
+    let after_tokens = estimate_tokens(&collected);
+    if config.gc_log {
+        config
+            .trace
+            .emit(&Event::Custom {
+                run_id: config.trace.run_id().into(),
+                name: "gc_collect".into(),
+                data: serde_json::json!({
+                    "type": "gc_collect",
+                    "strategy": config.gc.name(),
+                    "tokens_before": before_tokens,
+                    "tokens_after": after_tokens,
+                    "cache_invalidated": !config.gc.cache_preserving(),
+                }),
+                timestamp: Utc::now(),
+            })
+            .await?;
+    }
+    Ok(collected)
 }
 
 pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value> {
@@ -733,6 +791,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
         let prompt = vec![ChatMessage::user("use echo")];
 
@@ -779,6 +841,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
         let prompt = vec![ChatMessage::user("do two steps")];
 
@@ -812,6 +878,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let program = infer(Model("mock".into()), vec![ChatMessage::user("first")]).and_then(
@@ -862,6 +932,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
         let program = crate::op::put("temporal:history", json!(1))
             .and_then(|_| {
@@ -925,6 +999,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let (value, state) = run_sequential(
@@ -952,6 +1030,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let (_, state) = run_sequential(
@@ -988,6 +1070,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
         let prompt = vec![ChatMessage::user("answer")];
 
@@ -1033,6 +1119,10 @@ mod tests {
             },
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let (timeout_result, _) = run_sequential(&config, (), crate::op::eval("sleep 1")).await?;
@@ -1084,6 +1174,10 @@ mod tests {
             },
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let (result, _) = run_sequential(
@@ -1111,6 +1205,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let _ = run_sequential(
@@ -1140,6 +1238,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
             .and_then(|_| crate::op::eval("printf replayed"));
@@ -1156,6 +1258,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: Some(replay),
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
             .and_then(|_| crate::op::eval("printf replayed"));
@@ -1183,6 +1289,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         };
 
         let (value, _) = run_sequential(&config, (), crate::op::get("semantic:topic")).await?;

@@ -35,6 +35,7 @@ pub struct ResolvedModel {
     pub api_id: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub context: usize,
 }
 
 impl ModelRegistry {
@@ -64,6 +65,7 @@ impl ModelRegistry {
                 api_id: entry.api_id.clone().unwrap_or_else(|| entry.name.clone()),
                 base_url: entry.base_url.clone(),
                 api_key: expand_api_key(entry.api_key.as_deref())?,
+                context: entry.context,
             }),
             None => Ok(ResolvedModel {
                 alias: alias.to_string(),
@@ -71,6 +73,7 @@ impl ModelRegistry {
                 api_id: alias.to_string(),
                 base_url: None,
                 api_key: None,
+                context: default_context(),
             }),
         }
     }

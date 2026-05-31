@@ -606,6 +606,10 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            gc: crate::gc::GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
         }
     }
 
