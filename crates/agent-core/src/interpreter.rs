@@ -1005,15 +1005,16 @@ mod tests {
             context_budget: 200_000,
         };
 
+        let initial_state = vec![ChatMessage::user("state")];
         let (value, state) = run_sequential(
             &config,
-            vec![ChatMessage::user("state")],
+            initial_state.clone(),
             crate::op::get("session:state"),
         )
         .await?;
 
         assert_eq!(value, json!({ "checkpoint": 7 }));
-        assert_eq!(state, vec![ChatMessage::user("state")]);
+        assert_eq!(state, initial_state);
         Ok(())
     }
 
@@ -1036,16 +1037,17 @@ mod tests {
             context_budget: 200_000,
         };
 
+        let initial_state = vec![ChatMessage::user("state")];
         let (_, state) = run_sequential(
             &config,
-            vec![ChatMessage::user("state")],
+            initial_state.clone(),
             crate::op::put("session:state", json!({ "checkpoint": 8 })),
         )
         .await?;
         let content: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
 
         assert_eq!(content, json!({ "checkpoint": 8 }));
-        assert_eq!(state, vec![ChatMessage::user("state")]);
+        assert_eq!(state, initial_state);
         Ok(())
     }
 

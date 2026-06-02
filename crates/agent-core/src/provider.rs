@@ -2,6 +2,7 @@ use crate::op::{ChatMessage, Model, Response, ResponseToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -60,6 +61,34 @@ impl ProviderClient {
     }
 }
 
+struct WireChatMessage<'a>(&'a ChatMessage);
+
+impl Serialize for WireChatMessage<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let message = self.0;
+        let mut fields = 2;
+        if message.tool_call_id.is_some() {
+            fields += 1;
+        }
+        if message.tool_calls.is_some() {
+            fields += 1;
+        }
+        let mut state = serializer.serialize_struct("ChatMessage", fields)?;
+        state.serialize_field("role", &message.role)?;
+        state.serialize_field("content", &message.content)?;
+        if let Some(tool_call_id) = &message.tool_call_id {
+            state.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(tool_calls) = &message.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        state.end()
+    }
+}
+
 #[async_trait]
 impl ChatProvider for ProviderClient {
     async fn chat(
@@ -81,29 +110,27 @@ impl ChatProvider for ProviderClient {
 /// Build the JSON request body for a chat completion. When `nudge` is set, a
 /// synthetic user continuation message is appended so that a *retry* after an
 /// empty completion differs from the request that produced it.
+///
+/// Messages are serialized through [`WireChatMessage`] so internal stable ids
+/// (used for GC/trace state) never reach the provider.
 fn build_chat_body(
     model: &Model,
     tools: &[ToolSpec],
     messages: &[ChatMessage],
     nudge: bool,
 ) -> Value {
-    if nudge {
-        let mut messages = messages.to_vec();
-        messages.push(ChatMessage::user(CONTINUE_NUDGE));
-        json!({
-            "model": model.0,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-        })
-    } else {
-        json!({
-            "model": model.0,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-        })
+    let nudge_msg = nudge.then(|| ChatMessage::user(CONTINUE_NUDGE));
+    let mut wire_messages: Vec<WireChatMessage<'_>> =
+        messages.iter().map(WireChatMessage).collect();
+    if let Some(msg) = nudge_msg.as_ref() {
+        wire_messages.push(WireChatMessage(msg));
     }
+    json!({
+        "model": model.0,
+        "messages": wire_messages,
+        "tools": tools,
+        "tool_choice": "auto",
+    })
 }
 
 /// Drive the chat request through the bounded backoff loop.

@@ -1,5 +1,7 @@
 use crate::op::ChatMessage;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
+use uuid::Uuid;
 
 pub trait ContextGc: Send + Sync {
     fn collect(
@@ -16,8 +18,33 @@ pub trait ContextGc: Send + Sync {
     }
 }
 
-#[derive(Default)]
-pub struct GcState {}
+pub type MsgId = Uuid;
+pub type FrameId = String;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    Active,
+    Complete,
+    Evictable,
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameStatus {
+    Open,
+    Complete,
+    Popped,
+}
+
+#[derive(Debug, Default)]
+pub struct GcState {
+    /// Mark-sweep lifecycle tags, keyed by stable ChatMessage UUID.
+    pub lifecycle: HashMap<MsgId, LifecycleState>,
+    /// Stack-frame status, keyed by provider tool-call id.
+    pub frames: HashMap<FrameId, FrameStatus>,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RingGc;

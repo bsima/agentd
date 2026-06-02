@@ -542,6 +542,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::GcMode;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
     use crate::ir::validate_program;
@@ -606,7 +607,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
-            gc: crate::gc::GcMode::None,
+            gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
             context_budget: 200_000,

@@ -12,7 +12,10 @@ pub mod provider;
 pub mod trace;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
-pub use gc::{estimate_tokens, truncate_oversized_message, ContextGc, GcMode, GcState, RingGc};
+pub use gc::{
+    estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
+    LifecycleState, MsgId, RingGc,
+};
 pub use hydration::{
     HydrationSource, PassiveHydrationConfig, PassiveSource, SourceCapability, SourceKind,
     SourceParams, SourceRegistry, SourceResult, SEMANTIC_PREFIX, SESSION_STATE_KEY,

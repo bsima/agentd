@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use uuid::Uuid;
 
 pub type BoxFutureOp<S, A> = Pin<Box<dyn Future<Output = Op<S, A>> + Send>>;
 pub type Prompt = Vec<ChatMessage>;
@@ -11,6 +12,8 @@ pub struct Model(pub String);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
     pub role: String,
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22,6 +25,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             role: "system".into(),
             content: Some(content.into()),
             tool_call_id: None,
@@ -31,6 +35,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             role: "user".into(),
             content: Some(content.into()),
             tool_call_id: None,
@@ -40,6 +45,7 @@ impl ChatMessage {
 
     pub fn assistant(content: Option<String>, tool_calls: Vec<ResponseToolCall>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             role: "assistant".into(),
             content,
             tool_call_id: None,
@@ -49,6 +55,7 @@ impl ChatMessage {
 
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             role: "tool".into(),
             content: Some(content.into()),
             tool_call_id: Some(tool_call_id.into()),
