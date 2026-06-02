@@ -6,6 +6,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Number of attempts (initial + retries) the chat retry loop makes before
+/// surfacing a terminal error.
+const MAX_ATTEMPTS: usize = 3;
+
+/// Synthetic continuation message appended to the *retry* request after the
+/// provider returns an empty completion. gpt-5.5 has been observed returning a
+/// 200 OK with empty content AND empty tool_calls *repeatably* for a given
+/// context (most often the turn right after a tool result, e.g. the final
+/// squash-commit). Resending the identical request hits the same wall, so the
+/// retry mutates the request with this nudge to break the model out of the
+/// empty-turn collapse. See t-1071.
+const CONTINUE_NUDGE: &str =
+    "Your previous response was empty. Continue the task: if work remains, issue \
+     the next tool call; if the task is complete, say so explicitly.";
+
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub url: String,
@@ -54,26 +69,79 @@ impl ChatProvider for ProviderClient {
         messages: &[ChatMessage],
     ) -> Result<Response> {
         let url = format!("{}/chat/completions", self.config.url.trim_end_matches('/'));
-        let body = json!({
+        chat_with_retries(model, tools, messages, |body| {
+            let url = url.clone();
+            async move { self.send_chat_request(&url, &body).await }
+        })
+        .await
+        .map_err(ProviderError::into_anyhow)
+    }
+}
+
+/// Build the JSON request body for a chat completion. When `nudge` is set, a
+/// synthetic user continuation message is appended so that a *retry* after an
+/// empty completion differs from the request that produced it.
+fn build_chat_body(
+    model: &Model,
+    tools: &[ToolSpec],
+    messages: &[ChatMessage],
+    nudge: bool,
+) -> Value {
+    if nudge {
+        let mut messages = messages.to_vec();
+        messages.push(ChatMessage::user(CONTINUE_NUDGE));
+        json!({
             "model": model.0,
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
-        });
-
-        let mut delay = Duration::from_secs(1);
-        for attempt in 0..3 {
-            match self.send_chat_request(&url, &body).await {
-                Ok(response) => return Ok(response),
-                Err(err) if attempt < 2 && err.is_retryable() => {
-                    tokio::time::sleep(err.retry_after().unwrap_or(delay)).await;
-                    delay *= 2;
-                }
-                Err(err) => return Err(err.into_anyhow()),
-            }
-        }
-        unreachable!("retry loop always returns")
+        })
+    } else {
+        json!({
+            "model": model.0,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+        })
     }
+}
+
+/// Drive the chat request through the bounded backoff loop.
+///
+/// On a retryable [`ProviderError::EmptyCompletion`], the *next* request is
+/// mutated with [`CONTINUE_NUDGE`] rather than resending the identical body
+/// (identical resends have not recovered in observed gpt-5.5 cases — t-1071).
+/// If every attempt is exhausted the last error is returned so the run
+/// terminates with a descriptive message instead of a silent empty completion.
+async fn chat_with_retries<F, Fut>(
+    model: &Model,
+    tools: &[ToolSpec],
+    messages: &[ChatMessage],
+    mut send: F,
+) -> std::result::Result<Response, ProviderError>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Response, ProviderError>>,
+{
+    let mut delay = Duration::from_secs(1);
+    let mut nudge = false;
+    for attempt in 0..MAX_ATTEMPTS {
+        let body = build_chat_body(model, tools, messages, nudge);
+        match send(body).await {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt + 1 < MAX_ATTEMPTS && err.is_retryable() => {
+                // An empty completion is deterministic for a given context, so
+                // mutate the next request to break the loop.
+                if matches!(err, ProviderError::EmptyCompletion { .. }) {
+                    nudge = true;
+                }
+                tokio::time::sleep(err.retry_after().unwrap_or(delay)).await;
+                delay *= 2;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("retry loop always returns")
 }
 
 impl ProviderClient {
@@ -100,6 +168,9 @@ impl ProviderClient {
                 context: "reading provider response",
             })?;
         if !status.is_success() {
+            if is_context_overflow(status, &text) {
+                return Err(ProviderError::ContextOverflow { status, text });
+            }
             return Err(ProviderError::Http {
                 status,
                 text,
@@ -128,14 +199,18 @@ impl ProviderClient {
                 ResponseToolCall::new(call.id, call.function.name, arguments)
             })
             .collect();
-        // Some providers (observed with gpt-5.5) occasionally return a 200 OK with
-        // an empty completion: no content AND no tool calls. The agent loop treats
-        // an empty tool_calls list as "the model is done", so such a turn would be
-        // surfaced as a final, empty response (`agent_complete{response:""}`),
-        // silently terminating an otherwise-active run. Treat this as a retryable
-        // error so the existing backoff loop re-requests the turn instead.
+        // Some providers (observed with gpt-5.5) occasionally return a 200 OK
+        // with an empty completion: no content AND no tool calls. The agent
+        // loop treats an empty tool_calls list as "the model is done", so such
+        // a turn would be surfaced as a final, empty response
+        // (`agent_complete{response:""}`), silently terminating an otherwise
+        // active run. Treat this as a retryable error so the backoff loop
+        // re-requests the turn (with a continuation nudge — t-1071).
         if content.trim().is_empty() && tool_calls.is_empty() {
-            return Err(ProviderError::EmptyCompletion);
+            // Log the full raw body so we can confirm it is genuinely empty
+            // rather than a parse/serialization bug on our side (t-1071).
+            eprintln!("provider returned empty completion; raw response body: {text}");
+            return Err(ProviderError::EmptyCompletion { raw: text });
         }
         Ok(Response {
             content,
@@ -156,8 +231,15 @@ enum ProviderError {
         text: String,
         retry_after: Option<Duration>,
     },
-    /// Provider returned a 200 OK with neither content nor tool calls.
-    EmptyCompletion,
+    ContextOverflow {
+        status: StatusCode,
+        text: String,
+    },
+    /// Provider returned a 200 OK with neither content nor tool calls. Carries
+    /// the raw response body for diagnostics.
+    EmptyCompletion {
+        raw: String,
+    },
     Other(anyhow::Error),
 }
 
@@ -175,7 +257,8 @@ impl ProviderError {
             Self::Http { status, .. } => {
                 *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
-            Self::EmptyCompletion => true,
+            Self::ContextOverflow { .. } => false,
+            Self::EmptyCompletion { .. } => true,
             Self::Other(_) => false,
         }
     }
@@ -191,12 +274,28 @@ impl ProviderError {
         match self {
             Self::Transport { source, context } => anyhow::Error::new(source).context(context),
             Self::Http { status, text, .. } => anyhow!("provider returned {status}: {text}"),
-            Self::EmptyCompletion => {
-                anyhow!("provider returned an empty completion (no content or tool calls) after retries")
+            Self::ContextOverflow { status, text } => {
+                anyhow!("context_length_exceeded: provider returned {status}: {text}")
+            }
+            Self::EmptyCompletion { raw } => {
+                anyhow!("provider returned an empty completion (no content or tool calls) after retries; raw response body: {raw}")
             }
             Self::Other(err) => err,
         }
     }
+}
+
+fn is_context_overflow(status: StatusCode, text: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || (lower.contains("context")
+            && (lower.contains("limit")
+                || lower.contains("length")
+                || lower.contains("too long")
+                || lower.contains("maximum")))
 }
 
 fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
@@ -256,10 +355,68 @@ struct Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    fn ok(content: &str) -> Response {
+        Response {
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tokens: 0,
+        }
+    }
+
+    fn empty_err() -> ProviderError {
+        ProviderError::EmptyCompletion {
+            raw: r#"{"choices":[{"message":{"content":""}}]}"#.into(),
+        }
+    }
+
+    /// Count how many `user` messages a serialized request body carries. The
+    /// nudge injected on retry is a synthetic `user` message, so this lets a
+    /// test assert that the retry request was actually mutated.
+    fn user_message_count(body: &Value) -> usize {
+        body["messages"]
+            .as_array()
+            .map(|msgs| msgs.iter().filter(|m| m["role"] == "user").count())
+            .unwrap_or(0)
+    }
+
+    fn nudged(body: &Value) -> bool {
+        body["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .map(|c| c.contains("previous response was empty"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn model() -> Model {
+        Model("gpt-5.5".into())
+    }
+
+    fn convo() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("do the task"),
+            ChatMessage::assistant(
+                None,
+                vec![ResponseToolCall::new(
+                    "call_1",
+                    "shell",
+                    json!({"command": "git commit -m x"}),
+                )],
+            ),
+            ChatMessage::tool("call_1", "committed"),
+        ]
+    }
 
     #[test]
     fn empty_completion_is_retryable() {
-        assert!(ProviderError::EmptyCompletion.is_retryable());
+        assert!(empty_err().is_retryable());
     }
 
     #[test]
@@ -275,8 +432,108 @@ mod tests {
     }
 
     #[test]
-    fn empty_completion_has_descriptive_terminal_error() {
-        let msg = ProviderError::EmptyCompletion.into_anyhow().to_string();
+    fn empty_completion_terminal_error_includes_raw_body() {
+        let msg = empty_err().into_anyhow().to_string();
         assert!(msg.contains("empty completion"), "got: {msg}");
+        // Raw body must be surfaced so we can confirm it is genuinely empty
+        // rather than a parse bug (t-1071 acceptance criterion).
+        assert!(msg.contains("raw response body"), "got: {msg}");
+        assert!(msg.contains("choices"), "got: {msg}");
+    }
+
+    // Regression for t-1071: the empty-after-a-tool-call stall. The provider
+    // returns empty on every attempt; the loop must exhaust its retries and
+    // surface the descriptive terminal error rather than a silent empty
+    // completion (`agent_complete{response:""}`).
+    #[tokio::test(start_paused = true)]
+    async fn exhausts_retries_then_returns_descriptive_error() {
+        let calls = RefCell::new(0usize);
+        let result = chat_with_retries(&model(), &[], &convo(), |_body| {
+            *calls.borrow_mut() += 1;
+            async { Err(empty_err()) }
+        })
+        .await;
+
+        assert_eq!(
+            *calls.borrow(),
+            MAX_ATTEMPTS,
+            "must use the full retry budget"
+        );
+        let err = result.expect_err("all-empty must be terminal");
+        let msg = err.into_anyhow().to_string();
+        assert!(msg.contains("empty completion"), "got: {msg}");
+    }
+
+    // The core of t-1071: an identical resend does not recover, so the retry
+    // must MUTATE the request with a continuation nudge.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_empty_injects_continuation_nudge() {
+        let bodies: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+        let _ = chat_with_retries(&model(), &[], &convo(), |body| {
+            bodies.borrow_mut().push(body);
+            async { Err(empty_err()) }
+        })
+        .await;
+
+        let bodies = bodies.borrow();
+        assert_eq!(bodies.len(), MAX_ATTEMPTS);
+        // First request is the original context, unmutated.
+        assert!(!nudged(&bodies[0]), "first attempt must not be nudged");
+        let base_users = user_message_count(&bodies[0]);
+        // Every retry after an empty completion carries the nudge.
+        for body in &bodies[1..] {
+            assert!(nudged(body), "retry must inject the continuation nudge");
+            assert_eq!(
+                user_message_count(body),
+                base_users + 1,
+                "nudge must be an added user message, not a replacement"
+            );
+        }
+    }
+
+    // A nudged retry that succeeds returns that response (the run continues).
+    #[tokio::test(start_paused = true)]
+    async fn nudged_retry_recovers() {
+        let calls = RefCell::new(0usize);
+        let result = chat_with_retries(&model(), &[], &convo(), |body| {
+            let n = {
+                let mut c = calls.borrow_mut();
+                *c += 1;
+                *c
+            };
+            // First call empty; the nudged retry yields a real completion.
+            let out = if n == 1 {
+                assert!(!nudged(&body));
+                Err(empty_err())
+            } else {
+                assert!(nudged(&body), "recovery attempt should be nudged");
+                Ok(ok("done"))
+            };
+            async move { out }
+        })
+        .await;
+
+        assert_eq!(*calls.borrow(), 2);
+        assert_eq!(result.expect("should recover").content, "done");
+    }
+
+    // Non-retryable errors short-circuit immediately (no nudge, no extra calls).
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_error_is_not_retried() {
+        let calls = RefCell::new(0usize);
+        let result = chat_with_retries(&model(), &[], &convo(), |_body| {
+            *calls.borrow_mut() += 1;
+            async {
+                Err(ProviderError::Http {
+                    status: StatusCode::BAD_REQUEST,
+                    text: "bad".into(),
+                    retry_after: None,
+                })
+            }
+        })
+        .await;
+
+        assert_eq!(*calls.borrow(), 1, "4xx must not be retried");
+        assert!(result.is_err());
     }
 }
