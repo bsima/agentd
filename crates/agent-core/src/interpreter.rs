@@ -390,7 +390,7 @@ where
     }
 }
 
-async fn maybe_collect_prompt(
+pub(crate) async fn maybe_collect_prompt(
     config: &SeqConfig,
     mut prompt: Prompt,
     gc_state: &mut GcState,

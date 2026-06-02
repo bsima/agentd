@@ -1,9 +1,9 @@
 use agent_core::{
     agent_loop, agent_loop_ir, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
-    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, ModelRegistry,
-    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayTrace,
-    ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
-    SourceResult, TraceLogger,
+    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, MarkSweepGc,
+    ModelRegistry, PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig,
+    ReplayTrace, ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind, SourceParams,
+    SourceRegistry, SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -98,6 +98,7 @@ struct Args {
 enum GcArg {
     None,
     Ring,
+    MarkSweep,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -365,6 +366,7 @@ async fn main() -> Result<()> {
         gc: match args.gc {
             GcArg::None => GcMode::None,
             GcArg::Ring => GcMode::Ring(RingGc),
+            GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc),
         },
         gc_threshold: args.gc_threshold,
         gc_log: args.gc_log,

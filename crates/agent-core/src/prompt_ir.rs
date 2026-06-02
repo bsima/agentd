@@ -1,3 +1,4 @@
+use crate::gc::LifecycleState;
 use crate::hydration::{SourceKind, SourceResult};
 use crate::op::{ChatMessage, Prompt};
 use anyhow::Result;
@@ -44,6 +45,8 @@ pub struct Section {
     pub relevance: Option<f32>,
     pub recency: Option<DateTime<Utc>>,
     pub hash: ContentHash,
+    #[serde(default)]
+    pub lifecycle: LifecycleState,
     #[serde(default)]
     pub metadata: Value,
 }
@@ -367,9 +370,56 @@ impl Section {
             relevance,
             recency: None,
             hash,
+            lifecycle: match role {
+                SectionRole::System | SectionRole::Developer => LifecycleState::Pinned,
+                _ => LifecycleState::Active,
+            },
             metadata,
         }
     }
+}
+
+pub fn collect_prompt_ir_sections(ir: &mut PromptIR, budget: usize) {
+    if ir.meta.total_tokens.0 <= budget {
+        return;
+    }
+    sweep_sections(ir, budget, LifecycleState::Evictable);
+    sweep_sections(ir, budget, LifecycleState::Complete);
+}
+
+fn sweep_sections(ir: &mut PromptIR, budget: usize, target: LifecycleState) {
+    while ir_total_tokens(ir) > budget {
+        let Some(index) = section_sweep_candidate(&ir.sections, target) else {
+            break;
+        };
+        ir.sections.remove(index);
+        refresh_prompt_ir_tokens(ir);
+    }
+}
+
+fn section_sweep_candidate(sections: &[Section], target: LifecycleState) -> Option<usize> {
+    sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| {
+            section.lifecycle == target
+                && section.priority != Priority::Critical
+                && !matches!(section.role, SectionRole::System | SectionRole::Developer)
+        })
+        .min_by_key(|(index, section)| (section.priority, *index))
+        .map(|(index, _)| index)
+}
+
+fn ir_total_tokens(ir: &PromptIR) -> usize {
+    estimate_prompt_tokens(&ir.base_messages)
+        + ir.sections
+            .iter()
+            .map(|section| section.tokens.0)
+            .sum::<usize>()
+}
+
+fn refresh_prompt_ir_tokens(ir: &mut PromptIR) {
+    ir.meta.total_tokens = TokenEstimate(ir_total_tokens(ir));
 }
 
 pub fn compile_prompt_ir(ir: &PromptIR) -> Prompt {

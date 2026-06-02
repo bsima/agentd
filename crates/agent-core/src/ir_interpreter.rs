@@ -1,5 +1,7 @@
+use crate::gc::GcState;
 use crate::interpreter::{
-    hydrate_infer_prompt, millis_u64, prompt_preview, response_preview, run_eval, SeqConfig,
+    hydrate_infer_prompt, maybe_collect_prompt, millis_u64, prompt_preview, response_preview,
+    run_eval, SeqConfig,
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectKind,
@@ -7,7 +9,7 @@ use crate::ir::{
     PromptRef, Terminator, Var,
 };
 use crate::op::{ChatMessage, Model, Prompt};
-use crate::prompt_ir::{compile_prompt_ir, PromptIR};
+use crate::prompt_ir::{collect_prompt_ir_sections, compile_prompt_ir, PromptIR};
 use crate::trace::Event;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -306,6 +308,7 @@ pub async fn run_ir_steps_with_store_and_replay(
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
     let mut instructions_executed = 0usize;
+    let mut gc_state = GcState::default();
 
     loop {
         if max_instructions.is_some_and(|max| instructions_executed >= max) {
@@ -339,6 +342,7 @@ pub async fn run_ir_steps_with_store_and_replay(
                 dynamic_path,
                 ir_replay,
                 instr,
+                &mut gc_state,
             )
             .await?;
             machine.pc += 1;
@@ -397,6 +401,7 @@ async fn execute_instr(
     dynamic_path: DynamicPath,
     ir_replay: Option<&IrReplayTrace>,
     instr: Instr,
+    gc_state: &mut GcState,
 ) -> Result<()> {
     match instr {
         Instr::Let { out, expr } => {
@@ -417,8 +422,9 @@ async fn execute_instr(
             )?;
             emit_ir_effect(config, &location).await?;
             let model = string_expr(&machine.env, &model, "Infer.model")?;
-            let prompt = resolve_prompt(&machine.env, prompt)?;
+            let prompt = resolve_prompt(config, &machine.env, prompt)?;
             let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
+            let prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -806,7 +812,11 @@ fn usize_expr(env: &BTreeMap<Var, Value>, expr: &Expr, label: &str) -> Result<us
     usize::try_from(value).map_err(|_| anyhow!("AgentIR {label} must be non-negative, got {value}"))
 }
 
-fn resolve_prompt(env: &BTreeMap<Var, Value>, prompt: PromptRef) -> Result<Prompt> {
+fn resolve_prompt(
+    config: &SeqConfig,
+    env: &BTreeMap<Var, Value>,
+    prompt: PromptRef,
+) -> Result<Prompt> {
     match prompt {
         PromptRef::Inline(prompt) => Ok(prompt),
         PromptRef::Var(var) => {
@@ -816,14 +826,22 @@ fn resolve_prompt(env: &BTreeMap<Var, Value>, prompt: PromptRef) -> Result<Promp
                 .ok_or_else(|| anyhow!("unknown AgentIR prompt var {:?}", var))?;
             serde_json::from_value::<Vec<ChatMessage>>(value).context("decoding AgentIR prompt")
         }
-        PromptRef::PromptIr(prompt_ir) => Ok(compile_prompt_ir(&prompt_ir)),
+        PromptRef::PromptIr(mut prompt_ir) => {
+            if config.gc.is_mark_sweep() {
+                collect_prompt_ir_sections(&mut prompt_ir, config.context_budget);
+            }
+            Ok(compile_prompt_ir(&prompt_ir))
+        }
         PromptRef::PromptIrVar(var) => {
             let value = env
                 .get(&var)
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown AgentIR PromptIR var {:?}", var))?;
-            let prompt_ir =
+            let mut prompt_ir =
                 serde_json::from_value::<PromptIR>(value).context("decoding AgentIR PromptIR")?;
+            if config.gc.is_mark_sweep() {
+                collect_prompt_ir_sections(&mut prompt_ir, config.context_budget);
+            }
             Ok(compile_prompt_ir(&prompt_ir))
         }
     }

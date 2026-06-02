@@ -14,7 +14,7 @@ pub mod trace;
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use gc::{
     estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
-    LifecycleState, MsgId, RingGc,
+    LifecycleState, MarkSweepGc, MsgId, RingGc,
 };
 pub use hydration::{
     HydrationSource, PassiveHydrationConfig, PassiveSource, SourceCapability, SourceKind,
@@ -40,10 +40,10 @@ pub use op::{
     ResponseToolCall,
 };
 pub use prompt_ir::{
-    compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash, ContextRequest,
-    ContextStrategy, Observation, Priority, PromptIR, PromptIRTrace, PromptId, RetrievalMode,
-    RetrievalTiming, Section, SectionId, SectionOrigin, SectionRole, SectionSource, SectionSummary,
-    TokenBudget, TokenEstimate, ToolDef,
+    collect_prompt_ir_sections, compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash,
+    ContextRequest, ContextStrategy, Observation, Priority, PromptIR, PromptIRTrace, PromptId,
+    RetrievalMode, RetrievalTiming, Section, SectionId, SectionOrigin, SectionRole, SectionSource,
+    SectionSummary, TokenBudget, TokenEstimate, ToolDef,
 };
 pub use provider::{ChatProvider, ProviderClient, ProviderConfig};
 pub use trace::{Event, TraceLogger, TraceSummary};
