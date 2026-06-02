@@ -116,19 +116,30 @@ impl ProviderClient {
             .next()
             .ok_or_else(|| ProviderError::Other(anyhow!("provider returned no choices")))?;
         let tokens = completion.usage.map(|u| u.total_tokens).unwrap_or_default();
+        let content = choice.message.content.unwrap_or_default();
+        let tool_calls: Vec<ResponseToolCall> = choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|call| {
+                let arguments: Value = serde_json::from_str(&call.function.arguments)
+                    .unwrap_or_else(|_| json!({ "raw": call.function.arguments }));
+                ResponseToolCall::new(call.id, call.function.name, arguments)
+            })
+            .collect();
+        // Some providers (observed with gpt-5.5) occasionally return a 200 OK with
+        // an empty completion: no content AND no tool calls. The agent loop treats
+        // an empty tool_calls list as "the model is done", so such a turn would be
+        // surfaced as a final, empty response (`agent_complete{response:""}`),
+        // silently terminating an otherwise-active run. Treat this as a retryable
+        // error so the existing backoff loop re-requests the turn instead.
+        if content.trim().is_empty() && tool_calls.is_empty() {
+            return Err(ProviderError::EmptyCompletion);
+        }
         Ok(Response {
-            content: choice.message.content.unwrap_or_default(),
-            tool_calls: choice
-                .message
-                .tool_calls
-                .unwrap_or_default()
-                .into_iter()
-                .map(|call| {
-                    let arguments: Value = serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| json!({ "raw": call.function.arguments }));
-                    ResponseToolCall::new(call.id, call.function.name, arguments)
-                })
-                .collect(),
+            content,
+            tool_calls,
             tokens,
         })
     }
@@ -145,6 +156,8 @@ enum ProviderError {
         text: String,
         retry_after: Option<Duration>,
     },
+    /// Provider returned a 200 OK with neither content nor tool calls.
+    EmptyCompletion,
     Other(anyhow::Error),
 }
 
@@ -162,6 +175,7 @@ impl ProviderError {
             Self::Http { status, .. } => {
                 *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
+            Self::EmptyCompletion => true,
             Self::Other(_) => false,
         }
     }
@@ -177,6 +191,9 @@ impl ProviderError {
         match self {
             Self::Transport { source, context } => anyhow::Error::new(source).context(context),
             Self::Http { status, text, .. } => anyhow!("provider returned {status}: {text}"),
+            Self::EmptyCompletion => {
+                anyhow!("provider returned an empty completion (no content or tool calls) after retries")
+            }
             Self::Other(err) => err,
         }
     }
@@ -234,4 +251,32 @@ struct ApiToolFunction {
 #[derive(Debug, Deserialize)]
 struct Usage {
     total_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_completion_is_retryable() {
+        assert!(ProviderError::EmptyCompletion.is_retryable());
+    }
+
+    #[test]
+    fn http_429_and_5xx_are_retryable_but_4xx_is_not() {
+        let make = |status| ProviderError::Http {
+            status,
+            text: String::new(),
+            retry_after: None,
+        };
+        assert!(make(StatusCode::TOO_MANY_REQUESTS).is_retryable());
+        assert!(make(StatusCode::INTERNAL_SERVER_ERROR).is_retryable());
+        assert!(!make(StatusCode::BAD_REQUEST).is_retryable());
+    }
+
+    #[test]
+    fn empty_completion_has_descriptive_terminal_error() {
+        let msg = ProviderError::EmptyCompletion.into_anyhow().to_string();
+        assert!(msg.contains("empty completion"), "got: {msg}");
+    }
 }
