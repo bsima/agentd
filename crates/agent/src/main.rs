@@ -1,14 +1,17 @@
 use agent_core::{
     agent_loop, agent_loop_ir, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
-    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, MarkSweepGc,
-    ModelRegistry, PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig,
-    ReplayTrace, ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind, SourceParams,
-    SourceRegistry, SourceResult, TraceLogger,
+    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink,
+    MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
+    ProviderClient, ProviderConfig, ReplayTrace, ResolvedModel, RingGc, SeqConfig,
+    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use opentelemetry::global;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
@@ -18,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
 mod frontmatter;
@@ -79,6 +83,9 @@ struct Args {
     /// Emit gc_collect trace events.
     #[arg(long)]
     gc_log: bool,
+    /// Enable OpenTelemetry OTLP export to this collector endpoint. Also enabled by OTEL_EXPORTER_OTLP_ENDPOINT.
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    otel_endpoint: Option<String>,
     /// Prompt-cache policy for GC (parsed for future support).
     #[arg(long, value_enum, default_value_t = GcCacheArg::Preserve)]
     gc_cache: GcCacheArg,
@@ -310,7 +317,18 @@ async fn main() -> Result<()> {
         .or(args.run_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let trace_path = trace_path(&run_id)?;
-    let trace = TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug);
+    let otel = init_otel(args.otel_endpoint.as_deref())?;
+    let trace = match &otel {
+        Some(_) => TraceLogger::with_sinks(
+            run_id.clone(),
+            trace_path.clone(),
+            vec![
+                Arc::new(JsonlTraceSink::new(trace_path.clone()).mirror_stdout(args.debug)),
+                Arc::new(OtelTraceSink::new()),
+            ],
+        ),
+        None => TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug),
+    };
     let provider: Arc<dyn agent_core::ChatProvider> = if replay_enabled {
         Arc::new(ReplayOnlyProvider)
     } else {
@@ -393,6 +411,7 @@ async fn main() -> Result<()> {
         context_budget,
     };
 
+    tracing::info!(%model, trace = %trace_path.display(), %run_id, provider = %reported_provider_url, "agent runtime starting");
     eprintln!("model: {model}");
     eprintln!("trace: {}", trace_path.display());
     eprintln!("run_id: {run_id}");
@@ -401,7 +420,7 @@ async fn main() -> Result<()> {
         eprintln!("prompt: {}", prompt.body);
     }
 
-    match (loaded_prompt, args.fifo, args.session) {
+    let result = match (loaded_prompt, args.fifo, args.session) {
         (Some(prompt), None, false) => {
             let prompt = prompt_with_optional_stdin(prompt.body)?;
             run_one_shot(&mut runtime, prompt).await
@@ -410,7 +429,65 @@ async fn main() -> Result<()> {
         (Some(_), None, true) => Err(anyhow!("provide either a prompt or --session, not both")),
         (None, Some(path), _) => run_fifo_session(&mut runtime, path).await,
         (None, None, _) => run_stdin_session(&mut runtime).await,
+    };
+    if let Some(otel) = otel {
+        otel.shutdown();
     }
+    result
+}
+
+struct OtelGuard {
+    tracer_provider: SdkTracerProvider,
+    logger_provider: SdkLoggerProvider,
+}
+
+impl OtelGuard {
+    fn shutdown(self) {
+        let _ = self.tracer_provider.shutdown();
+        let _ = self.logger_provider.shutdown();
+    }
+}
+
+fn init_otel(endpoint: Option<&str>) -> Result<Option<OtelGuard>> {
+    let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let resource = Resource::builder().with_service_name("agentd").build();
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint(endpoint)
+        .build()
+        .context("building OTLP span exporter")?;
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(span_exporter)
+        .build();
+    global::set_tracer_provider(tracer_provider.clone());
+
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint(endpoint)
+        .build()
+        .context("building OTLP log exporter")?;
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(log_exporter)
+        .build();
+    let otel_log_layer =
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(otel_log_layer)
+        .try_init()
+        .context("initializing tracing subscriber")?;
+
+    Ok(Some(OtelGuard {
+        tracer_provider,
+        logger_provider,
+    }))
 }
 
 fn is_oauth_provider_tag(provider: &str) -> bool {

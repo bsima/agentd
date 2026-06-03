@@ -236,6 +236,7 @@ impl ProviderClient {
         if content.trim().is_empty() && tool_calls.is_empty() {
             // Log the full raw body so we can confirm it is genuinely empty
             // rather than a parse/serialization bug on our side (t-1071).
+            tracing::warn!(raw_response = %text, "provider returned empty completion");
             eprintln!("provider returned empty completion; raw response body: {text}");
             return Err(ProviderError::EmptyCompletion { raw: text });
         }

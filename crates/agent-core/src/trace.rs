@@ -2,12 +2,16 @@ use crate::op::{Prompt, Response};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use opentelemetry::global::BoxedSpan;
+use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::{global, KeyValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -135,6 +139,224 @@ pub enum Event {
     },
 }
 
+impl Event {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::InferCall { run_id, .. }
+            | Self::InferResult { run_id, .. }
+            | Self::EvalCall { run_id, .. }
+            | Self::EvalResult { run_id, .. }
+            | Self::GetCall { run_id, .. }
+            | Self::GetResult { run_id, .. }
+            | Self::PutCall { run_id, .. }
+            | Self::PutResult { run_id, .. }
+            | Self::HydrationStart { run_id, .. }
+            | Self::HydrationSection { run_id, .. }
+            | Self::HydrationEnd { run_id, .. }
+            | Self::ParStart { run_id, .. }
+            | Self::ParEnd { run_id, .. }
+            | Self::Checkpoint { run_id, .. }
+            | Self::AgentDone { run_id, .. }
+            | Self::Custom { run_id, .. } => run_id,
+        }
+    }
+
+    pub fn op_id(&self) -> Option<u64> {
+        match self {
+            Self::InferCall { op_id, .. }
+            | Self::InferResult { op_id, .. }
+            | Self::EvalCall { op_id, .. }
+            | Self::EvalResult { op_id, .. }
+            | Self::GetCall { op_id, .. }
+            | Self::GetResult { op_id, .. }
+            | Self::PutCall { op_id, .. }
+            | Self::PutResult { op_id, .. }
+            | Self::HydrationStart { op_id, .. }
+            | Self::HydrationSection { op_id, .. }
+            | Self::HydrationEnd { op_id, .. }
+            | Self::ParStart { op_id, .. }
+            | Self::ParEnd { op_id, .. } => Some(*op_id),
+            Self::Checkpoint { .. } | Self::AgentDone { .. } | Self::Custom { .. } => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::InferCall { .. } | Self::InferResult { .. } => "Infer",
+            Self::EvalCall { .. } | Self::EvalResult { .. } => "Eval",
+            Self::GetCall { .. } | Self::GetResult { .. } => "Get",
+            Self::PutCall { .. } | Self::PutResult { .. } => "Put",
+            Self::HydrationStart { .. } | Self::HydrationEnd { .. } => "Hydration",
+            Self::HydrationSection { .. } => "HydrationSection",
+            Self::ParStart { .. } | Self::ParEnd { .. } => "Par",
+            Self::Checkpoint { .. } => "Checkpoint",
+            Self::AgentDone { .. } => "AgentDone",
+            Self::Custom { name, .. } => match name.as_str() {
+                "agent_error" => "agent_error",
+                "agent_response" => "agent_response",
+                "gc_collect" => "gc_collect",
+                "context_overflow" => "context_overflow",
+                _ => "Custom",
+            },
+        }
+    }
+
+    fn is_start(&self) -> bool {
+        matches!(
+            self,
+            Self::InferCall { .. }
+                | Self::EvalCall { .. }
+                | Self::GetCall { .. }
+                | Self::PutCall { .. }
+                | Self::HydrationStart { .. }
+                | Self::ParStart { .. }
+        )
+    }
+
+    fn is_end(&self) -> bool {
+        matches!(
+            self,
+            Self::InferResult { .. }
+                | Self::EvalResult { .. }
+                | Self::GetResult { .. }
+                | Self::PutResult { .. }
+                | Self::HydrationEnd { .. }
+                | Self::ParEnd { .. }
+        )
+    }
+
+    fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Self::InferCall { timestamp, .. }
+            | Self::InferResult { timestamp, .. }
+            | Self::EvalCall { timestamp, .. }
+            | Self::EvalResult { timestamp, .. }
+            | Self::GetCall { timestamp, .. }
+            | Self::GetResult { timestamp, .. }
+            | Self::PutCall { timestamp, .. }
+            | Self::PutResult { timestamp, .. }
+            | Self::HydrationStart { timestamp, .. }
+            | Self::HydrationSection { timestamp, .. }
+            | Self::HydrationEnd { timestamp, .. }
+            | Self::ParStart { timestamp, .. }
+            | Self::ParEnd { timestamp, .. }
+            | Self::Checkpoint { timestamp, .. }
+            | Self::AgentDone { timestamp, .. }
+            | Self::Custom { timestamp, .. } => *timestamp,
+        }
+    }
+
+    fn otel_attributes(&self) -> Vec<KeyValue> {
+        let mut attrs = vec![
+            KeyValue::new("agent.run_id", self.run_id().to_string()),
+            KeyValue::new("agent.event", self.name()),
+        ];
+        if let Some(op_id) = self.op_id() {
+            attrs.push(KeyValue::new("agent.op_id", op_id as i64));
+        }
+        match self {
+            Self::InferCall {
+                model,
+                prompt_preview,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.model", model.clone()));
+                attrs.push(KeyValue::new(
+                    "agent.prompt_preview",
+                    prompt_preview.clone(),
+                ));
+            }
+            Self::InferResult {
+                tokens,
+                duration_ms,
+                response_preview,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.tokens", i64::from(*tokens)));
+                attrs.push(KeyValue::new("agent.duration_ms", *duration_ms as i64));
+                attrs.push(KeyValue::new(
+                    "agent.response_preview",
+                    response_preview.clone(),
+                ));
+            }
+            Self::EvalCall {
+                command,
+                cwd,
+                env_policy,
+                timeout_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.command", command.clone()));
+                if let Some(cwd) = cwd {
+                    attrs.push(KeyValue::new("agent.cwd", cwd.clone()));
+                }
+                attrs.push(KeyValue::new("agent.env_policy", env_policy.clone()));
+                attrs.push(KeyValue::new("agent.timeout_ms", *timeout_ms as i64));
+            }
+            Self::EvalResult {
+                duration_ms,
+                truncated_stdout,
+                truncated_stderr,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.duration_ms", *duration_ms as i64));
+                attrs.push(KeyValue::new("agent.stdout_truncated", *truncated_stdout));
+                attrs.push(KeyValue::new("agent.stderr_truncated", *truncated_stderr));
+            }
+            Self::GetCall { key, .. }
+            | Self::GetResult { key, .. }
+            | Self::PutCall { key, .. }
+            | Self::PutResult { key, .. } => attrs.push(KeyValue::new("agent.key", key.clone())),
+            Self::HydrationStart {
+                sources, max_bytes, ..
+            } => {
+                attrs.push(KeyValue::new("agent.sources", sources.join(",")));
+                if let Some(max_bytes) = max_bytes {
+                    attrs.push(KeyValue::new("agent.max_bytes", *max_bytes as i64));
+                }
+            }
+            Self::HydrationSection {
+                source,
+                kind,
+                bytes,
+                content_preview,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.source", source.clone()));
+                attrs.push(KeyValue::new("agent.kind", kind.clone()));
+                attrs.push(KeyValue::new("agent.bytes", *bytes as i64));
+                attrs.push(KeyValue::new(
+                    "agent.content_preview",
+                    content_preview.clone(),
+                ));
+            }
+            Self::HydrationEnd {
+                section_count,
+                total_bytes,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.section_count", *section_count as i64));
+                attrs.push(KeyValue::new("agent.total_bytes", *total_bytes as i64));
+            }
+            Self::ParStart { branch_count, .. } | Self::ParEnd { branch_count, .. } => {
+                attrs.push(KeyValue::new("agent.branch_count", *branch_count as i64));
+            }
+            Self::Checkpoint { name, path, .. } => {
+                attrs.push(KeyValue::new("agent.checkpoint", name.clone()));
+                if let Some(path) = path {
+                    attrs.push(KeyValue::new("agent.path", path.clone()));
+                }
+            }
+            Self::Custom { name, data, .. } => {
+                attrs.push(KeyValue::new("agent.custom_name", name.clone()));
+                attrs.push(KeyValue::new("agent.data", data.to_string()));
+            }
+            Self::AgentDone { .. } => {}
+        }
+        attrs
+    }
+}
+
 #[async_trait]
 pub trait TraceSink: Send + Sync {
     async fn emit(&self, event: &Event) -> Result<()>;
@@ -179,6 +401,73 @@ impl TraceSink for JsonlTraceSink {
             stdout.write_all(line.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
             stdout.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct OtelTraceSink {
+    spans: Mutex<HashMap<u64, BoxedSpan>>,
+}
+
+impl OtelTraceSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn start_span(&self, event: &Event) {
+        let Some(op_id) = event.op_id() else {
+            return;
+        };
+        let tracer = global::tracer("agentd");
+        let builder = tracer
+            .span_builder(event.name())
+            .with_kind(SpanKind::Internal)
+            .with_start_time(event.timestamp())
+            .with_attributes(event.otel_attributes());
+        let span = tracer.build(builder);
+        self.spans.lock().unwrap().insert(op_id, span);
+    }
+
+    fn finish_span(&self, event: &Event) {
+        let Some(op_id) = event.op_id() else {
+            self.emit_instant_event(event);
+            return;
+        };
+        let mut spans = self.spans.lock().unwrap();
+        if let Some(mut span) = spans.remove(&op_id) {
+            span.set_attributes(event.otel_attributes());
+            span.set_status(Status::Ok);
+            span.end_with_timestamp(event.timestamp().into());
+        } else {
+            drop(spans);
+            self.emit_instant_event(event);
+        }
+    }
+
+    fn emit_instant_event(&self, event: &Event) {
+        let tracer = global::tracer("agentd");
+        let builder = tracer
+            .span_builder(event.name())
+            .with_kind(SpanKind::Internal)
+            .with_start_time(event.timestamp())
+            .with_attributes(event.otel_attributes());
+        let mut span = tracer.build(builder);
+        span.set_status(Status::Ok);
+        span.end_with_timestamp(event.timestamp().into());
+    }
+}
+
+#[async_trait]
+impl TraceSink for OtelTraceSink {
+    async fn emit(&self, event: &Event) -> Result<()> {
+        if event.is_start() {
+            self.start_span(event);
+        } else if event.is_end() {
+            self.finish_span(event);
+        } else {
+            self.emit_instant_event(event);
         }
         Ok(())
     }
