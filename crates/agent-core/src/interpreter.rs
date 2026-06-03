@@ -435,6 +435,7 @@ pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value
         process.current_dir(cwd);
     }
     config.env.apply(&mut process);
+    propagate_trace_context_env(&mut process);
     // Detach the child's stdin so interactive commands (e.g. `git rebase -i`,
     // `git commit` with no -m, `ssh`, prompts) get immediate EOF instead of
     // consuming the agent's own control channel (NUL-framed session/fifo input).
@@ -471,6 +472,14 @@ pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value
             "stderr_truncated": false,
             "duration_ms": duration_ms,
         })),
+    }
+}
+
+fn propagate_trace_context_env(command: &mut Command) {
+    for name in ["TRACEPARENT", "TRACESTATE"] {
+        if let Ok(value) = std::env::var(name) {
+            command.env(name, value);
+        }
     }
 }
 
@@ -1178,6 +1187,32 @@ mod tests {
         .await?;
         assert_eq!(env_result["stdout"], json!("unse"));
         assert_eq!(env_result["stdout_truncated"], json!(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eval_propagates_traceparent_even_with_clean_env() -> Result<()> {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        std::env::set_var("TRACEPARENT", traceparent);
+        let mut clean_vars = std::collections::BTreeMap::new();
+        if let Ok(path) = std::env::var("PATH") {
+            clean_vars.insert("PATH".into(), path);
+        }
+        let result = run_eval(
+            &EvalConfig {
+                shell: "/bin/sh".into(),
+                cwd: None,
+                timeout: std::time::Duration::from_secs(1),
+                max_stdout_bytes: 1024,
+                max_stderr_bytes: 1024,
+                env: EnvPolicy::Clean { vars: clean_vars },
+            },
+            "printf %s \"$TRACEPARENT\"",
+        )
+        .await;
+        std::env::remove_var("TRACEPARENT");
+
+        assert_eq!(result?["stdout"], json!(traceparent));
         Ok(())
     }
 
