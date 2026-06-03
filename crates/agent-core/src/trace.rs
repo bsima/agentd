@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opentelemetry::global::BoxedSpan;
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{global, KeyValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -406,9 +406,15 @@ impl TraceSink for JsonlTraceSink {
     }
 }
 
+struct OpenSpan {
+    span: BoxedSpan,
+    context: SpanContext,
+}
+
 #[derive(Default)]
 pub struct OtelTraceSink {
-    spans: Mutex<HashMap<u64, BoxedSpan>>,
+    spans: Mutex<HashMap<u64, OpenSpan>>,
+    open_stack: Mutex<Vec<u64>>,
 }
 
 impl OtelTraceSink {
@@ -426,8 +432,33 @@ impl OtelTraceSink {
             .with_kind(SpanKind::Internal)
             .with_start_time(event.timestamp())
             .with_attributes(event.otel_attributes());
-        let span = tracer.build(builder);
-        self.spans.lock().unwrap().insert(op_id, span);
+        let parent_context = self.parent_context_for(op_id);
+        let span = match parent_context {
+            Some(parent_context) => tracer.build_with_context(builder, &parent_context),
+            None => tracer.build(builder),
+        };
+        let context = span.span_context().clone();
+        set_trace_context_env(&context);
+        self.spans
+            .lock()
+            .unwrap()
+            .insert(op_id, OpenSpan { span, context });
+        self.open_stack.lock().unwrap().push(op_id);
+    }
+
+    fn parent_context_for(&self, op_id: u64) -> Option<opentelemetry::Context> {
+        let spans = self.spans.lock().unwrap();
+        self.open_stack
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .copied()
+            .find(|open_op_id| *open_op_id != op_id)
+            .and_then(|parent_op_id| spans.get(&parent_op_id))
+            .map(|parent| {
+                opentelemetry::Context::current().with_remote_span_context(parent.context.clone())
+            })
     }
 
     fn finish_span(&self, event: &Event) {
@@ -435,11 +466,12 @@ impl OtelTraceSink {
             self.emit_instant_event(event);
             return;
         };
+        self.open_stack.lock().unwrap().retain(|id| *id != op_id);
         let mut spans = self.spans.lock().unwrap();
-        if let Some(mut span) = spans.remove(&op_id) {
-            span.set_attributes(event.otel_attributes());
-            span.set_status(Status::Ok);
-            span.end_with_timestamp(event.timestamp().into());
+        if let Some(mut open_span) = spans.remove(&op_id) {
+            open_span.span.set_attributes(event.otel_attributes());
+            open_span.span.set_status(Status::Ok);
+            open_span.span.end_with_timestamp(event.timestamp().into());
         } else {
             drop(spans);
             self.emit_instant_event(event);
@@ -456,6 +488,26 @@ impl OtelTraceSink {
         let mut span = tracer.build(builder);
         span.set_status(Status::Ok);
         span.end_with_timestamp(event.timestamp().into());
+    }
+}
+
+fn set_trace_context_env(context: &SpanContext) {
+    if context.is_valid() {
+        std::env::set_var(
+            "TRACEPARENT",
+            format!(
+                "00-{:032x}-{:016x}-{:02x}",
+                context.trace_id(),
+                context.span_id(),
+                context.trace_flags().to_u8()
+            ),
+        );
+        let tracestate = context.trace_state().header();
+        if tracestate.is_empty() {
+            std::env::remove_var("TRACESTATE");
+        } else {
+            std::env::set_var("TRACESTATE", tracestate);
+        }
     }
 }
 
@@ -601,6 +653,27 @@ mod tests {
         }
     }
 
+    fn install_in_memory_tracer() -> (
+        opentelemetry_sdk::trace::InMemorySpanExporter,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+    ) {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_span_processor(opentelemetry_sdk::trace::SimpleSpanProcessor::new(
+                exporter.clone(),
+            ))
+            .build();
+        global::set_tracer_provider(provider.clone());
+        (exporter, provider)
+    }
+
+    fn attr_value(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|attr| attr.key.as_str() == key)
+            .map(|attr| attr.value.to_string())
+    }
+
     #[tokio::test]
     async fn trace_logger_emits_to_all_sinks_and_preserves_jsonl_readback() -> Result<()> {
         let run_id = Uuid::new_v4().to_string();
@@ -624,6 +697,85 @@ mod tests {
         );
         assert_eq!(TraceLogger::read_events(&path).await?, vec![event]);
         let _ = tokio::fs::remove_file(path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn otel_sink_maps_spans_parents_and_traceparent() -> Result<()> {
+        let (exporter, provider) = install_in_memory_tracer();
+        let sink = OtelTraceSink::new();
+        let run_id = Uuid::new_v4().to_string();
+        std::env::remove_var("TRACEPARENT");
+
+        sink.emit(&Event::InferCall {
+            run_id: run_id.clone(),
+            op_id: 7,
+            model: "mock-model".into(),
+            prompt: None,
+            prompt_preview: "hello".into(),
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::InferResult {
+            run_id: run_id.clone(),
+            op_id: 7,
+            response: None,
+            response_preview: "world".into(),
+            tokens: 42,
+            duration_ms: 9,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::ParStart {
+            run_id: run_id.clone(),
+            op_id: 1,
+            branch_count: 1,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::EvalCall {
+            run_id: run_id.clone(),
+            op_id: 2,
+            command: "printf ok".into(),
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        let traceparent = std::env::var("TRACEPARENT")?;
+        assert!(traceparent.starts_with("00-"));
+        assert_eq!(traceparent.len(), 55);
+        sink.emit(&Event::EvalResult {
+            run_id: run_id.clone(),
+            op_id: 2,
+            command: "printf ok".into(),
+            result: serde_json::json!({ "ok": true }),
+            duration_ms: 1,
+            truncated_stdout: false,
+            truncated_stderr: false,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::ParEnd {
+            run_id,
+            op_id: 1,
+            branch_count: 1,
+            duration_ms: 2,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        provider.force_flush()?;
+
+        let spans = exporter.get_finished_spans()?;
+        let infer = spans.iter().find(|span| span.name == "Infer").unwrap();
+        assert_eq!(attr_value(infer, "agent.model"), Some("mock-model".into()));
+        assert_eq!(attr_value(infer, "agent.tokens"), Some("42".into()));
+        assert_eq!(attr_value(infer, "agent.duration_ms"), Some("9".into()));
+        let par = spans.iter().find(|span| span.name == "Par").unwrap();
+        let eval = spans.iter().find(|span| span.name == "Eval").unwrap();
+        assert_eq!(eval.parent_span_id, par.span_context.span_id());
+        let _ = provider.shutdown();
         Ok(())
     }
 }
