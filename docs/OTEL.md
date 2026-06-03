@@ -60,10 +60,9 @@ Resource (set once per process, attached to every span):
 
 Span-level, mapped straight off the existing `Event` fields:
 
-- Infer: `gen_ai.request.model` (`model`), `gen_ai.usage.output_tokens`
-  (`tokens`), `duration_ms`. Use the `gen_ai.*` semconv names so
-  off-the-shelf panels light up. Add `gen_ai.usage.input_tokens` once the
-  provider reports it.
+- Infer: `gen_ai.request.model` (`model`), `gen_ai.usage.input_tokens`,
+  `gen_ai.usage.output_tokens`, `gen_ai.usage.total_tokens`, `duration_ms`.
+  Use the `gen_ai.*` semconv names so off-the-shelf panels light up.
 - Eval: `tool.name` (sanitized, low-cardinality, e.g. `cargo build`),
   `command` (full string, detail only — not a group-by key), `exit_code`/`ok`,
   `attempt` / `retry.count`, `cwd`, `timeout_ms`, `truncated_*`.

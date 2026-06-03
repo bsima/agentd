@@ -457,7 +457,9 @@ async fn execute_instr(
                     op_id,
                     response: Some(response.clone()),
                     response_preview: response_preview(&response),
-                    tokens: response.tokens,
+                    input_tokens: response.input_tokens,
+                    output_tokens: response.output_tokens,
+                    total_tokens: response.total_tokens,
                     duration_ms: millis_u64(started.elapsed()),
                     timestamp: Utc::now(),
                 })
@@ -927,7 +929,9 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls: Vec::<ResponseToolCall>::new(),
-            tokens: 1,
+            input_tokens: 0,
+            output_tokens: 1,
+            total_tokens: 1,
         }
     }
 

@@ -244,7 +244,9 @@ where
                     op_id,
                     response: Some(response.clone()),
                     response_preview: response_preview(&response),
-                    tokens: response.tokens,
+                    input_tokens: response.input_tokens,
+                    output_tokens: response.output_tokens,
+                    total_tokens: response.total_tokens,
                     duration_ms: millis_u64(started.elapsed()),
                     timestamp: Utc::now(),
                 })
@@ -765,7 +767,9 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls,
-            tokens: 7,
+            input_tokens: 3,
+            output_tokens: 4,
+            total_tokens: 7,
         }
     }
 

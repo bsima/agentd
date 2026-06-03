@@ -77,7 +77,9 @@ impl ChatMessage {
 pub struct Response {
     pub content: String,
     pub tool_calls: Vec<ResponseToolCall>,
-    pub tokens: u32,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

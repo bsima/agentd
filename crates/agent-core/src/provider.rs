@@ -213,7 +213,12 @@ impl ProviderClient {
             .into_iter()
             .next()
             .ok_or_else(|| ProviderError::Other(anyhow!("provider returned no choices")))?;
-        let tokens = completion.usage.map(|u| u.total_tokens).unwrap_or_default();
+        let usage = completion.usage.unwrap_or_default();
+        let input_tokens = usage.prompt_tokens.unwrap_or_default();
+        let output_tokens = usage.completion_tokens.unwrap_or_default();
+        let total_tokens = usage
+            .total_tokens
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
         let content = choice.message.content.unwrap_or_default();
         let tool_calls: Vec<ResponseToolCall> = choice
             .message
@@ -243,7 +248,9 @@ impl ProviderClient {
         Ok(Response {
             content,
             tool_calls,
-            tokens,
+            input_tokens,
+            output_tokens,
+            total_tokens,
         })
     }
 }
@@ -375,9 +382,11 @@ struct ApiToolFunction {
     arguments: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Usage {
-    total_tokens: u32,
+    total_tokens: Option<u32>,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 #[cfg(test)]
@@ -389,7 +398,9 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls: Vec::new(),
-            tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
         }
     }
 

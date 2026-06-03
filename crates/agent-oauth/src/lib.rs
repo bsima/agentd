@@ -648,7 +648,9 @@ struct ApiToolFunction {
 
 #[derive(Debug, Deserialize)]
 struct Usage {
-    total_tokens: u32,
+    total_tokens: Option<u32>,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 const CODEX_DEFAULT_INSTRUCTIONS: &str =
@@ -751,7 +753,9 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
     let mut content = String::new();
     let mut current_tool: Option<CodexToolAccum> = None;
     let mut tool_calls = Vec::new();
-    let mut tokens = 0u32;
+    let mut input_tokens = 0_u32;
+    let mut output_tokens = 0_u32;
+    let mut total_tokens = 0_u32;
 
     for event_text in parse_sse_events(text) {
         let Some(event) = parse_sse_event_json(event_text) else {
@@ -800,12 +804,14 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
                 }
             }
             Some("response.completed" | "response.done") => {
-                if let Some(total) = event
+                if let Some((input, output, total)) = event
                     .get("response")
                     .and_then(|response| response.get("usage"))
-                    .and_then(codex_total_tokens)
+                    .and_then(codex_token_usage)
                 {
-                    tokens = total;
+                    input_tokens = input;
+                    output_tokens = output;
+                    total_tokens = total;
                 }
             }
             Some("error" | "response.failed") => {
@@ -832,7 +838,9 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
     Ok(Response {
         content,
         tool_calls,
-        tokens,
+        input_tokens,
+        output_tokens,
+        total_tokens,
     })
 }
 
@@ -901,16 +909,23 @@ fn extract_codex_output_text(item: &Value) -> String {
         .join("")
 }
 
-fn codex_total_tokens(usage: &Value) -> Option<u32> {
-    usage
+fn codex_token_usage(usage: &Value) -> Option<(u32, u32, u32)> {
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .unwrap_or_default();
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .unwrap_or_default();
+    let total = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| {
-            let input = usage.get("input_tokens").and_then(Value::as_u64)?;
-            let output = usage.get("output_tokens").and_then(Value::as_u64)?;
-            Some(input + output)
-        })
         .and_then(|tokens| u32::try_from(tokens).ok())
+        .unwrap_or_else(|| input.saturating_add(output));
+    Some((input, output, total))
 }
 
 fn extract_codex_account_id(token: &str) -> Option<String> {
@@ -976,10 +991,16 @@ fn parse_chat_response(text: &str) -> Result<Response> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("OAuth provider returned no choices"))?;
-    let tokens = completion
-        .usage
-        .map(|usage| usage.total_tokens)
-        .unwrap_or_default();
+    let usage = completion.usage.unwrap_or(Usage {
+        total_tokens: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+    });
+    let input_tokens = usage.prompt_tokens.unwrap_or_default();
+    let output_tokens = usage.completion_tokens.unwrap_or_default();
+    let total_tokens = usage
+        .total_tokens
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     Ok(Response {
         content: choice.message.content.unwrap_or_default(),
         tool_calls: choice
@@ -993,7 +1014,9 @@ fn parse_chat_response(text: &str) -> Result<Response> {
                 ResponseToolCall::new(call.id, call.function.name, arguments)
             })
             .collect(),
-        tokens,
+        input_tokens,
+        output_tokens,
+        total_tokens,
     })
 }
 
@@ -1075,7 +1098,9 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
 "#;
         let response = parse_codex_sse_response(sse)?;
         assert_eq!(response.content, "hello ");
-        assert_eq!(response.tokens, 5);
+        assert_eq!(response.input_tokens, 2);
+        assert_eq!(response.output_tokens, 3);
+        assert_eq!(response.total_tokens, 5);
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name(), "shell");
         assert_eq!(

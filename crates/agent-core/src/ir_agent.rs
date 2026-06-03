@@ -590,7 +590,9 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls,
-            tokens: 1,
+            input_tokens: 0,
+            output_tokens: 1,
+            total_tokens: 1,
         }
     }
 

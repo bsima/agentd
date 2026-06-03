@@ -35,7 +35,9 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         response: Option<Response>,
         response_preview: String,
-        tokens: u32,
+        input_tokens: u32,
+        output_tokens: u32,
+        total_tokens: u32,
         duration_ms: u64,
         timestamp: DateTime<Utc>,
     },
@@ -269,14 +271,24 @@ impl Event {
                 ));
             }
             Self::InferResult {
-                tokens,
+                input_tokens,
+                output_tokens,
+                total_tokens,
                 duration_ms,
                 response_preview,
                 ..
             } => {
                 attrs.push(KeyValue::new(
+                    "gen_ai.usage.input_tokens",
+                    i64::from(*input_tokens),
+                ));
+                attrs.push(KeyValue::new(
                     "gen_ai.usage.output_tokens",
-                    i64::from(*tokens),
+                    i64::from(*output_tokens),
+                ));
+                attrs.push(KeyValue::new(
+                    "gen_ai.usage.total_tokens",
+                    i64::from(*total_tokens),
                 ));
                 attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
                 attrs.push(KeyValue::new(
@@ -769,7 +781,7 @@ impl TraceSummary {
         for event in events {
             match event {
                 Event::InferCall { .. } => summary.infer_calls += 1,
-                Event::InferResult { tokens, .. } => summary.total_tokens += *tokens,
+                Event::InferResult { total_tokens, .. } => summary.total_tokens += *total_tokens,
                 Event::EvalCall { .. } => summary.eval_calls += 1,
                 Event::GetCall { .. } => summary.get_calls += 1,
                 Event::PutCall { .. } => summary.put_calls += 1,
@@ -886,7 +898,9 @@ mod tests {
             op_id: 7,
             response: None,
             response_preview: "world".into(),
-            tokens: 42,
+            input_tokens: 10,
+            output_tokens: 32,
+            total_tokens: 42,
             duration_ms: 9,
             timestamp: Utc::now(),
         })
@@ -943,7 +957,15 @@ mod tests {
             Some("mock-model".into())
         );
         assert_eq!(
+            attr_value(infer, "gen_ai.usage.input_tokens"),
+            Some("10".into())
+        );
+        assert_eq!(
             attr_value(infer, "gen_ai.usage.output_tokens"),
+            Some("32".into())
+        );
+        assert_eq!(
+            attr_value(infer, "gen_ai.usage.total_tokens"),
             Some("42".into())
         );
         assert_eq!(attr_value(infer, "duration_ms"), Some("9".into()));

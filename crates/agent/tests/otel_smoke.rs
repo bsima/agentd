@@ -42,9 +42,9 @@ fn otel_endpoint_smoke_preserves_replay_and_jsonl_trace() {
     std::fs::write(
         &replay_path,
         r#"{"event":"InferCall","run_id":"replay","op_id":1,"model":"mock","prompt_preview":"","timestamp":"2026-06-02T00:00:00Z"}
-{"event":"InferResult","run_id":"replay","op_id":1,"response":{"content":"thinking","tool_calls":[],"tokens":1},"response_preview":"thinking","tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}
+{"event":"InferResult","run_id":"replay","op_id":1,"response":{"content":"thinking","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"thinking","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}
 {"event":"InferCall","run_id":"replay","op_id":2,"model":"mock","prompt_preview":"","timestamp":"2026-06-02T00:00:00Z"}
-{"event":"InferResult","run_id":"replay","op_id":2,"response":{"content":"ok","tool_calls":[],"tokens":1},"response_preview":"ok","tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}
+{"event":"InferResult","run_id":"replay","op_id":2,"response":{"content":"ok","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"ok","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}
 "#,
     )
     .expect("write replay trace");

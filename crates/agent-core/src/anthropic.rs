@@ -193,7 +193,9 @@ fn parse_messages_response(text: &str) -> Result<Response> {
     Ok(Response {
         content,
         tool_calls,
-        tokens: response.usage.input_tokens + response.usage.output_tokens,
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+        total_tokens: response.usage.input_tokens + response.usage.output_tokens,
     })
 }
 
@@ -322,7 +324,9 @@ mod tests {
         )?;
 
         assert_eq!(response.content, "Hello");
-        assert_eq!(response.tokens, 15);
+        assert_eq!(response.input_tokens, 10);
+        assert_eq!(response.output_tokens, 5);
+        assert_eq!(response.total_tokens, 15);
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].id, "toolu_123");
         assert_eq!(response.tool_calls[0].name(), "lookup");
