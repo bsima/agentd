@@ -4,9 +4,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{global, KeyValue, SpanId, TraceId};
+use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -260,7 +262,7 @@ impl Event {
                 prompt_preview,
                 ..
             } => {
-                attrs.push(KeyValue::new("agent.model", model.clone()));
+                attrs.push(KeyValue::new("gen_ai.request.model", model.clone()));
                 attrs.push(KeyValue::new(
                     "agent.prompt_preview",
                     prompt_preview.clone(),
@@ -272,8 +274,11 @@ impl Event {
                 response_preview,
                 ..
             } => {
-                attrs.push(KeyValue::new("agent.tokens", i64::from(*tokens)));
-                attrs.push(KeyValue::new("agent.duration_ms", *duration_ms as i64));
+                attrs.push(KeyValue::new(
+                    "gen_ai.usage.output_tokens",
+                    i64::from(*tokens),
+                ));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
                 attrs.push(KeyValue::new(
                     "agent.response_preview",
                     response_preview.clone(),
@@ -286,27 +291,41 @@ impl Event {
                 timeout_ms,
                 ..
             } => {
-                attrs.push(KeyValue::new("agent.command", command.clone()));
+                attrs.push(KeyValue::new("tool.name", tool_name(command)));
+                attrs.push(KeyValue::new("command", command.clone()));
                 if let Some(cwd) = cwd {
-                    attrs.push(KeyValue::new("agent.cwd", cwd.clone()));
+                    attrs.push(KeyValue::new("cwd", cwd.clone()));
                 }
                 attrs.push(KeyValue::new("agent.env_policy", env_policy.clone()));
-                attrs.push(KeyValue::new("agent.timeout_ms", *timeout_ms as i64));
+                attrs.push(KeyValue::new("timeout_ms", *timeout_ms as i64));
             }
             Self::EvalResult {
+                result,
                 duration_ms,
                 truncated_stdout,
                 truncated_stderr,
                 ..
             } => {
-                attrs.push(KeyValue::new("agent.duration_ms", *duration_ms as i64));
-                attrs.push(KeyValue::new("agent.stdout_truncated", *truncated_stdout));
-                attrs.push(KeyValue::new("agent.stderr_truncated", *truncated_stderr));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+                if let Some(ok) = result.get("ok").and_then(Value::as_bool) {
+                    attrs.push(KeyValue::new("ok", ok));
+                }
+                if let Some(exit_code) = result.get("status").and_then(Value::as_i64) {
+                    attrs.push(KeyValue::new("exit_code", exit_code));
+                }
+                attrs.push(KeyValue::new("truncated_stdout", *truncated_stdout));
+                attrs.push(KeyValue::new("truncated_stderr", *truncated_stderr));
             }
-            Self::GetCall { key, .. }
-            | Self::GetResult { key, .. }
-            | Self::PutCall { key, .. }
-            | Self::PutResult { key, .. } => attrs.push(KeyValue::new("agent.key", key.clone())),
+            Self::GetCall { key, .. } | Self::PutCall { key, .. } => {
+                attrs.push(KeyValue::new("key", key.clone()))
+            }
+            Self::GetResult {
+                key, source_count, ..
+            } => {
+                attrs.push(KeyValue::new("key", key.clone()));
+                attrs.push(KeyValue::new("source_count", *source_count as i64));
+            }
+            Self::PutResult { key, .. } => attrs.push(KeyValue::new("key", key.clone())),
             Self::HydrationStart {
                 sources, max_bytes, ..
             } => {
@@ -339,7 +358,7 @@ impl Event {
                 attrs.push(KeyValue::new("agent.total_bytes", *total_bytes as i64));
             }
             Self::ParStart { branch_count, .. } | Self::ParEnd { branch_count, .. } => {
-                attrs.push(KeyValue::new("agent.branch_count", *branch_count as i64));
+                attrs.push(KeyValue::new("branch_count", *branch_count as i64));
             }
             Self::Checkpoint { name, path, .. } => {
                 attrs.push(KeyValue::new("agent.checkpoint", name.clone()));
@@ -355,6 +374,50 @@ impl Event {
         }
         attrs
     }
+}
+
+fn tool_name(command: &str) -> String {
+    command
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn eval_status(event: &Event) -> Status {
+    match event {
+        Event::EvalResult { result, .. }
+            if result.get("ok").and_then(Value::as_bool) == Some(false) =>
+        {
+            Status::error("eval failed")
+        }
+        _ => Status::Ok,
+    }
+}
+
+fn custom_event_kvs(event: &Event) -> Option<Vec<KeyValue>> {
+    let Event::Custom { data, .. } = event else {
+        return None;
+    };
+    let object = data.as_object()?;
+    Some(
+        object
+            .iter()
+            .filter_map(|(key, value)| match value {
+                Value::Bool(value) => Some(KeyValue::new(key.clone(), *value)),
+                Value::Number(value) => value
+                    .as_i64()
+                    .map(|value| KeyValue::new(key.clone(), value))
+                    .or_else(|| {
+                        value
+                            .as_f64()
+                            .map(|value| KeyValue::new(key.clone(), value))
+                    }),
+                Value::String(value) => Some(KeyValue::new(key.clone(), value.clone())),
+                _ => Some(KeyValue::new(key.clone(), value.to_string())),
+            })
+            .collect(),
+    )
 }
 
 #[async_trait]
@@ -406,6 +469,34 @@ impl TraceSink for JsonlTraceSink {
     }
 }
 
+thread_local! {
+    static NEXT_SPAN_ID: RefCell<Option<u64>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentIdGenerator {
+    random: RandomIdGenerator,
+}
+
+impl AgentIdGenerator {
+    fn use_next_span_id(span_id: u64) {
+        NEXT_SPAN_ID.with(|next| *next.borrow_mut() = Some(span_id.max(1)));
+    }
+}
+
+impl IdGenerator for AgentIdGenerator {
+    fn new_trace_id(&self) -> TraceId {
+        self.random.new_trace_id()
+    }
+
+    fn new_span_id(&self) -> SpanId {
+        NEXT_SPAN_ID
+            .with(|next| next.borrow_mut().take())
+            .map(SpanId::from)
+            .unwrap_or_else(|| self.random.new_span_id())
+    }
+}
+
 struct OpenSpan {
     span: BoxedSpan,
     context: SpanContext,
@@ -415,6 +506,7 @@ struct OpenSpan {
 pub struct OtelTraceSink {
     spans: Mutex<HashMap<u64, OpenSpan>>,
     open_stack: Mutex<Vec<u64>>,
+    eval_attempts: Mutex<HashMap<String, u64>>,
 }
 
 impl OtelTraceSink {
@@ -427,12 +519,24 @@ impl OtelTraceSink {
             return;
         };
         let tracer = global::tracer("agentd");
+        let mut attributes = event.otel_attributes();
+        if let Event::EvalCall { command, .. } = event {
+            let mut attempts = self.eval_attempts.lock().unwrap();
+            let attempt = attempts.entry(command.clone()).or_insert(0);
+            *attempt += 1;
+            attributes.push(KeyValue::new("attempt", *attempt as i64));
+            attributes.push(KeyValue::new(
+                "retry.count",
+                attempt.saturating_sub(1) as i64,
+            ));
+        }
         let builder = tracer
             .span_builder(event.name())
             .with_kind(SpanKind::Internal)
             .with_start_time(event.timestamp())
-            .with_attributes(event.otel_attributes());
+            .with_attributes(attributes);
         let parent_context = self.parent_context_for(op_id);
+        AgentIdGenerator::use_next_span_id(op_id);
         let span = match parent_context {
             Some(parent_context) => tracer.build_with_context(builder, &parent_context),
             None => tracer.build(builder),
@@ -470,7 +574,7 @@ impl OtelTraceSink {
         let mut spans = self.spans.lock().unwrap();
         if let Some(mut open_span) = spans.remove(&op_id) {
             open_span.span.set_attributes(event.otel_attributes());
-            open_span.span.set_status(Status::Ok);
+            open_span.span.set_status(eval_status(event));
             open_span.span.end_with_timestamp(event.timestamp().into());
         } else {
             drop(spans);
@@ -479,6 +583,9 @@ impl OtelTraceSink {
     }
 
     fn emit_instant_event(&self, event: &Event) {
+        if self.attach_custom_event_to_current_span(event) {
+            return;
+        }
         let tracer = global::tracer("agentd");
         let builder = tracer
             .span_builder(event.name())
@@ -488,6 +595,21 @@ impl OtelTraceSink {
         let mut span = tracer.build(builder);
         span.set_status(Status::Ok);
         span.end_with_timestamp(event.timestamp().into());
+    }
+
+    fn attach_custom_event_to_current_span(&self, event: &Event) -> bool {
+        let Some(kvs) = custom_event_kvs(event) else {
+            return false;
+        };
+        let Some(parent_op_id) = self.open_stack.lock().unwrap().last().copied() else {
+            return false;
+        };
+        let mut spans = self.spans.lock().unwrap();
+        let Some(open_span) = spans.get_mut(&parent_op_id) else {
+            return false;
+        };
+        open_span.span.set_attributes(kvs);
+        true
     }
 }
 
@@ -659,6 +781,7 @@ mod tests {
     ) {
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_id_generator(AgentIdGenerator::default())
             .with_span_processor(opentelemetry_sdk::trace::SimpleSpanProcessor::new(
                 exporter.clone(),
             ))
@@ -758,7 +881,7 @@ mod tests {
         })
         .await?;
         sink.emit(&Event::ParEnd {
-            run_id,
+            run_id: run_id.clone(),
             op_id: 1,
             branch_count: 1,
             duration_ms: 2,
@@ -769,12 +892,89 @@ mod tests {
 
         let spans = exporter.get_finished_spans()?;
         let infer = spans.iter().find(|span| span.name == "Infer").unwrap();
-        assert_eq!(attr_value(infer, "agent.model"), Some("mock-model".into()));
-        assert_eq!(attr_value(infer, "agent.tokens"), Some("42".into()));
-        assert_eq!(attr_value(infer, "agent.duration_ms"), Some("9".into()));
+        assert_eq!(
+            attr_value(infer, "gen_ai.request.model"),
+            Some("mock-model".into())
+        );
+        assert_eq!(
+            attr_value(infer, "gen_ai.usage.output_tokens"),
+            Some("42".into())
+        );
+        assert_eq!(attr_value(infer, "duration_ms"), Some("9".into()));
         let par = spans.iter().find(|span| span.name == "Par").unwrap();
         let eval = spans.iter().find(|span| span.name == "Eval").unwrap();
+        assert_eq!(par.span_context.span_id(), SpanId::from(1));
+        assert_eq!(eval.span_context.span_id(), SpanId::from(2));
         assert_eq!(eval.parent_span_id, par.span_context.span_id());
+        sink.emit(&Event::EvalCall {
+            run_id: run_id.clone(),
+            op_id: 3,
+            command: "cargo build --quiet".into(),
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::EvalResult {
+            run_id: run_id.clone(),
+            op_id: 3,
+            command: "cargo build --quiet".into(),
+            result: serde_json::json!({ "ok": true, "status": 0 }),
+            duration_ms: 4,
+            truncated_stdout: false,
+            truncated_stderr: false,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::EvalCall {
+            run_id: run_id.clone(),
+            op_id: 4,
+            command: "cargo build --quiet".into(),
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::Custom {
+            run_id: run_id.clone(),
+            name: "domain_tag".into(),
+            data: serde_json::json!({ "kernel.name": "linux" }),
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::EvalResult {
+            run_id,
+            op_id: 4,
+            command: "cargo build --quiet".into(),
+            result: serde_json::json!({ "ok": false, "status": 101 }),
+            duration_ms: 5,
+            truncated_stdout: false,
+            truncated_stderr: false,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        provider.force_flush()?;
+
+        let spans = exporter.get_finished_spans()?;
+        let failing_eval = spans
+            .iter()
+            .find(|span| matches!(span.status, Status::Error { .. }))
+            .unwrap();
+        assert!(matches!(failing_eval.status, Status::Error { .. }));
+        assert_eq!(
+            attr_value(failing_eval, "tool.name"),
+            Some("cargo build".into())
+        );
+        assert_eq!(attr_value(failing_eval, "exit_code"), Some("101".into()));
+        assert_eq!(attr_value(failing_eval, "ok"), Some("false".into()));
+        assert_eq!(
+            attr_value(failing_eval, "kernel.name"),
+            Some("linux".into())
+        );
+        assert_eq!(attr_value(failing_eval, "attempt"), Some("2".into()));
+        assert_eq!(attr_value(failing_eval, "retry.count"), Some("1".into()));
         let _ = provider.shutdown();
         Ok(())
     }

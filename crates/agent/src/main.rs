@@ -1,15 +1,15 @@
 use agent_core::{
-    agent_loop, agent_loop_ir, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
-    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink,
-    MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
-    ProviderClient, ProviderConfig, ReplayTrace, ResolvedModel, RingGc, SeqConfig,
+    agent_loop, agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatMessage,
+    EnvPolicy, EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace,
+    JsonlTraceSink, MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig,
+    PassiveSource, ProviderClient, ProviderConfig, ReplayTrace, ResolvedModel, RingGc, SeqConfig,
     SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
-use opentelemetry::global;
+use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider, Resource};
 use serde::{Deserialize, Serialize};
@@ -317,7 +317,7 @@ async fn main() -> Result<()> {
         .or(args.run_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let trace_path = trace_path(&run_id)?;
-    let otel = init_otel(args.otel_endpoint.as_deref())?;
+    let otel = init_otel(args.otel_endpoint.as_deref(), &run_id)?;
     let trace = match &otel {
         Some(_) => TraceLogger::with_sinks(
             run_id.clone(),
@@ -448,11 +448,20 @@ impl OtelGuard {
     }
 }
 
-fn init_otel(endpoint: Option<&str>) -> Result<Option<OtelGuard>> {
+fn init_otel(endpoint: Option<&str>, run_id: &str) -> Result<Option<OtelGuard>> {
     let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) else {
         return Ok(None);
     };
-    let resource = Resource::builder().with_service_name("agentd").build();
+    let mut resource = Resource::builder()
+        .with_service_name("agentd")
+        .with_attribute(KeyValue::new("agent.run_id", run_id.to_string()));
+    if let Ok(agent_name) = std::env::var("AGENT_NAME") {
+        resource = resource.with_attribute(KeyValue::new("agent.name", agent_name));
+    }
+    if let Ok(parent_run_id) = std::env::var("AGENT_PARENT_RUN_ID") {
+        resource = resource.with_attribute(KeyValue::new("agent.parent_run_id", parent_run_id));
+    }
+    let resource = resource.build();
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
@@ -461,6 +470,7 @@ fn init_otel(endpoint: Option<&str>) -> Result<Option<OtelGuard>> {
         .context("building OTLP span exporter")?;
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
+        .with_id_generator(AgentIdGenerator::default())
         .with_batch_exporter(span_exporter)
         .build();
     global::set_tracer_provider(tracer_provider.clone());
