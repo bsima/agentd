@@ -46,4 +46,4 @@ pub use prompt_ir::{
     SectionSummary, TokenBudget, TokenEstimate, ToolDef,
 };
 pub use provider::{ChatProvider, ProviderClient, ProviderConfig};
-pub use trace::{Event, TraceLogger, TraceSummary};
+pub use trace::{Event, JsonlTraceSink, TraceLogger, TraceSink, TraceSummary};

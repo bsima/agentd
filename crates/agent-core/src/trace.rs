@@ -1,5 +1,6 @@
 use crate::op::{Prompt, Response};
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +11,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "PascalCase")]
 pub enum Event {
     InferCall {
@@ -134,20 +135,21 @@ pub enum Event {
     },
 }
 
+#[async_trait]
+pub trait TraceSink: Send + Sync {
+    async fn emit(&self, event: &Event) -> Result<()>;
+}
+
 #[derive(Clone)]
-pub struct TraceLogger {
-    run_id: String,
+pub struct JsonlTraceSink {
     path: PathBuf,
-    next_op_id: Arc<AtomicU64>,
     mirror_stdout: bool,
 }
 
-impl TraceLogger {
-    pub fn new(run_id: impl Into<String>, path: PathBuf) -> Self {
+impl JsonlTraceSink {
+    pub fn new(path: PathBuf) -> Self {
         Self {
-            run_id: run_id.into(),
             path,
-            next_op_id: Arc::new(AtomicU64::new(1)),
             mirror_stdout: false,
         }
     }
@@ -156,20 +158,11 @@ impl TraceLogger {
         self.mirror_stdout = mirror_stdout;
         self
     }
+}
 
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
-    pub fn next_op_id(&self) -> u64 {
-        self.next_op_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub async fn emit(&self, event: &Event) -> Result<()> {
+#[async_trait]
+impl TraceSink for JsonlTraceSink {
+    async fn emit(&self, event: &Event) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -186,6 +179,59 @@ impl TraceLogger {
             stdout.write_all(line.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
             stdout.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct TraceLogger {
+    run_id: String,
+    path: PathBuf,
+    next_op_id: Arc<AtomicU64>,
+    sinks: Arc<Vec<Arc<dyn TraceSink>>>,
+}
+
+impl TraceLogger {
+    pub fn new(run_id: impl Into<String>, path: PathBuf) -> Self {
+        let sink = JsonlTraceSink::new(path.clone());
+        Self::with_sinks(run_id, path, vec![Arc::new(sink)])
+    }
+
+    pub fn with_sinks(
+        run_id: impl Into<String>,
+        path: PathBuf,
+        sinks: Vec<Arc<dyn TraceSink>>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            path,
+            next_op_id: Arc::new(AtomicU64::new(1)),
+            sinks: Arc::new(sinks),
+        }
+    }
+
+    pub fn mirror_stdout(mut self, mirror_stdout: bool) -> Self {
+        let sink = JsonlTraceSink::new(self.path.clone()).mirror_stdout(mirror_stdout);
+        self.sinks = Arc::new(vec![Arc::new(sink)]);
+        self
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn next_op_id(&self) -> u64 {
+        self.next_op_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub async fn emit(&self, event: &Event) -> Result<()> {
+        for sink in self.sinks.iter() {
+            sink.emit(event).await?;
         }
         Ok(())
     }
@@ -238,4 +284,57 @@ pub fn preview(input: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<Event>>,
+    }
+
+    #[async_trait]
+    impl TraceSink for RecordingSink {
+        async fn emit(&self, event: &Event) -> Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    fn done_event(run_id: &str) -> Event {
+        Event::AgentDone {
+            run_id: run_id.into(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_logger_emits_to_all_sinks_and_preserves_jsonl_readback() -> Result<()> {
+        let run_id = Uuid::new_v4().to_string();
+        let path = std::env::temp_dir().join(format!("trace-sink-test-{run_id}.jsonl"));
+        let recording = Arc::new(RecordingSink::default());
+        let logger = TraceLogger::with_sinks(
+            run_id.clone(),
+            path.clone(),
+            vec![
+                Arc::new(JsonlTraceSink::new(path.clone())),
+                recording.clone(),
+            ],
+        );
+        let event = done_event(&run_id);
+
+        logger.emit(&event).await?;
+
+        assert_eq!(
+            recording.events.lock().unwrap().as_slice(),
+            std::slice::from_ref(&event)
+        );
+        assert_eq!(TraceLogger::read_events(&path).await?, vec![event]);
+        let _ = tokio::fs::remove_file(path).await;
+        Ok(())
+    }
 }
