@@ -23,6 +23,8 @@ pub enum Event {
     InferCall {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         model: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<Prompt>,
@@ -32,6 +34,8 @@ pub enum Event {
     InferResult {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         response: Option<Response>,
         response_preview: String,
@@ -44,6 +48,8 @@ pub enum Event {
     EvalCall {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         command: String,
         cwd: Option<String>,
         env_policy: String,
@@ -53,6 +59,8 @@ pub enum Event {
     EvalResult {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         command: String,
         result: Value,
         duration_ms: u64,
@@ -63,12 +71,16 @@ pub enum Event {
     GetCall {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         key: String,
         timestamp: DateTime<Utc>,
     },
     GetResult {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         key: String,
         value: Value,
         value_preview: String,
@@ -78,6 +90,8 @@ pub enum Event {
     PutCall {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         key: String,
         value_preview: String,
         timestamp: DateTime<Utc>,
@@ -85,12 +99,16 @@ pub enum Event {
     PutResult {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         key: String,
         timestamp: DateTime<Utc>,
     },
     HydrationStart {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         sources: Vec<String>,
         max_bytes: Option<usize>,
         timestamp: DateTime<Utc>,
@@ -98,6 +116,8 @@ pub enum Event {
     HydrationSection {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         source: String,
         kind: String,
         bytes: usize,
@@ -108,6 +128,8 @@ pub enum Event {
     HydrationEnd {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         section_count: usize,
         total_bytes: usize,
         timestamp: DateTime<Utc>,
@@ -115,12 +137,16 @@ pub enum Event {
     ParStart {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         branch_count: usize,
         timestamp: DateTime<Utc>,
     },
     ParEnd {
         run_id: String,
         op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
         branch_count: usize,
         duration_ms: u64,
         timestamp: DateTime<Utc>,
@@ -180,6 +206,25 @@ impl Event {
             | Self::HydrationEnd { op_id, .. }
             | Self::ParStart { op_id, .. }
             | Self::ParEnd { op_id, .. } => Some(*op_id),
+            Self::Checkpoint { .. } | Self::AgentDone { .. } | Self::Custom { .. } => None,
+        }
+    }
+
+    pub fn parent_op_id(&self) -> Option<u64> {
+        match self {
+            Self::InferCall { parent_op_id, .. }
+            | Self::InferResult { parent_op_id, .. }
+            | Self::EvalCall { parent_op_id, .. }
+            | Self::EvalResult { parent_op_id, .. }
+            | Self::GetCall { parent_op_id, .. }
+            | Self::GetResult { parent_op_id, .. }
+            | Self::PutCall { parent_op_id, .. }
+            | Self::PutResult { parent_op_id, .. }
+            | Self::HydrationStart { parent_op_id, .. }
+            | Self::HydrationSection { parent_op_id, .. }
+            | Self::HydrationEnd { parent_op_id, .. }
+            | Self::ParStart { parent_op_id, .. }
+            | Self::ParEnd { parent_op_id, .. } => *parent_op_id,
             Self::Checkpoint { .. } | Self::AgentDone { .. } | Self::Custom { .. } => None,
         }
     }
@@ -574,7 +619,7 @@ impl OtelTraceSink {
             .with_kind(SpanKind::Internal)
             .with_start_time(event.timestamp())
             .with_attributes(attributes);
-        let parent_context = self.parent_context_for(op_id);
+        let parent_context = self.parent_context_for(event);
         AgentIdGenerator::use_next_span_id(op_id);
         let span = match parent_context {
             Some(parent_context) => tracer.build_with_context(builder, &parent_context),
@@ -589,19 +634,11 @@ impl OtelTraceSink {
         self.open_stack.lock().unwrap().push(op_id);
     }
 
-    fn parent_context_for(&self, op_id: u64) -> Option<opentelemetry::Context> {
-        let spans = self.spans.lock().unwrap();
-        self.open_stack
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .copied()
-            .find(|open_op_id| *open_op_id != op_id)
-            .and_then(|parent_op_id| spans.get(&parent_op_id))
-            .map(|parent| {
-                opentelemetry::Context::current().with_remote_span_context(parent.context.clone())
-            })
+    fn parent_context_for(&self, event: &Event) -> Option<opentelemetry::Context> {
+        let parent_op_id = event.parent_op_id()?;
+        self.spans.lock().unwrap().get(&parent_op_id).map(|parent| {
+            opentelemetry::Context::current().with_remote_span_context(parent.context.clone())
+        })
     }
 
     fn finish_span(&self, event: &Event) {
@@ -887,6 +924,7 @@ mod tests {
         sink.emit(&Event::InferCall {
             run_id: run_id.clone(),
             op_id: 7,
+            parent_op_id: None,
             model: "mock-model".into(),
             prompt: None,
             prompt_preview: "hello".into(),
@@ -896,6 +934,7 @@ mod tests {
         sink.emit(&Event::InferResult {
             run_id: run_id.clone(),
             op_id: 7,
+            parent_op_id: None,
             response: None,
             response_preview: "world".into(),
             input_tokens: 10,
@@ -908,6 +947,7 @@ mod tests {
         sink.emit(&Event::ParStart {
             run_id: run_id.clone(),
             op_id: 1,
+            parent_op_id: None,
             branch_count: 1,
             timestamp: Utc::now(),
         })
@@ -915,6 +955,7 @@ mod tests {
         sink.emit(&Event::EvalCall {
             run_id: run_id.clone(),
             op_id: 2,
+            parent_op_id: Some(1),
             command: "printf ok".into(),
             cwd: None,
             env_policy: "inherit".into(),
@@ -932,6 +973,7 @@ mod tests {
         sink.emit(&Event::EvalResult {
             run_id: run_id.clone(),
             op_id: 2,
+            parent_op_id: Some(1),
             command: "printf ok".into(),
             result: serde_json::json!({ "ok": true }),
             duration_ms: 1,
@@ -943,6 +985,7 @@ mod tests {
         sink.emit(&Event::ParEnd {
             run_id: run_id.clone(),
             op_id: 1,
+            parent_op_id: None,
             branch_count: 1,
             duration_ms: 2,
             timestamp: Utc::now(),
@@ -974,9 +1017,58 @@ mod tests {
         assert_eq!(par.span_context.span_id(), SpanId::from(1));
         assert_eq!(eval.span_context.span_id(), SpanId::from(2));
         assert_eq!(eval.parent_span_id, par.span_context.span_id());
+
+        sink.emit(&Event::ParStart {
+            run_id: run_id.clone(),
+            op_id: 10,
+            parent_op_id: None,
+            branch_count: 1,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::ParStart {
+            run_id: run_id.clone(),
+            op_id: 20,
+            parent_op_id: None,
+            branch_count: 1,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::EvalCall {
+            run_id: run_id.clone(),
+            op_id: 11,
+            parent_op_id: Some(10),
+            command: "printf interleaved".into(),
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        sink.emit(&Event::EvalResult {
+            run_id: run_id.clone(),
+            op_id: 11,
+            parent_op_id: Some(10),
+            command: "printf interleaved".into(),
+            result: serde_json::json!({ "ok": true }),
+            duration_ms: 1,
+            truncated_stdout: false,
+            truncated_stderr: false,
+            timestamp: Utc::now(),
+        })
+        .await?;
+        provider.force_flush()?;
+        let spans = exporter.get_finished_spans()?;
+        let interleaved_eval = spans
+            .iter()
+            .find(|span| span.span_context.span_id() == SpanId::from(11))
+            .unwrap();
+        assert_eq!(interleaved_eval.parent_span_id, SpanId::from(10));
+
         sink.emit(&Event::EvalCall {
             run_id: run_id.clone(),
             op_id: 3,
+            parent_op_id: None,
             command: "cargo build --quiet".into(),
             cwd: None,
             env_policy: "inherit".into(),
@@ -987,6 +1079,7 @@ mod tests {
         sink.emit(&Event::EvalResult {
             run_id: run_id.clone(),
             op_id: 3,
+            parent_op_id: None,
             command: "cargo build --quiet".into(),
             result: serde_json::json!({ "ok": true, "status": 0 }),
             duration_ms: 4,
@@ -998,6 +1091,7 @@ mod tests {
         sink.emit(&Event::EvalCall {
             run_id: run_id.clone(),
             op_id: 4,
+            parent_op_id: None,
             command: "cargo build --quiet".into(),
             cwd: None,
             env_policy: "inherit".into(),
@@ -1015,6 +1109,7 @@ mod tests {
         sink.emit(&Event::EvalResult {
             run_id,
             op_id: 4,
+            parent_op_id: None,
             command: "cargo build --quiet".into(),
             result: serde_json::json!({ "ok": false, "status": 101 }),
             duration_ms: 5,

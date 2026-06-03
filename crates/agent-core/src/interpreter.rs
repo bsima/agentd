@@ -102,6 +102,7 @@ impl ReplayTrace {
                 }
                 Event::InferResult {
                     op_id,
+                    parent_op_id: None,
                     response: Some(response),
                     ..
                 } => {
@@ -192,7 +193,7 @@ where
     A: Send + 'static,
 {
     let mut gc_state = GcState::default();
-    run_sequential_inner(config, state, op, &mut gc_state).await
+    run_sequential_inner(config, state, op, &mut gc_state, None).await
 }
 
 #[async_recursion]
@@ -201,6 +202,7 @@ async fn run_sequential_inner<S, A>(
     state: S,
     op: Op<S, A>,
     gc_state: &mut GcState,
+    parent_op_id: Option<u64>,
 ) -> Result<(A, S)>
 where
     S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
@@ -221,6 +223,7 @@ where
                 .emit(&Event::InferCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     model: model.0.clone(),
                     prompt: Some(prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
@@ -242,6 +245,7 @@ where
                 .emit(&Event::InferResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     response: Some(response.clone()),
                     response_preview: response_preview(&response),
                     input_tokens: response.input_tokens,
@@ -251,7 +255,7 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential_inner(config, state, next(response), gc_state).await
+            run_sequential_inner(config, state, next(response), gc_state, parent_op_id).await
         }
         OpF::Eval { command, next } => {
             let op_id = config.trace.next_op_id();
@@ -260,6 +264,7 @@ where
                 .emit(&Event::EvalCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     command: command.clone(),
                     cwd: config
                         .eval
@@ -295,6 +300,7 @@ where
                 .emit(&Event::EvalResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     command,
                     result: result.clone(),
                     duration_ms,
@@ -303,7 +309,7 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential_inner(config, state, next(result), gc_state).await
+            run_sequential_inner(config, state, next(result), gc_state, parent_op_id).await
         }
         OpF::Get { key, next } => {
             let op_id = config.trace.next_op_id();
@@ -312,6 +318,7 @@ where
                 .emit(&Event::GetCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     key: key.clone(),
                     timestamp: Utc::now(),
                 })
@@ -322,6 +329,7 @@ where
                 .emit(&Event::GetResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     key,
                     source_count: value.as_array().map(Vec::len).unwrap_or(0),
                     value_preview: preview(&value.to_string(), 512),
@@ -329,7 +337,7 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential_inner(config, state, next(value), gc_state).await
+            run_sequential_inner(config, state, next(value), gc_state, parent_op_id).await
         }
         OpF::Put { key, value, next } => {
             let op_id = config.trace.next_op_id();
@@ -338,6 +346,7 @@ where
                 .emit(&Event::PutCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     key: key.clone(),
                     value_preview: preview(&value.to_string(), 512),
                     timestamp: Utc::now(),
@@ -349,15 +358,16 @@ where
                 .emit(&Event::PutResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     key,
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential_inner(config, state, next, gc_state).await
+            run_sequential_inner(config, state, next, gc_state, parent_op_id).await
         }
         OpF::Emit { event, next } => {
             config.trace.emit(&event).await?;
-            run_sequential_inner(config, state, next, gc_state).await
+            run_sequential_inner(config, state, next, gc_state, parent_op_id).await
         }
         OpF::Par { ops, next } => {
             let op_id = config.trace.next_op_id();
@@ -367,6 +377,7 @@ where
                 .emit(&Event::ParStart {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     branch_count: ops.len(),
                     timestamp: Utc::now(),
                 })
@@ -376,7 +387,7 @@ where
             let mut current_state = state;
             for op in ops {
                 let (value, new_state) =
-                    run_sequential_inner(config, current_state, op, gc_state).await?;
+                    run_sequential_inner(config, current_state, op, gc_state, Some(op_id)).await?;
                 values.push(value);
                 current_state = new_state;
             }
@@ -385,12 +396,13 @@ where
                 .emit(&Event::ParEnd {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id,
                     branch_count,
                     duration_ms: millis_u64(started.elapsed()),
                     timestamp: Utc::now(),
                 })
                 .await?;
-            run_sequential_inner(config, current_state, next(values), gc_state).await
+            run_sequential_inner(config, current_state, next(values), gc_state, parent_op_id).await
         }
     }
 }
@@ -547,6 +559,7 @@ where
         .emit(&Event::HydrationStart {
             run_id: config.trace.run_id().into(),
             op_id,
+            parent_op_id: None,
             sources,
             max_bytes: config.passive_hydration.max_bytes,
             timestamp: Utc::now(),
@@ -577,6 +590,7 @@ where
                         .emit(&Event::HydrationSection {
                             run_id: config.trace.run_id().into(),
                             op_id,
+                            parent_op_id: None,
                             source: "temporal-history".into(),
                             kind: "Temporal".into(),
                             bytes: content.len(),
@@ -606,6 +620,7 @@ where
                         .emit(&Event::HydrationSection {
                             run_id: config.trace.run_id().into(),
                             op_id,
+                            parent_op_id: None,
                             source: result.source.clone(),
                             kind: format!("{:?}", result.kind),
                             bytes: result.content.len(),
@@ -648,6 +663,7 @@ where
         .emit(&Event::HydrationEnd {
             run_id: config.trace.run_id().into(),
             op_id,
+            parent_op_id: None,
             section_count,
             total_bytes,
             timestamp: Utc::now(),

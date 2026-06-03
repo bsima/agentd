@@ -431,6 +431,7 @@ async fn execute_instr(
                 .emit(&Event::InferCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id: None,
                     model: model.clone(),
                     prompt: Some(prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
@@ -455,6 +456,7 @@ async fn execute_instr(
                 .emit(&Event::InferResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id: None,
                     response: Some(response.clone()),
                     response_preview: response_preview(&response),
                     input_tokens: response.input_tokens,
@@ -489,6 +491,7 @@ async fn execute_instr(
                 .emit(&Event::EvalCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id: None,
                     command: command.clone(),
                     cwd: config
                         .eval
@@ -527,6 +530,7 @@ async fn execute_instr(
                 .emit(&Event::EvalResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
+                    parent_op_id: None,
                     command,
                     result: result.clone(),
                     duration_ms,

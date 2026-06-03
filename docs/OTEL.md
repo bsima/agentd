@@ -109,11 +109,12 @@ attributes; freeform blobs are span detail, not group-by keys.*
 
 ### Span identity
 
-`run_id` and `op_id` are span identity, not filterable attributes: `run_id` ->
-resource (`agent.run_id`), `op_id` -> span_id / parent linkage. Derive
-`parent_span_id` from the existing `op_id` lineage, not from a wall-clock
-"currently open span" stack heuristic — that is what makes Par-nesting and
-cross-agent nesting correct rather than fragile.
+`run_id`, `op_id`, and `parent_op_id` are span identity, not filterable
+attributes: `run_id` -> resource (`agent.run_id`), `op_id` -> span_id, and
+`parent_op_id` -> parent_span_id. The OTel sink derives parentage from explicit
+`parent_op_id` lineage, not from a wall-clock "currently open span" stack
+heuristic. That is what makes Par-nesting and cross-agent nesting correct rather
+than fragile.
 
 ### Naming convention
 
