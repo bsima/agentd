@@ -278,6 +278,7 @@ impl OAuthChatProvider {
     }
 
     async fn login(&self) -> Result<OAuthToken> {
+        tracing::info!(provider = self.kind.name(), "starting OAuth device login");
         let device = self.start_device_login().await?;
         eprintln!(
             "Open this URL to authorize {}: {}",
@@ -291,6 +292,7 @@ impl OAuthChatProvider {
             eprintln!("Enter code: {code}");
         }
         let token = self.poll_device_token(&device).await?;
+        tracing::info!(provider = self.kind.name(), "OAuth device login completed");
         self.store.save(&token).await?;
         Ok(token)
     }

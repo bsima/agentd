@@ -271,7 +271,10 @@ where
                 .await?;
             let result = match &config.replay {
                 Some(replay) => replay.eval_result(op_id, &command)?,
-                None => run_eval(&config.eval, &command).await?,
+                None => {
+                    run_eval_with_env(&config.eval, &command, config.trace.trace_context_env())
+                        .await?
+                }
             };
             let truncated_stdout = result
                 .get("stdout_truncated")
@@ -427,7 +430,11 @@ pub(crate) async fn maybe_collect_prompt(
     Ok(collected)
 }
 
-pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value> {
+pub(crate) async fn run_eval_with_env(
+    config: &EvalConfig,
+    command: &str,
+    extra_env: BTreeMap<String, String>,
+) -> Result<Value> {
     let started = Instant::now();
     let mut process = Command::new(&config.shell);
     process.arg("-c").arg(command);
@@ -435,7 +442,7 @@ pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value
         process.current_dir(cwd);
     }
     config.env.apply(&mut process);
-    propagate_trace_context_env(&mut process);
+    process.envs(extra_env);
     // Detach the child's stdin so interactive commands (e.g. `git rebase -i`,
     // `git commit` with no -m, `ssh`, prompts) get immediate EOF instead of
     // consuming the agent's own control channel (NUL-framed session/fifo input).
@@ -472,14 +479,6 @@ pub(crate) async fn run_eval(config: &EvalConfig, command: &str) -> Result<Value
             "stderr_truncated": false,
             "duration_ms": duration_ms,
         })),
-    }
-}
-
-fn propagate_trace_context_env(command: &mut Command) {
-    for name in ["TRACEPARENT", "TRACESTATE"] {
-        if let Ok(value) = std::env::var(name) {
-            command.env(name, value);
-        }
     }
 }
 
@@ -1191,14 +1190,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eval_propagates_traceparent_even_with_clean_env() -> Result<()> {
+    async fn eval_propagates_explicit_traceparent_even_with_clean_env() -> Result<()> {
         let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        std::env::set_var("TRACEPARENT", traceparent);
         let mut clean_vars = std::collections::BTreeMap::new();
         if let Ok(path) = std::env::var("PATH") {
             clean_vars.insert("PATH".into(), path);
         }
-        let result = run_eval(
+        let result = run_eval_with_env(
             &EvalConfig {
                 shell: "/bin/sh".into(),
                 cwd: None,
@@ -1208,9 +1206,9 @@ mod tests {
                 env: EnvPolicy::Clean { vars: clean_vars },
             },
             "printf %s \"$TRACEPARENT\"",
+            BTreeMap::from([("TRACEPARENT".into(), traceparent.into())]),
         )
         .await;
-        std::env::remove_var("TRACEPARENT");
 
         assert_eq!(result?["stdout"], json!(traceparent));
         Ok(())

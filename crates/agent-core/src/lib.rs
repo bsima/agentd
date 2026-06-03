@@ -47,5 +47,6 @@ pub use prompt_ir::{
 };
 pub use provider::{ChatProvider, ProviderClient, ProviderConfig};
 pub use trace::{
-    AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, TraceLogger, TraceSink, TraceSummary,
+    AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, TraceContextEnv, TraceLogger,
+    TraceSink, TraceSummary,
 };

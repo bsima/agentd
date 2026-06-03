@@ -3,7 +3,8 @@ use agent_core::{
     EnvPolicy, EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace,
     JsonlTraceSink, MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig,
     PassiveSource, ProviderClient, ProviderConfig, ReplayTrace, ResolvedModel, RingGc, SeqConfig,
-    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceLogger,
+    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceContextEnv,
+    TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -319,14 +320,18 @@ async fn main() -> Result<()> {
     let trace_path = trace_path(&run_id)?;
     let otel = init_otel(args.otel_endpoint.as_deref(), &run_id)?;
     let trace = match &otel {
-        Some(_) => TraceLogger::with_sinks(
-            run_id.clone(),
-            trace_path.clone(),
-            vec![
-                Arc::new(JsonlTraceSink::new(trace_path.clone()).mirror_stdout(args.debug)),
-                Arc::new(OtelTraceSink::new()),
-            ],
-        ),
+        Some(_) => {
+            let context_env = TraceContextEnv::default();
+            TraceLogger::with_sinks_and_context(
+                run_id.clone(),
+                trace_path.clone(),
+                vec![
+                    Arc::new(JsonlTraceSink::new(trace_path.clone()).mirror_stdout(args.debug)),
+                    Arc::new(OtelTraceSink::with_context_env(context_env.clone())),
+                ],
+                context_env,
+            )
+        }
         None => TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug),
     };
     let provider: Arc<dyn agent_core::ChatProvider> = if replay_enabled {
@@ -623,12 +628,14 @@ async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
 }
 
 async fn run_stdin_session(runtime: &mut Runtime) -> Result<()> {
+    tracing::info!(run_id = %runtime.run_id, "starting stdin session");
     let reader = BufReader::new(tokio::io::stdin());
     run_nul_delimited_prompt_loop(runtime, reader).await?;
     emit_done(runtime).await
 }
 
 async fn run_fifo_session(runtime: &mut Runtime, path: PathBuf) -> Result<()> {
+    tracing::info!(run_id = %runtime.run_id, fifo = %path.display(), "starting fifo session");
     validate_fifo_path(&path).await?;
 
     let mut consecutive_empty_sessions = 0_u32;
@@ -721,6 +728,7 @@ async fn run_turn_with_status(
         }
         Err(err) => {
             let message = err.to_string();
+            tracing::error!(run_id = %runtime.run_id, error = %message, "agent turn failed");
             if is_context_overflow_error(&message) {
                 emit_context_overflow(runtime, &message).await?;
             }
@@ -940,6 +948,7 @@ async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
             timestamp: Utc::now(),
         })
         .await?;
+    tracing::info!(run_id = %runtime.run_id, checkpoint = %path.display(), "checkpoint saved");
     if runtime.debug {
         eprintln!("checkpoint: {}", path.display());
     }
@@ -947,6 +956,7 @@ async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
 }
 
 async fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
+    tracing::info!(checkpoint = %path.display(), "loading checkpoint");
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading checkpoint {}", path.display()))?;

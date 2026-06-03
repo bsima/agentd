@@ -1,7 +1,7 @@
 use crate::gc::GcState;
 use crate::interpreter::{
     hydrate_infer_prompt, maybe_collect_prompt, millis_u64, prompt_preview, response_preview,
-    run_eval, SeqConfig,
+    run_eval_with_env, SeqConfig,
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectKind,
@@ -502,7 +502,10 @@ async fn execute_instr(
                 Some(replay) => replay.eval_result(&location, &command)?,
                 None => match &config.replay {
                     Some(replay) => replay.eval_result(op_id, &command)?,
-                    None => run_eval(&config.eval, &command).await?,
+                    None => {
+                        run_eval_with_env(&config.eval, &command, config.trace.trace_context_env())
+                            .await?
+                    }
                 },
             };
             let truncated_stdout = result

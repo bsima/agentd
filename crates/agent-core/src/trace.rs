@@ -9,7 +9,7 @@ use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -502,16 +502,43 @@ struct OpenSpan {
     context: SpanContext,
 }
 
+#[derive(Clone, Default)]
+pub struct TraceContextEnv {
+    vars: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+impl TraceContextEnv {
+    pub fn set(&self, name: impl Into<String>, value: impl Into<String>) {
+        self.vars.lock().unwrap().insert(name.into(), value.into());
+    }
+
+    pub fn remove(&self, name: &str) {
+        self.vars.lock().unwrap().remove(name);
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<String, String> {
+        self.vars.lock().unwrap().clone()
+    }
+}
+
 #[derive(Default)]
 pub struct OtelTraceSink {
     spans: Mutex<HashMap<u64, OpenSpan>>,
     open_stack: Mutex<Vec<u64>>,
     eval_attempts: Mutex<HashMap<String, u64>>,
+    context_env: TraceContextEnv,
 }
 
 impl OtelTraceSink {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_context_env(context_env: TraceContextEnv) -> Self {
+        Self {
+            context_env,
+            ..Self::default()
+        }
     }
 
     fn start_span(&self, event: &Event) {
@@ -542,7 +569,7 @@ impl OtelTraceSink {
             None => tracer.build(builder),
         };
         let context = span.span_context().clone();
-        set_trace_context_env(&context);
+        set_trace_context_env(&self.context_env, &context);
         self.spans
             .lock()
             .unwrap()
@@ -613,9 +640,9 @@ impl OtelTraceSink {
     }
 }
 
-fn set_trace_context_env(context: &SpanContext) {
+fn set_trace_context_env(context_env: &TraceContextEnv, context: &SpanContext) {
     if context.is_valid() {
-        std::env::set_var(
+        context_env.set(
             "TRACEPARENT",
             format!(
                 "00-{:032x}-{:016x}-{:02x}",
@@ -626,9 +653,9 @@ fn set_trace_context_env(context: &SpanContext) {
         );
         let tracestate = context.trace_state().header();
         if tracestate.is_empty() {
-            std::env::remove_var("TRACESTATE");
+            context_env.remove("TRACESTATE");
         } else {
-            std::env::set_var("TRACESTATE", tracestate);
+            context_env.set("TRACESTATE", tracestate);
         }
     }
 }
@@ -653,6 +680,7 @@ pub struct TraceLogger {
     path: PathBuf,
     next_op_id: Arc<AtomicU64>,
     sinks: Arc<Vec<Arc<dyn TraceSink>>>,
+    context_env: TraceContextEnv,
 }
 
 impl TraceLogger {
@@ -666,11 +694,21 @@ impl TraceLogger {
         path: PathBuf,
         sinks: Vec<Arc<dyn TraceSink>>,
     ) -> Self {
+        Self::with_sinks_and_context(run_id, path, sinks, TraceContextEnv::default())
+    }
+
+    pub fn with_sinks_and_context(
+        run_id: impl Into<String>,
+        path: PathBuf,
+        sinks: Vec<Arc<dyn TraceSink>>,
+        context_env: TraceContextEnv,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
             path,
             next_op_id: Arc::new(AtomicU64::new(1)),
             sinks: Arc::new(sinks),
+            context_env,
         }
     }
 
@@ -678,6 +716,10 @@ impl TraceLogger {
         let sink = JsonlTraceSink::new(self.path.clone()).mirror_stdout(mirror_stdout);
         self.sinks = Arc::new(vec![Arc::new(sink)]);
         self
+    }
+
+    pub fn trace_context_env(&self) -> BTreeMap<String, String> {
+        self.context_env.snapshot()
     }
 
     pub fn run_id(&self) -> &str {
@@ -826,9 +868,9 @@ mod tests {
     #[tokio::test]
     async fn otel_sink_maps_spans_parents_and_traceparent() -> Result<()> {
         let (exporter, provider) = install_in_memory_tracer();
-        let sink = OtelTraceSink::new();
+        let context_env = TraceContextEnv::default();
+        let sink = OtelTraceSink::with_context_env(context_env.clone());
         let run_id = Uuid::new_v4().to_string();
-        std::env::remove_var("TRACEPARENT");
 
         sink.emit(&Event::InferCall {
             run_id: run_id.clone(),
@@ -866,7 +908,11 @@ mod tests {
             timestamp: Utc::now(),
         })
         .await?;
-        let traceparent = std::env::var("TRACEPARENT")?;
+        let traceparent = context_env
+            .snapshot()
+            .get("TRACEPARENT")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("TRACEPARENT not set"))?;
         assert!(traceparent.starts_with("00-"));
         assert_eq!(traceparent.len(), 55);
         sink.emit(&Event::EvalResult {
