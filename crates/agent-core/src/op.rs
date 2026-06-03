@@ -10,7 +10,7 @@ pub type Prompt = Vec<ChatMessage>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model(pub String);
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
@@ -20,6 +20,15 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+impl PartialEq for ChatMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.content == other.content
+            && self.tool_call_id == other.tool_call_id
+            && self.tool_calls == other.tool_calls
+    }
 }
 
 impl ChatMessage {
@@ -330,6 +339,15 @@ mod tests {
                 "noop provider should not be called by pure Op tests"
             ))
         }
+    }
+
+    #[test]
+    fn chat_message_equality_ignores_stable_id() {
+        let a = ChatMessage::user("same content");
+        let b = ChatMessage::user("same content");
+
+        assert_ne!(a.id, b.id);
+        assert_eq!(a, b);
     }
 
     fn seq_config() -> SeqConfig {

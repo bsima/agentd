@@ -138,7 +138,7 @@ impl ContextGc for MarkSweepGc {
     }
 
     fn cache_preserving(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -427,6 +427,22 @@ mod tests {
 
     fn read_file_call(id: &str, path: &str) -> ResponseToolCall {
         ResponseToolCall::new(id, "read_file", serde_json::json!({ "path": path }))
+    }
+
+    #[test]
+    fn mark_sweep_cache_preserving_matches_retained_prompt_bytes() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(None, vec![read_file_call("call-1", "/tmp/large.txt")]),
+            ChatMessage::tool("call-1", "x".repeat(2000)),
+            ChatMessage::assistant(Some("I incorporated that result".into()), vec![]),
+        ];
+        let mut state = GcState::default();
+        let collected = MarkSweepGc.collect(messages.clone(), 10_000, &mut state);
+
+        if MarkSweepGc.cache_preserving() {
+            assert_eq!(collected, messages);
+        }
     }
 
     #[test]

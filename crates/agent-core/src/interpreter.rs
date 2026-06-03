@@ -403,8 +403,9 @@ pub(crate) async fn maybe_collect_prompt(
     if before_tokens <= threshold {
         return Ok(prompt);
     }
-    truncate_oversized_message(&mut prompt, config.context_budget);
-    let collected = config.gc.collect(prompt, config.context_budget, gc_state);
+    let target_budget = threshold.max(1);
+    truncate_oversized_message(&mut prompt, target_budget);
+    let collected = config.gc.collect(prompt, target_budget, gc_state);
     let after_tokens = estimate_tokens(&collected);
     if config.gc_log {
         config
@@ -767,6 +768,38 @@ mod tests {
     fn test_trace() -> TraceLogger {
         let path = std::env::temp_dir().join(format!("agent-core-test-{}.jsonl", Uuid::new_v4()));
         TraceLogger::new(Uuid::new_v4().to_string(), path)
+    }
+
+    #[tokio::test]
+    async fn gc_collects_to_threshold_budget() -> Result<()> {
+        let config = SeqConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            gc: crate::gc::GcMode::Ring(crate::gc::RingGc),
+            gc_threshold: 0.5,
+            gc_log: false,
+            context_budget: 100,
+        };
+        let prompt = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(90)),
+            ChatMessage::user("y".repeat(90)),
+        ];
+        assert!(estimate_tokens(&prompt) > 50);
+        assert!(estimate_tokens(&prompt) <= 100);
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(estimate_tokens(&collected) <= 50, "collected={collected:?}");
+        assert!(collected.iter().any(|message| message.role == "system"));
+        Ok(())
     }
 
     #[tokio::test]
