@@ -1,4 +1,4 @@
-use crate::op::{ChatMessage, Model, Response, ResponseToolCall};
+use crate::op::{ChatMessage, FinishReason, Model, Response, ResponseToolCall};
 use crate::provider::{ChatProvider, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -193,6 +193,10 @@ fn parse_messages_response(text: &str) -> Result<Response> {
     Ok(Response {
         content,
         tool_calls,
+        finish_reason: response
+            .stop_reason
+            .as_deref()
+            .map(FinishReason::from_provider),
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
         total_tokens: response.usage.input_tokens + response.usage.output_tokens,
@@ -202,6 +206,7 @@ fn parse_messages_response(text: &str) -> Result<Response> {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContentBlock>,
+    stop_reason: Option<String>,
     usage: AnthropicUsage,
 }
 
