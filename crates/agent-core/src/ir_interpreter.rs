@@ -945,20 +945,7 @@ mod tests {
     }
 
     fn config(provider: Arc<dyn ChatProvider>) -> SeqConfig {
-        SeqConfig {
-            provider,
-            hydration: SourceRegistry::new(),
-            passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
-            trace: test_trace(),
-            eval: EvalConfig::default(),
-            replay: None,
-            trace_full_prompt_ir: false,
-            gc: GcMode::None,
-            gc_threshold: 0.85,
-            gc_log: false,
-            context_budget: 200_000,
-        }
+        config_with_trace(provider, test_trace())
     }
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {

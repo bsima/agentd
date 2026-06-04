@@ -596,16 +596,24 @@ mod tests {
         }
     }
 
+    fn test_trace() -> TraceLogger {
+        TraceLogger::new(
+            Uuid::new_v4().to_string(),
+            std::env::temp_dir().join(format!("agent-ir-loop-{}.jsonl", Uuid::new_v4())),
+        )
+    }
+
     fn config(provider: Arc<dyn ChatProvider>) -> SeqConfig {
+        config_with_trace(provider, test_trace())
+    }
+
+    fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
             checkpoint_path: None,
-            trace: TraceLogger::new(
-                Uuid::new_v4().to_string(),
-                std::env::temp_dir().join(format!("agent-ir-loop-{}.jsonl", Uuid::new_v4())),
-            ),
+            trace,
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
