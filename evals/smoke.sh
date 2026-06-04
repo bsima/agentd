@@ -28,7 +28,7 @@ cat >"$trace" <<'JSONL'
 {"event":"HydrationStart","run_id":"smoke-replay","op_id":1,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"smoke-replay","op_id":1,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"smoke-replay","op_id":2,"model":"ignored","prompt":[],"prompt_preview":"smoke","timestamp":"2026-01-01T00:00:00Z"}
-{"event":"InferResult","run_id":"smoke-replay","op_id":2,"response":{"content":"agentd-eval-smoke","tool_calls":[],"tokens":1},"response_preview":"agentd-eval-smoke","tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"InferResult","run_id":"smoke-replay","op_id":2,"response":{"content":"agentd-eval-smoke","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"agentd-eval-smoke","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
 output="$({ env -u AGENT_API_KEY -u OPENROUTER_API_KEY "$agent_bin" \

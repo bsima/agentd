@@ -13,7 +13,7 @@ cat >"$fixture" <<'JSONL'
 {"event":"HydrationStart","run_id":"fixture","op_id":1,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"fixture","op_id":1,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"fixture","op_id":2,"model":"foo","prompt":[],"prompt_preview":"diverge","timestamp":"2026-01-01T00:00:00Z"}
-{"event":"InferResult","run_id":"fixture","op_id":2,"response":{"content":"should-not-print","tool_calls":[],"tokens":1},"response_preview":"should-not-print","tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"InferResult","run_id":"fixture","op_id":2,"response":{"content":"should-not-print","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"should-not-print","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
 set +e

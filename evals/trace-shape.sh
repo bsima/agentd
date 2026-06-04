@@ -14,7 +14,7 @@ cat >"$fixture" <<'JSONL'
 {"event":"HydrationStart","run_id":"fixture","op_id":1,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"fixture","op_id":1,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"fixture","op_id":2,"model":"ignored","prompt":[],"prompt_preview":"trace","timestamp":"2026-01-01T00:00:00Z"}
-{"event":"InferResult","run_id":"fixture","op_id":2,"response":{"content":"trace-shape","tool_calls":[],"tokens":3},"response_preview":"trace-shape","tokens":3,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"InferResult","run_id":"fixture","op_id":2,"response":{"content":"trace-shape","tool_calls":[],"input_tokens":1,"output_tokens":2,"total_tokens":3},"response_preview":"trace-shape","input_tokens":1,"output_tokens":2,"total_tokens":3,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
 hydration_dir="$workdir/hydration"
