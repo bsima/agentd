@@ -36,8 +36,8 @@ pub use ir_interpreter::{
 };
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
-    agent_loop, emit, eval, get, infer, par, put, ChatMessage, Model, Op, OpF, Prompt, Response,
-    ResponseToolCall,
+    agent_loop, emit, eval, get, infer, par, put, ChatMessage, FinishReason, Model, Op, OpF,
+    Prompt, Response, ResponseToolCall,
 };
 pub use prompt_ir::{
     collect_prompt_ir_sections, compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash,

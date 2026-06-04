@@ -1,5 +1,5 @@
 use agent_core::provider::ToolSpec;
-use agent_core::{ChatMessage, ChatProvider, Model, Response, ResponseToolCall};
+use agent_core::{ChatMessage, ChatProvider, FinishReason, Model, Response, ResponseToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -626,6 +626,7 @@ struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: AssistantMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,6 +839,7 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
     Ok(Response {
         content,
         tool_calls,
+        finish_reason: Some(FinishReason::Stop),
         input_tokens,
         output_tokens,
         total_tokens,
@@ -1003,6 +1005,10 @@ fn parse_chat_response(text: &str) -> Result<Response> {
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     Ok(Response {
         content: choice.message.content.unwrap_or_default(),
+        finish_reason: choice
+            .finish_reason
+            .as_deref()
+            .map(FinishReason::from_provider),
         tool_calls: choice
             .message
             .tool_calls

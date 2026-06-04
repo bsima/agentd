@@ -1,4 +1,4 @@
-use crate::op::{ChatMessage, Model, Response, ResponseToolCall};
+use crate::op::{ChatMessage, FinishReason, Model, Response, ResponseToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
@@ -219,6 +219,10 @@ impl ProviderClient {
         let total_tokens = usage
             .total_tokens
             .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        let finish_reason = choice
+            .finish_reason
+            .as_deref()
+            .map(FinishReason::from_provider);
         let content = choice.message.content.unwrap_or_default();
         let tool_calls: Vec<ResponseToolCall> = choice
             .message
@@ -238,7 +242,10 @@ impl ProviderClient {
         // (`agent_complete{response:""}`), silently terminating an otherwise
         // active run. Treat this as a retryable error so the backoff loop
         // re-requests the turn (with a continuation nudge — t-1071).
-        if content.trim().is_empty() && tool_calls.is_empty() {
+        if content.trim().is_empty()
+            && tool_calls.is_empty()
+            && !matches!(finish_reason.as_ref(), Some(FinishReason::Stop))
+        {
             // Log the full raw body so we can confirm it is genuinely empty
             // rather than a parse/serialization bug on our side (t-1071).
             tracing::warn!(raw_response = %text, "provider returned empty completion");
@@ -248,6 +255,7 @@ impl ProviderClient {
         Ok(Response {
             content,
             tool_calls,
+            finish_reason,
             input_tokens,
             output_tokens,
             total_tokens,
@@ -362,6 +370,7 @@ struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: AssistantMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,6 +407,7 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls: Vec::new(),
+            finish_reason: Some(FinishReason::Stop),
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,

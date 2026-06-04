@@ -933,6 +933,7 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls: Vec::<ResponseToolCall>::new(),
+            finish_reason: Some(crate::op::FinishReason::Stop),
             input_tokens: 0,
             output_tokens: 1,
             total_tokens: 1,

@@ -783,6 +783,7 @@ mod tests {
         Response {
             content: content.into(),
             tool_calls,
+            finish_reason: Some(crate::op::FinishReason::Stop),
             input_tokens: 3,
             output_tokens: 4,
             total_tokens: 7,

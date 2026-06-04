@@ -10,6 +10,32 @@ pub type Prompt = Vec<ChatMessage>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model(pub String);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+    Other(String),
+}
+
+impl FinishReason {
+    pub fn from_provider(value: impl AsRef<str>) -> Self {
+        match value.as_ref() {
+            "stop" | "end_turn" => Self::Stop,
+            "tool_calls" | "tool_use" => Self::ToolCalls,
+            "length" | "max_tokens" => Self::Length,
+            "content_filter" => Self::ContentFilter,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     #[serde(default = "Uuid::new_v4")]
@@ -77,6 +103,8 @@ impl ChatMessage {
 pub struct Response {
     pub content: String,
     pub tool_calls: Vec<ResponseToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
@@ -254,8 +282,26 @@ pub fn par<S: Send + 'static>(ops: Vec<Op<S, ()>>) -> Op<S, Vec<()>> {
 
 pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, Response> {
     infer(model.clone(), prompt.clone()).and_then(move |response| {
-        if response.tool_calls.is_empty() || max_turns == 0 {
+        let can_stop = response
+            .finish_reason
+            .as_ref()
+            .is_some_and(FinishReason::is_stop)
+            && response.tool_calls.is_empty()
+            && !has_pending_tool_calls(&prompt);
+        if can_stop || max_turns == 0 {
             Op::pure(response)
+        } else if response.tool_calls.is_empty() {
+            let mut history = prompt.clone();
+            if !response.content.is_empty() {
+                history.push(ChatMessage::assistant(
+                    Some(response.content.clone()),
+                    Vec::new(),
+                ));
+            }
+            history.push(ChatMessage::user(CONTINUE_NUDGE));
+            let value = serde_json::to_value(&history).unwrap_or(Value::Null);
+            put("temporal:history", value)
+                .and_then(move |_| agent_loop(model, history, max_turns - 1))
         } else {
             let calls = response.tool_calls.clone();
             get("temporal:history").and_then(move |value| {
@@ -293,6 +339,23 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
     })
 }
 
+const CONTINUE_NUDGE: &str =
+    "Your previous response did not finish the turn. Continue the task: if work remains, issue \
+     the next tool call; if the task is complete, say so explicitly.";
+
+fn has_pending_tool_calls(prompt: &[ChatMessage]) -> bool {
+    let mut pending = std::collections::BTreeSet::new();
+    for message in prompt {
+        if let Some(tool_calls) = &message.tool_calls {
+            pending.extend(tool_calls.iter().map(|call| call.id.clone()));
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            pending.remove(tool_call_id);
+        }
+    }
+    !pending.is_empty()
+}
+
 fn command_from_tool_call(call: &ResponseToolCall) -> std::result::Result<String, Value> {
     if call.name() != "shell" {
         return Err(serde_json::json!({
@@ -324,10 +387,23 @@ mod tests {
     use crate::trace::TraceLogger;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     struct NoopProvider;
+
+    struct QueueProvider {
+        responses: Mutex<VecDeque<Response>>,
+    }
+
+    impl QueueProvider {
+        fn new(responses: Vec<Response>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+            }
+        }
+    }
 
     #[async_trait]
     impl ChatProvider for NoopProvider {
@@ -340,6 +416,33 @@ mod tests {
             Err(anyhow!(
                 "noop provider should not be called by pure Op tests"
             ))
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for QueueProvider {
+        async fn chat(
+            &self,
+            _model: &Model,
+            _tools: &[ToolSpec],
+            _messages: &[ChatMessage],
+        ) -> Result<Response> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow!("no queued response"))
+        }
+    }
+
+    fn response_with_finish(content: &str, finish_reason: Option<FinishReason>) -> Response {
+        Response {
+            content: content.into(),
+            tool_calls: Vec::new(),
+            finish_reason,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
         }
     }
 
@@ -368,6 +471,13 @@ mod tests {
             gc_threshold: 0.85,
             gc_log: false,
             context_budget: 200_000,
+        }
+    }
+
+    fn seq_config_with_provider(provider: Arc<dyn ChatProvider>) -> SeqConfig {
+        SeqConfig {
+            provider,
+            ..seq_config()
         }
     }
 
@@ -476,6 +586,46 @@ mod tests {
             command_from_tool_call(&empty).unwrap_err()["error"],
             serde_json::json!("invalid_arguments")
         );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_nudges_empty_non_stop_turn_instead_of_completing() -> Result<()> {
+        let provider = Arc::new(QueueProvider::new(vec![
+            response_with_finish("", Some(FinishReason::Other("length".into()))),
+            response_with_finish("done", Some(FinishReason::Stop)),
+        ]));
+        let op = agent_loop(Model("model".into()), vec![ChatMessage::user("work")], 3);
+
+        let (response, _state) = run_sequential(
+            &seq_config_with_provider(provider),
+            vec![ChatMessage::user("work")],
+            op,
+        )
+        .await?;
+
+        assert_eq!(response.content, "done");
+        assert_eq!(response.finish_reason, Some(FinishReason::Stop));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_allows_clean_empty_stop_to_complete() -> Result<()> {
+        let provider = Arc::new(QueueProvider::new(vec![response_with_finish(
+            "",
+            Some(FinishReason::Stop),
+        )]));
+        let op = agent_loop(Model("model".into()), vec![ChatMessage::user("work")], 3);
+
+        let (response, _state) = run_sequential(
+            &seq_config_with_provider(provider),
+            vec![ChatMessage::user("work")],
+            op,
+        )
+        .await?;
+
+        assert_eq!(response.content, "");
+        assert_eq!(response.finish_reason, Some(FinishReason::Stop));
+        Ok(())
     }
 
     #[tokio::test]
