@@ -129,6 +129,8 @@ enum RuntimeMode {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print GC statistics from a trace JSONL file.
+    GcStats { trace: PathBuf },
     #[cfg(feature = "oauth")]
     Auth {
         #[command(subcommand)]
@@ -560,8 +562,164 @@ async fn resolve_model(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct GcFireStats {
+    index: usize,
+    strategy: String,
+    tokens_before: u64,
+    tokens_after: u64,
+    cache_invalidated: bool,
+    dropped_count: Option<u64>,
+}
+
+impl GcFireStats {
+    fn reclaimed(&self) -> u64 {
+        self.tokens_before.saturating_sub(self.tokens_after)
+    }
+
+    fn reduction_pct(&self) -> f64 {
+        if self.tokens_before == 0 {
+            0.0
+        } else {
+            (self.reclaimed() as f64 / self.tokens_before as f64) * 100.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GcStatsReport {
+    fires: Vec<GcFireStats>,
+}
+
+impl GcStatsReport {
+    fn from_events(events: &[Event]) -> Self {
+        let fires = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_collect" => Some(data),
+                _ => None,
+            })
+            .enumerate()
+            .map(|(idx, data)| GcFireStats {
+                index: idx + 1,
+                strategy: data
+                    .get("strategy")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                tokens_before: data
+                    .get("tokens_before")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                tokens_after: data
+                    .get("tokens_after")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                cache_invalidated: data
+                    .get("cache_invalidated")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                dropped_count: data.get("dropped_count").and_then(|value| value.as_u64()),
+            })
+            .collect();
+        Self { fires }
+    }
+
+    fn fire_count(&self) -> usize {
+        self.fires.len()
+    }
+
+    fn total_reclaimed(&self) -> u64 {
+        self.fires.iter().map(GcFireStats::reclaimed).sum()
+    }
+
+    fn cache_invalidation_count(&self) -> usize {
+        self.fires
+            .iter()
+            .filter(|fire| fire.cache_invalidated)
+            .count()
+    }
+
+    fn mean_reduction_pct(&self) -> Option<f64> {
+        (!self.fires.is_empty()).then(|| {
+            self.fires
+                .iter()
+                .map(GcFireStats::reduction_pct)
+                .sum::<f64>()
+                / self.fires.len() as f64
+        })
+    }
+
+    fn median_reduction_pct(&self) -> Option<f64> {
+        if self.fires.is_empty() {
+            return None;
+        }
+        let mut reductions: Vec<f64> = self.fires.iter().map(GcFireStats::reduction_pct).collect();
+        reductions.sort_by(f64::total_cmp);
+        let mid = reductions.len() / 2;
+        Some(if reductions.len().is_multiple_of(2) {
+            (reductions[mid - 1] + reductions[mid]) / 2.0
+        } else {
+            reductions[mid]
+        })
+    }
+
+    fn render(&self) -> String {
+        if self.fires.is_empty() {
+            return "GC never fired in this trace\n".to_owned();
+        }
+
+        let mut out = String::new();
+        out.push_str(&format!("GC fires: {}\n", self.fire_count()));
+        out.push_str(
+            "\n#  strategy    tokens before -> after  reduction  cache invalidated  dropped\n",
+        );
+        for fire in &self.fires {
+            let dropped = fire
+                .dropped_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "n/a".to_owned());
+            out.push_str(&format!(
+                "{:<2} {:<11} {:>8} -> {:<8} {:>6.1}%   {:<17} {}\n",
+                fire.index,
+                fire.strategy,
+                fire.tokens_before,
+                fire.tokens_after,
+                fire.reduction_pct(),
+                fire.cache_invalidated,
+                dropped
+            ));
+        }
+        out.push_str("\nSummary:\n");
+        out.push_str(&format!(
+            "  total tokens reclaimed: {}\n",
+            self.total_reclaimed()
+        ));
+        out.push_str(&format!(
+            "  cache-invalidating fires: {}\n",
+            self.cache_invalidation_count()
+        ));
+        out.push_str(&format!(
+            "  mean reduction: {:.1}%\n",
+            self.mean_reduction_pct().unwrap_or(0.0)
+        ));
+        out.push_str(&format!(
+            "  median reduction: {:.1}%\n",
+            self.median_reduction_pct().unwrap_or(0.0)
+        ));
+        out
+    }
+}
+
+async fn run_gc_stats_command(trace: &Path) -> Result<()> {
+    let events = TraceLogger::read_events(trace).await?;
+    print!("{}", GcStatsReport::from_events(&events).render());
+    Ok(())
+}
+
 async fn run_command(command: &Command) -> Result<()> {
     match command {
+        Command::GcStats { trace } => run_gc_stats_command(trace).await,
         #[cfg(feature = "oauth")]
         Command::Auth { command } => run_auth_command(command).await,
         #[cfg(not(feature = "oauth"))]
@@ -1151,5 +1309,62 @@ mod tests {
         assert_eq!(resolved.api_id, "openrouter/auto");
         assert_eq!(resolved.provider, None);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gc_stats_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn custom_gc(tokens_before: u64, tokens_after: u64, cache_invalidated: bool) -> Event {
+        Event::Custom {
+            run_id: "run".into(),
+            name: "gc_collect".into(),
+            data: serde_json::json!({
+                "type": "gc_collect",
+                "strategy": "ring",
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "cache_invalidated": cache_invalidated,
+                "dropped_count": 2,
+            }),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn gc_stats_computes_aggregates_from_trace_events() {
+        let events = vec![
+            Event::AgentDone {
+                run_id: "run".into(),
+                timestamp: Utc::now(),
+            },
+            custom_gc(100, 60, false),
+            custom_gc(200, 100, true),
+        ];
+
+        let report = GcStatsReport::from_events(&events);
+
+        assert_eq!(report.fire_count(), 2);
+        assert_eq!(report.total_reclaimed(), 140);
+        assert_eq!(report.cache_invalidation_count(), 1);
+        assert_eq!(report.mean_reduction_pct(), Some(45.0));
+        assert_eq!(report.median_reduction_pct(), Some(45.0));
+        assert!(report.render().contains("GC fires: 2"));
+        assert!(report.render().contains("total tokens reclaimed: 140"));
+    }
+
+    #[test]
+    fn gc_stats_reports_zero_fire_case_clearly() {
+        let events = vec![Event::AgentDone {
+            run_id: "run".into(),
+            timestamp: Utc::now(),
+        }];
+
+        let report = GcStatsReport::from_events(&events);
+
+        assert_eq!(report.fire_count(), 0);
+        assert_eq!(report.render(), "GC never fired in this trace\n");
     }
 }

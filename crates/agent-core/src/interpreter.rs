@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -422,7 +422,10 @@ pub(crate) async fn maybe_collect_prompt(
     }
     let target_budget = threshold.max(1);
     truncate_oversized_message(&mut prompt, target_budget);
+    let before_ids: BTreeSet<_> = prompt.iter().map(|message| message.id).collect();
     let collected = config.gc.collect(prompt, target_budget, gc_state);
+    let after_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
+    let dropped_count = before_ids.difference(&after_ids).count();
     let after_tokens = estimate_tokens(&collected);
     if config.gc_log {
         config
@@ -436,6 +439,7 @@ pub(crate) async fn maybe_collect_prompt(
                     "tokens_before": before_tokens,
                     "tokens_after": after_tokens,
                     "cache_invalidated": !config.gc.cache_preserving(),
+                    "dropped_count": dropped_count,
                 }),
                 timestamp: Utc::now(),
             })
