@@ -927,7 +927,7 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             (response, history)
         }
     };
-    if !response.content.is_empty() || response.tool_calls.is_empty() {
+    if !response.content.is_empty() || !response.tool_calls.is_empty() {
         new_history.push(ChatMessage::assistant(
             (!response.content.is_empty()).then_some(response.content.clone()),
             response.tool_calls.clone(),

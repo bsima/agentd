@@ -746,6 +746,15 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
         Expr::Or { left, right } => Ok(Value::Bool(
             bool_expr(env, left, "Or.left")? || bool_expr(env, right, "Or.right")?,
         )),
+        Expr::And { left, right } => Ok(Value::Bool(
+            bool_expr(env, left, "And.left")? && bool_expr(env, right, "And.right")?,
+        )),
+        Expr::HasPendingToolCalls { base } => {
+            let value = env
+                .get(base)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", base))?;
+            Ok(Value::Bool(has_pending_tool_calls(value)?))
+        }
         Expr::Add { left, right } => Ok(Value::Number(
             (number_expr(env, left, "Add.left")? + number_expr(env, right, "Add.right")?).into(),
         )),
@@ -791,6 +800,26 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
             Ok(Value::Object(object))
         }
     }
+}
+
+fn has_pending_tool_calls(value: &Value) -> Result<bool> {
+    let messages = value
+        .as_array()
+        .ok_or_else(|| anyhow!("AgentIR HasPendingToolCalls expected array, got {value}"))?;
+    let mut pending = std::collections::BTreeSet::new();
+    for message in messages {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            pending.extend(tool_calls.iter().filter_map(|call| {
+                call.get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            }));
+        }
+        if let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+            pending.remove(tool_call_id);
+        }
+    }
+    Ok(!pending.is_empty())
 }
 
 fn string_expr(env: &BTreeMap<Var, Value>, expr: &Expr, label: &str) -> Result<String> {

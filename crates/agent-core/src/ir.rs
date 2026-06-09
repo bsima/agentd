@@ -195,6 +195,13 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    And {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    HasPendingToolCalls {
+        base: Var,
+    },
     Add {
         left: Box<Expr>,
         right: Box<Expr>,
@@ -551,9 +558,10 @@ fn validate_expr_vars(
     match expr {
         Expr::Value(_) => Ok(()),
         Expr::Var(var) => validate_var(var, defined, block_id),
-        Expr::Field { base, .. } | Expr::Len { base } | Expr::IsEmpty { base } => {
-            validate_var(base, defined, block_id)
-        }
+        Expr::Field { base, .. }
+        | Expr::Len { base }
+        | Expr::IsEmpty { base }
+        | Expr::HasPendingToolCalls { base } => validate_var(base, defined, block_id),
         Expr::FieldOr { base, default, .. } => {
             validate_var(base, defined, block_id)?;
             validate_expr_vars(default, defined, block_id)
@@ -569,6 +577,7 @@ fn validate_expr_vars(
         Expr::Eq { left, right }
         | Expr::Lt { left, right }
         | Expr::Or { left, right }
+        | Expr::And { left, right }
         | Expr::Add { left, right }
         | Expr::Sub { left, right } => {
             validate_expr_vars(left, defined, block_id)?;

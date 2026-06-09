@@ -26,6 +26,11 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let response = Var("response".into());
     let tool_calls = Var("tool_calls".into());
     let no_tool_calls = Var("no_tool_calls".into());
+    let finish_reason = Var("finish_reason".into());
+    let is_stop = Var("is_stop".into());
+    let has_pending_tool_calls = Var("has_pending_tool_calls".into());
+    let no_pending_tool_calls = Var("no_pending_tool_calls".into());
+    let can_stop = Var("can_stop".into());
     let no_turns_left = Var("no_turns_left".into());
     let should_return = Var("should_return".into());
     let history_with_assistant = Var("history_with_assistant".into());
@@ -81,6 +86,44 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     },
                 },
                 Instr::Let {
+                    out: finish_reason.clone(),
+                    expr: Expr::FieldOr {
+                        base: response.clone(),
+                        field: "finish_reason".into(),
+                        default: Box::new(Expr::Value(Value::Null)),
+                    },
+                },
+                Instr::Let {
+                    out: is_stop.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(finish_reason)),
+                        right: Box::new(Expr::Value(Value::String("stop".into()))),
+                    },
+                },
+                Instr::Let {
+                    out: has_pending_tool_calls.clone(),
+                    expr: Expr::HasPendingToolCalls {
+                        base: history.clone(),
+                    },
+                },
+                Instr::Let {
+                    out: no_pending_tool_calls.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(has_pending_tool_calls)),
+                        right: Box::new(Expr::Value(Value::Bool(false))),
+                    },
+                },
+                Instr::Let {
+                    out: can_stop.clone(),
+                    expr: Expr::And {
+                        left: Box::new(Expr::And {
+                            left: Box::new(Expr::Var(is_stop)),
+                            right: Box::new(Expr::Var(no_tool_calls)),
+                        }),
+                        right: Box::new(Expr::Var(no_pending_tool_calls)),
+                    },
+                },
+                Instr::Let {
                     out: no_turns_left.clone(),
                     expr: Expr::Eq {
                         left: Box::new(Expr::Var(turns_left.clone())),
@@ -90,7 +133,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                 Instr::Let {
                     out: should_return.clone(),
                     expr: Expr::Or {
-                        left: Box::new(Expr::Var(no_tool_calls)),
+                        left: Box::new(Expr::Var(can_stop)),
                         right: Box::new(Expr::Var(no_turns_left)),
                     },
                 },
@@ -548,7 +591,7 @@ mod tests {
     use crate::ir::validate_program;
     use crate::op::{ChatMessage, Response, ResponseToolCall};
     use crate::provider::{ChatProvider, ToolSpec};
-    use crate::trace::TraceLogger;
+    use crate::trace::{Event, TraceLogger, TraceSummary};
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -716,6 +759,45 @@ mod tests {
         let (value, _machine) =
             crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
 
+        assert_eq!(value["content"], Value::String("done".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_stop_with_tool_call_dispatches_before_finishing() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ResponseToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({ "command": "printf ir-loop" }),
+                )],
+            ),
+            response("done", vec![]),
+        ]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("use shell"),
+            ],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config_with_trace(provider, trace), machine)
+                .await?;
+
+        let events = TraceLogger::read_events(trace_path).await?;
+        let summary = TraceSummary::from_events(&events);
+        assert_eq!(summary.eval_calls, 1);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::Custom { name, .. } if name == "agent_complete"
+        )));
         assert_eq!(value["content"], Value::String("done".into()));
         Ok(())
     }
