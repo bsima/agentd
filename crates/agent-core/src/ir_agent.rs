@@ -59,6 +59,8 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let infer_prompt_text = Var("infer_prompt_text".into());
     let infer_prompt = Var("infer_prompt".into());
     let infer_result = Var("infer_result".into());
+    let infer_content = Var("infer_content".into());
+    let infer_content_empty = Var("infer_content_empty".into());
     let tool_content = Var("tool_content".into());
     let tool_message = Var("tool_message".into());
     let next_history = Var("next_history".into());
@@ -512,10 +514,36 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     prompt: PromptRef::Var(infer_prompt),
                     policy: Default::default(),
                 },
+                // Feed back the sub-response *text*, not the serialized
+                // Response envelope (token counts, finish_reason, ids) — the
+                // envelope wastes context and teaches the model to imitate
+                // it. Fall back to the envelope only when there is no text
+                // (e.g. the sub-infer answered with tool calls).
+                Instr::Let {
+                    out: infer_content.clone(),
+                    expr: Expr::StringOr {
+                        value: Box::new(Expr::FieldOr {
+                            base: infer_result.clone(),
+                            field: "content".into(),
+                            default: Box::new(Expr::Value(Value::String("".into()))),
+                        }),
+                        default: Box::new(Expr::Value(Value::String("".into()))),
+                    },
+                },
+                Instr::Let {
+                    out: infer_content_empty.clone(),
+                    expr: Expr::IsEmpty {
+                        base: infer_content.clone(),
+                    },
+                },
                 Instr::Let {
                     out: tool_content.clone(),
-                    expr: Expr::ToString {
-                        value: Box::new(Expr::Var(infer_result)),
+                    expr: Expr::If {
+                        cond: Box::new(Expr::Var(infer_content_empty)),
+                        then_value: Box::new(Expr::ToString {
+                            value: Box::new(Expr::Var(infer_result)),
+                        }),
+                        else_value: Box::new(Expr::Var(infer_content)),
                     },
                 },
             ],
@@ -789,9 +817,19 @@ mod tests {
         );
 
         let (value, _machine) =
-            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
 
         assert_eq!(value["content"], Value::String("done".into()));
+        // The tool result fed back to the model must be the sub-response
+        // text, not the serialized Response envelope.
+        let prompts = provider.prompts();
+        let tool_message = prompts
+            .last()
+            .unwrap()
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("infer tool result in final prompt");
+        assert_eq!(tool_message.content.as_deref(), Some("sub answer"));
         Ok(())
     }
 
