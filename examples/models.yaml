@@ -56,6 +56,9 @@ models:
     input: 15.0
     output: 75.0
     context: 1000000
+    # Optional per-response output token cap (anthropic provider only;
+    # defaults to 8192 when unset).
+    max_tokens: 32000
     thinking: true
     vision: true
     display: Claude Opus 4.8 via Claude Code OAuth
@@ -89,6 +92,9 @@ models:
     input: 15.0
     output: 75.0
     context: 1000000
+    # Optional per-response output token cap (anthropic provider only;
+    # defaults to 8192 when unset).
+    max_tokens: 32000
     thinking: true
     vision: true
     display: Claude Opus 4.8 via Anthropic API key

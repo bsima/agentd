@@ -371,6 +371,7 @@ async fn main() -> Result<()> {
                 base_url: url.clone(),
                 api_key: api_key.expect("api_key is set for non-OAuth providers"),
                 model: agent_core::Model(model.clone()),
+                max_tokens: resolved_model.max_tokens,
             })),
             None => Arc::new(ProviderClient::new(ProviderConfig {
                 url: url.clone(),
@@ -579,6 +580,7 @@ fn resolve_model_from(
                 base_url: None,
                 api_key: None,
                 context: 200_000,
+                max_tokens: None,
             })
         }
         Err(err) => Err(err.context(

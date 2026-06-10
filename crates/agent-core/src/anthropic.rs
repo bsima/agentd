@@ -18,6 +18,10 @@ pub struct AnthropicConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: Model,
+    /// Per-response output token cap. Defaults to `DEFAULT_MAX_TOKENS` when
+    /// unset; configure via the model registry (`max_tokens` in models.yaml)
+    /// for models that need longer completions.
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -56,14 +60,15 @@ impl ChatProvider for AnthropicProvider {
             ));
         }
         let url = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
+        let max_tokens = self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         chat_with_retries(
             |nudge| {
                 if nudge {
                     let mut messages = messages.to_vec();
                     messages.push(ChatMessage::user(CONTINUE_NUDGE));
-                    build_messages_body(model, tools, &messages)
+                    build_messages_body(model, tools, &messages, max_tokens)
                 } else {
-                    build_messages_body(model, tools, messages)
+                    build_messages_body(model, tools, messages, max_tokens)
                 }
             },
             |body| {
@@ -126,7 +131,12 @@ impl AnthropicProvider {
     }
 }
 
-fn build_messages_body(model: &Model, tools: &[ToolSpec], messages: &[ChatMessage]) -> Value {
+fn build_messages_body(
+    model: &Model,
+    tools: &[ToolSpec],
+    messages: &[ChatMessage],
+    max_tokens: u32,
+) -> Value {
     let system = messages
         .iter()
         .filter(|message| message.role == "system")
@@ -142,11 +152,17 @@ fn build_messages_body(model: &Model, tools: &[ToolSpec], messages: &[ChatMessag
 
     let mut body = json!({
         "model": model.0,
-        "max_tokens": DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "messages": anthropic_messages,
     });
     if !system.is_empty() {
-        body["system"] = json!(system);
+        // The system prompt is the long stable prefix of every request in a
+        // session - mark it cacheable so repeated turns hit the prompt cache.
+        body["system"] = json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": { "type": "ephemeral" },
+        }]);
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools.iter().map(tool_to_anthropic).collect::<Vec<_>>());
@@ -221,7 +237,10 @@ fn parse_messages_response(text: &str) -> Result<Response> {
             .map(FinishReason::from_provider),
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
-        total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+        total_tokens: response
+            .usage
+            .input_tokens
+            .saturating_add(response.usage.output_tokens),
     })
 }
 
@@ -303,11 +322,23 @@ mod tests {
             },
         }];
 
-        let body = build_messages_body(&Model("claude-opus-4-8".into()), &tools, &messages);
+        let body = build_messages_body(
+            &Model("claude-opus-4-8".into()),
+            &tools,
+            &messages,
+            DEFAULT_MAX_TOKENS,
+        );
 
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
-        assert_eq!(body["system"], "system one\n\nsystem two");
+        assert_eq!(
+            body["system"],
+            json!([{
+                "type": "text",
+                "text": "system one\n\nsystem two",
+                "cache_control": { "type": "ephemeral" },
+            }])
+        );
         assert_eq!(
             body["messages"],
             json!([

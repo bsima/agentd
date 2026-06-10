@@ -15,6 +15,9 @@ pub struct ModelEntry {
     pub output: f64,
     #[serde(default = "default_context")]
     pub context: usize,
+    /// Optional per-response output token cap for providers that need one
+    /// (the anthropic provider defaults to 8192 when unset).
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub thinking: bool,
     #[serde(default)]
@@ -36,6 +39,7 @@ pub struct ResolvedModel {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub context: usize,
+    pub max_tokens: Option<u32>,
 }
 
 impl ModelRegistry {
@@ -66,6 +70,7 @@ impl ModelRegistry {
                 base_url: entry.base_url.clone(),
                 api_key: expand_api_key(entry.api_key.as_deref())?,
                 context: entry.context,
+                max_tokens: entry.max_tokens,
             }),
             None => Ok(ResolvedModel {
                 alias: alias.to_string(),
@@ -74,6 +79,7 @@ impl ModelRegistry {
                 base_url: None,
                 api_key: None,
                 context: default_context(),
+                max_tokens: None,
             }),
         }
     }
@@ -124,6 +130,7 @@ models:
   input: 0.5
   output: 2.0
   context: 131072
+  max_tokens: 32000
   thinking: false
   vision: false
   display: Qwen3 235B (parasail)
@@ -145,6 +152,9 @@ models:
             Some("https://api.parasail.io/v1")
         );
         assert_eq!(resolved.api_key.as_deref(), Some("literal-key"));
+        assert_eq!(resolved.max_tokens, Some(32000));
+        // Entries without the field resolve to None (provider default).
+        assert_eq!(registry.resolve(Some("direct-name"))?.max_tokens, None);
         Ok(())
     }
 
