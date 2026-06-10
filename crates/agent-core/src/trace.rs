@@ -542,6 +542,10 @@ pub trait TraceSink: Send + Sync {
 pub struct JsonlTraceSink {
     path: PathBuf,
     mirror_stdout: bool,
+    /// Lazily-opened append handle, shared across clones so a long session
+    /// does not reopen the trace file on every event. The mutex also
+    /// serializes writers, keeping each JSONL line atomic.
+    file: Arc<tokio::sync::Mutex<Option<tokio::fs::File>>>,
 }
 
 impl JsonlTraceSink {
@@ -549,6 +553,7 @@ impl JsonlTraceSink {
         Self {
             path,
             mirror_stdout: false,
+            file: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -561,17 +566,24 @@ impl JsonlTraceSink {
 #[async_trait]
 impl TraceSink for JsonlTraceSink {
     async fn emit(&self, event: &Event) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
         let line = serde_json::to_string(event)?;
+        let mut guard = self.file.lock().await;
+        if guard.is_none() {
+            if let Some(parent) = self.path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            *guard = Some(
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .await?,
+            );
+        }
+        let file = guard.as_mut().expect("handle opened above");
         file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
+        drop(guard);
         if self.mirror_stdout {
             let mut stdout = tokio::io::stdout();
             stdout.write_all(line.as_bytes()).await?;
@@ -966,6 +978,24 @@ mod tests {
             std::slice::from_ref(&event)
         );
         assert_eq!(TraceLogger::read_events(&path).await?, vec![event]);
+        let _ = tokio::fs::remove_file(path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_appends_many_events_through_one_handle() -> Result<()> {
+        let run_id = Uuid::new_v4().to_string();
+        let path = std::env::temp_dir().join(format!("trace-handle-test-{run_id}.jsonl"));
+        let sink = JsonlTraceSink::new(path.clone());
+        // Clones share the handle; interleave writes through both.
+        let clone = sink.clone();
+        for i in 0..50 {
+            let target = if i % 2 == 0 { &sink } else { &clone };
+            target.emit(&done_event(&run_id)).await?;
+        }
+
+        let events = TraceLogger::read_events(&path).await?;
+        assert_eq!(events.len(), 50);
         let _ = tokio::fs::remove_file(path).await;
         Ok(())
     }
