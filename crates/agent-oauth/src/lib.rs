@@ -403,23 +403,18 @@ impl OAuthChatProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        // Shared body builder: strips internal message ids and adapts neutral
-        // tool calls to the OpenAI wire shape.
-        let body = agent_core::provider::openai_chat_body(model, tools, messages);
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(anyhow!("OAuth provider returned {status}: {text}"));
-        }
-        parse_chat_response(&text)
+        // Shared transport: wire adaptation (no internal ids), bounded
+        // retry/backoff, and the empty-completion nudge — identical to the
+        // API-key provider path.
+        agent_core::provider::openai_compatible_chat(
+            &self.client,
+            &self.base_url,
+            token,
+            model,
+            tools,
+            messages,
+        )
+        .await
     }
 
     async fn chat_codex(
@@ -617,43 +612,6 @@ fn parse_token(text: &str) -> Result<OAuthToken> {
         }),
         token_type: token.token_type,
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletion {
-    choices: Vec<Choice>,
-    usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: AssistantMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssistantMessage {
-    content: Option<String>,
-    tool_calls: Option<Vec<ApiToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiToolCall {
-    id: String,
-    function: ApiToolFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiToolFunction {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Usage {
-    total_tokens: Option<u32>,
-    prompt_tokens: Option<u32>,
-    completion_tokens: Option<u32>,
 }
 
 const CODEX_DEFAULT_INSTRUCTIONS: &str =
@@ -985,47 +943,6 @@ fn base64_value(byte: u8) -> Option<i16> {
         b'=' => Some(-1),
         _ => None,
     }
-}
-
-fn parse_chat_response(text: &str) -> Result<Response> {
-    let completion: ChatCompletion =
-        serde_json::from_str(text).context("parsing OAuth provider response")?;
-    let choice = completion
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("OAuth provider returned no choices"))?;
-    let usage = completion.usage.unwrap_or(Usage {
-        total_tokens: None,
-        prompt_tokens: None,
-        completion_tokens: None,
-    });
-    let input_tokens = usage.prompt_tokens.unwrap_or_default();
-    let output_tokens = usage.completion_tokens.unwrap_or_default();
-    let total_tokens = usage
-        .total_tokens
-        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
-    Ok(Response {
-        content: choice.message.content.unwrap_or_default(),
-        finish_reason: choice
-            .finish_reason
-            .as_deref()
-            .map(FinishReason::from_provider),
-        tool_calls: choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|call| {
-                let arguments: Value = serde_json::from_str(&call.function.arguments)
-                    .unwrap_or_else(|_| json!({ "raw": call.function.arguments }));
-                ToolCall::new(call.id, call.function.name, arguments)
-            })
-            .collect(),
-        input_tokens,
-        output_tokens,
-        total_tokens,
-    })
 }
 
 #[cfg(test)]

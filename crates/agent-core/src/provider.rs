@@ -18,7 +18,7 @@ const MAX_ATTEMPTS: usize = 3;
 /// squash-commit). Resending the identical request hits the same wall, so the
 /// retry mutates the request with this nudge to break the model out of the
 /// empty-turn collapse. See t-1071.
-const CONTINUE_NUDGE: &str =
+pub(crate) const CONTINUE_NUDGE: &str =
     "Your previous response was empty. Continue the task: if work remains, issue \
      the next tool call; if the task is complete, say so explicitly.";
 
@@ -117,19 +117,45 @@ impl ChatProvider for ProviderClient {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
-        if crate::op::has_pending_tool_calls(messages) {
-            return Err(anyhow::anyhow!(
-                "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
-            ));
-        }
-        let url = format!("{}/chat/completions", self.config.url.trim_end_matches('/'));
-        chat_with_retries(model, tools, messages, |body| {
-            let url = url.clone();
-            async move { self.send_chat_request(&url, &body).await }
-        })
+        openai_compatible_chat(
+            &self.client,
+            &self.config.url,
+            &self.config.api_key,
+            model,
+            tools,
+            messages,
+        )
         .await
-        .map_err(ProviderError::into_anyhow)
     }
+}
+
+/// Full OpenAI-compatible chat call: pending-tool-call guard, wire
+/// adaptation, bounded retry/backoff, and the empty-completion nudge.
+/// Shared by [`ProviderClient`] and the OAuth providers in `agent-oauth` so
+/// every OpenAI-shaped path gets the same transport behavior.
+pub async fn openai_compatible_chat(
+    client: &Client,
+    base_url: &str,
+    bearer_token: &str,
+    model: &Model,
+    tools: &[ToolSpec],
+    messages: &[ChatMessage],
+) -> Result<Response> {
+    if crate::op::has_pending_tool_calls(messages) {
+        return Err(anyhow::anyhow!(
+            "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
+        ));
+    }
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    chat_with_retries(
+        |nudge| build_chat_body(model, tools, messages, nudge),
+        |body| {
+            let url = url.clone();
+            async move { send_chat_request(client, bearer_token, &url, &body).await }
+        },
+    )
+    .await
+    .map_err(ProviderError::into_anyhow)
 }
 
 /// Build the JSON request body for an OpenAI-compatible chat completion.
@@ -165,27 +191,27 @@ fn build_chat_body(
     })
 }
 
-/// Drive the chat request through the bounded backoff loop.
+/// Drive a chat request through the bounded backoff loop.
 ///
-/// On a retryable [`ProviderError::EmptyCompletion`], the *next* request is
-/// mutated with [`CONTINUE_NUDGE`] rather than resending the identical body
-/// (identical resends have not recovered in observed gpt-5.5 cases — t-1071).
-/// If every attempt is exhausted the last error is returned so the run
-/// terminates with a descriptive message instead of a silent empty completion.
-async fn chat_with_retries<F, Fut>(
-    model: &Model,
-    tools: &[ToolSpec],
-    messages: &[ChatMessage],
+/// `build_body` receives a nudge flag: on a retryable
+/// [`ProviderError::EmptyCompletion`], the *next* request is mutated with a
+/// continuation nudge rather than resending the identical body (identical
+/// resends have not recovered in observed gpt-5.5 cases — t-1071). If every
+/// attempt is exhausted the last error is returned so the run terminates
+/// with a descriptive message instead of a silent empty completion.
+pub(crate) async fn chat_with_retries<B, F, Fut>(
+    mut build_body: B,
     mut send: F,
 ) -> std::result::Result<Response, ProviderError>
 where
+    B: FnMut(bool) -> Value,
     F: FnMut(Value) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<Response, ProviderError>>,
 {
     let mut delay = Duration::from_secs(1);
     let mut nudge = false;
     for attempt in 0..MAX_ATTEMPTS {
-        let body = build_chat_body(model, tools, messages, nudge);
+        let body = build_body(nudge);
         match send(body).await {
             Ok(response) => return Ok(response),
             Err(err) if attempt + 1 < MAX_ATTEMPTS && err.is_retryable() => {
@@ -203,16 +229,16 @@ where
     unreachable!("retry loop always returns")
 }
 
-impl ProviderClient {
-    async fn send_chat_request(
-        &self,
-        url: &str,
-        body: &Value,
-    ) -> std::result::Result<Response, ProviderError> {
-        let response = self
-            .client
+async fn send_chat_request(
+    client: &Client,
+    bearer_token: &str,
+    url: &str,
+    body: &Value,
+) -> std::result::Result<Response, ProviderError> {
+    {
+        let response = client
             .post(url)
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(bearer_token)
             .json(body)
             .send()
             .await
@@ -296,7 +322,7 @@ impl ProviderClient {
 }
 
 #[derive(Debug)]
-enum ProviderError {
+pub(crate) enum ProviderError {
     Transport {
         source: reqwest::Error,
         context: &'static str,
@@ -319,14 +345,14 @@ enum ProviderError {
 }
 
 impl ProviderError {
-    fn transport(source: reqwest::Error) -> Self {
+    pub(crate) fn transport(source: reqwest::Error) -> Self {
         Self::Transport {
             source,
             context: "provider request failed",
         }
     }
 
-    fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } => true,
             Self::Http { status, .. } => {
@@ -338,14 +364,14 @@ impl ProviderError {
         }
     }
 
-    fn retry_after(&self) -> Option<Duration> {
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Http { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
 
-    fn into_anyhow(self) -> anyhow::Error {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::Transport { source, context } => anyhow::Error::new(source).context(context),
             Self::Http { status, text, .. } => anyhow!("provider returned {status}: {text}"),
@@ -360,7 +386,7 @@ impl ProviderError {
     }
 }
 
-fn is_context_overflow(status: StatusCode, text: &str) -> bool {
+pub(crate) fn is_context_overflow(status: StatusCode, text: &str) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
     }
@@ -373,7 +399,7 @@ fn is_context_overflow(status: StatusCode, text: &str) -> bool {
                 || lower.contains("maximum")))
 }
 
-fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+pub(crate) fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
     let header = response.headers().get(RETRY_AFTER)?.to_str().ok()?;
     let seconds = header.parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
@@ -592,10 +618,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exhausts_retries_then_returns_descriptive_error() {
         let calls = RefCell::new(0usize);
-        let result = chat_with_retries(&model(), &[], &convo(), |_body| {
-            *calls.borrow_mut() += 1;
-            async { Err(empty_err()) }
-        })
+        let result = chat_with_retries(
+            |nudge| build_chat_body(&model(), &[], &convo(), nudge),
+            |_body| {
+                *calls.borrow_mut() += 1;
+                async { Err(empty_err()) }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -613,10 +642,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retry_after_empty_injects_continuation_nudge() {
         let bodies: RefCell<Vec<Value>> = RefCell::new(Vec::new());
-        let _ = chat_with_retries(&model(), &[], &convo(), |body| {
-            bodies.borrow_mut().push(body);
-            async { Err(empty_err()) }
-        })
+        let _ = chat_with_retries(
+            |nudge| build_chat_body(&model(), &[], &convo(), nudge),
+            |body| {
+                bodies.borrow_mut().push(body);
+                async { Err(empty_err()) }
+            },
+        )
         .await;
 
         let bodies = bodies.borrow();
@@ -639,22 +671,25 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nudged_retry_recovers() {
         let calls = RefCell::new(0usize);
-        let result = chat_with_retries(&model(), &[], &convo(), |body| {
-            let n = {
-                let mut c = calls.borrow_mut();
-                *c += 1;
-                *c
-            };
-            // First call empty; the nudged retry yields a real completion.
-            let out = if n == 1 {
-                assert!(!nudged(&body));
-                Err(empty_err())
-            } else {
-                assert!(nudged(&body), "recovery attempt should be nudged");
-                Ok(ok("done"))
-            };
-            async move { out }
-        })
+        let result = chat_with_retries(
+            |nudge| build_chat_body(&model(), &[], &convo(), nudge),
+            |body| {
+                let n = {
+                    let mut c = calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                // First call empty; the nudged retry yields a real completion.
+                let out = if n == 1 {
+                    assert!(!nudged(&body));
+                    Err(empty_err())
+                } else {
+                    assert!(nudged(&body), "recovery attempt should be nudged");
+                    Ok(ok("done"))
+                };
+                async move { out }
+            },
+        )
         .await;
 
         assert_eq!(*calls.borrow(), 2);
@@ -665,16 +700,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn non_retryable_error_is_not_retried() {
         let calls = RefCell::new(0usize);
-        let result = chat_with_retries(&model(), &[], &convo(), |_body| {
-            *calls.borrow_mut() += 1;
-            async {
-                Err(ProviderError::Http {
-                    status: StatusCode::BAD_REQUEST,
-                    text: "bad".into(),
-                    retry_after: None,
-                })
-            }
-        })
+        let result = chat_with_retries(
+            |nudge| build_chat_body(&model(), &[], &convo(), nudge),
+            |_body| {
+                *calls.borrow_mut() += 1;
+                async {
+                    Err(ProviderError::Http {
+                        status: StatusCode::BAD_REQUEST,
+                        text: "bad".into(),
+                        retry_after: None,
+                    })
+                }
+            },
+        )
         .await;
 
         assert_eq!(*calls.borrow(), 1, "4xx must not be retried");

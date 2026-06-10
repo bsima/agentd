@@ -1,8 +1,11 @@
 use crate::op::{ChatMessage, FinishReason, Model, Response, ToolCall};
-use crate::provider::{ChatProvider, ToolSpec};
-use anyhow::{anyhow, Context, Result};
+use crate::provider::{
+    chat_with_retries, is_context_overflow, retry_after_delay, ChatProvider, ProviderError,
+    ToolSpec, CONTINUE_NUDGE,
+};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use reqwest::{header::RETRY_AFTER, Client, StatusCode};
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -47,21 +50,29 @@ impl ChatProvider for AnthropicProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
-        let url = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
-        let body = build_messages_body(model, tools, messages);
-
-        let mut delay = Duration::from_secs(1);
-        for attempt in 0..3 {
-            match self.send_messages_request(&url, &body).await {
-                Ok(response) => return Ok(response),
-                Err(err) if attempt < 2 && err.is_retryable() => {
-                    tokio::time::sleep(err.retry_after().unwrap_or(delay)).await;
-                    delay *= 2;
-                }
-                Err(err) => return Err(err.into_anyhow()),
-            }
+        if crate::op::has_pending_tool_calls(messages) {
+            return Err(anyhow::anyhow!(
+                "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
+            ));
         }
-        unreachable!("retry loop always returns")
+        let url = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
+        chat_with_retries(
+            |nudge| {
+                if nudge {
+                    let mut messages = messages.to_vec();
+                    messages.push(ChatMessage::user(CONTINUE_NUDGE));
+                    build_messages_body(model, tools, &messages)
+                } else {
+                    build_messages_body(model, tools, messages)
+                }
+            },
+            |body| {
+                let url = url.clone();
+                async move { self.send_messages_request(&url, &body).await }
+            },
+        )
+        .await
+        .map_err(ProviderError::into_anyhow)
     }
 }
 
@@ -100,7 +111,18 @@ impl AnthropicProvider {
                 retry_after,
             });
         }
-        parse_messages_response(&text).map_err(ProviderError::Other)
+        let response = parse_messages_response(&text).map_err(ProviderError::Other)?;
+        // Same guard as the OpenAI-compatible path (t-1071): a non-stop turn
+        // with neither text nor tool_use blocks would silently terminate an
+        // active run. Retry it (with a continuation nudge) instead.
+        if response.content.trim().is_empty()
+            && response.tool_calls.is_empty()
+            && !matches!(response.finish_reason.as_ref(), Some(FinishReason::Stop))
+        {
+            tracing::warn!(raw_response = %text, "provider returned empty completion");
+            return Err(ProviderError::EmptyCompletion { raw: text });
+        }
+        Ok(response)
     }
 }
 
@@ -229,81 +251,6 @@ enum AnthropicContentBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
-}
-
-#[derive(Debug)]
-enum ProviderError {
-    Transport {
-        source: reqwest::Error,
-        context: &'static str,
-    },
-    Http {
-        status: StatusCode,
-        text: String,
-        retry_after: Option<Duration>,
-    },
-    ContextOverflow {
-        status: StatusCode,
-        text: String,
-    },
-    Other(anyhow::Error),
-}
-
-impl ProviderError {
-    fn transport(source: reqwest::Error) -> Self {
-        Self::Transport {
-            source,
-            context: "Anthropic request failed",
-        }
-    }
-
-    fn is_retryable(&self) -> bool {
-        match self {
-            Self::Transport { .. } => true,
-            Self::Http { status, .. } => {
-                *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-            }
-            Self::ContextOverflow { .. } => false,
-            Self::Other(_) => false,
-        }
-    }
-
-    fn retry_after(&self) -> Option<Duration> {
-        match self {
-            Self::Http { retry_after, .. } => *retry_after,
-            _ => None,
-        }
-    }
-
-    fn into_anyhow(self) -> anyhow::Error {
-        match self {
-            Self::Transport { source, context } => anyhow::Error::new(source).context(context),
-            Self::Http { status, text, .. } => anyhow!("Anthropic returned {status}: {text}"),
-            Self::ContextOverflow { status, text } => {
-                anyhow!("context_length_exceeded: Anthropic returned {status}: {text}")
-            }
-            Self::Other(err) => err,
-        }
-    }
-}
-
-fn is_context_overflow(status: StatusCode, text: &str) -> bool {
-    if status != StatusCode::BAD_REQUEST {
-        return false;
-    }
-    let lower = text.to_ascii_lowercase();
-    lower.contains("context_length_exceeded")
-        || (lower.contains("context")
-            && (lower.contains("limit")
-                || lower.contains("length")
-                || lower.contains("too long")
-                || lower.contains("maximum")))
-}
-
-fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
-    let header = response.headers().get(RETRY_AFTER)?.to_str().ok()?;
-    let seconds = header.parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds))
 }
 
 #[cfg(test)]
