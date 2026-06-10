@@ -88,8 +88,10 @@ impl Default for EvalConfig {
 pub struct ReplayTrace {
     infer_calls: BTreeMap<u64, String>,
     infer_results: BTreeMap<u64, Response>,
+    infer_errors: BTreeMap<u64, String>,
     eval_calls: BTreeMap<u64, String>,
     eval_results: BTreeMap<u64, Value>,
+    eval_errors: BTreeMap<u64, String>,
 }
 
 impl ReplayTrace {
@@ -108,11 +110,17 @@ impl ReplayTrace {
                 } => {
                     replay.infer_results.insert(*op_id, response.clone());
                 }
+                Event::InferError { op_id, error, .. } => {
+                    replay.infer_errors.insert(*op_id, error.clone());
+                }
                 Event::EvalCall { op_id, command, .. } => {
                     replay.eval_calls.insert(*op_id, command.clone());
                 }
                 Event::EvalResult { op_id, result, .. } => {
                     replay.eval_results.insert(*op_id, result.clone());
+                }
+                Event::EvalError { op_id, error, .. } => {
+                    replay.eval_errors.insert(*op_id, error.clone());
                 }
                 _ => {}
             }
@@ -133,6 +141,11 @@ impl ReplayTrace {
                 ));
             }
         }
+        if let Some(error) = self.infer_errors.get(&op_id) {
+            return Err(anyhow!(
+                "replaying recorded Infer failure at op {op_id}: {error}"
+            ));
+        }
         self.infer_results
             .get(&op_id)
             .cloned()
@@ -146,6 +159,11 @@ impl ReplayTrace {
                     "replay diverged at Eval op {op_id}: recorded command '{recorded_command}', requested '{command}'"
                 ));
             }
+        }
+        if let Some(error) = self.eval_errors.get(&op_id) {
+            return Err(anyhow!(
+                "replaying recorded Eval failure at op {op_id}: {error}"
+            ));
         }
         self.eval_results
             .get(&op_id)
@@ -231,13 +249,30 @@ where
                 })
                 .await?;
             let started = Instant::now();
-            let response = match &config.replay {
-                Some(replay) => replay.infer_result(op_id, &model.0)?,
+            let result = match &config.replay {
+                Some(replay) => replay.infer_result(op_id, &model.0),
                 None => {
                     config
                         .provider
                         .chat(&model, &config.tool_specs(), &prompt)
-                        .await?
+                        .await
+                }
+            };
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::InferError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id,
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    return Err(err);
                 }
             };
             config
@@ -276,11 +311,30 @@ where
                     timestamp: Utc::now(),
                 })
                 .await?;
+            let started = Instant::now();
             let result = match &config.replay {
-                Some(replay) => replay.eval_result(op_id, &command)?,
+                Some(replay) => replay.eval_result(op_id, &command),
                 None => {
                     run_eval_with_env(&config.eval, &command, config.trace.trace_context_env())
-                        .await?
+                        .await
+                }
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::EvalError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id,
+                            command,
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    return Err(err);
                 }
             };
             let truncated_stdout = result
@@ -1360,6 +1414,106 @@ mod tests {
             .and_then(|_| crate::op::eval("printf replayed"));
         let (replayed, _) = run_sequential(&replay_config, (), program).await?;
         assert_eq!(replayed, recorded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_failure_emits_infer_error_and_replays_as_failure() -> Result<()> {
+        // Record a run whose provider fails terminally.
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let record_config = SeqConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: record_trace,
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
+        let err = run_sequential(&record_config, (), program)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock provider exhausted"));
+
+        let events = TraceLogger::read_events(&record_path).await?;
+        let infer_error = events
+            .iter()
+            .find_map(|event| match event {
+                Event::InferError { op_id, error, .. } => Some((op_id, error.clone())),
+                _ => None,
+            })
+            .expect("failed run must record an InferError event");
+        assert!(infer_error.1.contains("mock provider exhausted"));
+
+        // Replaying the failed run reproduces the failure without touching
+        // the provider.
+        let replay = ReplayTrace::load(record_path).await?;
+        let live_provider = Arc::new(MockProvider::new(vec![response("unused", vec![])]));
+        let replay_config = SeqConfig {
+            provider: live_provider.clone(),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: Some(replay),
+            trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
+        let err = run_sequential(&replay_config, (), program)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("replaying recorded Infer failure"), "{err}");
+        assert!(err.contains("mock provider exhausted"), "{err}");
+        assert_eq!(live_provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eval_spawn_failure_emits_eval_error() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = SeqConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig {
+                shell: "/nonexistent-shell-for-eval-error-test".into(),
+                ..EvalConfig::default()
+            },
+            replay: None,
+            trace_full_prompt_ir: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
+        };
+
+        let result = run_sequential(&config, (), crate::op::eval("printf hi")).await;
+
+        assert!(result.is_err());
+        let events = TraceLogger::read_events(trace_path).await?;
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::EvalError { command, .. } if command == "printf hi")
+            ),
+            "failed eval must record an EvalError event: {events:?}"
+        );
         Ok(())
     }
 

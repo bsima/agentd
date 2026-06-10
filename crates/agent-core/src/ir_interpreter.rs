@@ -23,8 +23,10 @@ use std::time::Instant;
 pub struct IrReplayTrace {
     infer_calls: BTreeMap<String, IrInferCall>,
     infer_results: BTreeMap<String, crate::op::Response>,
+    infer_errors: BTreeMap<String, String>,
     eval_calls: BTreeMap<String, IrEvalCall>,
     eval_results: BTreeMap<String, Value>,
+    eval_errors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +80,11 @@ impl IrReplayTrace {
                         replay.infer_results.insert(effect_id, response.clone());
                     }
                 }
+                Event::InferError { error, .. } => {
+                    if let Some(effect_id) = last_infer_id.take() {
+                        replay.infer_errors.insert(effect_id, error.clone());
+                    }
+                }
                 Event::EvalCall { command, .. } => {
                     let location = take_location(&mut last_location, EffectKind::Eval)?;
                     let effect_id = location.effect_id.0.clone();
@@ -93,6 +100,11 @@ impl IrReplayTrace {
                 Event::EvalResult { result, .. } => {
                     if let Some(effect_id) = last_eval_id.take() {
                         replay.eval_results.insert(effect_id, result.clone());
+                    }
+                }
+                Event::EvalError { error, .. } => {
+                    if let Some(effect_id) = last_eval_id.take() {
+                        replay.eval_errors.insert(effect_id, error.clone());
                     }
                 }
                 _ => {}
@@ -121,6 +133,11 @@ impl IrReplayTrace {
                 model
             ));
         }
+        if let Some(error) = self.infer_errors.get(effect_id) {
+            return Err(anyhow!(
+                "AgentIR replaying recorded Infer failure at effect {effect_id}: {error}"
+            ));
+        }
         self.infer_results
             .get(effect_id)
             .cloned()
@@ -145,6 +162,11 @@ impl IrReplayTrace {
                 call.location.site.block,
                 call.location.site.instruction_index,
                 command
+            ));
+        }
+        if let Some(error) = self.eval_errors.get(effect_id) {
+            return Err(anyhow!(
+                "AgentIR replaying recorded Eval failure at effect {effect_id}: {error}"
             ));
         }
         self.eval_results
@@ -439,17 +461,34 @@ async fn execute_instr(
                 })
                 .await?;
             let started = Instant::now();
-            let response = match ir_replay {
-                Some(replay) => replay.infer_result(&location, &model)?,
+            let result = match ir_replay {
+                Some(replay) => replay.infer_result(&location, &model),
                 None => match &config.replay {
-                    Some(replay) => replay.infer_result(op_id, &model)?,
+                    Some(replay) => replay.infer_result(op_id, &model),
                     None => {
                         config
                             .provider
-                            .chat(&Model(model), &ir_tool_specs(), &prompt)
-                            .await?
+                            .chat(&Model(model.clone()), &ir_tool_specs(), &prompt)
+                            .await
                     }
                 },
+            };
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::InferError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id: None,
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    return Err(err);
+                }
             };
             config
                 .trace
@@ -503,15 +542,34 @@ async fn execute_instr(
                     timestamp: Utc::now(),
                 })
                 .await?;
+            let started = Instant::now();
             let result = match ir_replay {
-                Some(replay) => replay.eval_result(&location, &command)?,
+                Some(replay) => replay.eval_result(&location, &command),
                 None => match &config.replay {
-                    Some(replay) => replay.eval_result(op_id, &command)?,
+                    Some(replay) => replay.eval_result(op_id, &command),
                     None => {
                         run_eval_with_env(&config.eval, &command, config.trace.trace_context_env())
-                            .await?
+                            .await
                     }
                 },
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::EvalError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id: None,
+                            command,
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    return Err(err);
+                }
             };
             let truncated_stdout = result
                 .get("stdout_truncated")

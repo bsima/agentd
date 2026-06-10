@@ -45,6 +45,18 @@ pub enum Event {
         duration_ms: u64,
         timestamp: DateTime<Utc>,
     },
+    /// Terminal failure of an Infer effect (provider error after retries,
+    /// replay divergence). Closes the matching InferCall so failed runs stay
+    /// inspectable and replayable instead of ending on a dangling call.
+    InferError {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        error: String,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
     EvalCall {
         run_id: String,
         op_id: u64,
@@ -66,6 +78,17 @@ pub enum Event {
         duration_ms: u64,
         truncated_stdout: bool,
         truncated_stderr: bool,
+        timestamp: DateTime<Utc>,
+    },
+    /// Terminal failure of an Eval effect (spawn failure, replay divergence).
+    EvalError {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        command: String,
+        error: String,
+        duration_ms: u64,
         timestamp: DateTime<Utc>,
     },
     GetCall {
@@ -174,7 +197,9 @@ impl Event {
         match self {
             Self::InferCall { run_id, .. }
             | Self::InferResult { run_id, .. }
+            | Self::InferError { run_id, .. }
             | Self::EvalCall { run_id, .. }
+            | Self::EvalError { run_id, .. }
             | Self::EvalResult { run_id, .. }
             | Self::GetCall { run_id, .. }
             | Self::GetResult { run_id, .. }
@@ -195,7 +220,9 @@ impl Event {
         match self {
             Self::InferCall { op_id, .. }
             | Self::InferResult { op_id, .. }
+            | Self::InferError { op_id, .. }
             | Self::EvalCall { op_id, .. }
+            | Self::EvalError { op_id, .. }
             | Self::EvalResult { op_id, .. }
             | Self::GetCall { op_id, .. }
             | Self::GetResult { op_id, .. }
@@ -214,7 +241,9 @@ impl Event {
         match self {
             Self::InferCall { parent_op_id, .. }
             | Self::InferResult { parent_op_id, .. }
+            | Self::InferError { parent_op_id, .. }
             | Self::EvalCall { parent_op_id, .. }
+            | Self::EvalError { parent_op_id, .. }
             | Self::EvalResult { parent_op_id, .. }
             | Self::GetCall { parent_op_id, .. }
             | Self::GetResult { parent_op_id, .. }
@@ -231,8 +260,8 @@ impl Event {
 
     pub fn name(&self) -> &'static str {
         match self {
-            Self::InferCall { .. } | Self::InferResult { .. } => "Infer",
-            Self::EvalCall { .. } | Self::EvalResult { .. } => "Eval",
+            Self::InferCall { .. } | Self::InferResult { .. } | Self::InferError { .. } => "Infer",
+            Self::EvalCall { .. } | Self::EvalResult { .. } | Self::EvalError { .. } => "Eval",
             Self::GetCall { .. } | Self::GetResult { .. } => "Get",
             Self::PutCall { .. } | Self::PutResult { .. } => "Put",
             Self::HydrationStart { .. } | Self::HydrationEnd { .. } => "Hydration",
@@ -266,7 +295,9 @@ impl Event {
         matches!(
             self,
             Self::InferResult { .. }
+                | Self::InferError { .. }
                 | Self::EvalResult { .. }
+                | Self::EvalError { .. }
                 | Self::GetResult { .. }
                 | Self::PutResult { .. }
                 | Self::HydrationEnd { .. }
@@ -278,7 +309,9 @@ impl Event {
         match self {
             Self::InferCall { timestamp, .. }
             | Self::InferResult { timestamp, .. }
+            | Self::InferError { timestamp, .. }
             | Self::EvalCall { timestamp, .. }
+            | Self::EvalError { timestamp, .. }
             | Self::EvalResult { timestamp, .. }
             | Self::GetCall { timestamp, .. }
             | Self::GetResult { timestamp, .. }
@@ -373,6 +406,23 @@ impl Event {
                 attrs.push(KeyValue::new("truncated_stdout", *truncated_stdout));
                 attrs.push(KeyValue::new("truncated_stderr", *truncated_stderr));
             }
+            Self::InferError {
+                error, duration_ms, ..
+            } => {
+                attrs.push(KeyValue::new("error", error.clone()));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
+            Self::EvalError {
+                command,
+                error,
+                duration_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("tool.name", tool_name(command)));
+                attrs.push(KeyValue::new("command", command.clone()));
+                attrs.push(KeyValue::new("error", error.clone()));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
             Self::GetCall { key, .. } | Self::PutCall { key, .. } => {
                 attrs.push(KeyValue::new("key", key.clone()))
             }
@@ -447,6 +497,9 @@ fn eval_status(event: &Event) -> Status {
             if result.get("ok").and_then(Value::as_bool) == Some(false) =>
         {
             Status::error("eval failed")
+        }
+        Event::InferError { error, .. } | Event::EvalError { error, .. } => {
+            Status::error(error.clone())
         }
         _ => Status::Ok,
     }

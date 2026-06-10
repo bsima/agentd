@@ -275,8 +275,10 @@ fn summarize_ops(events: &[Event]) -> String {
         let name = match event {
             Event::InferCall { .. } => "InferCall",
             Event::InferResult { .. } => "InferResult",
+            Event::InferError { .. } => "InferError",
             Event::EvalCall { .. } => "EvalCall",
             Event::EvalResult { .. } => "EvalResult",
+            Event::EvalError { .. } => "EvalError",
             Event::GetCall { .. } => "GetCall",
             Event::GetResult { .. } => "GetResult",
             Event::PutCall { .. } => "PutCall",
