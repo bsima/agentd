@@ -81,6 +81,31 @@ Crash recovery is `resume`, driven either manually, by systemd
 at all — the checkpoint model makes restart safe, so the supervisor does not
 need its own babysitting loop.
 
+## Design constraint: the spec file is the single source of truth (t-1105)
+
+The Haskell supervisor stores the canonical agent spec in a DB row and
+*regenerates* a per-agent `.env` from it on `start`. That file looks editable
+but isn't: hand-edits are silently reverted and the process relaunches on the
+old config. This has eaten real model changes twice (2026-05-30 gc-coder,
+2026-06-08 designer), with `rm`/`create` (archiving history) as the only
+workaround. The Rust port must make this failure mode structurally
+impossible:
+
+- **The on-disk spec (`<name>/agent.md`) is canonical.** `start` and `resume`
+  read it fresh on every launch; nothing regenerates it from a shadow store.
+  There is no DB row to disagree with.
+- **Config mutation is a command, not a file convention:**
+  `agentd set-model <name> <model>` (and `set-*` generally) edits the
+  canonical spec in place and prints whether a restart is needed. Editing
+  `agent.md` by hand is equally valid — same file, same effect.
+- **Generated files must not look editable.** Anything the supervisor derives
+  (systemd units, pid files) either carries a `GENERATED — edits are
+  overwritten by agentd` header or is obviously runtime state. Nothing that
+  influences the next launch may be both generated and silently regenerated.
+- Acceptance addition: edit the spec's model (by hand or via `set-model`),
+  `agentd resume`, and verify via the startup banner/`agent_start` trace
+  event (or `/proc/<pid>/environ`) that the new model is live.
+
 ## Open questions (settle before implementing)
 
 1. **Concurrent `send` semantics.** Turns queue in the FIFO and the agent
