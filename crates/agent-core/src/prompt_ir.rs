@@ -363,7 +363,7 @@ impl Section {
             label: label.into(),
             source,
             role,
-            tokens: TokenEstimate(estimate_tokens(&content)),
+            tokens: TokenEstimate(crate::gc::estimate_text_tokens(&content)),
             content,
             priority,
             composition,
@@ -510,19 +510,11 @@ fn content_hash(content: &str) -> ContentHash {
     ContentHash(format!("sha256:{:x}", hasher.finalize()))
 }
 
+/// Base messages are estimated with the same message-level estimator the GC
+/// uses, so PromptIR section sweeping and message GC see the same budget
+/// pressure for the same content (one estimator, one conservative bound).
 fn estimate_prompt_tokens(prompt: &Prompt) -> usize {
-    prompt
-        .iter()
-        .map(|message| estimate_tokens(message.content.as_deref().unwrap_or_default()))
-        .sum()
-}
-
-fn estimate_tokens(content: &str) -> usize {
-    content
-        .split_whitespace()
-        .count()
-        .max(content.len() / 4)
-        .max(1)
+    crate::gc::estimate_tokens(prompt)
 }
 
 fn preview(content: &str, max_chars: usize) -> String {

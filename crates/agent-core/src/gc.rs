@@ -411,7 +411,11 @@ fn estimate_message_overhead_tokens() -> usize {
     8
 }
 
-fn estimate_text_tokens(text: &str) -> usize {
+/// The one token estimator for budget decisions (GC trigger/stop conditions
+/// and PromptIR section budgets). Per docs/GC.md this must be a conservative
+/// *upper bound*: chars/3 over-counts on prose, which errs toward GC firing
+/// early rather than overflowing the provider context.
+pub(crate) fn estimate_text_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(3).max(1)
 }
 
