@@ -79,7 +79,11 @@ struct Args {
     /// Working directory for Eval shell commands.
     #[arg(long)]
     eval_cwd: Option<PathBuf>,
-    /// Environment policy for Eval shell commands.
+    /// Environment policy for Eval shell commands. `inherit` (default)
+    /// passes the parent environment minus known credential vars
+    /// (ANTHROPIC_AUTH_TOKEN and anything ending in _API_KEY) so model-issued
+    /// commands cannot read the key the agent runs on; `inherit-full` passes
+    /// everything, credentials included; `clean` passes nothing.
     #[arg(long, value_enum, default_value_t = EvalEnvMode::Inherit)]
     eval_env: EvalEnvMode,
     /// Context GC strategy.
@@ -127,6 +131,7 @@ enum GcCacheArg {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum EvalEnvMode {
     Inherit,
+    InheritFull,
     Clean,
 }
 
@@ -261,6 +266,7 @@ async fn main() -> Result<()> {
         max_stderr_bytes: args.eval_max_output_bytes.unwrap_or(1024 * 1024),
         env: match args.eval_env {
             EvalEnvMode::Inherit => EnvPolicy::Inherit,
+            EvalEnvMode::InheritFull => EnvPolicy::InheritFull,
             EvalEnvMode::Clean => EnvPolicy::Clean {
                 vars: Default::default(),
             },

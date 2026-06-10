@@ -22,7 +22,13 @@ use tokio::process::Command;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnvPolicy {
+    /// Inherit the parent environment minus known credential variables
+    /// (see [`is_credential_var`]). The agent's own provider key must not be
+    /// readable by model-issued shell commands by default.
     Inherit,
+    /// Inherit the parent environment unmodified, credentials included.
+    /// Explicit opt-in for workflows whose commands need the keys.
+    InheritFull,
     Clean {
         vars: BTreeMap<String, String>,
     },
@@ -32,18 +38,48 @@ pub enum EnvPolicy {
     },
 }
 
+/// Environment variables stripped from Eval children under
+/// [`EnvPolicy::Inherit`]: the variables the agent itself reads for provider
+/// auth, plus the `*_API_KEY` convention used by model-registry entries
+/// (`api_key: $NAME` in models.yaml). `*_TOKEN` is deliberately NOT stripped:
+/// vars like GITHUB_TOKEN are often the agent's working credentials, not the
+/// key it runs on.
+pub(crate) fn is_credential_var(name: &str) -> bool {
+    name == "ANTHROPIC_AUTH_TOKEN" || name.ends_with("_API_KEY")
+}
+
 impl EnvPolicy {
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Inherit => "inherit".into(),
+            Self::InheritFull => "inherit-full".into(),
             Self::Clean { .. } => "clean".into(),
             Self::AllowList { .. } => "allowlist".into(),
         }
     }
 
     fn apply(&self, command: &mut Command) {
+        self.apply_with_parent_env(command, std::env::vars_os())
+    }
+
+    /// Testable core of [`EnvPolicy::apply`]: the parent environment is
+    /// injected so tests do not need to mutate process-global env vars.
+    fn apply_with_parent_env(
+        &self,
+        command: &mut Command,
+        parent_env: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) {
         match self {
-            Self::Inherit => {}
+            Self::Inherit => {
+                command.env_clear();
+                for (name, value) in parent_env {
+                    let denied = name.to_str().is_some_and(is_credential_var);
+                    if !denied {
+                        command.env(name, value);
+                    }
+                }
+            }
+            Self::InheritFull => {}
             Self::Clean { vars } => {
                 command.env_clear();
                 command.envs(vars);
@@ -1293,6 +1329,75 @@ mod tests {
             .await?;
             assert_eq!(env_result["stdout"], json!(""), "leaked: {inherited}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn credential_var_classification() {
+        // The agent's own provider auth must be stripped from Eval children…
+        assert!(is_credential_var("AGENT_API_KEY"));
+        assert!(is_credential_var("ANTHROPIC_API_KEY"));
+        assert!(is_credential_var("OPENROUTER_API_KEY"));
+        assert!(is_credential_var("PARASAIL_API_KEY"));
+        assert!(is_credential_var("ANTHROPIC_AUTH_TOKEN"));
+        // …but working credentials and ordinary vars must not be.
+        assert!(!is_credential_var("GITHUB_TOKEN"));
+        assert!(!is_credential_var("PATH"));
+        assert!(!is_credential_var("HOME"));
+        assert!(!is_credential_var("API_KEYS_DIR"));
+    }
+
+    #[tokio::test]
+    async fn inherit_policy_strips_credential_vars_but_keeps_the_rest() -> Result<()> {
+        use std::ffi::OsString;
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"printf %s "${ANTHROPIC_API_KEY+key-leaked}${ANTHROPIC_AUTH_TOKEN+token-leaked}${SAFE_VAR-safe-missing}""#,
+        );
+        command.stdin(Stdio::null());
+        // Inject a fake parent environment instead of mutating process env.
+        let parent = vec![
+            (
+                OsString::from("PATH"),
+                std::env::var_os("PATH").unwrap_or_default(),
+            ),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("sk-fake"),
+            ),
+            (
+                OsString::from("ANTHROPIC_AUTH_TOKEN"),
+                OsString::from("oauth-fake"),
+            ),
+            (OsString::from("SAFE_VAR"), OsString::from("visible")),
+        ];
+
+        EnvPolicy::Inherit.apply_with_parent_env(&mut command, parent.into_iter());
+        let output = command.output().await?;
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "visible");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inherit_full_policy_keeps_credentials() -> Result<()> {
+        use std::ffi::OsString;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(r#"printf %s "${FAKE_TEST_API_KEY-missing}""#);
+        command.stdin(Stdio::null());
+        // InheritFull leaves the command env untouched; simulate the parent
+        // env with an explicit Command-level var.
+        command.env("FAKE_TEST_API_KEY", "still-here");
+
+        EnvPolicy::InheritFull
+            .apply_with_parent_env(&mut command, std::iter::empty::<(OsString, OsString)>());
+        let output = command.output().await?;
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "still-here");
         Ok(())
     }
 

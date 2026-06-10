@@ -162,6 +162,13 @@ Useful execution controls:
 agent --eval-timeout-seconds 10 --eval-max-output-bytes 65536 --eval-env clean "inspect this repo"
 ```
 
+By default (`--eval-env inherit`), shell commands issued by the model inherit
+the parent environment **minus known credential variables** —
+`ANTHROPIC_AUTH_TOKEN` and anything ending in `_API_KEY` — so the model cannot
+read the key the agent runs on. Working credentials like `GITHUB_TOKEN` are
+not stripped. Use `--eval-env inherit-full` if your commands genuinely need
+the provider keys, or `--eval-env clean` for an empty environment.
+
 Replay recorded `Infer` and `Eval` results without an API key or shell execution:
 
 ```sh
