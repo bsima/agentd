@@ -410,6 +410,10 @@ pub async fn run_ir_steps_with_store_and_replay(
                 ));
             }
         }
+        // Block transitions count as steps too: a cycle of blocks with empty
+        // instruction lists (pure Goto/If/Match loops) must still hit the
+        // instruction limit, or the limit is useless as a watchdog.
+        instructions_executed += 1;
     }
 }
 
@@ -1403,6 +1407,57 @@ mod tests {
 
         assert_eq!(value, Value::Number(42.into()));
         assert_eq!(store.get_local("answer"), Value::Number(42.into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ir_step_limit_suspends_goto_only_loops() -> Result<()> {
+        // A cycle of blocks with no instructions must still hit the step
+        // limit: block transitions count as steps.
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Goto {
+                    block: BlockId(1),
+                    args: vec![],
+                },
+            },
+        );
+        blocks.insert(
+            BlockId(1),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Goto {
+                    block: BlockId(0),
+                    args: vec![],
+                },
+            },
+        );
+        let machine = Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("goto-loop".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        };
+
+        let outcome =
+            run_ir_steps(&config(Arc::new(MockProvider::new(vec![]))), machine, 10).await?;
+
+        assert!(
+            matches!(outcome, IrStepOutcome::Suspended { .. }),
+            "goto-only loop must suspend at the step limit, got {outcome:?}"
+        );
         Ok(())
     }
 

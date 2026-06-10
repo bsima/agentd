@@ -8,7 +8,7 @@ whether reality has caught up.
 |---|---|
 | Serializable `Program`/`Block`/`Instr`/`Terminator`/`Expr` | Implemented (`agent-core::ir`) |
 | Validation before execution | Implemented (`validate_program`) |
-| Explicit machine, mid-turn checkpoints, step limit | Implemented (`run_ir_steps`); terminators do not count toward the step limit yet |
+| Explicit machine, mid-turn checkpoints, step limit | Implemented (`run_ir_steps`); block terminators count toward the step limit |
 | Stable effect IDs + replay + divergence locations | Implemented (`IrReplayTrace`) |
 | Failure semantics: error events with stable IDs | Implemented (`InferError`/`EvalError` trace events; replay reproduces failures) |
 | `agent_loop` ported with feature parity | Implemented (`agent_loop_ir`, including stalled-turn nudge) |
