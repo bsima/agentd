@@ -785,6 +785,15 @@ async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
     Ok(())
 }
 
+/// Why a NUL-delimited prompt loop stopped reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStop {
+    /// Reader hit EOF or an explicit empty frame.
+    Eof,
+    /// SIGINT/SIGTERM arrived; the whole session should wind down.
+    Shutdown,
+}
+
 async fn run_stdin_session(runtime: &mut Runtime) -> Result<()> {
     tracing::info!(run_id = %runtime.run_id, "starting stdin session");
     let reader = BufReader::new(tokio::io::stdin());
@@ -798,18 +807,27 @@ async fn run_fifo_session(runtime: &mut Runtime, path: PathBuf) -> Result<()> {
 
     let mut consecutive_empty_sessions = 0_u32;
     loop {
-        let file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("opening fifo {}", path.display()))?;
+        // Opening a FIFO for read blocks until a writer appears; keep the
+        // shutdown signal selectable during that wait or the process can only
+        // be stopped with SIGKILL once the signal handlers are installed.
+        let mut open_options = tokio::fs::OpenOptions::new();
+        open_options.read(true);
+        let file = tokio::select! {
+            file = open_options.open(&path) => {
+                file.with_context(|| format!("opening fifo {}", path.display()))?
+            }
+            _ = shutdown_signal() => break,
+        };
         let reader = BufReader::new(file);
-        let handled_messages = run_nul_delimited_prompt_loop(runtime, reader).await?;
+        let (handled_messages, stop) = run_nul_delimited_prompt_loop(runtime, reader).await?;
         if handled_messages {
             consecutive_empty_sessions = 0;
             emit_done(runtime).await?;
         } else {
             consecutive_empty_sessions = consecutive_empty_sessions.saturating_add(1);
+        }
+        if stop == SessionStop::Shutdown {
+            break;
         }
 
         let backoff = if consecutive_empty_sessions == 0 {
@@ -819,6 +837,8 @@ async fn run_fifo_session(runtime: &mut Runtime, path: PathBuf) -> Result<()> {
         };
         tokio::time::sleep(backoff).await;
     }
+    tracing::info!(run_id = %runtime.run_id, "fifo session shutting down");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -840,27 +860,36 @@ async fn validate_fifo_path(_path: &Path) -> Result<()> {
     Err(anyhow!("--fifo is only supported on Unix platforms"))
 }
 
-async fn run_nul_delimited_prompt_loop<R>(runtime: &mut Runtime, mut reader: R) -> Result<bool>
+async fn run_nul_delimited_prompt_loop<R>(
+    runtime: &mut Runtime,
+    mut reader: R,
+) -> Result<(bool, SessionStop)>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     let mut handled_messages = false;
-    loop {
+    let stop = loop {
         tokio::select! {
             frame = read_nul_frame(&mut reader) => {
                 match frame? {
-                    Some(message) if message.is_empty() => break,
+                    Some(message) if message.is_empty() => break SessionStop::Eof,
                     Some(message) => {
                         handled_messages = true;
-                        write_session_response(runtime, message).await?;
+                        // A failed turn (provider outage, replay divergence,
+                        // context overflow) is already traced via agent_error;
+                        // a long-running session survives it and waits for
+                        // the next turn instead of crashing.
+                        if let Err(err) = write_session_response(runtime, message).await {
+                            eprintln!("turn failed: {err:#}");
+                        }
                     }
-                    None => break,
+                    None => break SessionStop::Eof,
                 }
             }
-            _ = shutdown_signal() => break,
+            _ = shutdown_signal() => break SessionStop::Shutdown,
         }
-    }
-    Ok(handled_messages)
+    };
+    Ok((handled_messages, stop))
 }
 
 async fn write_session_response(runtime: &mut Runtime, message: String) -> Result<()> {
