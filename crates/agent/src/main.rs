@@ -100,8 +100,10 @@ struct Args {
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
-    /// Experimental runtime backend.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::Ir, hide = true)]
+    /// Runtime backend. `ir` (default) runs the serializable AgentIR machine.
+    /// `op` is the closure-based compatibility runtime; it is deprecated and
+    /// will be removed once IR-mode replay fixtures are regenerated.
+    #[arg(long, value_enum, default_value_t = RuntimeMode::Ir)]
     runtime: RuntimeMode,
     /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
