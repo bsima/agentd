@@ -36,7 +36,7 @@ pub use ir_interpreter::{
 };
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
-    agent_loop, emit, eval, get, has_pending_tool_calls, infer, par, put,
+    agent_loop, close_pending_tool_calls, emit, eval, get, has_pending_tool_calls, infer, par, put,
     repair_trailing_pending_tool_calls, ChatMessage, FinishReason, Model, Op, OpF, Prompt,
     Response, ToolCall,
 };

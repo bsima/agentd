@@ -933,6 +933,17 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             response.tool_calls.clone(),
         ));
     }
+    // A turn that exhausted its budget mid-tool-call returns unexecuted tool
+    // calls; close them with synthetic error results so the next turn is not
+    // rejected by the provider's pending-tool-call guard.
+    let closed = agent_core::close_pending_tool_calls(&mut new_history);
+    if !closed.is_empty() {
+        tracing::warn!(
+            run_id = %runtime.run_id,
+            closed = closed.len(),
+            "closed unexecuted tool calls left by an exhausted turn budget"
+        );
+    }
     runtime.history = new_history;
     put_checkpoint(runtime).await?;
     save_checkpoint(runtime).await?;

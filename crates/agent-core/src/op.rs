@@ -406,6 +406,40 @@ pub fn repair_trailing_pending_tool_calls(prompt: &[ChatMessage]) -> Vec<ChatMes
     prompt[..latest_clean_len].to_vec()
 }
 
+/// Append a synthetic error tool result for every assistant tool call that has
+/// no matching result, so the transcript stays well-formed for providers.
+///
+/// The agent loop returns its final response with unexecuted tool calls when
+/// the turn budget runs out. Once that assistant message is appended to the
+/// live history, every later provider call would be rejected by the
+/// pending-tool-call guard, wedging the session until an operator restarts it
+/// from a repaired checkpoint. Closing the calls keeps the session usable and
+/// tells the model why its calls never ran. Returns the closed call ids.
+pub fn close_pending_tool_calls(history: &mut Vec<ChatMessage>) -> Vec<String> {
+    let mut pending: Vec<String> = Vec::new();
+    for message in history.iter() {
+        if let Some(tool_calls) = &message.tool_calls {
+            for call in tool_calls {
+                if !pending.contains(&call.id) {
+                    pending.push(call.id.clone());
+                }
+            }
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            pending.retain(|id| id != tool_call_id);
+        }
+    }
+    for id in &pending {
+        let content = serde_json::json!({
+            "ok": false,
+            "error": "turn_budget_exhausted",
+            "message": "tool call was not executed: the turn budget ran out before dispatch",
+        });
+        history.push(ChatMessage::tool(id, content.to_string()));
+    }
+    pending
+}
+
 fn command_from_tool_call(call: &ToolCall) -> std::result::Result<String, Value> {
     if call.name != "shell" {
         return Err(serde_json::json!({
@@ -690,6 +724,43 @@ mod tests {
             command_from_tool_call(&empty).unwrap_err()["error"],
             serde_json::json!("invalid_arguments")
         );
+    }
+
+    #[test]
+    fn close_pending_tool_calls_appends_error_results_for_dangling_calls() {
+        let call_1 = ToolCall::new("call-1", "shell", serde_json::json!({ "command": "pwd" }));
+        let call_2 = ToolCall::new("call-2", "shell", serde_json::json!({ "command": "ls" }));
+        let mut history = vec![
+            ChatMessage::user("work"),
+            ChatMessage::assistant(None, vec![call_1]),
+            ChatMessage::tool("call-1", "ok"),
+            ChatMessage::assistant(Some("one more".into()), vec![call_2]),
+        ];
+
+        let closed = close_pending_tool_calls(&mut history);
+
+        assert_eq!(closed, vec!["call-2".to_string()]);
+        assert!(!has_pending_tool_calls(&history));
+        let result = history.last().unwrap();
+        assert_eq!(result.role, "tool");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call-2"));
+        assert!(result
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("turn_budget_exhausted"));
+    }
+
+    #[test]
+    fn close_pending_tool_calls_is_a_noop_on_clean_history() {
+        let mut history = vec![
+            ChatMessage::user("work"),
+            ChatMessage::assistant(Some("done".into()), Vec::new()),
+        ];
+        let before = history.clone();
+
+        assert!(close_pending_tool_calls(&mut history).is_empty());
+        assert_eq!(history, before);
     }
 
     #[test]
