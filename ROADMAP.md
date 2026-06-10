@@ -32,7 +32,12 @@ Required evals/checks:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test`
 - `./evals/smoke.sh` for an offline CLI/replay smoke test
-- `RUN_RUST_AGENT_INTEGRATION=1 ~/omni/live/Omni/Agentd/Test/rust-agent-integration.sh` for persistent `agentd` compatibility
+- `./evals/release.sh` (runs all of the above plus the offline shell evals)
+
+Maintainer-gated (requires the private omni monorepo; outside contributors can
+skip — CI does not depend on it):
+
+- `RUN_RUST_AGENT_INTEGRATION=1 <omni>/Omni/Agentd/Test/rust-agent-integration.sh` for persistent `agentd` compatibility (also reachable via the gated `./evals/agentd-persistent.sh`)
 
 Planned work:
 
@@ -77,7 +82,7 @@ PromptIR is the structured payload for `Infer`. It should represent context as l
 
 Planned work:
 
-- port the core shape from `~/omni/live/Omni/Agent/Prompt/IR.hs`
+- port the core shape from the Haskell prototype (`Omni/Agent/Prompt/IR.hs` in the maintainer's private monorepo)
 - add Rust `PromptIR`, `Section`, `SectionSource`, `CompositionMode`, `Priority`, `TokenBudget`, `ContextStrategy`, and `ContextRequest`
 - change hydration from direct prompt string concatenation to `SourceResult -> Section -> PromptIR -> ChatMessage[]`
 - trace PromptIR hashes and section metadata for every `Infer`
@@ -111,7 +116,7 @@ Acceptance:
 ## M2: Rust `agentd` supervisor
 
 Status: design in [docs/SUPERVISOR.md](./docs/SUPERVISOR.md); implementation
-not started. Working in the Haskell system today (`~/omni/live/Omni/Agentd`).
+not started. Working in the Haskell system today (`Omni/Agentd` in the maintainer's private monorepo).
 
 The supervisor will manage named long-running sessions around the existing `agent` process model:
 

@@ -11,7 +11,7 @@ PromptIR is the structured payload for `AgentIR::Infer`.
 
 AgentIR answers when effects happen. PromptIR answers what context the model saw, where it came from, how it was budgeted, and how it should be traced.
 
-The prior Haskell implementation lives at `~/omni/live/Omni/Agent/Prompt/IR.hs`. The useful parts to port are the section/provenance/budget model. The graph-expression part should not be ported directly because AgentIR now owns control flow, effect scheduling, and parallelism.
+The prior Haskell implementation lives in the maintainer's private monorepo (`Omni/Agent/Prompt/IR.hs`); this document carries everything from it that matters here. The useful parts to port are the section/provenance/budget model. The graph-expression part should not be ported directly because AgentIR now owns control flow, effect scheduling, and parallelism.
 
 ## Goal
 

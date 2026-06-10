@@ -57,9 +57,13 @@ So a multi-agent system is not a special framework layer. It is just an agent pr
 
 This is the SICP meta-circular idea applied to agents. `eval` calling `eval` collapses the interpreter/object-language boundary, `Infer` calling `Infer` does the same thing for agents.
 
-### Context is a buffer, not an append-only log
+### Context is a window over a log, not the log itself
 
-Most systems treat context as an append-only prompt log. `agent-core` models context as keyed reads and writes. This is similar to RLM.
+The durable history is an append-only record (checkpoints, traces, replay all
+depend on that). What the *model sees per turn* is a managed window over it:
+`agent-core` models context as keyed reads and writes, hydrates passively
+before each turn, and garbage-collects the outbound window under budget
+pressure (see `docs/GC.md`). This is similar to RLM.
 
 There are really only 2 ways to lookup content for context: temporally via chat history, and semantically via similarity search; these operations work on any unstructured text.
 Similarly, there are 2 times during an agentic turn that an agent can build context: it can be injected passively into the LLM prompt, or the agent can actively use a tool call to find more context.
