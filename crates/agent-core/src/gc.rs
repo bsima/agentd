@@ -45,13 +45,75 @@ pub struct GcState {
     pub lifecycle: HashMap<MsgId, LifecycleState>,
     /// Stack-frame status, keyed by provider tool-call id.
     pub frames: HashMap<FrameId, FrameStatus>,
+    /// Whether the most recent collect() changed bytes inside the cached
+    /// prefix region (provider prompt caches key on a stable prefix).
+    /// Set by every strategy on every collection; read for gc_collect
+    /// trace events.
+    pub prefix_invalidated: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RingGc;
+/// Fraction of the budget pinned as the stable cache-prefix region under
+/// preserve mode: the system prompt plus the oldest messages up to this
+/// share of the budget never change, so provider prefix caches keep hitting.
+const CACHE_PREFIX_BUDGET_RATIO: f32 = 0.25;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MarkSweepGc;
+/// Index of the first message *outside* the pinned cache prefix. System
+/// messages are always pinned regardless of position; the oldest non-system
+/// messages are pinned until the prefix allowance is spent. The boundary
+/// never splits a tool-call pair: if a pinned assistant message issued a
+/// call, its result is pinned too.
+fn cache_prefix_boundary(messages: &[ChatMessage], budget: usize) -> usize {
+    let allowance = ((budget as f32) * CACHE_PREFIX_BUDGET_RATIO) as usize;
+    let mut spent = 0usize;
+    let mut boundary = 0usize;
+    let mut pinned_call_ids = BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        let tokens = estimate_tokens(std::slice::from_ref(message));
+        let completes_pinned_pair = message
+            .tool_call_id
+            .as_ref()
+            .is_some_and(|id| pinned_call_ids.contains(id));
+        if message.role != "system" && spent + tokens > allowance && !completes_pinned_pair {
+            break;
+        }
+        spent = spent.saturating_add(tokens);
+        collect_pair_ids(message, &mut pinned_call_ids);
+        boundary = index + 1;
+    }
+    boundary
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RingGc {
+    /// Preserve the cached prefix: evict oldest-first from the *interior*
+    /// (after the pinned prefix region) instead of the front, falling back
+    /// to front-drop (and reporting the invalidation) only when preserving
+    /// cannot reach the budget.
+    pub preserve_prefix: bool,
+}
+
+impl Default for RingGc {
+    fn default() -> Self {
+        Self {
+            preserve_prefix: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MarkSweepGc {
+    /// Preserve the cached prefix: only annotate/evict messages after the
+    /// pinned prefix region.
+    pub preserve_prefix: bool,
+}
+
+impl Default for MarkSweepGc {
+    fn default() -> Self {
+        Self {
+            preserve_prefix: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum GcMode {
@@ -106,8 +168,14 @@ impl ContextGc for MarkSweepGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
+        let boundary = cache_prefix_boundary(&messages, budget);
+        let prefix_snapshot = messages[..boundary].to_vec();
+        // Under preserve, annotation and eviction are restricted to the
+        // interior; in ignore mode the whole window is fair game.
+        let restrict = if self.preserve_prefix { boundary } else { 0 };
+
         tag_lifecycles(&messages, state);
-        annotate_evictable_tool_results(&mut messages, state);
+        annotate_evictable_tool_results(&mut messages, state, restrict);
 
         let mut keep = vec![true; messages.len()];
         sweep_by_lifecycle(
@@ -115,6 +183,7 @@ impl ContextGc for MarkSweepGc {
             &mut keep,
             state,
             budget,
+            restrict,
             LifecycleState::Evictable,
         );
         sweep_by_lifecycle(
@@ -122,15 +191,18 @@ impl ContextGc for MarkSweepGc {
             &mut keep,
             state,
             budget,
+            restrict,
             LifecycleState::Complete,
         );
 
-        messages
+        let collected: Vec<ChatMessage> = messages
             .into_iter()
             .zip(keep)
             .filter(|(_, keep)| *keep)
             .map(|(message, _)| message)
-            .collect()
+            .collect();
+        state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
+        collected
     }
 
     fn name(&self) -> &'static str {
@@ -138,8 +210,18 @@ impl ContextGc for MarkSweepGc {
     }
 
     fn cache_preserving(&self) -> bool {
-        false
+        self.preserve_prefix
     }
+}
+
+/// Did the collected window change anything inside the pinned prefix region?
+/// Provider prompt caches key on a byte-stable prefix, so any drop or
+/// mutation among the leading messages invalidates them.
+fn prefix_changed(prefix_snapshot: &[ChatMessage], collected: &[ChatMessage]) -> bool {
+    if collected.len() < prefix_snapshot.len() {
+        return true;
+    }
+    prefix_snapshot != &collected[..prefix_snapshot.len()]
 }
 
 fn tag_lifecycles(messages: &[ChatMessage], state: &mut GcState) {
@@ -198,9 +280,9 @@ fn is_large_tool_result(message: &ChatMessage) -> bool {
             .is_some_and(|content| content.len() > 512)
 }
 
-fn annotate_evictable_tool_results(messages: &mut [ChatMessage], state: &GcState) {
+fn annotate_evictable_tool_results(messages: &mut [ChatMessage], state: &GcState, boundary: usize) {
     let call_summaries = tool_call_summaries(messages);
-    for message in messages {
+    for message in messages.iter_mut().skip(boundary) {
         if message.role != "tool" {
             continue;
         }
@@ -254,13 +336,16 @@ fn sweep_by_lifecycle(
     keep: &mut [bool],
     state: &GcState,
     budget: usize,
+    boundary: usize,
     target: LifecycleState,
 ) {
     while estimate_tokens(&kept_messages(messages, keep)) > budget {
         let Some(index) = messages.iter().enumerate().position(|(idx, message)| {
-            keep[idx]
+            idx >= boundary
+                && keep[idx]
                 && message.role != "system"
                 && state.lifecycle.get(&message.id).copied() == Some(target)
+                && atomic_group_stays_past(messages, keep, idx, boundary)
         }) else {
             break;
         };
@@ -268,38 +353,95 @@ fn sweep_by_lifecycle(
     }
 }
 
+/// Would dropping `index`'s atomic group (tool-call pairs travel together)
+/// touch anything before `boundary`? Used to keep preserve-mode sweeps from
+/// pulling pinned-prefix messages out via pair atomicity.
+fn atomic_group_stays_past(
+    messages: &[ChatMessage],
+    keep: &[bool],
+    index: usize,
+    boundary: usize,
+) -> bool {
+    if boundary == 0 {
+        return true;
+    }
+    let mut scratch = keep.to_vec();
+    drop_atomic_group(messages, &mut scratch, index);
+    keep.iter()
+        .zip(&scratch)
+        .take(boundary)
+        .all(|(before, after)| before == after)
+}
+
 impl ContextGc for RingGc {
     fn collect(
         &self,
         messages: Vec<ChatMessage>,
         budget: usize,
-        _state: &mut GcState,
+        state: &mut GcState,
     ) -> Vec<ChatMessage> {
+        let boundary = if self.preserve_prefix {
+            cache_prefix_boundary(&messages, budget)
+        } else {
+            0
+        };
+        let prefix_snapshot =
+            messages[..cache_prefix_boundary(&messages, budget).min(messages.len())].to_vec();
+
         let mut keep = vec![true; messages.len()];
-        while estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-            let Some(index) = oldest_droppable_index(&messages, &keep) else {
-                break;
-            };
-            drop_atomic_group(&messages, &mut keep, index);
+        // Phase 1: drop oldest-first from the interior (boundary 0 in ignore
+        // mode makes this the classic front-drop).
+        sweep_ring(&messages, &mut keep, budget, boundary);
+        // Phase 2 (preserve fallback): the pinned prefix plus the live tail
+        // alone exceed the budget. Overflowing the model is worse than a
+        // cache miss, so degrade to front-drop; the gc_collect event reports
+        // the invalidation via state.prefix_invalidated.
+        if boundary > 0 && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            sweep_ring(&messages, &mut keep, budget, 0);
         }
-        messages
+
+        let collected: Vec<ChatMessage> = messages
             .into_iter()
             .zip(keep)
             .filter(|(_, keep)| *keep)
             .map(|(message, _)| message)
-            .collect()
+            .collect();
+        state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
+        collected
     }
 
     fn name(&self) -> &'static str {
         "ring"
     }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
+    }
 }
 
-fn oldest_droppable_index(messages: &[ChatMessage], keep: &[bool]) -> Option<usize> {
+fn sweep_ring(messages: &[ChatMessage], keep: &mut [bool], budget: usize, boundary: usize) {
+    while estimate_tokens(&kept_messages(messages, keep)) > budget {
+        let Some(index) = oldest_droppable_index(messages, keep, boundary) else {
+            break;
+        };
+        drop_atomic_group(messages, keep, index);
+    }
+}
+
+fn oldest_droppable_index(
+    messages: &[ChatMessage],
+    keep: &[bool],
+    boundary: usize,
+) -> Option<usize> {
     messages
         .iter()
         .enumerate()
-        .find(|(idx, message)| keep[*idx] && message.role != "system")
+        .find(|(idx, message)| {
+            *idx >= boundary
+                && keep[*idx]
+                && message.role != "system"
+                && atomic_group_stays_past(messages, keep, *idx, boundary)
+        })
         .map(|(idx, _)| idx)
 }
 
@@ -548,9 +690,9 @@ mod tests {
             ChatMessage::assistant(Some("I incorporated that result".into()), vec![]),
         ];
         let mut state = GcState::default();
-        let collected = MarkSweepGc.collect(messages.clone(), 10_000, &mut state);
+        let collected = MarkSweepGc::default().collect(messages.clone(), 10_000, &mut state);
 
-        if MarkSweepGc.cache_preserving() {
+        if MarkSweepGc::default().cache_preserving() {
             assert_eq!(collected, messages);
         }
     }
@@ -564,7 +706,7 @@ mod tests {
             ChatMessage::assistant(Some("I incorporated that result".into()), vec![]),
         ];
         let mut state = GcState::default();
-        let collected = MarkSweepGc.collect(messages, 120, &mut state);
+        let collected = MarkSweepGc::default().collect(messages, 120, &mut state);
 
         let tool = collected
             .iter()
@@ -587,7 +729,7 @@ mod tests {
             ChatMessage::user("recent user message that should stay"),
         ];
         let mut state = GcState::default();
-        let collected = MarkSweepGc.collect(messages, 40, &mut state);
+        let collected = MarkSweepGc::default().collect(messages, 40, &mut state);
 
         assert!(collected.iter().any(|message| message.role == "system"));
         assert!(collected.iter().any(|message| {
@@ -618,10 +760,127 @@ mod tests {
         let mut state_a = GcState::default();
         let mut state_b = GcState::default();
 
-        let a = MarkSweepGc.collect(messages.clone(), 55, &mut state_a);
-        let b = MarkSweepGc.collect(messages, 55, &mut state_b);
+        let a = MarkSweepGc::default().collect(messages.clone(), 55, &mut state_a);
+        let b = MarkSweepGc::default().collect(messages, 55, &mut state_b);
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ring_preserve_evicts_interior_and_keeps_the_cached_prefix() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("a".repeat(100)),
+            ChatMessage::user("b".repeat(200)),
+            ChatMessage::user("c".repeat(300)),
+        ];
+        // Budget such that the 25% prefix allowance covers system + the
+        // oldest message, and something must still drop.
+        let prefix_tokens = estimate_tokens(&messages[..2]);
+        let budget = prefix_tokens * 4;
+        assert!(
+            estimate_tokens(&messages) > budget,
+            "test setup: collection must be under pressure"
+        );
+
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: true,
+        }
+        .collect(messages.clone(), budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget);
+        assert_eq!(
+            &collected[..2],
+            &messages[..2],
+            "the cached prefix must stay byte-identical"
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|message| message.content.as_deref() == Some(&"a".repeat(100))),
+            "pinned oldest message must survive"
+        );
+        assert!(
+            !collected
+                .iter()
+                .any(|message| message.content.as_deref() == Some(&"b".repeat(200))),
+            "interior message should be evicted"
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|message| message.content.as_deref() == Some(&"c".repeat(300))),
+            "live tail should survive"
+        );
+        assert!(!state.prefix_invalidated);
+    }
+
+    #[test]
+    fn ring_ignore_mode_reports_prefix_invalidation() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("oldest"),
+            ChatMessage::user("d".repeat(400)),
+        ];
+        let prefix_tokens = estimate_tokens(&messages[..2]);
+        let budget = prefix_tokens * 4;
+        assert!(estimate_tokens(&messages) > budget);
+
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, budget, &mut state);
+
+        assert!(
+            state.prefix_invalidated,
+            "front-drop changed the prefix region: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn mark_sweep_preserve_does_not_touch_the_pinned_prefix() {
+        let pinned_result = "x".repeat(2000);
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(None, vec![read_file_call("call-1", "/tmp/pinned.txt")]),
+            // Completes the pinned pair, so it is pinned despite its size.
+            ChatMessage::tool("call-1", pinned_result.clone()),
+            ChatMessage::assistant(Some("incorporated pinned".into()), vec![]),
+            ChatMessage::assistant(None, vec![tool_call("call-2")]),
+            ChatMessage::tool("call-2", "small interior result"),
+            ChatMessage::assistant(Some("incorporated interior".into()), vec![]),
+            ChatMessage::user("latest"),
+        ];
+        // Allowance covers system + the call message; the giant result rides
+        // along via pair pinning.
+        let prefix_tokens = estimate_tokens(&messages[..2]);
+        let budget = prefix_tokens * 4;
+        assert!(estimate_tokens(&messages) > budget);
+
+        let mut state = GcState::default();
+        let collected = MarkSweepGc {
+            preserve_prefix: true,
+        }
+        .collect(messages, budget, &mut state);
+
+        let pinned_tool = collected
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("pinned tool result must survive");
+        assert_eq!(
+            pinned_tool.content.as_deref(),
+            Some(pinned_result.as_str()),
+            "preserve mode must not annotate inside the pinned prefix"
+        );
+        assert!(
+            !collected
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("call-2")),
+            "interior completed pair should be evicted under pressure"
+        );
+        assert!(!state.prefix_invalidated);
     }
 
     #[test]
@@ -634,7 +893,10 @@ mod tests {
             ChatMessage::user("recent user message that should remain"),
         ];
         let mut state = GcState::default();
-        let collected = RingGc.collect(messages, 45, &mut state);
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, 45, &mut state);
 
         let live_call_ids: BTreeSet<_> = collected
             .iter()

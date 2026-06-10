@@ -40,11 +40,23 @@ fn gc_strategy_evals() -> Result<()> {
 
     for trace in &traces {
         let budget = eval_budget(&trace.prompt);
-        let ring = evaluate_strategy(trace, budget, RingGc)?;
+        let ring = evaluate_strategy(
+            trace,
+            budget,
+            RingGc {
+                preserve_prefix: false,
+            },
+        )?;
         print_metrics(&ring);
         ring_metrics.push(ring);
 
-        let mark_sweep = evaluate_strategy(trace, budget, MarkSweepGc)?;
+        let mark_sweep = evaluate_strategy(
+            trace,
+            budget,
+            MarkSweepGc {
+                preserve_prefix: false,
+            },
+        )?;
         print_metrics(&mark_sweep);
         challenger_metrics.push(mark_sweep);
     }
@@ -258,4 +270,99 @@ fn print_metrics(metrics: &EvalMetrics) {
         metrics.tool_results_after,
         metrics.tool_results_before
     );
+}
+
+/// Compare --gc-cache preserve against ignore on the fixture set: preserve
+/// must keep a stable leading prefix (provider prompt caches key on it) at
+/// least as long as ignore's, without invalidating it, while still reclaiming
+/// tokens. Gate for the preserve implementation per docs/GC.md.
+#[test]
+fn gc_cache_preserve_keeps_prefix_stable() -> Result<()> {
+    let traces = load_trace_cases()?;
+    assert!(!traces.is_empty(), "expected at least one eval trace");
+
+    type StrategyPair = (&'static str, Box<dyn ContextGc>, Box<dyn ContextGc>);
+    let strategies: Vec<StrategyPair> = vec![
+        (
+            "ring",
+            Box::new(RingGc {
+                preserve_prefix: true,
+            }),
+            Box::new(RingGc {
+                preserve_prefix: false,
+            }),
+        ),
+        (
+            "mark-sweep",
+            Box::new(MarkSweepGc {
+                preserve_prefix: true,
+            }),
+            Box::new(MarkSweepGc {
+                preserve_prefix: false,
+            }),
+        ),
+    ];
+
+    for trace in &traces {
+        let budget = eval_budget(&trace.prompt);
+        let mut input = trace.prompt.clone();
+        truncate_oversized_message(&mut input, budget);
+
+        for (name, preserve, ignore) in &strategies {
+            let mut preserve_state = GcState::default();
+            let preserved = preserve.collect(input.clone(), budget, &mut preserve_state);
+            let mut ignore_state = GcState::default();
+            let ignored = ignore.collect(input.clone(), budget, &mut ignore_state);
+
+            let preserve_prefix = stable_prefix_len(&input, &preserved);
+            let ignore_prefix = stable_prefix_len(&input, &ignored);
+            println!(
+                "gc_cache_eval trace={} strategy={name} budget={budget} \
+                 preserve: tokens={} stable_prefix={preserve_prefix} invalidated={} | \
+                 ignore: tokens={} stable_prefix={ignore_prefix} invalidated={}",
+                trace.name,
+                estimate_tokens(&preserved),
+                preserve_state.prefix_invalidated,
+                estimate_tokens(&ignored),
+                ignore_state.prefix_invalidated,
+            );
+
+            assert!(
+                !preserve_state.prefix_invalidated,
+                "{name} preserve on {} must not invalidate the cached prefix",
+                trace.name
+            );
+            assert!(
+                preserve_prefix >= ignore_prefix,
+                "{name} preserve on {} must keep at least as long a stable prefix \
+                 (preserve={preserve_prefix}, ignore={ignore_prefix})",
+                trace.name
+            );
+            assert!(
+                estimate_tokens(&preserved) < estimate_tokens(&input),
+                "{name} preserve on {} must still reclaim tokens",
+                trace.name
+            );
+            if *name == "ring" {
+                // The front-drop fallback guarantees ring converges whenever
+                // classic ring would; mark-sweep stays best-effort (it only
+                // evicts complete/evictable lifecycles).
+                assert!(
+                    estimate_tokens(&preserved) <= budget,
+                    "ring preserve on {} must converge under budget",
+                    trace.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Longest run of leading messages the collection left untouched.
+fn stable_prefix_len(original: &[ChatMessage], collected: &[ChatMessage]) -> usize {
+    original
+        .iter()
+        .zip(collected)
+        .take_while(|(before, after)| before == after)
+        .count()
 }

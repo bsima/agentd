@@ -2,11 +2,15 @@
 
 Status: **`ring` and `mark-sweep` are implemented** (with `--gc`,
 `--gc-threshold`, `--gc-log`, the `truncate_oversized_message` pre-pass, pair
-atomicity, and the eval harness). **`stack` is designed but not implemented.**
-**`--gc-cache` is parsed but not implemented** — both strategies currently
-behave as cache-invalidating (`cache_preserving()` is `false`), and the
-`preserve` mechanics described below are the design target, not shipped
-behavior. The `gc_collect` event reports `dropped_count`, not `frames_popped`.
+atomicity, and the eval harness). **`--gc-cache preserve|ignore` is
+implemented** and `preserve` is the default: the system prompt plus the
+oldest ~25% of the budget are pinned as the stable cache prefix, eviction
+happens in the interior, and ring falls back to front-drop (reported via
+`cache_invalidated` on the `gc_collect` event, which is now observed per
+collection rather than static per strategy) only when preserving cannot
+reach the budget. `tests/gc_evals.rs::gc_cache_preserve_keeps_prefix_stable`
+gates the preserve behavior. **`stack` is designed but not implemented.**
+The `gc_collect` event reports `dropped_count`, not `frames_popped`.
 
 ## Overview
 

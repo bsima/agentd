@@ -98,7 +98,11 @@ struct Args {
     /// Enable OpenTelemetry OTLP export to this collector endpoint. Also enabled by OTEL_EXPORTER_OTLP_ENDPOINT.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otel_endpoint: Option<String>,
-    /// Prompt-cache policy for GC (parsed for future support).
+    /// Prompt-cache policy for GC. `preserve` (default) pins the system
+    /// prompt plus the oldest ~25% of the budget as a stable cache prefix and
+    /// evicts from the interior, falling back to front-drop only when that
+    /// cannot reach the budget; `ignore` maximizes token reclaim and may
+    /// invalidate the provider prompt cache on every collection.
     #[arg(long, value_enum, default_value_t = GcCacheArg::Preserve)]
     gc_cache: GcCacheArg,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
@@ -405,10 +409,13 @@ async fn main() -> Result<()> {
         replay: replay.clone(),
         trace_full_prompt_ir: args.trace_full_prompt_ir,
         trace_full_payloads: args.trace_full_payloads,
-        gc: match args.gc {
-            GcArg::None => GcMode::None,
-            GcArg::Ring => GcMode::Ring(RingGc),
-            GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc),
+        gc: {
+            let preserve_prefix = matches!(args.gc_cache, GcCacheArg::Preserve);
+            match args.gc {
+                GcArg::None => GcMode::None,
+                GcArg::Ring => GcMode::Ring(RingGc { preserve_prefix }),
+                GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc { preserve_prefix }),
+            }
         },
         gc_threshold: args.gc_threshold,
         gc_log: args.gc_log,
