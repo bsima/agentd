@@ -38,7 +38,7 @@ pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
     agent_loop, emit, eval, get, has_pending_tool_calls, infer, par, put,
     repair_trailing_pending_tool_calls, ChatMessage, FinishReason, Model, Op, OpF, Prompt,
-    Response, ResponseToolCall,
+    Response, ToolCall,
 };
 pub use prompt_ir::{
     collect_prompt_ir_sections, compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash,

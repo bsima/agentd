@@ -222,18 +222,18 @@ fn tool_call_summaries(messages: &[ChatMessage]) -> HashMap<String, String> {
     let mut summaries = HashMap::new();
     for message in messages {
         for call in message.tool_calls.as_deref().unwrap_or_default() {
-            let args = call.arguments();
-            let arg_summary = args
+            let arg_summary = call
+                .arguments
                 .get("path")
-                .or_else(|| args.get("file"))
-                .or_else(|| args.get("command"))
+                .or_else(|| call.arguments.get("file"))
+                .or_else(|| call.arguments.get("command"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_default();
             let summary = if arg_summary.is_empty() {
-                call.name().to_string()
+                call.name.clone()
             } else {
-                format!("{} {}", call.name(), preview_chars(&arg_summary, 80))
+                format!("{} {}", call.name, preview_chars(&arg_summary, 80))
             };
             summaries.insert(call.id.clone(), summary);
         }
@@ -398,9 +398,8 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
                         .iter()
                         .map(|call| {
                             estimate_text_tokens(&call.id)
-                                .saturating_add(estimate_text_tokens(&call.kind))
-                                .saturating_add(estimate_text_tokens(&call.function.name))
-                                .saturating_add(estimate_text_tokens(&call.function.arguments))
+                                .saturating_add(estimate_text_tokens(&call.name))
+                                .saturating_add(estimate_text_tokens(&call.arguments.to_string()))
                         })
                         .sum()
                 }))
@@ -419,14 +418,14 @@ fn estimate_text_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::op::ResponseToolCall;
+    use crate::op::ToolCall;
 
-    fn tool_call(id: &str) -> ResponseToolCall {
-        ResponseToolCall::new(id, "shell", serde_json::json!({}))
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall::new(id, "shell", serde_json::json!({}))
     }
 
-    fn read_file_call(id: &str, path: &str) -> ResponseToolCall {
-        ResponseToolCall::new(id, "read_file", serde_json::json!({ "path": path }))
+    fn read_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall::new(id, "read_file", serde_json::json!({ "path": path }))
     }
 
     #[test]

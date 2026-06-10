@@ -1,5 +1,5 @@
 use agent_core::provider::ToolSpec;
-use agent_core::{ChatMessage, ChatProvider, FinishReason, Model, Response, ResponseToolCall};
+use agent_core::{ChatMessage, ChatProvider, FinishReason, Model, Response, ToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -404,12 +404,9 @@ impl OAuthChatProvider {
         messages: &[ChatMessage],
     ) -> Result<Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = json!({
-            "model": model.0,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-        });
+        // Shared body builder: strips internal message ids and adapts neutral
+        // tool calls to the OpenAI wire shape.
+        let body = agent_core::provider::openai_chat_body(model, tools, messages);
         let response = self
             .client
             .post(url)
@@ -708,8 +705,8 @@ fn message_to_codex_input(message: &ChatMessage) -> Vec<Value> {
                 items.push(json!({
                     "type": "function_call",
                     "call_id": call.id,
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
+                    "name": call.name,
+                    "arguments": call.arguments.to_string(),
                 }));
             }
             items
@@ -881,10 +878,10 @@ impl CodexToolAccum {
         }
     }
 
-    fn into_tool_call(self) -> ResponseToolCall {
+    fn into_tool_call(self) -> ToolCall {
         let arguments = serde_json::from_str(&self.arguments)
             .unwrap_or_else(|_| json!({ "raw": self.arguments }));
-        ResponseToolCall::new(self.id, self.name, arguments)
+        ToolCall::new(self.id, self.name, arguments)
     }
 }
 
@@ -1022,7 +1019,7 @@ fn parse_chat_response(text: &str) -> Result<Response> {
             .map(|call| {
                 let arguments: Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| json!({ "raw": call.function.arguments }));
-                ResponseToolCall::new(call.id, call.function.name, arguments)
+                ToolCall::new(call.id, call.function.name, arguments)
             })
             .collect(),
         input_tokens,
@@ -1113,9 +1110,9 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
         assert_eq!(response.output_tokens, 3);
         assert_eq!(response.total_tokens, 5);
         assert_eq!(response.tool_calls.len(), 1);
-        assert_eq!(response.tool_calls[0].name(), "shell");
+        assert_eq!(response.tool_calls[0].name, "shell");
         assert_eq!(
-            response.tool_calls[0].arguments()["command"],
+            response.tool_calls[0].arguments["command"],
             json!("printf ok")
         );
         Ok(())

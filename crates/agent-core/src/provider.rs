@@ -1,4 +1,4 @@
-use crate::op::{ChatMessage, FinishReason, Model, Response, ResponseToolCall};
+use crate::op::{ChatMessage, FinishReason, Model, Response, ToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
@@ -63,17 +63,37 @@ impl ProviderClient {
 
 struct WireChatMessage<'a>(&'a ChatMessage);
 
+/// Adapt a neutral [`ToolCall`] to the OpenAI chat-completions wire shape:
+/// nested `function` object with the arguments JSON-encoded as a string.
+fn tool_call_to_openai_wire(call: &crate::op::ToolCall) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": call.arguments.to_string(),
+        },
+    })
+}
+
 impl Serialize for WireChatMessage<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         let message = self.0;
+        // An empty tool_calls array is rejected by OpenAI-compatible
+        // providers; omit the field entirely rather than sending [].
+        let tool_calls: Option<Vec<Value>> = message
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+            .map(|calls| calls.iter().map(tool_call_to_openai_wire).collect());
         let mut fields = 2;
         if message.tool_call_id.is_some() {
             fields += 1;
         }
-        if message.tool_calls.is_some() {
+        if tool_calls.is_some() {
             fields += 1;
         }
         let mut state = serializer.serialize_struct("ChatMessage", fields)?;
@@ -82,7 +102,7 @@ impl Serialize for WireChatMessage<'_> {
         if let Some(tool_call_id) = &message.tool_call_id {
             state.serialize_field("tool_call_id", tool_call_id)?;
         }
-        if let Some(tool_calls) = &message.tool_calls {
+        if let Some(tool_calls) = &tool_calls {
             state.serialize_field("tool_calls", tool_calls)?;
         }
         state.end()
@@ -112,12 +132,19 @@ impl ChatProvider for ProviderClient {
     }
 }
 
-/// Build the JSON request body for a chat completion. When `nudge` is set, a
-/// synthetic user continuation message is appended so that a *retry* after an
-/// empty completion differs from the request that produced it.
+/// Build the JSON request body for an OpenAI-compatible chat completion.
+/// Shared by [`ProviderClient`] and the OAuth providers in `agent-oauth`.
 ///
 /// Messages are serialized through [`WireChatMessage`] so internal stable ids
-/// (used for GC/trace state) never reach the provider.
+/// (used for GC/trace state) never reach the provider and neutral tool calls
+/// are adapted to the OpenAI wire shape.
+pub fn openai_chat_body(model: &Model, tools: &[ToolSpec], messages: &[ChatMessage]) -> Value {
+    build_chat_body(model, tools, messages, false)
+}
+
+/// Like [`openai_chat_body`], but when `nudge` is set a synthetic user
+/// continuation message is appended so that a *retry* after an empty
+/// completion differs from the request that produced it.
 fn build_chat_body(
     model: &Model,
     tools: &[ToolSpec],
@@ -229,7 +256,7 @@ impl ProviderClient {
             .as_deref()
             .map(FinishReason::from_provider);
         let content = choice.message.content.unwrap_or_default();
-        let tool_calls: Vec<ResponseToolCall> = choice
+        let tool_calls: Vec<ToolCall> = choice
             .message
             .tool_calls
             .unwrap_or_default()
@@ -237,7 +264,7 @@ impl ProviderClient {
             .map(|call| {
                 let arguments: Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| json!({ "raw": call.function.arguments }));
-                ResponseToolCall::new(call.id, call.function.name, arguments)
+                ToolCall::new(call.id, call.function.name, arguments)
             })
             .collect();
         // Some providers (observed with gpt-5.5) occasionally return a 200 OK
@@ -458,7 +485,7 @@ mod tests {
             ChatMessage::user("do the task"),
             ChatMessage::assistant(
                 None,
-                vec![ResponseToolCall::new(
+                vec![ToolCall::new(
                     "call_1",
                     "shell",
                     json!({"command": "git commit -m x"}),
@@ -466,6 +493,45 @@ mod tests {
             ),
             ChatMessage::tool("call_1", "committed"),
         ]
+    }
+
+    #[test]
+    fn wire_messages_strip_ids_and_adapt_tool_calls_to_openai_shape() {
+        let messages = vec![
+            ChatMessage::assistant(
+                Some("text".into()),
+                vec![ToolCall::new("call_1", "shell", json!({"command": "pwd"}))],
+            ),
+            ChatMessage::tool("call_1", "ok"),
+        ];
+
+        let body = openai_chat_body(&model(), &[], &messages);
+
+        let wire = body["messages"].as_array().unwrap();
+        assert!(
+            wire.iter().all(|message| message.get("id").is_none()),
+            "internal ids must not reach the wire: {wire:?}"
+        );
+        assert_eq!(wire[0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(wire[0]["tool_calls"][0]["type"], json!("function"));
+        assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], json!("shell"));
+        assert_eq!(
+            wire[0]["tool_calls"][0]["function"]["arguments"],
+            json!(r#"{"command":"pwd"}"#)
+        );
+        assert_eq!(wire[1]["tool_call_id"], json!("call_1"));
+    }
+
+    #[test]
+    fn wire_messages_omit_empty_tool_calls_array() {
+        // OpenAI-compatible providers reject assistant messages carrying an
+        // empty tool_calls array, so the wire layer must drop the field.
+        let mut message = ChatMessage::assistant(Some("text".into()), Vec::new());
+        message.tool_calls = Some(Vec::new());
+
+        let body = openai_chat_body(&model(), &[], &[message]);
+
+        assert!(body["messages"][0].get("tool_calls").is_none());
     }
 
     #[test]
@@ -496,11 +562,7 @@ mod tests {
             ChatMessage::user("do the task"),
             ChatMessage::assistant(
                 None,
-                vec![ResponseToolCall::new(
-                    "call_1",
-                    "shell",
-                    json!({"command": "pwd"}),
-                )],
+                vec![ToolCall::new("call_1", "shell", json!({"command": "pwd"}))],
             ),
         ];
 

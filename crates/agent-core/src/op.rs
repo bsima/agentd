@@ -45,7 +45,7 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ResponseToolCall>>,
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl PartialEq for ChatMessage {
@@ -78,7 +78,7 @@ impl ChatMessage {
         }
     }
 
-    pub fn assistant(content: Option<String>, tool_calls: Vec<ResponseToolCall>) -> Self {
+    pub fn assistant(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             id: Uuid::new_v4(),
             role: "assistant".into(),
@@ -102,7 +102,7 @@ impl ChatMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub content: String,
-    pub tool_calls: Vec<ResponseToolCall>,
+    pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
     pub input_tokens: u32,
@@ -110,44 +110,74 @@ pub struct Response {
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResponseToolCall {
+/// A provider-neutral tool invocation. `arguments` is the parsed JSON value,
+/// not a provider-specific encoding. Providers adapt this to their own wire
+/// shape at the serialization edge (see `provider`, `anthropic`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolCall {
     pub id: String,
-    #[serde(rename = "type", default = "tool_call_type")]
-    pub kind: String,
-    pub function: ResponseToolFunction,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResponseToolFunction {
     pub name: String,
-    pub arguments: String,
+    pub arguments: Value,
 }
 
-impl ResponseToolCall {
+impl ToolCall {
     pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
         Self {
             id: id.into(),
-            kind: tool_call_type(),
-            function: ResponseToolFunction {
-                name: name.into(),
-                arguments: arguments.to_string(),
-            },
+            name: name.into(),
+            arguments,
         }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.function.name
-    }
-
-    pub fn arguments(&self) -> Value {
-        serde_json::from_str(&self.function.arguments)
-            .unwrap_or_else(|_| serde_json::json!({ "raw": self.function.arguments }))
     }
 }
 
-fn tool_call_type() -> String {
-    "function".into()
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Checkpoints, traces, and eval fixtures written before the neutral
+        // shape carry OpenAI-wire tool calls
+        // ({"id", "type", "function": {"name", "arguments": "<json string>"}}).
+        // Accept both so old persisted state keeps loading; serialization is
+        // always the neutral shape.
+        #[derive(Deserialize)]
+        struct LegacyOpenAiFunction {
+            name: String,
+            arguments: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Compat {
+            Neutral {
+                id: String,
+                name: String,
+                arguments: Value,
+            },
+            LegacyOpenAi {
+                id: String,
+                function: LegacyOpenAiFunction,
+            },
+        }
+
+        Ok(match Compat::deserialize(deserializer)? {
+            Compat::Neutral {
+                id,
+                name,
+                arguments,
+            } => Self {
+                id,
+                name,
+                arguments,
+            },
+            Compat::LegacyOpenAi { id, function } => Self {
+                id,
+                name: function.name,
+                arguments: serde_json::from_str(&function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": function.arguments })),
+            },
+        })
+    }
 }
 
 pub enum OpF<S, A> {
@@ -373,18 +403,17 @@ pub fn repair_trailing_pending_tool_calls(prompt: &[ChatMessage]) -> Vec<ChatMes
     prompt[..latest_clean_len].to_vec()
 }
 
-fn command_from_tool_call(call: &ResponseToolCall) -> std::result::Result<String, Value> {
-    if call.name() != "shell" {
+fn command_from_tool_call(call: &ToolCall) -> std::result::Result<String, Value> {
+    if call.name != "shell" {
         return Err(serde_json::json!({
             "ok": false,
             "error": "unknown_tool",
-            "tool": call.name(),
+            "tool": call.name,
             "message": "unknown tool; available tools: shell"
         }));
     }
 
-    let args = call.arguments();
-    match args.get("command").and_then(Value::as_str) {
+    match call.arguments.get("command").and_then(Value::as_str) {
         Some(command) if !command.trim().is_empty() => Ok(command.to_string()),
         _ => Err(serde_json::json!({
             "ok": false,
@@ -461,6 +490,62 @@ mod tests {
             output_tokens: 0,
             total_tokens: 0,
         }
+    }
+
+    #[test]
+    fn tool_call_serializes_neutral_and_deserializes_both_shapes() {
+        let call = ToolCall::new("call-1", "shell", serde_json::json!({ "command": "pwd" }));
+        let encoded = serde_json::to_value(&call).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "id": "call-1",
+                "name": "shell",
+                "arguments": { "command": "pwd" }
+            })
+        );
+        let decoded: ToolCall = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, call);
+
+        // Legacy OpenAI wire shape from pre-neutral checkpoints/traces.
+        let legacy = serde_json::json!({
+            "id": "call-1",
+            "type": "function",
+            "function": { "name": "shell", "arguments": "{\"command\":\"pwd\"}" }
+        });
+        let decoded: ToolCall = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded, call);
+    }
+
+    #[test]
+    fn legacy_tool_call_with_unparseable_arguments_falls_back_to_raw() {
+        let legacy = serde_json::json!({
+            "id": "call-1",
+            "type": "function",
+            "function": { "name": "shell", "arguments": "not json" }
+        });
+        let decoded: ToolCall = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.name, "shell");
+        assert_eq!(decoded.arguments, serde_json::json!({ "raw": "not json" }));
+    }
+
+    #[test]
+    fn chat_message_with_legacy_tool_calls_deserializes() {
+        // A checkpoint written before the neutral ToolCall shape.
+        let message = serde_json::json!({
+            "id": "f3b9c2d8-1111-2222-3333-444455556666",
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": { "name": "shell", "arguments": "{\"command\":\"pwd\"}" }
+            }]
+        });
+        let decoded: ChatMessage = serde_json::from_value(message).unwrap();
+        let calls = decoded.tool_calls.unwrap();
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments, serde_json::json!({ "command": "pwd" }));
     }
 
     #[test]
@@ -574,14 +659,14 @@ mod tests {
 
     #[test]
     fn shell_tool_call_parser_accepts_only_non_empty_shell_command() {
-        let valid = ResponseToolCall::new(
+        let valid = ToolCall::new(
             "call-1",
             "shell",
             serde_json::json!({ "command": "printf ok" }),
         );
         assert_eq!(command_from_tool_call(&valid).unwrap(), "printf ok");
 
-        let unknown = ResponseToolCall::new(
+        let unknown = ToolCall::new(
             "call-2",
             "echo",
             serde_json::json!({ "command": "printf bad" }),
@@ -591,14 +676,13 @@ mod tests {
             serde_json::json!("unknown_tool")
         );
 
-        let missing = ResponseToolCall::new("call-3", "shell", serde_json::json!({}));
+        let missing = ToolCall::new("call-3", "shell", serde_json::json!({}));
         assert_eq!(
             command_from_tool_call(&missing).unwrap_err()["error"],
             serde_json::json!("invalid_arguments")
         );
 
-        let empty =
-            ResponseToolCall::new("call-4", "shell", serde_json::json!({ "command": "   " }));
+        let empty = ToolCall::new("call-4", "shell", serde_json::json!({ "command": "   " }));
         assert_eq!(
             command_from_tool_call(&empty).unwrap_err()["error"],
             serde_json::json!("invalid_arguments")
@@ -607,13 +691,12 @@ mod tests {
 
     #[test]
     fn repair_trailing_pending_tool_calls_drops_to_clean_prefix() {
-        let call_1 = ResponseToolCall::new(
+        let call_1 = ToolCall::new(
             "call-1",
             "shell",
             serde_json::json!({ "command": "printf ok" }),
         );
-        let call_2 =
-            ResponseToolCall::new("call-2", "shell", serde_json::json!({ "command": "pwd" }));
+        let call_2 = ToolCall::new("call-2", "shell", serde_json::json!({ "command": "pwd" }));
         let prompt = vec![
             ChatMessage::system("system"),
             ChatMessage::user("first"),

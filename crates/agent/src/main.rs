@@ -1347,7 +1347,7 @@ mod tests {
                 ChatMessage::user("inspect"),
                 ChatMessage::assistant(
                     None,
-                    vec![agent_core::ResponseToolCall::new(
+                    vec![agent_core::ToolCall::new(
                         "call-1",
                         "shell",
                         serde_json::json!({ "command": "pwd" }),

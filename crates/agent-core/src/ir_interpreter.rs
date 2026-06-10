@@ -910,7 +910,7 @@ mod tests {
     use crate::gc::GcMode;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
-    use crate::op::{Response, ResponseToolCall};
+    use crate::op::{Response, ToolCall};
     use crate::provider::{ChatProvider, ToolSpec};
     use crate::trace::TraceLogger;
     use anyhow::{anyhow, Result};
@@ -961,7 +961,7 @@ mod tests {
     fn response(content: &str) -> Response {
         Response {
             content: content.into(),
-            tool_calls: Vec::<ResponseToolCall>::new(),
+            tool_calls: Vec::<ToolCall>::new(),
             finish_reason: Some(crate::op::FinishReason::Stop),
             input_tokens: 0,
             output_tokens: 1,

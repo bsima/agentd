@@ -736,7 +736,7 @@ where
 mod tests {
     use super::*;
     use crate::hydration::{HydrationSource, SourceCapability, SourceKind, SourceResult};
-    use crate::op::{agent_loop, infer, Model, Response, ResponseToolCall};
+    use crate::op::{agent_loop, infer, Model, Response, ToolCall};
     use crate::provider::ToolSpec;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -783,7 +783,7 @@ mod tests {
         }
     }
 
-    fn response(content: &str, tool_calls: Vec<ResponseToolCall>) -> Response {
+    fn response(content: &str, tool_calls: Vec<ToolCall>) -> Response {
         Response {
             content: content.into(),
             tool_calls,
@@ -794,8 +794,8 @@ mod tests {
         }
     }
 
-    fn tool_call(id: &str, name: &str, arguments: Value) -> ResponseToolCall {
-        ResponseToolCall::new(id, name, arguments)
+    fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
+        ToolCall::new(id, name, arguments)
     }
 
     fn test_trace() -> TraceLogger {

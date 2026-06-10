@@ -37,8 +37,6 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let i = Var("i".into());
     let keep_looping = Var("keep_looping".into());
     let call = Var("call".into());
-    let function = Var("function".into());
-    let raw_arguments = Var("raw_arguments".into());
     let arguments = Var("arguments".into());
     let function_name = Var("function_name".into());
     let is_infer_tool = Var("is_infer_tool".into());
@@ -238,17 +236,10 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     },
                 },
                 Instr::Let {
-                    out: function.clone(),
-                    expr: Expr::Field {
-                        base: call.clone(),
-                        field: "function".into(),
-                    },
-                },
-                Instr::Let {
                     out: function_name.clone(),
                     expr: Expr::StringOr {
                         value: Box::new(Expr::FieldOr {
-                            base: function.clone(),
+                            base: call.clone(),
                             field: "name".into(),
                             default: Box::new(Expr::Value(Value::String("".into()))),
                         }),
@@ -256,20 +247,10 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     },
                 },
                 Instr::Let {
-                    out: raw_arguments.clone(),
-                    expr: Expr::StringOr {
-                        value: Box::new(Expr::FieldOr {
-                            base: function.clone(),
-                            field: "arguments".into(),
-                            default: Box::new(Expr::Value(Value::String("{}".into()))),
-                        }),
-                        default: Box::new(Expr::Value(Value::String("{}".into()))),
-                    },
-                },
-                Instr::Let {
                     out: arguments.clone(),
-                    expr: Expr::JsonParseOr {
-                        value: Box::new(Expr::Var(raw_arguments)),
+                    expr: Expr::FieldOr {
+                        base: call.clone(),
+                        field: "arguments".into(),
                         default: Box::new(Expr::Object(BTreeMap::new())),
                     },
                 },
@@ -589,7 +570,7 @@ mod tests {
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
     use crate::ir::validate_program;
-    use crate::op::{ChatMessage, Response, ResponseToolCall};
+    use crate::op::{ChatMessage, Response, ToolCall};
     use crate::provider::{ChatProvider, ToolSpec};
     use crate::trace::{Event, TraceLogger, TraceSummary};
     use anyhow::{anyhow, Result};
@@ -629,7 +610,7 @@ mod tests {
         }
     }
 
-    fn response(content: &str, tool_calls: Vec<ResponseToolCall>) -> Response {
+    fn response(content: &str, tool_calls: Vec<ToolCall>) -> Response {
         Response {
             content: content.into(),
             tool_calls,
@@ -683,7 +664,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             response(
                 "",
-                vec![ResponseToolCall::new(
+                vec![ToolCall::new(
                     "call-1",
                     "infer",
                     serde_json::json!({ "model": "mock", "prompt": "sub question" }),
@@ -713,11 +694,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             response(
                 "",
-                vec![ResponseToolCall::new(
-                    "call-1",
-                    "shell",
-                    serde_json::json!({}),
-                )],
+                vec![ToolCall::new("call-1", "shell", serde_json::json!({}))],
             ),
             response("recovered", vec![]),
         ]));
@@ -739,7 +716,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             response(
                 "",
-                vec![ResponseToolCall::new(
+                vec![ToolCall::new(
                     "call-1",
                     "shell",
                     serde_json::json!({ "command": "printf ir-loop" }),
@@ -768,7 +745,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             response(
                 "",
-                vec![ResponseToolCall::new(
+                vec![ToolCall::new(
                     "call-1",
                     "shell",
                     serde_json::json!({ "command": "printf ir-loop" }),

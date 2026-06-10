@@ -1,4 +1,4 @@
-use crate::op::{ChatMessage, FinishReason, Model, Response, ResponseToolCall};
+use crate::op::{ChatMessage, FinishReason, Model, Response, ToolCall};
 use crate::provider::{ChatProvider, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -144,8 +144,8 @@ fn message_to_anthropic(message: &ChatMessage) -> Value {
                 content.push(json!({
                     "type": "tool_use",
                     "id": call.id,
-                    "name": call.name(),
-                    "input": call.arguments(),
+                    "name": call.name,
+                    "input": call.arguments,
                 }));
             }
             json!({ "role": "assistant", "content": content })
@@ -185,7 +185,7 @@ fn parse_messages_response(text: &str) -> Result<Response> {
         match block {
             AnthropicContentBlock::Text { text } => content.push_str(&text),
             AnthropicContentBlock::ToolUse { id, name, input } => {
-                tool_calls.push(ResponseToolCall::new(id, name, input));
+                tool_calls.push(ToolCall::new(id, name, input));
             }
             AnthropicContentBlock::Other => {}
         }
@@ -334,8 +334,8 @@ mod tests {
         assert_eq!(response.total_tokens, 15);
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].id, "toolu_123");
-        assert_eq!(response.tool_calls[0].name(), "lookup");
-        assert_eq!(response.tool_calls[0].arguments(), json!({"query": "rust"}));
+        assert_eq!(response.tool_calls[0].name, "lookup");
+        assert_eq!(response.tool_calls[0].arguments, json!({"query": "rust"}));
         Ok(())
     }
 

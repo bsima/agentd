@@ -1,3 +1,7 @@
+use agent_core::{
+    agent_loop_ir, effect_location, program_hash, BlockId, DynamicPath, EffectKind, EffectSite,
+    Model,
+};
 use std::process::{Command, Stdio};
 use uuid::Uuid;
 
@@ -14,8 +18,27 @@ fn json_mode_stdout_is_parseable_jsonl() {
     std::fs::create_dir_all(&root).unwrap();
     let replay_path = root.join("replay.jsonl");
     let timestamp = "2026-05-29T00:00:00Z";
+
+    // Compute the stable effect id for the entry-block Infer of the IR agent
+    // loop, instead of hardcoding hashes that break whenever the program
+    // changes. This mirrors what the IR interpreter emits as `ir_effect`.
+    let machine = agent_loop_ir(Model("test-model".into()), vec![], 16);
+    let hash = program_hash(&machine.program).unwrap();
+    let site = EffectSite {
+        block: BlockId(0),
+        instruction_index: 0,
+    };
+    let location = effect_location(
+        hash,
+        EffectKind::Infer,
+        site,
+        DynamicPath::with_visit(site, 0),
+    )
+    .unwrap();
+    let ir_effect = serde_json::to_string(&location).unwrap();
+
     let replay = format!(
-        r#"{{"event":"Custom","run_id":"replay","op_id":0,"name":"ir_effect","data":{{"program_hash":"sha256:8802383da9c1512cab1b71856d9bf11cc656234b9a6bbf3fdfce87282820aa97","effect_id":"sha256:4f4edbc242c6acb8ff4440936c115b45bff528d6d74122ff682574dff34b43e0","kind":"Infer","site":{{"block":0,"instruction_index":0}},"dynamic_path":[{{"Visit":{{"site":{{"block":0,"instruction_index":0}},"visit":0}}}}]}},"timestamp":"{timestamp}"}}
+        r#"{{"event":"Custom","run_id":"replay","op_id":0,"name":"ir_effect","data":{ir_effect},"timestamp":"{timestamp}"}}
 {{"event":"InferCall","run_id":"replay","op_id":2,"model":"test-model","prompt_preview":"","timestamp":"{timestamp}"}}
 {{"event":"InferResult","run_id":"replay","op_id":2,"response":{{"content":"hello human","tool_calls":[],"finish_reason":"stop","input_tokens":3,"output_tokens":4,"total_tokens":7}},"response_preview":"hello human","input_tokens":3,"output_tokens":4,"total_tokens":7,"duration_ms":1,"timestamp":"{timestamp}"}}
 "#
