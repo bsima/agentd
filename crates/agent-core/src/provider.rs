@@ -97,6 +97,11 @@ impl ChatProvider for ProviderClient {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
+        if crate::op::has_pending_tool_calls(messages) {
+            return Err(anyhow::anyhow!(
+                "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
+            ));
+        }
         let url = format!("{}/chat/completions", self.config.url.trim_end_matches('/'));
         chat_with_retries(model, tools, messages, |body| {
             let url = url.clone();
@@ -478,6 +483,34 @@ mod tests {
         assert!(make(StatusCode::TOO_MANY_REQUESTS).is_retryable());
         assert!(make(StatusCode::INTERNAL_SERVER_ERROR).is_retryable());
         assert!(!make(StatusCode::BAD_REQUEST).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn provider_refuses_dangling_tool_call_before_http() {
+        let provider = ProviderClient::new(ProviderConfig {
+            url: "http://127.0.0.1:1".into(),
+            api_key: "test".into(),
+            model: model(),
+        });
+        let messages = vec![
+            ChatMessage::user("do the task"),
+            ChatMessage::assistant(
+                None,
+                vec![ResponseToolCall::new(
+                    "call_1",
+                    "shell",
+                    json!({"command": "pwd"}),
+                )],
+            ),
+        ];
+
+        let err = provider.chat(&model(), &[], &messages).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("refusing to send malformed transcript"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -1041,14 +1041,9 @@ async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
     let Some(path) = runtime.checkpoint_path.clone() else {
         return Ok(());
     };
-    let checkpoint = Checkpoint {
-        run_id: runtime.run_id.clone(),
-        sequence: runtime.checkpoint_sequence + 1,
-        model: runtime.model.0.clone(),
-        provider_url: runtime.provider_url.clone(),
-        messages: runtime.history.clone(),
-        trace_path: runtime.trace_path.clone(),
-        timestamp: Utc::now(),
+    let Some(checkpoint) = checkpoint_from_runtime(runtime, runtime.checkpoint_sequence + 1) else {
+        tracing::warn!(run_id = %runtime.run_id, "skipping session:state checkpoint with pending tool calls");
+        return Ok(());
     };
     let value = serde_json::to_value(checkpoint)?;
     let config = SeqConfig {
@@ -1078,17 +1073,13 @@ async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
     let Some(dir) = &runtime.checkpoint_dir else {
         return Ok(());
     };
-    runtime.checkpoint_sequence += 1;
-    tokio::fs::create_dir_all(dir).await?;
-    let checkpoint = Checkpoint {
-        run_id: runtime.run_id.clone(),
-        sequence: runtime.checkpoint_sequence,
-        model: runtime.model.0.clone(),
-        provider_url: runtime.provider_url.clone(),
-        messages: runtime.history.clone(),
-        trace_path: runtime.trace_path.clone(),
-        timestamp: Utc::now(),
+    let sequence = runtime.checkpoint_sequence + 1;
+    let Some(checkpoint) = checkpoint_from_runtime(runtime, sequence) else {
+        tracing::warn!(run_id = %runtime.run_id, "skipping checkpoint with pending tool calls");
+        return Ok(());
     };
+    runtime.checkpoint_sequence = sequence;
+    tokio::fs::create_dir_all(dir).await?;
     let bytes = serde_json::to_vec_pretty(&checkpoint)?;
     let path = dir.join(format!(
         "checkpoint-{:06}-{}.json",
@@ -1113,12 +1104,44 @@ async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
     Ok(())
 }
 
+fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoint> {
+    if agent_core::has_pending_tool_calls(&runtime.history) {
+        return None;
+    }
+    Some(Checkpoint {
+        run_id: runtime.run_id.clone(),
+        sequence,
+        model: runtime.model.0.clone(),
+        provider_url: runtime.provider_url.clone(),
+        messages: runtime.history.clone(),
+        trace_path: runtime.trace_path.clone(),
+        timestamp: Utc::now(),
+    })
+}
+
 async fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     tracing::info!(checkpoint = %path.display(), "loading checkpoint");
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading checkpoint {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("parsing checkpoint {}", path.display()))
+    let mut checkpoint: Checkpoint = serde_json::from_str(&content)
+        .with_context(|| format!("parsing checkpoint {}", path.display()))?;
+    if agent_core::has_pending_tool_calls(&checkpoint.messages) {
+        let original_len = checkpoint.messages.len();
+        checkpoint.messages = agent_core::repair_trailing_pending_tool_calls(&checkpoint.messages);
+        let repaired_len = checkpoint.messages.len();
+        tracing::warn!(
+            checkpoint = %path.display(),
+            original_len,
+            repaired_len,
+            "repaired checkpoint with pending tool calls"
+        );
+        let bytes = serde_json::to_vec_pretty(&checkpoint)?;
+        tokio::fs::write(path, bytes)
+            .await
+            .with_context(|| format!("writing repaired checkpoint {}", path.display()))?;
+    }
+    Ok(checkpoint)
 }
 
 async fn shutdown_signal() {
@@ -1308,6 +1331,40 @@ mod tests {
         assert_eq!(resolved.alias, "openrouter/auto");
         assert_eq!(resolved.api_id, "openrouter/auto");
         assert_eq!(resolved.provider, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_checkpoint_repairs_trailing_tool_call() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("agent-checkpoint-{}.json", Uuid::new_v4()));
+        let checkpoint = Checkpoint {
+            run_id: "run".into(),
+            sequence: 7,
+            model: "model".into(),
+            provider_url: "https://chatgpt.com/backend-api".into(),
+            messages: vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("inspect"),
+                ChatMessage::assistant(
+                    None,
+                    vec![agent_core::ResponseToolCall::new(
+                        "call-1",
+                        "shell",
+                        serde_json::json!({ "command": "pwd" }),
+                    )],
+                ),
+            ],
+            trace_path: path.with_extension("jsonl"),
+            timestamp: Utc::now(),
+        };
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&checkpoint)?).await?;
+
+        let repaired = load_checkpoint(&path).await?;
+
+        assert!(!agent_core::has_pending_tool_calls(&repaired.messages));
+        assert_eq!(repaired.messages.len(), 2);
+        let on_disk: Checkpoint = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+        assert_eq!(on_disk.messages.len(), 2);
         Ok(())
     }
 }

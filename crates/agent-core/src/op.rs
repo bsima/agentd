@@ -343,7 +343,7 @@ const CONTINUE_NUDGE: &str =
     "Your previous response did not finish the turn. Continue the task: if work remains, issue \
      the next tool call; if the task is complete, say so explicitly.";
 
-fn has_pending_tool_calls(prompt: &[ChatMessage]) -> bool {
+pub fn has_pending_tool_calls(prompt: &[ChatMessage]) -> bool {
     let mut pending = std::collections::BTreeSet::new();
     for message in prompt {
         if let Some(tool_calls) = &message.tool_calls {
@@ -354,6 +354,23 @@ fn has_pending_tool_calls(prompt: &[ChatMessage]) -> bool {
         }
     }
     !pending.is_empty()
+}
+
+pub fn repair_trailing_pending_tool_calls(prompt: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut pending = std::collections::BTreeSet::new();
+    let mut latest_clean_len = 0;
+    for (index, message) in prompt.iter().enumerate() {
+        if let Some(tool_calls) = &message.tool_calls {
+            pending.extend(tool_calls.iter().map(|call| call.id.clone()));
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            pending.remove(tool_call_id);
+        }
+        if pending.is_empty() {
+            latest_clean_len = index + 1;
+        }
+    }
+    prompt[..latest_clean_len].to_vec()
 }
 
 fn command_from_tool_call(call: &ResponseToolCall) -> std::result::Result<String, Value> {
@@ -586,6 +603,31 @@ mod tests {
             command_from_tool_call(&empty).unwrap_err()["error"],
             serde_json::json!("invalid_arguments")
         );
+    }
+
+    #[test]
+    fn repair_trailing_pending_tool_calls_drops_to_clean_prefix() {
+        let call_1 = ResponseToolCall::new(
+            "call-1",
+            "shell",
+            serde_json::json!({ "command": "printf ok" }),
+        );
+        let call_2 =
+            ResponseToolCall::new("call-2", "shell", serde_json::json!({ "command": "pwd" }));
+        let prompt = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("first"),
+            ChatMessage::assistant(None, vec![call_1]),
+            ChatMessage::tool("call-1", "ok"),
+            ChatMessage::user("second"),
+            ChatMessage::assistant(None, vec![call_2]),
+        ];
+
+        let repaired = repair_trailing_pending_tool_calls(&prompt);
+
+        assert!(!has_pending_tool_calls(&repaired));
+        assert_eq!(repaired.len(), 5);
+        assert_eq!(repaired.last().unwrap().role, "user");
     }
 
     #[tokio::test]

@@ -379,6 +379,11 @@ impl ChatProvider for OAuthChatProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
+        if agent_core::has_pending_tool_calls(messages) {
+            return Err(anyhow!(
+                "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
+            ));
+        }
         let token = self.access_token().await?;
         match self.kind {
             OAuthProviderKind::Codex => self.chat_codex(&token, model, tools, messages).await,
