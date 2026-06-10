@@ -358,6 +358,7 @@ pub fn truncate_oversized_message(messages: &mut Vec<ChatMessage>, budget: usize
     if budget == 0 {
         for message in messages {
             message.content = Some(MARKER.to_string());
+            truncate_tool_call_arguments(message, 1);
         }
         return;
     }
@@ -366,16 +367,47 @@ pub fn truncate_oversized_message(messages: &mut Vec<ChatMessage>, budget: usize
         .saturating_sub(estimate_message_overhead_tokens())
         .max(1);
     let target_tokens = max_content_tokens.saturating_sub(marker_tokens).max(1);
-    let target_chars = target_tokens.saturating_mul(3);
 
     for message in messages {
-        if estimate_tokens(std::slice::from_ref(message)) <= budget {
-            continue;
+        // A single over-budget message defeats every strategy: nothing dropped
+        // *around* it can help, so the GC loop would bail and ship an
+        // over-budget prompt anyway. Shrink content AND tool_call arguments,
+        // halving the cap until the message fits (or we hit the floor).
+        let mut cap_tokens = target_tokens;
+        loop {
+            if estimate_tokens(std::slice::from_ref(message)) <= budget {
+                break;
+            }
+            let cap_chars = cap_tokens.saturating_mul(3).max(1);
+            if let Some(content) = &mut message.content {
+                if content.chars().count() > cap_chars {
+                    let mut truncated: String = content.chars().take(cap_chars).collect();
+                    truncated.push_str(MARKER);
+                    *content = truncated;
+                }
+            }
+            truncate_tool_call_arguments(message, cap_chars);
+            if cap_tokens == 1 {
+                break;
+            }
+            cap_tokens = (cap_tokens / 2).max(1);
         }
-        if let Some(content) = &mut message.content {
-            let mut truncated: String = content.chars().take(target_chars).collect();
-            truncated.push_str(MARKER);
-            *content = truncated;
+    }
+}
+
+/// Replace oversized tool-call argument values with a marked preview. The
+/// call id and name stay intact so pair-atomicity and provider echo keep
+/// working; only the argument payload shrinks.
+fn truncate_tool_call_arguments(message: &mut ChatMessage, cap_chars: usize) {
+    let Some(calls) = &mut message.tool_calls else {
+        return;
+    };
+    for call in calls.iter_mut() {
+        let serialized = call.arguments.to_string();
+        if serialized.chars().count() > cap_chars {
+            call.arguments = serde_json::json!({
+                "truncated": preview_chars(&serialized, cap_chars),
+            });
         }
     }
 }
@@ -430,6 +462,81 @@ mod tests {
 
     fn read_file_call(id: &str, path: &str) -> ToolCall {
         ToolCall::new(id, "read_file", serde_json::json!({ "path": path }))
+    }
+
+    #[test]
+    fn truncate_oversized_message_shrinks_giant_tool_call_arguments() {
+        let budget = 200;
+        let mut messages = vec![ChatMessage::assistant(
+            None,
+            vec![ToolCall::new(
+                "call-1",
+                "shell",
+                serde_json::json!({ "command": "x".repeat(10_000) }),
+            )],
+        )];
+
+        truncate_oversized_message(&mut messages, budget);
+
+        assert!(
+            estimate_tokens(&messages) <= budget,
+            "pre-pass must converge: {} tokens",
+            estimate_tokens(&messages)
+        );
+        let call = &messages[0].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "shell");
+        assert!(
+            call.arguments.get("truncated").is_some(),
+            "arguments must carry the truncation marker: {:?}",
+            call.arguments
+        );
+    }
+
+    #[test]
+    fn truncate_oversized_message_shrinks_content_and_arguments_together() {
+        let budget = 300;
+        let mut messages = vec![ChatMessage::assistant(
+            Some("y".repeat(20_000)),
+            vec![ToolCall::new(
+                "call-1",
+                "shell",
+                serde_json::json!({ "command": "x".repeat(20_000) }),
+            )],
+        )];
+
+        truncate_oversized_message(&mut messages, budget);
+
+        assert!(
+            estimate_tokens(&messages) <= budget,
+            "pre-pass must converge: {} tokens",
+            estimate_tokens(&messages)
+        );
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("[truncated for context budget]"));
+    }
+
+    #[test]
+    fn truncate_oversized_message_keeps_content_only_behavior() {
+        let budget = 100;
+        let mut messages = vec![
+            ChatMessage::system("small"),
+            ChatMessage::user("z".repeat(5_000)),
+        ];
+
+        truncate_oversized_message(&mut messages, budget);
+
+        assert!(estimate_tokens(&messages) <= 2 * budget);
+        assert_eq!(messages[0].content.as_deref(), Some("small"));
+        assert!(messages[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .ends_with("[truncated for context budget]"));
+        assert!(estimate_tokens(std::slice::from_ref(&messages[1])) <= budget);
     }
 
     #[test]
