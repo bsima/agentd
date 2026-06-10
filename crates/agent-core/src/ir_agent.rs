@@ -20,6 +20,8 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let invalid_arguments = BlockId(11);
     let shell_eval = BlockId(12);
     let infer_eval = BlockId(13);
+    let route = BlockId(14);
+    let nudge_turn = BlockId(15);
 
     let history = Var("history".into());
     let turns_left = Var("turns_left".into());
@@ -33,6 +35,11 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let can_stop = Var("can_stop".into());
     let no_turns_left = Var("no_turns_left".into());
     let should_return = Var("should_return".into());
+    let content = Var("content".into());
+    let content_empty = Var("content_empty".into());
+    let history_for_nudge = Var("history_for_nudge".into());
+    let nudged_history = Var("nudged_history".into());
+    let nudge_turns_left = Var("nudge_turns_left".into());
     let history_with_assistant = Var("history_with_assistant".into());
     let i = Var("i".into());
     let keep_looping = Var("keep_looping".into());
@@ -116,7 +123,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     expr: Expr::And {
                         left: Box::new(Expr::And {
                             left: Box::new(Expr::Var(is_stop)),
-                            right: Box::new(Expr::Var(no_tool_calls)),
+                            right: Box::new(Expr::Var(no_tool_calls.clone())),
                         }),
                         right: Box::new(Expr::Var(no_pending_tool_calls)),
                     },
@@ -135,11 +142,94 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                         right: Box::new(Expr::Var(no_turns_left)),
                     },
                 },
+                Instr::Let {
+                    out: content.clone(),
+                    expr: Expr::StringOr {
+                        value: Box::new(Expr::FieldOr {
+                            base: response.clone(),
+                            field: "content".into(),
+                            default: Box::new(Expr::Value(Value::String("".into()))),
+                        }),
+                        default: Box::new(Expr::Value(Value::String("".into()))),
+                    },
+                },
+                Instr::Let {
+                    out: content_empty.clone(),
+                    expr: Expr::IsEmpty {
+                        base: content.clone(),
+                    },
+                },
             ],
             terminator: Terminator::If {
                 cond: Expr::Var(should_return),
                 then_block: done,
+                else_block: route,
+            },
+        },
+    );
+
+    blocks.insert(
+        route,
+        Block {
+            params: vec![],
+            instructions: vec![],
+            terminator: Terminator::If {
+                cond: Expr::Var(no_tool_calls.clone()),
+                then_block: nudge_turn,
                 else_block: prepare_tools,
+            },
+        },
+    );
+
+    // Mirror of the Op loop's stalled-turn recovery: a non-stop response with
+    // no tool calls gets the assistant text (when present) plus a synthetic
+    // user continuation nudge appended, then the loop re-infers.
+    blocks.insert(
+        nudge_turn,
+        Block {
+            params: vec![],
+            instructions: vec![
+                Instr::Let {
+                    out: history_for_nudge.clone(),
+                    expr: Expr::If {
+                        cond: Box::new(Expr::Var(content_empty.clone())),
+                        then_value: Box::new(Expr::Var(history.clone())),
+                        else_value: Box::new(Expr::Push {
+                            base: history.clone(),
+                            value: Box::new(Expr::Object(BTreeMap::from([
+                                (
+                                    "role".into(),
+                                    Expr::Value(Value::String("assistant".into())),
+                                ),
+                                ("content".into(), Expr::Var(content.clone())),
+                            ]))),
+                        }),
+                    },
+                },
+                Instr::Let {
+                    out: nudged_history.clone(),
+                    expr: Expr::Push {
+                        base: history_for_nudge.clone(),
+                        value: Box::new(Expr::Object(BTreeMap::from([
+                            ("role".into(), Expr::Value(Value::String("user".into()))),
+                            (
+                                "content".into(),
+                                Expr::Value(Value::String(crate::op::CONTINUE_NUDGE.into())),
+                            ),
+                        ]))),
+                    },
+                },
+                Instr::Let {
+                    out: nudge_turns_left.clone(),
+                    expr: Expr::Sub {
+                        left: Box::new(Expr::Var(turns_left.clone())),
+                        right: Box::new(Expr::Value(Value::Number(1.into()))),
+                    },
+                },
+            ],
+            terminator: Terminator::Goto {
+                block: entry,
+                args: vec![Expr::Var(nudged_history), Expr::Var(nudge_turns_left)],
             },
         },
     );
@@ -169,10 +259,13 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                             Expr::Value(Value::String("assistant".into())),
                         ),
                         (
+                            // Parity with ChatMessage::assistant: empty text
+                            // becomes null content, not an empty string.
                             "content".into(),
-                            Expr::Field {
-                                base: response.clone(),
-                                field: "content".into(),
+                            Expr::If {
+                                cond: Box::new(Expr::Var(content_empty.clone())),
+                                then_value: Box::new(Expr::Value(Value::Null)),
+                                else_value: Box::new(Expr::Var(content.clone())),
                             },
                         ),
                         (
@@ -570,7 +663,7 @@ mod tests {
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
     use crate::ir::validate_program;
-    use crate::op::{ChatMessage, Response, ToolCall};
+    use crate::op::{ChatMessage, FinishReason, Prompt, Response, ToolCall};
     use crate::provider::{ChatProvider, ToolSpec};
     use crate::trace::{Event, TraceLogger, TraceSummary};
     use anyhow::{anyhow, Result};
@@ -580,7 +673,7 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<Vec<Response>>,
-        prompt_count: Mutex<usize>,
+        prompts: Mutex<Vec<Prompt>>,
     }
 
     impl MockProvider {
@@ -588,8 +681,12 @@ mod tests {
             responses.reverse();
             Self {
                 responses: Mutex::new(responses),
-                prompt_count: Mutex::new(0),
+                prompts: Mutex::new(Vec::new()),
             }
+        }
+
+        fn prompts(&self) -> Vec<Prompt> {
+            self.prompts.lock().unwrap().clone()
         }
     }
 
@@ -599,9 +696,9 @@ mod tests {
             &self,
             _model: &Model,
             _tools: &[ToolSpec],
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
         ) -> Result<Response> {
-            *self.prompt_count.lock().unwrap() += 1;
+            self.prompts.lock().unwrap().push(messages.to_vec());
             self.responses
                 .lock()
                 .unwrap()
@@ -611,10 +708,18 @@ mod tests {
     }
 
     fn response(content: &str, tool_calls: Vec<ToolCall>) -> Response {
+        response_with_finish(content, tool_calls, Some(FinishReason::Stop))
+    }
+
+    fn response_with_finish(
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        finish_reason: Option<FinishReason>,
+    ) -> Response {
         Response {
             content: content.into(),
             tool_calls,
-            finish_reason: Some(crate::op::FinishReason::Stop),
+            finish_reason,
             input_tokens: 0,
             output_tokens: 1,
             total_tokens: 1,
@@ -686,6 +791,85 @@ mod tests {
             crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
 
         assert_eq!(value["content"], Value::String("done".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_nudges_non_stop_turn_without_tool_calls() -> Result<()> {
+        // Parity with the Op loop: a non-stop response with no tool calls must
+        // not loop on the same context — the assistant text plus a synthetic
+        // user continuation nudge are appended before the next infer.
+        let provider = Arc::new(MockProvider::new(vec![
+            response_with_finish("partial answer", vec![], Some(FinishReason::Length)),
+            response("done", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("work")],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+
+        assert_eq!(value["content"], Value::String("done".into()));
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2);
+        let second = &prompts[1];
+        let assistant = second
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant turn carried into nudged prompt");
+        assert_eq!(assistant.content.as_deref(), Some("partial answer"));
+        assert!(
+            assistant.tool_calls.is_none(),
+            "nudged assistant message must not carry a tool_calls field"
+        );
+        let last = second.last().expect("nudged prompt is non-empty");
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content.as_deref(), Some(crate::op::CONTINUE_NUDGE));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_tool_turn_normalizes_empty_content_to_null() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({ "command": "printf ir-loop" }),
+                )],
+            ),
+            response("done", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("use shell"),
+            ],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+
+        assert_eq!(value["content"], Value::String("done".into()));
+        let prompts = provider.prompts();
+        let assistant = prompts[1]
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant tool-call turn in second prompt");
+        assert_eq!(
+            assistant.content, None,
+            "empty assistant text must be null, not an empty string"
+        );
+        assert!(assistant
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty()));
         Ok(())
     }
 

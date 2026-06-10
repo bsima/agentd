@@ -705,6 +705,17 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
             Value::String(value) => Ok(Value::String(value)),
             _ => eval_expr(env, default),
         },
+        Expr::If {
+            cond,
+            then_value,
+            else_value,
+        } => {
+            if bool_expr(env, cond, "If.cond")? {
+                eval_expr(env, then_value)
+            } else {
+                eval_expr(env, else_value)
+            }
+        }
         Expr::Index { base, index } => {
             let value = env
                 .get(base)
@@ -1334,6 +1345,27 @@ mod tests {
         assert_eq!(value, Value::Number(42.into()));
         assert_eq!(store.get_local("answer"), Value::Number(42.into()));
         Ok(())
+    }
+
+    #[test]
+    fn if_expr_selects_branch_lazily_and_rejects_non_bool_cond() {
+        let env = BTreeMap::from([(Var("flag".into()), Value::Bool(true))]);
+        let expr = Expr::If {
+            cond: Box::new(Expr::Var(Var("flag".into()))),
+            then_value: Box::new(Expr::Value(Value::String("yes".into()))),
+            // The untaken branch references an unknown var; lazy evaluation
+            // must not touch it.
+            else_value: Box::new(Expr::Var(Var("missing".into()))),
+        };
+        assert_eq!(eval_expr(&env, &expr).unwrap(), Value::String("yes".into()));
+
+        let non_bool = Expr::If {
+            cond: Box::new(Expr::Value(Value::String("nope".into()))),
+            then_value: Box::new(Expr::Value(Value::Null)),
+            else_value: Box::new(Expr::Value(Value::Null)),
+        };
+        let err = eval_expr(&env, &non_bool).unwrap_err().to_string();
+        assert!(err.contains("If.cond"), "got: {err}");
     }
 
     #[tokio::test]

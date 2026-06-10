@@ -173,6 +173,11 @@ pub enum Expr {
         value: Box<Expr>,
         default: Box<Expr>,
     },
+    If {
+        cond: Box<Expr>,
+        then_value: Box<Expr>,
+        else_value: Box<Expr>,
+    },
     Index {
         base: Var,
         index: Box<Expr>,
@@ -569,6 +574,15 @@ fn validate_expr_vars(
         Expr::StringOr { value, default } => {
             validate_expr_vars(value, defined, block_id)?;
             validate_expr_vars(default, defined, block_id)
+        }
+        Expr::If {
+            cond,
+            then_value,
+            else_value,
+        } => {
+            validate_expr_vars(cond, defined, block_id)?;
+            validate_expr_vars(then_value, defined, block_id)?;
+            validate_expr_vars(else_value, defined, block_id)
         }
         Expr::Index { base, index } => {
             validate_var(base, defined, block_id)?;

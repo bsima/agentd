@@ -369,7 +369,10 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
     })
 }
 
-const CONTINUE_NUDGE: &str =
+/// Synthetic user message appended when the model returns a non-stop turn with
+/// no tool calls. Shared by the Op and IR agent loops so both runtimes recover
+/// from stalled turns identically.
+pub(crate) const CONTINUE_NUDGE: &str =
     "Your previous response did not finish the turn. Continue the task: if work remains, issue \
      the next tool call; if the task is complete, say so explicitly.";
 
