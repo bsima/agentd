@@ -1,6 +1,6 @@
 # AgentIR design
 
-Status: **implemented and the default runtime** (`--runtime ir`). This document
+Status: **implemented; the CLI's only runtime.** This document
 is the design rationale; where it says "should", check the table below for
 whether reality has caught up.
 
@@ -12,7 +12,7 @@ whether reality has caught up.
 | Stable effect IDs + replay + divergence locations | Implemented (`IrReplayTrace`) |
 | Failure semantics: error events with stable IDs | Implemented (`InferError`/`EvalError` trace events; replay reproduces failures) |
 | `agent_loop` ported with feature parity | Implemented (`agent_loop_ir`, including stalled-turn nudge) |
-| CLI switched to AgentIR | Implemented (default); `--runtime op` is the deprecated compatibility mode |
+| CLI switched to AgentIR | Implemented; the CLI is IR-only (`--runtime` removed; the Op layer remains a library builder/test API) |
 | In-memory **STM** store with transactional Get/Put | Not implemented — `InMemoryStore` is a plain map; see docs/STATE_KEYS.md for the key contract |
 | Normalization pass for canonical hashing | Not implemented — hashing uses the serde encoding of the (BTreeMap-ordered) program |
 | `Par` semantics | Not implemented — the IR runtime rejects `Par` until the open questions below are settled |

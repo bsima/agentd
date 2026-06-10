@@ -8,17 +8,18 @@ trap cleanup EXIT
 
 cargo build --manifest-path "$repo_root/Cargo.toml" --quiet
 agent_bin="$repo_root/target/debug/agent"
+ir_effect="$("$agent_bin" ir-effect --model foo --visit 0)"
 fixture="$workdir/replay.jsonl"
-cat >"$fixture" <<'JSONL'
+cat >"$fixture" <<JSONL
 {"event":"HydrationStart","run_id":"fixture","op_id":1,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"fixture","op_id":1,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"Custom","run_id":"fixture","op_id":0,"name":"ir_effect","data":$ir_effect,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"fixture","op_id":2,"model":"foo","prompt":[],"prompt_preview":"diverge","timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferResult","run_id":"fixture","op_id":2,"response":{"finish_reason":"stop","content":"should-not-print","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"should-not-print","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
 set +e
 env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
-  --runtime op \
   --replay-trace "$fixture" \
   --model bar \
   "diverge" >"$workdir/stdout" 2>"$workdir/stderr"
@@ -30,7 +31,7 @@ if [[ "$status" -eq 0 ]]; then
   cat "$workdir/stdout" >&2
   exit 1
 fi
-if ! grep -q 'replay diverged' "$workdir/stderr"; then
+if ! grep -qE 'replay diverged|AgentIR replay missing InferCall' "$workdir/stderr"; then
   echo "error: expected replay divergence error" >&2
   cat "$workdir/stderr" >&2
   exit 1

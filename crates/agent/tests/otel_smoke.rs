@@ -1,3 +1,7 @@
+use agent_core::{
+    agent_loop_ir, effect_location, program_hash, BlockId, DynamicPath, EffectKind, EffectSite,
+    Model,
+};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
@@ -39,13 +43,39 @@ fn otel_endpoint_smoke_preserves_replay_and_jsonl_trace() {
     let dir = std::env::temp_dir().join(format!("agent-otel-smoke-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let replay_path = dir.join("replay.jsonl");
+    // IR replay keys on stable effect ids: compute the entry-Infer location
+    // for each visit (the second Infer is the nudge retry after the non-stop
+    // "thinking" turn) instead of hardcoding hashes.
+    let machine = agent_loop_ir(Model("mock".into()), vec![], 16);
+    let hash = program_hash(&machine.program).unwrap();
+    let site = EffectSite {
+        block: BlockId(0),
+        instruction_index: 0,
+    };
+    let effect = |visit: u64| {
+        serde_json::to_string(
+            &effect_location(
+                hash.clone(),
+                EffectKind::Infer,
+                site,
+                DynamicPath::with_visit(site, visit),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let (effect_0, effect_1) = (effect(0), effect(1));
     std::fs::write(
         &replay_path,
-        r#"{"event":"InferCall","run_id":"replay","op_id":1,"model":"mock","prompt_preview":"","timestamp":"2026-06-02T00:00:00Z"}
-{"event":"InferResult","run_id":"replay","op_id":1,"response":{"content":"thinking","tool_calls":[],"finish_reason":"length","input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"thinking","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}
-{"event":"InferCall","run_id":"replay","op_id":2,"model":"mock","prompt_preview":"","timestamp":"2026-06-02T00:00:00Z"}
-{"event":"InferResult","run_id":"replay","op_id":2,"response":{"content":"ok","tool_calls":[],"finish_reason":"stop","input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"ok","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}
-"#,
+        format!(
+            r#"{{"event":"Custom","run_id":"replay","op_id":0,"name":"ir_effect","data":{effect_0},"timestamp":"2026-06-02T00:00:00Z"}}
+{{"event":"InferCall","run_id":"replay","op_id":1,"model":"mock","prompt_preview":"","timestamp":"2026-06-02T00:00:00Z"}}
+{{"event":"InferResult","run_id":"replay","op_id":1,"response":{{"content":"thinking","tool_calls":[],"finish_reason":"length","input_tokens":0,"output_tokens":1,"total_tokens":1}},"response_preview":"thinking","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}}
+{{"event":"Custom","run_id":"replay","op_id":0,"name":"ir_effect","data":{effect_1},"timestamp":"2026-06-02T00:00:00Z"}}
+{{"event":"InferCall","run_id":"replay","op_id":2,"model":"mock","prompt_preview":"","timestamp":"2026-06-02T00:00:00Z"}}
+{{"event":"InferResult","run_id":"replay","op_id":2,"response":{{"content":"ok","tool_calls":[],"finish_reason":"stop","input_tokens":0,"output_tokens":1,"total_tokens":1}},"response_preview":"ok","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}}
+"#
+        ),
     )
     .expect("write replay trace");
     let run_id = format!("otel-smoke-{}", uuid::Uuid::new_v4());
@@ -55,8 +85,6 @@ fn otel_endpoint_smoke_preserves_replay_and_jsonl_trace() {
         .env("AGENT_RUN_ID", &run_id)
         .arg("--model")
         .arg("mock")
-        .arg("--runtime")
-        .arg("op")
         .arg("--replay-trace")
         .arg(&replay_path)
         .arg("--otel-endpoint")

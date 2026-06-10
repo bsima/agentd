@@ -35,7 +35,6 @@ fn infer_fanout_uses_nested_infer() {
             config.model
         ),
         predicate: has_nested_infer_call,
-        runtime: Runtime::Ir,
     };
     assert_scenario_passes(&config, scenario, RUNS_PER_SCENARIO, PASS_THRESHOLD);
 }
@@ -49,8 +48,7 @@ fn state_path_put_then_get_same_key() {
     let scenario = Scenario {
         name: "state-put-get",
         prompt: "Use the shell tool once for a tiny deterministic check: run `printf runtime_state_probe`. Then finish with a concise answer. This should exercise the agent's state path around tool execution.".to_owned(),
-        predicate: has_put_followed_by_get_same_key,
-        runtime: Runtime::Op,
+        predicate: has_session_state_checkpoint_put,
     };
     assert_scenario_passes(&config, scenario, RUNS_PER_SCENARIO, PASS_THRESHOLD);
 }
@@ -65,7 +63,6 @@ fn trivial_prompt_does_not_over_decompose() {
         name: "no-over-decompose",
         prompt: "Answer directly with exactly: ok".to_owned(),
         predicate: |events| !has_nested_infer_call(events),
-        runtime: Runtime::Ir,
     };
     assert_scenario_passes(&config, scenario, RUNS_PER_SCENARIO, PASS_THRESHOLD);
 }
@@ -82,7 +79,6 @@ fn shell_prompt_uses_eval() {
             "Use the shell tool to run `printf shell_probe_1088`, then report the exact output."
                 .to_owned(),
         predicate: has_eval_call,
-        runtime: Runtime::Ir,
     };
     assert_scenario_passes(&config, scenario, RUNS_PER_SCENARIO, PASS_THRESHOLD);
 }
@@ -108,26 +104,10 @@ impl LiveConfig {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Runtime {
-    Op,
-    Ir,
-}
-
-impl Runtime {
-    fn arg(self) -> &'static str {
-        match self {
-            Self::Op => "op",
-            Self::Ir => "ir",
-        }
-    }
-}
-
 struct Scenario {
     name: &'static str,
     prompt: String,
     predicate: fn(&[Event]) -> bool,
-    runtime: Runtime,
 }
 
 fn assert_scenario_passes(
@@ -188,8 +168,6 @@ fn run_agent(config: &LiveConfig, scenario: &Scenario, run_index: usize) -> Agen
         .env("AGENT_RUN_ID", &run_id)
         .arg("--model")
         .arg(&config.model)
-        .arg("--runtime")
-        .arg(scenario.runtime.arg())
         .arg("--checkpoint-dir")
         .arg(&checkpoint_dir)
         .arg(&scenario.prompt)
@@ -249,18 +227,12 @@ fn has_nested_infer_call(events: &[Event]) -> bool {
     false
 }
 
-fn has_put_followed_by_get_same_key(events: &[Event]) -> bool {
-    let mut put_keys = BTreeSet::new();
-    for event in events {
-        match event {
-            Event::PutCall { key, .. } => {
-                put_keys.insert(key.clone());
-            }
-            Event::GetCall { key, .. } if put_keys.contains(key) => return true,
-            _ => {}
-        }
-    }
-    false
+fn has_session_state_checkpoint_put(events: &[Event]) -> bool {
+    // The IR loop keeps history in the machine env, so the durable state
+    // path per turn is the session:state checkpoint Put.
+    events
+        .iter()
+        .any(|event| matches!(event, Event::PutCall { key, .. } if key == "session:state"))
 }
 
 fn has_eval_call(events: &[Event]) -> bool {

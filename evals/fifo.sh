@@ -16,12 +16,14 @@ trap cleanup EXIT
 
 cargo build --manifest-path "$repo_root/Cargo.toml" --quiet
 agent_bin="$repo_root/target/debug/agent"
+ir_effect="$("$agent_bin" ir-effect --model ignored --visit 0)"
 fifo="$workdir/agent.fifo"
 mkfifo "$fifo"
 trace_fixture="$workdir/replay.jsonl"
-cat >"$trace_fixture" <<'JSONL'
+cat >"$trace_fixture" <<JSONL
 {"event":"HydrationStart","run_id":"fifo-fixture","op_id":1,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"fifo-fixture","op_id":1,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"Custom","run_id":"fifo-fixture","op_id":0,"name":"ir_effect","data":$ir_effect,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"fifo-fixture","op_id":2,"model":"ignored","prompt":[],"prompt_preview":"fifo","timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferResult","run_id":"fifo-fixture","op_id":2,"response":{"finish_reason":"stop","content":"fifo-smoke","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"fifo-smoke","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
@@ -30,7 +32,6 @@ stdout_log="$workdir/stdout.log"
 stderr_log="$workdir/stderr.log"
 env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
   --fifo "$fifo" \
-  --runtime op \
   --replay-trace "$trace_fixture" \
   --model ignored \
   >"$stdout_log" 2>"$stderr_log" &

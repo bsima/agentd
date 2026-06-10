@@ -26,8 +26,8 @@ The loop is the agent.
 
 | Representation | Module | Status |
 |---|---|---|
-| **AgentIR** — serializable block/instruction CFG with an explicit machine | `agent-core::ir`, `ir_interpreter` | Stable runtime; CLI default (`--runtime ir`) |
-| **Op** — free monad with Rust closure continuations | `agent-core::op`, `interpreter` | Deprecated compatibility runtime and builder API |
+| **AgentIR** — serializable block/instruction CFG with an explicit machine | `agent-core::ir`, `ir_interpreter` | Stable runtime; the CLI's only runtime |
+| **Op** — free monad with Rust closure continuations | `agent-core::op`, `interpreter` | Library-level builder/test API; no CLI runtime mode |
 
 The effect algebra, not either encoding, is the architectural constraint. Interpreters must preserve explicit `Infer`/`Eval`/`Get`/`Put`/`Emit`/`Par` effects regardless of how programs are authored.
 
@@ -77,7 +77,7 @@ pub enum OpF<S, A> {
 }
 ```
 
-It proved the interpreter boundary (M1) and remains useful as an ergonomic, typed way to compose programs in Rust. But closures are not serializable, hashable, or checkpointable mid-turn — which is why it is not the stable runtime representation. The CLI still accepts `--runtime op` as a deprecated compatibility mode; new work targets AgentIR.
+It proved the interpreter boundary (M1) and remains useful as an ergonomic, typed way to compose programs in Rust. But closures are not serializable, hashable, or checkpointable mid-turn — which is why it is not the stable runtime representation. The CLI runs AgentIR exclusively; the Op layer survives as a library builder and test API (`run_sequential` remains the reference interpreter for the effect algebra).
 
 ## Infer can call Infer
 
@@ -173,8 +173,8 @@ The interpreter decides what each effect means. Change the interpreter and the s
 
 | Interpreter | `Eval` behavior        | `Infer` behavior         | `Par` behavior       |
 |-------------|-------------------------|--------------------------|----------------------|
-| IR sequential (default) | fork `$SHELL -c` | HTTP provider call      | not yet implemented (errors) |
-| Op sequential (compat)  | fork `$SHELL -c` | HTTP provider call      | serial execution     |
+| IR sequential (CLI) | fork `$SHELL -c`    | HTTP provider call       | not yet implemented (errors) |
+| Op sequential (library) | fork `$SHELL -c` | HTTP provider call      | serial execution     |
 | Replay      | return recorded result/failure | return recorded result/failure | serial |
 | Sandboxed   | wrapped fork            | HTTP provider call       | (future)             |
 | Parallel    | fork `$SHELL -c`        | HTTP provider call       | concurrent (future)  |

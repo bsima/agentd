@@ -1,10 +1,9 @@
 use agent_core::{
-    agent_loop, agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatMessage,
-    EnvPolicy, EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace,
-    JsonlTraceSink, MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig,
-    PassiveSource, ProviderClient, ProviderConfig, ReplayTrace, ResolvedModel, RingGc, SeqConfig,
-    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceContextEnv,
-    TraceLogger,
+    agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
+    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink,
+    MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
+    ProviderClient, ProviderConfig, ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind,
+    SourceParams, SourceRegistry, SourceResult, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -108,11 +107,6 @@ struct Args {
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
-    /// Runtime backend. `ir` (default) runs the serializable AgentIR machine.
-    /// `op` is the closure-based compatibility runtime; it is deprecated and
-    /// will be removed once IR-mode replay fixtures are regenerated.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::Ir)]
-    runtime: RuntimeMode,
     /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
     #[command(subcommand)]
@@ -139,16 +133,21 @@ enum EvalEnvMode {
     Clean,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum RuntimeMode {
-    Op,
-    Ir,
-}
-
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print GC statistics from a trace JSONL file.
     GcStats { trace: PathBuf },
+    /// Print the AgentIR effect-location JSON for the entry Infer of the
+    /// built-in agent loop. Eval scripts use it to build replay fixtures
+    /// without hardcoding program hashes.
+    #[command(hide = true)]
+    IrEffect {
+        #[arg(long)]
+        model: String,
+        /// Visit count for the effect site (the Nth Infer of a session).
+        #[arg(long, default_value_t = 0)]
+        visit: u64,
+    },
     #[cfg(feature = "oauth")]
     Auth {
         #[command(subcommand)]
@@ -215,7 +214,6 @@ struct Runtime {
     history: Vec<ChatMessage>,
     debug: bool,
     max_turns: usize,
-    runtime_mode: RuntimeMode,
     ir_store: InMemoryStore,
     ir_replay: Option<IrReplayTrace>,
     ir_effect_visits: BTreeMap<String, u64>,
@@ -294,13 +292,9 @@ async fn main() -> Result<()> {
         });
     let reported_provider_url = reported_provider_url(oauth_provider, &url);
     let replay_enabled = args.replay_trace.is_some();
-    let replay = match (args.runtime, args.replay_trace.as_ref()) {
-        (RuntimeMode::Op, Some(path)) => Some(ReplayTrace::load(path).await?),
-        _ => None,
-    };
-    let ir_replay = match (args.runtime, args.replay_trace.as_ref()) {
-        (RuntimeMode::Ir, Some(path)) => Some(IrReplayTrace::load(path).await?),
-        _ => None,
+    let ir_replay = match args.replay_trace.as_ref() {
+        Some(path) => Some(IrReplayTrace::load(path).await?),
+        None => None,
     };
     let context_budget = resolved_model.context;
     let model = resolved_model.api_id.clone();
@@ -406,7 +400,7 @@ async fn main() -> Result<()> {
         checkpoint_path: checkpoint_path.clone(),
         trace: trace.clone(),
         eval: eval_config,
-        replay: replay.clone(),
+        replay: None,
         trace_full_prompt_ir: args.trace_full_prompt_ir,
         trace_full_payloads: args.trace_full_payloads,
         gc: {
@@ -434,7 +428,6 @@ async fn main() -> Result<()> {
         history,
         debug: args.debug,
         max_turns,
-        runtime_mode: args.runtime,
         ir_store: InMemoryStore::new(),
         ir_replay,
         ir_effect_visits: BTreeMap::new(),
@@ -754,6 +747,22 @@ async fn run_gc_stats_command(trace: &Path) -> Result<()> {
 async fn run_command(command: &Command) -> Result<()> {
     match command {
         Command::GcStats { trace } => run_gc_stats_command(trace).await,
+        Command::IrEffect { model, visit } => {
+            let machine = agent_loop_ir(agent_core::Model(model.clone()), vec![], 16);
+            let hash = agent_core::program_hash(&machine.program)?;
+            let site = agent_core::EffectSite {
+                block: agent_core::BlockId(0),
+                instruction_index: 0,
+            };
+            let location = agent_core::effect_location(
+                hash,
+                agent_core::EffectKind::Infer,
+                site,
+                agent_core::DynamicPath::with_visit(site, *visit),
+            )?;
+            println!("{}", serde_json::to_string(&location)?);
+            Ok(())
+        }
         #[cfg(feature = "oauth")]
         Command::Auth { command } => run_auth_command(command).await,
         #[cfg(not(feature = "oauth"))]
@@ -962,33 +971,26 @@ async fn run_turn_with_status(
 async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::Response> {
     runtime.history.push(ChatMessage::user(message));
     let prompt = runtime.history.clone();
-    let (response, mut new_history) = match runtime.runtime_mode {
-        RuntimeMode::Op => {
-            let program = agent_loop(runtime.model.clone(), prompt.clone(), runtime.max_turns);
-            agent_core::run_sequential(&runtime.config, prompt, program).await?
-        }
-        RuntimeMode::Ir => {
-            let mut machine =
-                agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
-            machine.effect_visits = runtime.ir_effect_visits.clone();
-            let (value, machine) = agent_core::run_ir_sequential_with_store_and_replay(
-                &runtime.config,
-                machine,
-                &mut runtime.ir_store,
-                runtime.ir_replay.as_ref(),
-            )
-            .await?;
-            runtime.ir_effect_visits = machine.effect_visits.clone();
-            let response: agent_core::Response =
-                serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
-            let history = machine
-                .env
-                .get(&agent_core::Var("history".into()))
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or(prompt);
-            (response, history)
-        }
+    let (response, mut new_history) = {
+        let mut machine = agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
+        machine.effect_visits = runtime.ir_effect_visits.clone();
+        let (value, machine) = agent_core::run_ir_sequential_with_store_and_replay(
+            &runtime.config,
+            machine,
+            &mut runtime.ir_store,
+            runtime.ir_replay.as_ref(),
+        )
+        .await?;
+        runtime.ir_effect_visits = machine.effect_visits.clone();
+        let response: agent_core::Response =
+            serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
+        let history = machine
+            .env
+            .get(&agent_core::Var("history".into()))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(prompt);
+        (response, history)
     };
     if !response.content.is_empty() || !response.tool_calls.is_empty() {
         new_history.push(ChatMessage::assistant(

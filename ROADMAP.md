@@ -48,10 +48,10 @@ Planned work:
 
 ## AgentIR track: serializable runtime core
 
-Status: implemented; `--runtime ir` is the CLI default and `--runtime op` is
-the deprecated compatibility mode. Remaining gaps (STM store, normalization
-pass, `Par`) are tracked in the status table of
-[docs/AGENT_IR.md](./docs/AGENT_IR.md).
+Status: implemented; the CLI is IR-only (the `--runtime` flag is removed and
+the closure-based Op layer remains a library builder/test API). Remaining
+gaps (STM store, normalization pass, `Par`) are tracked in the status table
+of [docs/AGENT_IR.md](./docs/AGENT_IR.md).
 
 The `Op` free monad uses Rust closure continuations. That was useful for the
 M1 runtime, but it is not the final interpreter representation. AgentIR is the

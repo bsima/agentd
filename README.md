@@ -215,7 +215,7 @@ See [ROADMAP.md](./ROADMAP.md) for the Rust port plan.
 
 ## Status
 
-M1 and the AgentIR track are implemented: single-agent CLI, the serializable AgentIR runtime (default) plus the deprecated closure-based `Op` compatibility runtime, bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces with error events, stable-effect-id replay (including replay of failures), mid-turn IR checkpoints, context GC (`ring`, `mark-sweep`), hydration registry with PromptIR provenance, and optional model registry loading.
+M1 and the AgentIR track are implemented: single-agent CLI, the serializable AgentIR runtime (the CLI's only runtime; the closure-based `Op` layer remains a library builder/test API), bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces with error events, stable-effect-id replay (including replay of failures), mid-turn IR checkpoints, context GC (`ring`, `mark-sweep`), hydration registry with PromptIR provenance, and optional model registry loading.
 
 Active development:
 
