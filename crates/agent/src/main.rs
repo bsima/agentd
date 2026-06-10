@@ -553,7 +553,16 @@ async fn resolve_model(
     let requested = args_model
         .or(file_model)
         .or_else(|| std::env::var("AGENT_MODEL").ok());
-    match ModelRegistry::load_default().await {
+    resolve_model_from(ModelRegistry::load_default().await, requested)
+}
+
+/// Pure registry-or-fallback resolution, split from the env/filesystem reads
+/// so it is testable without mutating process-global state.
+fn resolve_model_from(
+    registry: Result<ModelRegistry>,
+    requested: Option<String>,
+) -> Result<ResolvedModel> {
+    match registry {
         Ok(registry) => registry.resolve(requested.as_deref()),
         Err(_err) if requested.is_some() => {
             let model = requested.expect("requested model checked above");
@@ -1367,22 +1376,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn raw_model_is_resolved_without_model_registry() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("agent-main-config-{}", Uuid::new_v4()));
-        let old = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-        let resolved = resolve_model(Some("openrouter/auto".into()), None).await;
-        match old {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
+    #[test]
+    fn raw_model_is_resolved_without_model_registry() -> Result<()> {
+        // Exercise the registry-missing fallback purely — no env mutation,
+        // which races under parallel test execution.
+        let missing_registry = Err(anyhow!("no registry on this machine"));
 
-        let resolved = resolved?;
+        let resolved = resolve_model_from(missing_registry, Some("openrouter/auto".into()))?;
+
         assert_eq!(resolved.alias, "openrouter/auto");
         assert_eq!(resolved.api_id, "openrouter/auto");
         assert_eq!(resolved.provider, None);
         Ok(())
+    }
+
+    #[test]
+    fn missing_registry_without_requested_model_is_an_error() {
+        let err = resolve_model_from(Err(anyhow!("no registry")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("models.yaml"), "got: {err}");
     }
 
     #[tokio::test]

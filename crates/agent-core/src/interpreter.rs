@@ -1233,7 +1233,6 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![]));
         let cwd = std::env::temp_dir().join(format!("agent-core-eval-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&cwd).await?;
-        std::env::set_var("AGENT_CORE_EVAL_SECRET", "leaked");
         let mut clean_vars = std::collections::BTreeMap::new();
         if let Ok(path) = std::env::var("PATH") {
             clean_vars.insert("PATH".into(), path);
@@ -1271,14 +1270,29 @@ mod tests {
         let _ = run_sequential(&config, (), crate::op::eval("printf cwd > marker")).await?;
         assert_eq!(tokio::fs::read_to_string(cwd.join("marker")).await?, "cwd");
 
-        let (env_result, _) = run_sequential(
-            &config,
-            (),
-            crate::op::eval("printf ${AGENT_CORE_EVAL_SECRET-unset}"),
-        )
-        .await?;
-        assert_eq!(env_result["stdout"], json!("unse"));
-        assert_eq!(env_result["stdout_truncated"], json!(true));
+        // Clean policy must not leak inherited vars. Probe with a var that is
+        // already present in the parent environment instead of set_var, which
+        // races under parallel test execution. `${VAR+leaked}` expands to
+        // "leaked" only if VAR is set in the *child* environment.
+        let is_shell_identifier = |key: &str| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        if let Some((inherited, _)) =
+            std::env::vars().find(|(key, _)| key != "PATH" && is_shell_identifier(key))
+        {
+            let (env_result, _) = run_sequential(
+                &config,
+                (),
+                crate::op::eval(format!(r#"printf %s "${{{inherited}+leaked}}""#)),
+            )
+            .await?;
+            assert_eq!(env_result["stdout"], json!(""), "leaked: {inherited}");
+        }
         Ok(())
     }
 
