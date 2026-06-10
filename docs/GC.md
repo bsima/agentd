@@ -1,5 +1,13 @@
 # agentd Context GC Design
 
+Status: **`ring` and `mark-sweep` are implemented** (with `--gc`,
+`--gc-threshold`, `--gc-log`, the `truncate_oversized_message` pre-pass, pair
+atomicity, and the eval harness). **`stack` is designed but not implemented.**
+**`--gc-cache` is parsed but not implemented** — both strategies currently
+behave as cache-invalidating (`cache_preserving()` is `false`), and the
+`preserve` mechanics described below are the design target, not shipped
+behavior. The `gc_collect` event reports `dropped_count`, not `frames_popped`.
+
 ## Overview
 
 The agent context window is a fixed-size buffer, not an infinite log.
@@ -32,7 +40,7 @@ don't need it at all. Make it tunable from day one.
 
 `--gc-log` emits structured trace events on every collection:
 ```json
-{"type": "gc_collect", "strategy": "ring", "tokens_before": 90000, "tokens_after": 60000, "frames_popped": 12}
+{"type": "gc_collect", "strategy": "ring", "tokens_before": 90000, "tokens_after": 60000, "cache_invalidated": true, "dropped_count": 12}
 ```
 This is essential for debugging task failures — you want to know which messages
 were dropped or summarized.
@@ -52,14 +60,14 @@ opposed needs, so the toggle is permanent, not a migration step.
 
 Strategies (planned, not all implemented at once):
 
-| Name           | Description                                      | Status     |
-|----------------|--------------------------------------------------|------------|
-| `none`         | No GC; overflow = hard error (current behavior) | existing   |
-| `ring`         | Drop oldest messages when buffer fills           | v1 default |
-| `mark-sweep`   | Evict "dead" sections by type annotation         | v1         |
-| `stack`        | Pop completed tool-call frames to summaries      | v1         |
-| `generational` | Hot/warm/cold compaction (JVM-style)             | future     |
-| `refcount`     | Dependency-graph reachability eviction           | future     |
+| Name           | Description                                      | Status      |
+|----------------|--------------------------------------------------|-------------|
+| `none`         | No GC; overflow = hard error                     | implemented |
+| `ring`         | Drop oldest messages when buffer fills           | implemented (default) |
+| `mark-sweep`   | Evict "dead" sections by type annotation         | implemented |
+| `stack`        | Pop completed tool-call frames to summaries      | designed, not implemented |
+| `generational` | Hot/warm/cold compaction (JVM-style)             | future      |
+| `refcount`     | Dependency-graph reachability eviction           | future      |
 
 ---
 
@@ -386,6 +394,8 @@ runs against a collection of real long-running task traces:
 - `evals/gc/`: collection of `.jsonl` trace files (real agent sessions)
 - Metrics: task completion rate, token reduction %, semantic coherence score
 - Run with: `cargo test --test gc_evals -- --nocapture`
+- Recording new fixtures requires `--trace-full-payloads`: the harness reads
+  full `InferCall` prompts, which are preview-only in traces by default
 
 Gate any strategy change on showing improvement over `ring` on the existing
 eval set. This also lets us tune `--gc-threshold` empirically.

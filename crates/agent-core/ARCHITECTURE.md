@@ -2,7 +2,9 @@
 
 `agent-core` keeps agent programs separate from the runtime that executes them.
 
-The M1 compatibility representation is a free monad. The stable runtime representation is AgentIR: a serializable control/effect IR with explicit machine state. Programs are data until an interpreter walks them and performs effects.
+The M1 compatibility representation is a free monad. The stable runtime representation is AgentIR: a serializable control/effect IR with explicit machine state (see `docs/AGENT_IR.md`; the CLI defaults to it via `--runtime ir`). Programs are data until an interpreter walks them and performs effects.
+
+This file documents the Op layer — kept as a typed builder/compatibility API and reference interpreter. The Get/Put key contract shared by both runtimes is specified in `docs/STATE_KEYS.md`.
 
 ## Why a free monad
 

@@ -204,11 +204,11 @@ See [ROADMAP.md](./ROADMAP.md) for the Rust port plan.
 
 ## Status
 
-M1 is implemented: single-agent CLI, sequential interpreter, bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces, `Infer`/`Eval` replay, checkpoints, hydration registry, and optional model registry loading.
+M1 and the AgentIR track are implemented: single-agent CLI, the serializable AgentIR runtime (default) plus the deprecated closure-based `Op` compatibility runtime, bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces with error events, stable-effect-id replay (including replay of failures), mid-turn IR checkpoints, context GC (`ring`, `mark-sweep`), hydration registry with PromptIR provenance, and optional model registry loading.
 
 Active development:
 
-- M2: Rust `agentd` supervisor/daemon port from the working Haskell implementation
+- M2: Rust `agentd` supervisor/daemon port from the working Haskell implementation (design: [docs/SUPERVISOR.md](./docs/SUPERVISOR.md))
 - M3: hermetic PATH, stronger sandbox integration, richer `HydrationSource` implementations
 - M4: parallel interpreter with real `Par` execution
 - M5: distributed interpreter, multi-VM campaigns

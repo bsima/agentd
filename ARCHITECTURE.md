@@ -22,44 +22,68 @@ An agent needs both. It infers from text, history, files, and command output. Th
 
 The loop is the agent.
 
-`agentd` encodes that loop with a free monad over `OpF`. `Infer` and `Eval` are not two unrelated subsystems. They are variants in the same operation language, interpreted by the same runtime.
+`agentd` encodes that loop with a small effect algebra — `Infer`, `Eval`, `Get`, `Put`, `Emit`, `Par` — shared by two program representations:
+
+| Representation | Module | Status |
+|---|---|---|
+| **AgentIR** — serializable block/instruction CFG with an explicit machine | `agent-core::ir`, `ir_interpreter` | Stable runtime; CLI default (`--runtime ir`) |
+| **Op** — free monad with Rust closure continuations | `agent-core::op`, `interpreter` | Deprecated compatibility runtime and builder API |
+
+The effect algebra, not either encoding, is the architectural constraint. Interpreters must preserve explicit `Infer`/`Eval`/`Get`/`Put`/`Emit`/`Par` effects regardless of how programs are authored.
+
+## AgentIR: programs are data, literally
+
+AgentIR is a validated, serializable program representation:
+
+```rust
+pub struct Program {
+    pub id: ProgramId,
+    pub entry: BlockId,
+    pub blocks: BTreeMap<BlockId, Block>,   // params, instructions, terminator
+}
+
+pub enum Instr {
+    Let   { out, expr },
+    Infer { out, model, prompt, policy },   // LLM call: infer(unstructured)
+    Eval  { out, request, policy },         // process call: eval(structured)
+    Get   { out, key },                     // state/context read
+    Put   { key, value },                   // state/context write
+    Emit  { event },                        // trace
+}
+```
+
+Execution is an explicit machine — `{program, block, pc, env, budgets}` — stepped by `run_ir_sequential`. Because the machine is plain data:
+
+- programs round-trip through JSON and are validated (block refs, arity, use-before-def, shadowing) before any effect runs
+- checkpoints can snapshot a machine **mid-turn** and resume without re-running completed effects
+- every effect has a stable id derived from `hash(program_hash, effect_site, dynamic_path)`, so replay keys on program identity rather than incidental sequence numbers, and divergence errors name the block and instruction
+- a failed effect closes with an `InferError`/`EvalError` trace event, so failed runs replay as the same failure
+
+The design is specified in [docs/AGENT_IR.md](./docs/AGENT_IR.md).
+
+## The Op layer
+
+The original encoding is a free monad over `OpF`, with `and_then`/`map` and closure continuations:
 
 ```rust
 pub enum OpF<S, A> {
-    Infer { model, prompt, next },  // LLM call: infer(unstructured)
-    Eval  { command, next },        // process call: eval(structured), currently $SHELL -c
-    Get   { key, next },            // state/context read
-    Put   { key, value, next },     // state/context write
-    Emit  { event, next },          // trace
-    Par   { ops, next },            // parallel effects
+    Infer { model, prompt, next },
+    Eval  { command, next },
+    Get   { key, next },
+    Put   { key, value, next },
+    Emit  { event, next },
+    Par   { ops, next },
     Pure(A),
 }
 ```
 
-An `Op<S, A>` carries state `S` and eventually produces `A`. It does not execute anything by itself.
-
-## Why a free monad
-
-The free monad preserves the structure of effects.
-
-That is the bigger lever. If the agent is just an `async fn`, you cannot know what it will do without running it. You cannot replay it cleanly. You cannot swap in a dry-run interpreter without plumbing mock objects through everything.
-
-With `Op`, the program is data at the interpreter boundary. It can be:
-
-- interpreted by a sequential, parallel, replay, dry-run, sandboxed, or distributed runtime
-- inspected before any IO happens
-- tested against a mock provider or no-op evaluator
-- transformed with `and_then` and `map`
-
-The Rust DSL still uses closure continuations, so this is not a fully serializable AST. Replay works by re-running the same program and feeding recorded operation results back at matching op IDs.
-
-Adding a capability means adding an `OpF` variant and teaching interpreters how to handle it. Effects stay explicit.
+It proved the interpreter boundary (M1) and remains useful as an ergonomic, typed way to compose programs in Rust. But closures are not serializable, hashable, or checkpointable mid-turn — which is why it is not the stable runtime representation. The CLI still accepts `--runtime op` as a deprecated compatibility mode; new work targets AgentIR.
 
 ## Infer can call Infer
 
-The important meta-circular move is that agent programs can emit every `OpF` variant, including `Infer`.
+The important meta-circular move is that agent programs can emit every effect, including `Infer`.
 
-So sub-agents are not a separate orchestration layer. They are just `Infer` calls emitted by another agent program. The outer agent can choose the model, prompt, context, and budget for each inner call. The interpreter enforces whatever governance rules we need.
+So sub-agents are not a separate orchestration layer. They are just `Infer` effects emitted by another agent program — the IR agent loop exposes this to the model as an `infer` tool. The outer agent can choose the model, prompt, context, and budget for each inner call. The interpreter enforces whatever governance rules we need.
 
 This is the SICP evaluator idea in agent form. `eval` calling `eval` collapses the interpreter/object-language boundary. `Infer` calling `Infer` collapses the agent/orchestrator boundary.
 
@@ -82,16 +106,15 @@ It also gives one sandboxing hook. You do not sandbox each tool. You sandbox the
 Every context source is a keyed read:
 
 ```text
-Get("temporal-passive")   -> recent chat history
+Get("temporal:history")   -> conversation history
 Get("semantic:topic")     -> vector search or other semantic recall
 Get("session:state")      -> current checkpoint
 Put("session:state", v)   -> write checkpoint
-Put("trace:event", e)     -> append event
 ```
 
-The interpreter decides what each key means.
+The interpreter decides how each key is backed, but the guaranteed namespaces — `session:state`, `temporal:*`, `semantic:*` — have a fixed observable contract that every runtime must satisfy. The contract, including the one deliberate divergence (unknown keys), is specified in [docs/STATE_KEYS.md](./docs/STATE_KEYS.md) and enforced by a conformance test against both runtimes.
 
-This gives one model for passive context injection and active recall.
+This gives one model for passive context injection and active recall:
 
 |            | Passive, interpreter-owned | Active, agent-emitted |
 |------------|----------------------------|------------------------|
@@ -100,18 +123,9 @@ This gives one model for passive context injection and active recall.
 
 Passive mode is ordinary context construction. The interpreter gathers recent history, semantic matches, workspace facts, or session data before `Infer`.
 
-Active mode is agent-driven recall. If the passive window is not enough, the program can emit `Get("temporal:3 weeks ago")` or `Get("semantic:prior architecture decisions")`.
+Active mode is agent-driven recall. If the passive window is not enough, the program can emit `Get("semantic:prior architecture decisions")`.
 
 Same operation. Different timing.
-
-The source taxonomy is just a naming convention over keys:
-
-|                | Passive                  | Active |
-|----------------|--------------------------|--------|
-| Temporal       | recent events/history     | `Get("temporal:query")` |
-| Semantic       | similarity/workspace RAG  | `Get("semantic:topic")` |
-
-Sources are still registered at startup. The point is that the agent's interface stays uniform.
 
 ## Hydration sources
 
@@ -126,15 +140,15 @@ pub trait HydrationSource: Send + Sync {
 }
 ```
 
-`SeqConfig::passive_hydration` selects passive sources before each `Infer`. Active reads use the same `Get` shape. Today `Get("semantic:topic")` dispatches to query-capable sources, `Get("session:state")` reads checkpoint JSON, and `Get("temporal:...")` reads interpreter state.
+`SeqConfig::passive_hydration` selects passive sources before each `Infer`. Active reads use the same `Get` shape: `Get("semantic:topic")` dispatches to query-capable sources.
 
-The accurate model here is provenance. Every context chunk has a key and source. The interpreter can decide whether that source is passive, active, local, remote, replayed, or sandboxed.
+Passively hydrated sections are assembled through PromptIR — labeled, sourced, budgeted sections compiled to provider messages — so every context chunk has a key, source, and hash in the trace. See [docs/PROMPT_IR.md](./docs/PROMPT_IR.md).
 
 ## Sessions are FIFOs plus checkpoints
 
 An agent session is a long-lived process.
 
-Turn delivery happens through stdin or a FIFO. Each turn is NUL-terminated. The agent reads one turn, runs the loop, writes trace events and checkpoints, then waits for the next turn.
+Turn delivery happens through stdin or a FIFO. Each turn is NUL-terminated. The agent reads one turn, runs the loop, writes trace events and checkpoints, then waits for the next turn. A failed turn is traced and reported; the session keeps reading.
 
 A FIFO works because it is boring:
 
@@ -145,22 +159,28 @@ A FIFO works because it is boring:
 
 No broker is required. No coordinator is required.
 
-Checkpoints are written after turns through `Put("session:state", ...)` and mirrored to checkpoint files by the CLI. A crashed agent can restart from the latest checkpoint with history intact.
+Checkpoints are written after turns through `Put("session:state", ...)` and mirrored to checkpoint files by the CLI. A crashed agent can restart from the latest checkpoint with history intact; checkpoints with dangling tool calls are repaired on load.
+
+## Provider neutrality
+
+The core message type (`ChatMessage`/`ToolCall`) is provider-neutral: tool calls are `{id, name, arguments: json}`, not any provider's wire shape. Each provider adapts at its serialization edge — the OpenAI-compatible client nests `function` objects and stringifies arguments, the Anthropic client emits `tool_use` content blocks. Persisted state (checkpoints, traces) uses the neutral shape; legacy OpenAI-shaped state still deserializes.
+
+Known limitation: `ChatMessage` is flat text-plus-tool-calls. Content blocks (e.g. provider thinking blocks) cannot round-trip through history yet.
 
 ## Interpreters define execution
 
-The interpreter decides what each `OpF` variant means. Change the interpreter and the same agent program runs under a different execution model.
+The interpreter decides what each effect means. Change the interpreter and the same agent program runs under a different execution model.
 
 | Interpreter | `Eval` behavior        | `Infer` behavior         | `Par` behavior       |
 |-------------|-------------------------|--------------------------|----------------------|
-| Sequential  | fork `$SHELL -c`        | HTTP provider call       | serial execution     |
-| Sandboxed   | wrapped fork            | HTTP provider call       | serial execution     |
-| Parallel    | fork `$SHELL -c`        | HTTP provider call       | concurrent futures   |
-| Replay      | return trace result     | return trace result      | serial execution     |
-| Distributed | RPC to worker/sandbox   | RPC/provider pool        | distributed dispatch |
-| Dry-run     | log intent, no-op       | mock response            | serial execution     |
+| IR sequential (default) | fork `$SHELL -c` | HTTP provider call      | not yet implemented (errors) |
+| Op sequential (compat)  | fork `$SHELL -c` | HTTP provider call      | serial execution     |
+| Replay      | return recorded result/failure | return recorded result/failure | serial |
+| Sandboxed   | wrapped fork            | HTTP provider call       | (future)             |
+| Parallel    | fork `$SHELL -c`        | HTTP provider call       | concurrent (future)  |
+| Distributed | RPC to worker/sandbox   | RPC/provider pool        | distributed (future) |
 
-That is the point of the free monad. The agent program is written once. The runtime changes independently.
+`Par` is deliberately unimplemented in the IR runtime until its semantics (store isolation, join merge, failure propagation, trace ordering) are settled — see docs/AGENT_IR.md.
 
 ## Resource governance
 
@@ -172,19 +192,19 @@ One governance hook. Both operations.
 
 ## Trace log
 
-Every op execution appends JSONL events with a run id and operation id:
+Every effect execution appends JSONL events with a run id, operation id, and — in IR mode — a stable effect id:
 
 ```json
-{"event":"EvalCall", "run_id":"...", "op_id":2, "command":"rg TODO src/"}
-{"event":"EvalResult", "run_id":"...", "op_id":2, "result":{"status":0,"stdout":"..."}}
-{"event":"InferCall", "run_id":"...", "op_id":3, "model":"...", "prompt_preview":"..."}
-{"event":"InferResult", "run_id":"...", "op_id":3, "tokens":340, "response_preview":"..."}
-{"event":"GetCall", "run_id":"...", "op_id":4, "key":"semantic:prior decisions"}
-{"event":"GetResult", "run_id":"...", "op_id":4, "source_count":3}
-{"event":"PutCall", "run_id":"...", "op_id":5, "key":"session:state"}
+{"event":"Custom","name":"ir_effect","data":{"effect_id":"sha256:...","kind":"Infer","site":{"block":0,"instruction_index":0}}}
+{"event":"InferCall",  "op_id":3, "model":"...", "prompt_preview":"..."}
+{"event":"InferResult","op_id":3, "tokens":340, "response_preview":"..."}
+{"event":"EvalCall",   "op_id":4, "command":"rg TODO src/"}
+{"event":"EvalError",  "op_id":4, "error":"..."}
 ```
 
-The log is for debugging and replay. Replay mode re-runs the same program and feeds logged `Eval` and `Infer` results back at matching op IDs instead of calling providers or executing shell commands.
+Failures close their call with `InferError`/`EvalError`, so failed runs are as inspectable and replayable as successful ones. Replay mode re-runs the same program and feeds recorded results (or failures) back at matching effect ids instead of calling providers or executing shell commands.
+
+Full prompts and `Get` values are opt-in (`--trace-full-payloads`); by default traces carry previews, keeping trace growth linear in session length.
 
 ## Non-goals
 
@@ -198,7 +218,8 @@ The model is: agent programs emit operations; interpreters run them; Linux is th
 
 ```text
 crates/
-  agent-core/   -- Op, OpF, interpreter, hydration, provider traits
+  agent-core/   -- effect algebra, AgentIR + machine, Op builder, interpreters,
+                   hydration, PromptIR, GC, providers, tracing
   agent/        -- CLI binary, session loop, FIFO management
   agent-oauth/  -- OAuth flows for claude-code / openai-codex providers
 ```
@@ -207,6 +228,6 @@ crates/
 
 ## Prior art
 
-The design comes from `Omni/Agent/Op.hs`, a Haskell prototype that proved the free monad Op abstraction at production scale. This Rust port preserves the same boundary: programs built with `Op` constructors, interpreted by `run_sequential` or future interpreters.
+The design comes from `Omni/Agent/Op.hs`, a Haskell prototype that proved the free monad Op abstraction at production scale. The Rust port keeps the same effect boundary while moving the stable representation from closures to serializable IR.
 
 The meta-circular `Infer`-emitting-`Infer` pattern has direct precedent in SICP's meta-circular evaluator.

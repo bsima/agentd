@@ -1,5 +1,12 @@
 # PromptIR design
 
+Status: **v1 implemented as a traceable representation** (`agent-core::prompt_ir`).
+Migration steps 1–7 from the plan below are done: hydration builds PromptIR,
+compiles it before provider calls, and emits hash + section summaries per
+`InferCall`; `PromptRef::PromptIr`/`PromptIrVar` exist in AgentIR. PromptIR is
+constructed when hydration produces sections — bare prompts skip it. The
+optimization passes listed under Non-goals remain future work.
+
 PromptIR is the structured payload for `AgentIR::Infer`.
 
 AgentIR answers when effects happen. PromptIR answers what context the model saw, where it came from, how it was budgeted, and how it should be traced.

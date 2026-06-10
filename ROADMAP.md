@@ -43,9 +43,15 @@ Planned work:
 
 ## AgentIR track: serializable runtime core
 
-Status: required for the next stable release.
+Status: implemented; `--runtime ir` is the CLI default and `--runtime op` is
+the deprecated compatibility mode. Remaining gaps (STM store, normalization
+pass, `Par`) are tracked in the status table of
+[docs/AGENT_IR.md](./docs/AGENT_IR.md).
 
-The current `Op` free monad uses Rust closure continuations. That is useful for an M1 runtime, but it is not the final interpreter representation. The next stable release should introduce a serializable AgentIR and make the runtime IR-first. The concrete AST/CFG design is captured in [docs/AGENT_IR.md](./docs/AGENT_IR.md).
+The `Op` free monad uses Rust closure continuations. That was useful for the
+M1 runtime, but it is not the final interpreter representation. AgentIR is the
+serializable, IR-first runtime. The concrete AST/CFG design is captured in
+[docs/AGENT_IR.md](./docs/AGENT_IR.md).
 
 Planned work:
 
@@ -104,7 +110,8 @@ Acceptance:
 
 ## M2: Rust `agentd` supervisor
 
-Status: future Rust port. Working in the Haskell system today (`~/omni/live/Omni/Agentd`).
+Status: design in [docs/SUPERVISOR.md](./docs/SUPERVISOR.md); implementation
+not started. Working in the Haskell system today (`~/omni/live/Omni/Agentd`).
 
 The supervisor will manage named long-running sessions around the existing `agent` process model:
 

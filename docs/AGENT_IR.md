@@ -1,6 +1,23 @@
 # AgentIR design
 
-AgentIR is the planned serializable core representation for `agentd` programs.
+Status: **implemented and the default runtime** (`--runtime ir`). This document
+is the design rationale; where it says "should", check the table below for
+whether reality has caught up.
+
+| Design item | Status |
+|---|---|
+| Serializable `Program`/`Block`/`Instr`/`Terminator`/`Expr` | Implemented (`agent-core::ir`) |
+| Validation before execution | Implemented (`validate_program`) |
+| Explicit machine, mid-turn checkpoints, step limit | Implemented (`run_ir_steps`); terminators do not count toward the step limit yet |
+| Stable effect IDs + replay + divergence locations | Implemented (`IrReplayTrace`) |
+| Failure semantics: error events with stable IDs | Implemented (`InferError`/`EvalError` trace events; replay reproduces failures) |
+| `agent_loop` ported with feature parity | Implemented (`agent_loop_ir`, including stalled-turn nudge) |
+| CLI switched to AgentIR | Implemented (default); `--runtime op` is the deprecated compatibility mode |
+| In-memory **STM** store with transactional Get/Put | Not implemented — `InMemoryStore` is a plain map; see docs/STATE_KEYS.md for the key contract |
+| Normalization pass for canonical hashing | Not implemented — hashing uses the serde encoding of the (BTreeMap-ordered) program |
+| `Par` semantics | Not implemented — the IR runtime rejects `Par` until the open questions below are settled |
+
+AgentIR is the serializable core representation for `agentd` programs.
 
 The current `Op` free monad is useful for M1, but it is not the final runtime representation because continuations are Rust closures:
 

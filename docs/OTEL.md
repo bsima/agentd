@@ -18,8 +18,8 @@ OTel is off by default. When enabled, `TraceLogger::emit(&Event)` fans out to th
 
 The OTel sink maps typed trace events to spans:
 
-- `InferCall` / `InferResult` -> `Infer` span
-- `EvalCall` / `EvalResult` -> `Eval` span
+- `InferCall` / `InferResult` (or `InferError`) -> `Infer` span
+- `EvalCall` / `EvalResult` (or `EvalError`) -> `Eval` span
 - `GetCall` / `GetResult` -> `Get` span
 - `PutCall` / `PutResult` -> `Put` span
 - `HydrationStart` / `HydrationEnd` -> `Hydration` span
@@ -69,8 +69,10 @@ Span-level, mapped straight off the existing `Event` fields:
 - Get / Put: `key`, `source_count`.
 - Par: `branch_count`.
 
-Span status: an `Eval` that exits nonzero sets span status `ERROR`. That makes
-"show me failing tool calls" a one-click filter instead of a text search.
+Span status: an `Eval` that exits nonzero sets span status `ERROR`, and an
+`InferError`/`EvalError` (terminal effect failure) closes its span with
+`ERROR` and the error message. That makes "show me failing tool calls" a
+one-click filter instead of a text search.
 
 The two attributes that turn a pretty tree into a control surface:
 
