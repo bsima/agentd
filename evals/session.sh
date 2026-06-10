@@ -13,11 +13,11 @@ cat >"$trace_fixture" <<'JSONL'
 {"event":"HydrationStart","run_id":"session-fixture","op_id":1,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"session-fixture","op_id":1,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"session-fixture","op_id":2,"model":"ignored","prompt":[],"prompt_preview":"first","timestamp":"2026-01-01T00:00:00Z"}
-{"event":"InferResult","run_id":"session-fixture","op_id":2,"response":{"content":"session-one","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"session-one","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"InferResult","run_id":"session-fixture","op_id":2,"response":{"finish_reason":"stop","content":"session-one","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"session-one","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationStart","run_id":"session-fixture","op_id":3,"sources":["TemporalHistory","SessionContext"],"max_bytes":null,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"session-fixture","op_id":3,"section_count":0,"total_bytes":0,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"session-fixture","op_id":4,"model":"ignored","prompt":[],"prompt_preview":"second","timestamp":"2026-01-01T00:00:00Z"}
-{"event":"InferResult","run_id":"session-fixture","op_id":4,"response":{"content":"session-two","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"session-two","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"InferResult","run_id":"session-fixture","op_id":4,"response":{"finish_reason":"stop","content":"session-two","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"session-two","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
 output="$(env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \

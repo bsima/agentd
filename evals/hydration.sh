@@ -19,14 +19,17 @@ cat >"$fixture" <<'JSONL'
 {"event":"HydrationSection","run_id":"fixture","op_id":1,"source":"local-files","kind":"Knowledge","bytes":1,"content_preview":"fixture","metadata":{},"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"HydrationEnd","run_id":"fixture","op_id":1,"section_count":1,"total_bytes":1,"timestamp":"2026-01-01T00:00:00Z"}
 {"event":"InferCall","run_id":"fixture","op_id":2,"model":"ignored","prompt":[],"prompt_preview":"hydration","timestamp":"2026-01-01T00:00:00Z"}
-{"event":"InferResult","run_id":"fixture","op_id":2,"response":{"content":"hydration-smoke","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"hydration-smoke","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
+{"event":"InferResult","run_id":"fixture","op_id":2,"response":{"finish_reason":"stop","content":"hydration-smoke","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"hydration-smoke","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
+# --trace-full-payloads: this eval asserts over the full Infer prompt, which
+# is opt-in in traces (previews are the default).
 env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
   --runtime op \
   --run-id "$run_id" \
   --hydration-dir "$hydration_dir" \
   --replay-trace "$fixture" \
+  --trace-full-payloads \
   --model ignored \
   "hydrate" >/dev/null
 
