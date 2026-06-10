@@ -181,6 +181,11 @@ pub struct SeqConfig {
     pub eval: EvalConfig,
     pub replay: Option<ReplayTrace>,
     pub trace_full_prompt_ir: bool,
+    /// Record full Infer prompts and Get values in trace events. Off by
+    /// default: the full prompt repeats the entire conversation on every
+    /// call, making traces O(n^2) in session length, and replay only needs
+    /// the recorded results. Previews are always recorded.
+    pub trace_full_payloads: bool,
     pub gc: GcMode,
     pub gc_threshold: f32,
     pub gc_log: bool,
@@ -243,7 +248,7 @@ where
                     op_id,
                     parent_op_id,
                     model: model.0.clone(),
-                    prompt: Some(prompt.clone()),
+                    prompt: config.trace_full_payloads.then(|| prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
                     timestamp: Utc::now(),
                 })
@@ -387,7 +392,7 @@ where
                     key,
                     source_count: value.as_array().map(Vec::len).unwrap_or(0),
                     value_preview: preview(&value.to_string(), 512),
-                    value: value.clone(),
+                    value: config.trace_full_payloads.then(|| value.clone()),
                     timestamp: Utc::now(),
                 })
                 .await?;
@@ -868,6 +873,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: crate::gc::GcMode::Ring(crate::gc::RingGc),
             gc_threshold: 0.5,
             gc_log: false,
@@ -911,6 +917,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -961,6 +968,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -998,6 +1006,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1052,6 +1061,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1119,6 +1129,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1151,6 +1162,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1192,6 +1204,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1241,6 +1254,7 @@ mod tests {
             },
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1321,6 +1335,7 @@ mod tests {
             },
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1352,6 +1367,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1385,6 +1401,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1405,6 +1422,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: Some(replay),
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1414,6 +1432,56 @@ mod tests {
             .and_then(|_| crate::op::eval("printf replayed"));
         let (replayed, _) = run_sequential(&replay_config, (), program).await?;
         assert_eq!(replayed, recorded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_payloads_are_omitted_from_traces_by_default() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("ok", vec![])]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = SeqConfig {
+            provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            context_budget: 200_000,
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
+            .and_then(|_| crate::op::get("temporal:history"));
+
+        let _ = run_sequential(&config, vec![ChatMessage::user("hello")], program).await?;
+
+        let events = TraceLogger::read_events(trace_path).await?;
+        for event in &events {
+            match event {
+                Event::InferCall {
+                    prompt,
+                    prompt_preview,
+                    ..
+                } => {
+                    assert!(prompt.is_none(), "full prompt must be opt-in");
+                    assert!(!prompt_preview.is_empty());
+                }
+                Event::GetResult {
+                    value,
+                    value_preview,
+                    ..
+                } => {
+                    assert!(value.is_none(), "full Get value must be opt-in");
+                    assert!(!value_preview.is_empty());
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -1431,6 +1499,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1465,6 +1534,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: Some(replay),
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1498,6 +1568,7 @@ mod tests {
             },
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
@@ -1536,6 +1607,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,

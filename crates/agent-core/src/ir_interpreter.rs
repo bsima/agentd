@@ -455,7 +455,7 @@ async fn execute_instr(
                     op_id,
                     parent_op_id: None,
                     model: model.clone(),
-                    prompt: Some(prompt.clone()),
+                    prompt: config.trace_full_payloads.then(|| prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
                     timestamp: Utc::now(),
                 })
@@ -1057,6 +1057,7 @@ mod tests {
             eval: EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,

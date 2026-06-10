@@ -60,6 +60,13 @@ struct Args {
     /// Store full PromptIR section content in traces instead of previews/hashes only.
     #[arg(long, env = "AGENT_TRACE_FULL_PROMPT_IR")]
     trace_full_prompt_ir: bool,
+    /// Store full Infer prompts and Get values in traces. Off by default:
+    /// full prompts repeat the whole conversation per call (O(n^2) trace
+    /// growth) and replay only needs recorded results. Previews are always
+    /// stored. Enable when recording fixtures that need full prompts (e.g.
+    /// GC eval traces).
+    #[arg(long, env = "AGENT_TRACE_FULL_PAYLOADS")]
+    trace_full_payloads: bool,
     /// Directory to read into passive hydration context.
     #[arg(long, env = "AGENT_HYDRATION_DIR")]
     hydration_dir: Option<PathBuf>,
@@ -388,6 +395,7 @@ async fn main() -> Result<()> {
         eval: eval_config,
         replay: replay.clone(),
         trace_full_prompt_ir: args.trace_full_prompt_ir,
+        trace_full_payloads: args.trace_full_payloads,
         gc: match args.gc {
             GcArg::None => GcMode::None,
             GcArg::Ring => GcMode::Ring(RingGc),
@@ -1095,6 +1103,7 @@ async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
         eval: runtime.config.eval.clone(),
         replay: runtime.config.replay.clone(),
         trace_full_prompt_ir: runtime.config.trace_full_prompt_ir,
+        trace_full_payloads: runtime.config.trace_full_payloads,
         gc: GcMode::None,
         gc_threshold: runtime.gc_threshold,
         gc_log: false,

@@ -606,6 +606,7 @@ mod tests {
             eval: crate::interpreter::EvalConfig::default(),
             replay: None,
             trace_full_prompt_ir: false,
+            trace_full_payloads: false,
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,

@@ -105,7 +105,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_op_id: Option<u64>,
         key: String,
-        value: Value,
+        /// Full value, present only when full-payload tracing is enabled.
+        /// Replay never needs it; `value_preview` is always recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<Value>,
         value_preview: String,
         source_count: usize,
         timestamp: DateTime<Utc>,
