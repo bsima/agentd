@@ -261,6 +261,7 @@ fn summarize_ops(events: &[Event]) -> String {
             Event::ParStart { .. } => "ParStart",
             Event::ParEnd { .. } => "ParEnd",
             Event::Checkpoint { .. } => "Checkpoint",
+            Event::TurnBudgetExhausted { .. } => "TurnBudgetExhausted",
             Event::AgentDone { .. } => "AgentDone",
             Event::Custom { .. } => "Custom",
         };

@@ -108,6 +108,11 @@ pub struct Response {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// Runtime annotations that travel with the response (e.g.
+    /// stop_reason = "turn_budget_exhausted" when the agent loop returned
+    /// because max_turns ran out rather than a natural stop — t-1133).
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub metadata: serde_json::Map<String, Value>,
 }
 
 /// A provider-neutral tool invocation. `arguments` is the parsed JSON value,
@@ -526,6 +531,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            metadata: Default::default(),
         }
     }
 

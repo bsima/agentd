@@ -495,14 +495,19 @@ fn message_mentions_any_id(message: &ChatMessage, ids: &BTreeSet<String>) -> boo
             .is_some_and(|id| ids.contains(id))
 }
 
-pub fn truncate_oversized_message(messages: &mut Vec<ChatMessage>, budget: usize) {
+/// Returns how many messages were shrunk so the caller can emit a distinct
+/// gc_truncate trace event: single-message token-budget pressure is a
+/// different overflow condition than whole-window gc_collect eviction
+/// (t-1133 overflow taxonomy).
+pub fn truncate_oversized_message(messages: &mut Vec<ChatMessage>, budget: usize) -> usize {
     const MARKER: &str = "\n...[truncated for context budget]";
     if budget == 0 {
+        let count = messages.len();
         for message in messages {
             message.content = Some(MARKER.to_string());
             truncate_tool_call_arguments(message, 1);
         }
-        return;
+        return count;
     }
     let marker_tokens = estimate_text_tokens(MARKER);
     let max_content_tokens = budget
@@ -510,11 +515,15 @@ pub fn truncate_oversized_message(messages: &mut Vec<ChatMessage>, budget: usize
         .max(1);
     let target_tokens = max_content_tokens.saturating_sub(marker_tokens).max(1);
 
+    let mut truncated_count = 0;
     for message in messages {
         // A single over-budget message defeats every strategy: nothing dropped
         // *around* it can help, so the GC loop would bail and ship an
         // over-budget prompt anyway. Shrink content AND tool_call arguments,
         // halving the cap until the message fits (or we hit the floor).
+        if estimate_tokens(std::slice::from_ref(message)) > budget {
+            truncated_count += 1;
+        }
         let mut cap_tokens = target_tokens;
         loop {
             if estimate_tokens(std::slice::from_ref(message)) <= budget {
@@ -535,6 +544,7 @@ pub fn truncate_oversized_message(messages: &mut Vec<ChatMessage>, budget: usize
             cap_tokens = (cap_tokens / 2).max(1);
         }
     }
+    truncated_count
 }
 
 /// Replace oversized tool-call argument values with a marked preview. The

@@ -516,7 +516,24 @@ pub(crate) async fn maybe_collect_prompt(
         return Ok(prompt);
     }
     let target_budget = threshold.max(1);
-    truncate_oversized_message(&mut prompt, target_budget);
+    let truncated_count = truncate_oversized_message(&mut prompt, target_budget);
+    if truncated_count > 0 && config.gc_log {
+        // Distinct from gc_collect: one or more single messages exceeded the
+        // whole budget and were truncated in place (t-1133 overflow taxonomy).
+        config
+            .trace
+            .emit(&Event::Custom {
+                run_id: config.trace.run_id().into(),
+                name: "gc_truncate".into(),
+                data: serde_json::json!({
+                    "type": "gc_truncate",
+                    "truncated_messages": truncated_count,
+                    "budget": target_budget,
+                }),
+                timestamp: Utc::now(),
+            })
+            .await?;
+    }
     let before_ids: BTreeSet<_> = prompt.iter().map(|message| message.id).collect();
     let collected = config.gc.collect(prompt, target_budget, gc_state);
     let after_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
@@ -886,6 +903,7 @@ mod tests {
             input_tokens: 3,
             output_tokens: 4,
             total_tokens: 7,
+            metadata: Default::default(),
         }
     }
 
@@ -928,6 +946,54 @@ mod tests {
 
         assert!(estimate_tokens(&collected) <= 50, "collected={collected:?}");
         assert!(collected.iter().any(|message| message.role == "system"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_truncation_emits_distinct_gc_truncate_event() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = SeqConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: crate::gc::GcMode::Ring(crate::gc::RingGc::default()),
+            gc_threshold: 0.5,
+            gc_log: true,
+            context_budget: 100,
+        };
+        // One message alone larger than the whole budget: only the truncate
+        // pre-pass can shrink it, and that must be visible as its own event.
+        let prompt = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(2000)),
+        ];
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+        assert!(estimate_tokens(&collected) <= 50);
+
+        let events = TraceLogger::read_events(trace_path).await?;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Custom { name, .. } if name == "gc_truncate"
+            )),
+            "single-oversized-message truncation must emit gc_truncate: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Custom { name, .. } if name == "gc_collect"
+            )),
+            "the collection event must still fire"
+        );
         Ok(())
     }
 

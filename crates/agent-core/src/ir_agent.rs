@@ -22,6 +22,8 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let infer_eval = BlockId(13);
     let route = BlockId(14);
     let nudge_turn = BlockId(15);
+    let route_done = BlockId(16);
+    let budget_done = BlockId(17);
 
     let history = Var("history".into());
     let turns_left = Var("turns_left".into());
@@ -40,6 +42,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let history_for_nudge = Var("history_for_nudge".into());
     let nudged_history = Var("nudged_history".into());
     let nudge_turns_left = Var("nudge_turns_left".into());
+    let budget_response = Var("budget_response".into());
     let history_with_assistant = Var("history_with_assistant".into());
     let i = Var("i".into());
     let keep_looping = Var("keep_looping".into());
@@ -140,7 +143,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                 Instr::Let {
                     out: should_return.clone(),
                     expr: Expr::Or {
-                        left: Box::new(Expr::Var(can_stop)),
+                        left: Box::new(Expr::Var(can_stop.clone())),
                         right: Box::new(Expr::Var(no_turns_left)),
                     },
                 },
@@ -164,8 +167,90 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
             ],
             terminator: Terminator::If {
                 cond: Expr::Var(should_return),
-                then_block: done,
+                then_block: route_done,
                 else_block: route,
+            },
+        },
+    );
+
+    // A natural stop returns the response verbatim; a turn-budget stop must
+    // be distinguishable downstream (t-1133), so it returns the response
+    // annotated with metadata.stop_reason = "turn_budget_exhausted". When
+    // both conditions hold, the natural stop wins: the budget never fired.
+    blocks.insert(
+        route_done,
+        Block {
+            params: vec![],
+            instructions: vec![],
+            terminator: Terminator::If {
+                cond: Expr::Var(can_stop),
+                then_block: done,
+                else_block: budget_done,
+            },
+        },
+    );
+
+    blocks.insert(
+        budget_done,
+        Block {
+            params: vec![],
+            instructions: vec![Instr::Let {
+                out: budget_response.clone(),
+                expr: Expr::Object(BTreeMap::from([
+                    (
+                        "content".into(),
+                        Expr::Field {
+                            base: response.clone(),
+                            field: "content".into(),
+                        },
+                    ),
+                    (
+                        "tool_calls".into(),
+                        Expr::Field {
+                            base: response.clone(),
+                            field: "tool_calls".into(),
+                        },
+                    ),
+                    (
+                        "finish_reason".into(),
+                        Expr::FieldOr {
+                            base: response.clone(),
+                            field: "finish_reason".into(),
+                            default: Box::new(Expr::Value(Value::Null)),
+                        },
+                    ),
+                    (
+                        "input_tokens".into(),
+                        Expr::Field {
+                            base: response.clone(),
+                            field: "input_tokens".into(),
+                        },
+                    ),
+                    (
+                        "output_tokens".into(),
+                        Expr::Field {
+                            base: response.clone(),
+                            field: "output_tokens".into(),
+                        },
+                    ),
+                    (
+                        "total_tokens".into(),
+                        Expr::Field {
+                            base: response.clone(),
+                            field: "total_tokens".into(),
+                        },
+                    ),
+                    (
+                        "metadata".into(),
+                        Expr::Object(BTreeMap::from([(
+                            "stop_reason".into(),
+                            Expr::Value(Value::String("turn_budget_exhausted".into())),
+                        )])),
+                    ),
+                ])),
+            }],
+            terminator: Terminator::Return {
+                value: Expr::Var(budget_response),
             },
         },
     );
@@ -751,6 +836,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 1,
             total_tokens: 1,
+            metadata: Default::default(),
         }
     }
 
@@ -830,6 +916,74 @@ mod tests {
             .find(|message| message.role == "tool")
             .expect("infer tool result in final prompt");
         assert_eq!(tool_message.content.as_deref(), Some("sub answer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_turn_budget_exhaustion_annotates_response() -> Result<()> {
+        // A model that always answers finish=stop + a tool call never reaches
+        // can_stop; with max_turns=2 the loop must return via no_turns_left
+        // and annotate the response so the runtime can tell a budget stop
+        // from a natural one (t-1133).
+        let tool_turn = || {
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-budget",
+                    "shell",
+                    serde_json::json!({ "command": "printf spin" }),
+                )],
+            )
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_turn(),
+            tool_turn(),
+            tool_turn(),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("spin")],
+            2,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(
+            value["metadata"]["stop_reason"],
+            Value::String("turn_budget_exhausted".into()),
+            "budget stop must be annotated: {value}"
+        );
+        assert!(
+            !value["tool_calls"].as_array().unwrap().is_empty(),
+            "the unexecuted tool calls must survive in the response"
+        );
+        // The annotated value still decodes as a Response.
+        let decoded: Response = serde_json::from_value(value)?;
+        assert_eq!(
+            decoded.metadata.get("stop_reason").and_then(Value::as_str),
+            Some("turn_budget_exhausted")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_natural_stop_has_no_budget_metadata() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("done", vec![])]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("hi")],
+            2,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value["content"], Value::String("done".into()));
+        assert!(
+            value.get("metadata").is_none(),
+            "natural stop must not carry budget metadata: {value}"
+        );
         Ok(())
     }
 

@@ -241,6 +241,7 @@ fn parse_messages_response(text: &str) -> Result<Response> {
             .usage
             .input_tokens
             .saturating_add(response.usage.output_tokens),
+        metadata: Default::default(),
     })
 }
 

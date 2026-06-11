@@ -183,6 +183,19 @@ pub enum Event {
         path: Option<String>,
         timestamp: DateTime<Utc>,
     },
+    /// The agent loop returned because the soft max-turns ceiling ran out
+    /// (t-1133). Budget-overflow events are intentionally distinct:
+    /// turn_budget_exhausted is the soft turn ceiling, context_overflow is
+    /// the hard provider context-window error, and gc_collect/gc_truncate
+    /// are token-budget pressure inside GC.
+    TurnBudgetExhausted {
+        run_id: String,
+        max_turns: usize,
+        pending_tool_calls: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_tool: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
     AgentDone {
         run_id: String,
         timestamp: DateTime<Utc>,
@@ -214,6 +227,7 @@ impl Event {
             | Self::ParStart { run_id, .. }
             | Self::ParEnd { run_id, .. }
             | Self::Checkpoint { run_id, .. }
+            | Self::TurnBudgetExhausted { run_id, .. }
             | Self::AgentDone { run_id, .. }
             | Self::Custom { run_id, .. } => run_id,
         }
@@ -236,7 +250,10 @@ impl Event {
             | Self::HydrationEnd { op_id, .. }
             | Self::ParStart { op_id, .. }
             | Self::ParEnd { op_id, .. } => Some(*op_id),
-            Self::Checkpoint { .. } | Self::AgentDone { .. } | Self::Custom { .. } => None,
+            Self::Checkpoint { .. }
+            | Self::TurnBudgetExhausted { .. }
+            | Self::AgentDone { .. }
+            | Self::Custom { .. } => None,
         }
     }
 
@@ -257,7 +274,10 @@ impl Event {
             | Self::HydrationEnd { parent_op_id, .. }
             | Self::ParStart { parent_op_id, .. }
             | Self::ParEnd { parent_op_id, .. } => *parent_op_id,
-            Self::Checkpoint { .. } | Self::AgentDone { .. } | Self::Custom { .. } => None,
+            Self::Checkpoint { .. }
+            | Self::TurnBudgetExhausted { .. }
+            | Self::AgentDone { .. }
+            | Self::Custom { .. } => None,
         }
     }
 
@@ -271,11 +291,13 @@ impl Event {
             Self::HydrationSection { .. } => "HydrationSection",
             Self::ParStart { .. } | Self::ParEnd { .. } => "Par",
             Self::Checkpoint { .. } => "Checkpoint",
+            Self::TurnBudgetExhausted { .. } => "turn_budget_exhausted",
             Self::AgentDone { .. } => "AgentDone",
             Self::Custom { name, .. } => match name.as_str() {
                 "agent_error" => "agent_error",
                 "agent_response" => "agent_response",
                 "gc_collect" => "gc_collect",
+                "gc_truncate" => "gc_truncate",
                 "context_overflow" => "context_overflow",
                 _ => "Custom",
             },
@@ -326,6 +348,7 @@ impl Event {
             | Self::ParStart { timestamp, .. }
             | Self::ParEnd { timestamp, .. }
             | Self::Checkpoint { timestamp, .. }
+            | Self::TurnBudgetExhausted { timestamp, .. }
             | Self::AgentDone { timestamp, .. }
             | Self::Custom { timestamp, .. } => *timestamp,
         }
@@ -474,6 +497,21 @@ impl Event {
                 attrs.push(KeyValue::new("agent.checkpoint", name.clone()));
                 if let Some(path) = path {
                     attrs.push(KeyValue::new("agent.path", path.clone()));
+                }
+            }
+            Self::TurnBudgetExhausted {
+                max_turns,
+                pending_tool_calls,
+                first_tool,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.max_turns", *max_turns as i64));
+                attrs.push(KeyValue::new(
+                    "agent.pending_tool_calls",
+                    *pending_tool_calls as i64,
+                ));
+                if let Some(first_tool) = first_tool {
+                    attrs.push(KeyValue::new("agent.first_tool", first_tool.clone()));
                 }
             }
             Self::Custom { name, data, .. } => {

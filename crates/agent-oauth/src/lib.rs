@@ -803,6 +803,7 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
         input_tokens,
         output_tokens,
         total_tokens,
+        metadata: Default::default(),
     })
 }
 

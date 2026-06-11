@@ -1039,6 +1039,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 1,
             total_tokens: 1,
+            metadata: Default::default(),
         }
     }
 

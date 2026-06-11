@@ -317,6 +317,7 @@ async fn send_chat_request(
             input_tokens,
             output_tokens,
             total_tokens,
+            metadata: Default::default(),
         })
     }
 }
@@ -469,6 +470,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            metadata: Default::default(),
         }
     }
 

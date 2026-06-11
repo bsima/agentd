@@ -26,6 +26,14 @@ use uuid::Uuid;
 
 mod frontmatter;
 
+/// Soft turn ceiling per session turn (Ben's decision on t-1133). Models like
+/// gpt-5.5 issue one tool call per assistant turn, so real inspect/edit loops
+/// burn turns fast; 100 is generous enough that no legitimate task dies one
+/// step from the line, while still bounding a runaway loop before it burns
+/// real spend or hits the context wall. Hitting it is reported (typed
+/// TurnBudgetExhausted event + non-empty terminal notice), not fatal-looking.
+const DEFAULT_MAX_TURNS: usize = 100;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -247,7 +255,7 @@ async fn main() -> Result<()> {
         .or_else(|| frontmatter.and_then(|meta| meta.provider.clone()));
     let max_turns = frontmatter
         .and_then(|meta| meta.max_iterations)
-        .unwrap_or(16);
+        .unwrap_or(DEFAULT_MAX_TURNS);
     let system_prompt_override = match loaded_prompt.as_ref() {
         Some(prompt) => {
             frontmatter::resolve_system_prompt(
@@ -953,7 +961,10 @@ async fn run_turn_with_status(
     emit_agent_start(runtime).await?;
     match run_turn(runtime, message).await {
         Ok(response) => {
-            emit_agent_complete(runtime, &response.content).await?;
+            // A turn-budget stop with empty content must not look like a
+            // crash: surface a clear terminal notice instead (t-1133).
+            let completion = terminal_response(runtime, &response);
+            emit_agent_complete(runtime, &completion).await?;
             Ok(response)
         }
         Err(err) => {
@@ -998,6 +1009,9 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             response.tool_calls.clone(),
         ));
     }
+    if response_turn_budget_exhausted(&response) {
+        emit_turn_budget_exhausted(runtime, &response).await?;
+    }
     // A turn that exhausted its budget mid-tool-call returns unexecuted tool
     // calls; close them with synthetic error results so the next turn is not
     // rejected by the provider's pending-tool-call guard.
@@ -1013,6 +1027,71 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
     put_checkpoint(runtime).await?;
     save_checkpoint(runtime).await?;
     Ok(response)
+}
+
+fn response_turn_budget_exhausted(response: &agent_core::Response) -> bool {
+    matches!(
+        response
+            .metadata
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("turn_budget_exhausted")
+    )
+}
+
+/// What agent_complete should carry: the assistant text, or — when the turn
+/// budget ran out with nothing left to say — a clear notice naming the limit
+/// and what was pending, so budget exhaustion is distinguishable from a crash.
+fn terminal_response(runtime: &Runtime, response: &agent_core::Response) -> String {
+    if response_turn_budget_exhausted(response) && response.content.is_empty() {
+        return turn_budget_message(runtime.max_turns, &response.tool_calls);
+    }
+    response.content.clone()
+}
+
+fn turn_budget_message(max_turns: usize, tool_calls: &[agent_core::ToolCall]) -> String {
+    let pending = tool_calls.len();
+    let summary = tool_calls
+        .first()
+        .map(summarize_tool_call)
+        .unwrap_or_else(|| "no pending tool call".into());
+    format!(
+        "[turn budget exhausted after {max_turns} turns; {pending} tool call(s) left unexecuted: {summary}]"
+    )
+}
+
+fn summarize_tool_call(call: &agent_core::ToolCall) -> String {
+    let detail = call
+        .arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            call.arguments
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+    if detail.is_empty() {
+        call.name.clone()
+    } else {
+        format!("{} {}", call.name, detail)
+    }
+}
+
+async fn emit_turn_budget_exhausted(
+    runtime: &mut Runtime,
+    response: &agent_core::Response,
+) -> Result<()> {
+    runtime
+        .trace
+        .emit(&Event::TurnBudgetExhausted {
+            run_id: runtime.run_id.clone(),
+            max_turns: runtime.max_turns,
+            pending_tool_calls: response.tool_calls.len(),
+            first_tool: response.tool_calls.first().map(summarize_tool_call),
+            timestamp: Utc::now(),
+        })
+        .await
 }
 
 async fn read_nul_frame<R>(reader: &mut R) -> Result<Option<String>>
@@ -1372,6 +1451,104 @@ fn trace_path(run_id: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn budget_exhausted_response(tool_calls: Vec<agent_core::ToolCall>) -> agent_core::Response {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "stop_reason".into(),
+            serde_json::Value::String("turn_budget_exhausted".into()),
+        );
+        agent_core::Response {
+            content: String::new(),
+            tool_calls,
+            finish_reason: Some(agent_core::FinishReason::Stop),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn turn_budget_exhaustion_is_detected_and_message_is_non_empty() {
+        let call = agent_core::ToolCall::new(
+            "call-1",
+            "shell",
+            serde_json::json!({ "command": "cargo test" }),
+        );
+        let response = budget_exhausted_response(vec![call]);
+
+        assert!(response_turn_budget_exhausted(&response));
+        let message = turn_budget_message(100, &response.tool_calls);
+        assert!(
+            message.contains("turn budget exhausted after 100 turns"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("1 tool call(s) left unexecuted"),
+            "got: {message}"
+        );
+        assert!(message.contains("shell cargo test"), "got: {message}");
+    }
+
+    #[test]
+    fn natural_responses_are_not_flagged_as_budget_exhausted() {
+        let response = agent_core::Response {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some(agent_core::FinishReason::Stop),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            metadata: Default::default(),
+        };
+        assert!(!response_turn_budget_exhausted(&response));
+    }
+
+    // Overflow taxonomy regression (t-1133): the three budget conditions stay
+    // distinct — turn_budget_exhausted (soft turn ceiling), context_overflow
+    // (hard provider context window), gc_collect/gc_truncate (token-budget
+    // pressure inside GC).
+    #[test]
+    fn context_overflow_detection_still_matches_provider_sentinel() {
+        assert!(is_context_overflow_error(
+            "context_length_exceeded: provider returned 400: too long"
+        ));
+        assert!(!is_context_overflow_error("provider returned 500: boom"));
+    }
+
+    #[test]
+    fn overflow_event_names_are_distinct() {
+        let turn_budget = Event::TurnBudgetExhausted {
+            run_id: "r".into(),
+            max_turns: 100,
+            pending_tool_calls: 1,
+            first_tool: Some("shell cargo test".into()),
+            timestamp: Utc::now(),
+        };
+        let custom = |name: &str| Event::Custom {
+            run_id: "r".into(),
+            name: name.into(),
+            data: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+
+        let names = [
+            turn_budget.name(),
+            custom("context_overflow").name(),
+            custom("gc_collect").name(),
+            custom("gc_truncate").name(),
+        ];
+        assert_eq!(
+            names,
+            [
+                "turn_budget_exhausted",
+                "context_overflow",
+                "gc_collect",
+                "gc_truncate"
+            ]
+        );
+    }
 
     #[test]
     fn reports_oauth_provider_base_url_instead_of_fallback() {
