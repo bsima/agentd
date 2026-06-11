@@ -377,7 +377,7 @@ impl ProviderError {
             Self::Transport { source, context } => anyhow::Error::new(source).context(context),
             Self::Http { status, text, .. } => anyhow!("provider returned {status}: {text}"),
             Self::ContextOverflow { status, text } => {
-                anyhow!("context_length_exceeded: provider returned {status}: {text}")
+                anyhow::Error::new(ContextOverflowError { status, text })
             }
             Self::EmptyCompletion { raw } => {
                 anyhow!("provider returned an empty completion (no content or tool calls) after retries; raw response body: {raw}")
@@ -385,6 +385,57 @@ impl ProviderError {
             Self::Other(err) => err,
         }
     }
+}
+
+/// Typed context-overflow error so interpreters can classify it without
+/// string-matching (t-1151). The Display string keeps the historical
+/// `context_length_exceeded:` prefix that traces and tooling key on.
+#[derive(Debug)]
+pub struct ContextOverflowError {
+    pub status: StatusCode,
+    pub text: String,
+}
+
+impl std::fmt::Display for ContextOverflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "context_length_exceeded: provider returned {}: {}",
+            self.status, self.text
+        )
+    }
+}
+
+impl std::error::Error for ContextOverflowError {}
+
+/// Classify a provider error as a context overflow. Typed when the provider
+/// constructed [`ContextOverflowError`]; falls back to message heuristics for
+/// providers that surface raw backend text (the codex OAuth path returns
+/// `anyhow!("Codex OAuth provider returned {status}: {text}")` unclassified,
+/// which is how smith's overflow escaped the t-1133 taxonomy entirely).
+pub fn is_context_overflow_anyhow(err: &anyhow::Error) -> bool {
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ContextOverflowError>().is_some())
+    {
+        return true;
+    }
+    is_context_overflow_message(&format!("{err:#}"))
+}
+
+/// Message-level overflow heuristic covering observed provider phrasings:
+/// OpenAI-compat (`context_length_exceeded`), the codex/Responses backend
+/// ("your input exceeds the context window of this model"), and Anthropic
+/// ("prompt is too long: N tokens > M maximum").
+pub fn is_context_overflow_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("prompt is too long")
+        || (lower.contains("context window")
+            && (lower.contains("exceed") || lower.contains("too long")))
+        || (lower.contains("context")
+            && lower.contains("length")
+            && (lower.contains("exceed") || lower.contains("maximum")))
 }
 
 pub(crate) fn is_context_overflow(status: StatusCode, text: &str) -> bool {
@@ -478,6 +529,42 @@ mod tests {
         ProviderError::EmptyCompletion {
             raw: r#"{"choices":[{"message":{"content":""}}]}"#.into(),
         }
+    }
+
+    #[test]
+    fn typed_context_overflow_survives_anyhow_conversion() {
+        let err = ProviderError::ContextOverflow {
+            status: StatusCode::BAD_REQUEST,
+            text: "context_length_exceeded".into(),
+        }
+        .into_anyhow();
+        assert!(is_context_overflow_anyhow(&err));
+        // Traces and tooling key on this prefix; keep it stable.
+        assert!(err.to_string().starts_with("context_length_exceeded"));
+    }
+
+    #[test]
+    fn raw_provider_messages_classify_as_overflow() {
+        // The codex OAuth path surfaces the backend text unclassified —
+        // exactly what the t-1145 smith overflow looked like.
+        assert!(is_context_overflow_anyhow(&anyhow!(
+            "Codex OAuth provider returned 400 Bad Request: \
+             Your input exceeds the context window of this model."
+        )));
+        // Anthropic phrasing.
+        assert!(is_context_overflow_message(
+            "prompt is too long: 215000 tokens > 200000 maximum"
+        ));
+        // OpenAI-compat error code.
+        assert!(is_context_overflow_message(
+            "context_length_exceeded: provider returned 400: ..."
+        ));
+        assert!(!is_context_overflow_anyhow(&anyhow!(
+            "provider returned 500: boom"
+        )));
+        assert!(!is_context_overflow_message(
+            "shell command printed 'context' and 'length' is fine"
+        ));
     }
 
     /// Count how many `user` messages a serialized request body carries. The

@@ -14,7 +14,7 @@ pub mod trace;
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use gc::{
     estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
-    LifecycleState, MarkSweepGc, MsgId, RingGc,
+    GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc,
 };
 pub use hydration::{
     HydrationSource, PassiveHydrationConfig, PassiveSource, SourceCapability, SourceKind,
@@ -46,7 +46,10 @@ pub use prompt_ir::{
     RetrievalMode, RetrievalTiming, Section, SectionId, SectionOrigin, SectionRole, SectionSource,
     SectionSummary, TokenBudget, TokenEstimate, ToolDef,
 };
-pub use provider::{ChatProvider, ProviderClient, ProviderConfig};
+pub use provider::{
+    is_context_overflow_anyhow, is_context_overflow_message, ChatProvider, ContextOverflowError,
+    ProviderClient, ProviderConfig,
+};
 pub use trace::{
     AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, TraceContextEnv, TraceLogger,
     TraceSink, TraceSummary,

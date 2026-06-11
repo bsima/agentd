@@ -50,6 +50,69 @@ pub struct GcState {
     /// Set by every strategy on every collection; read for gc_collect
     /// trace events.
     pub prefix_invalidated: bool,
+    /// Infer calls seen by this loop run; drives the every-N timing strategy.
+    pub infer_calls: u64,
+    /// Token budget a catch-overflow retry actually succeeded under. Once
+    /// the provider has rejected a prompt, its real window — not our
+    /// estimate — is the ceiling; later calls in the same loop collect to
+    /// this proactively instead of paying a failed request per turn.
+    pub discovered_budget: Option<usize>,
+}
+
+/// When GC runs, independent of which strategy reclaims tokens (t-1151).
+/// Token estimates diverge from provider tokenizers, so a purely
+/// estimate-driven threshold can sit idle while the provider hard-rejects;
+/// catch-overflow makes the provider the source of truth instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GcTiming {
+    /// Collect when the estimated prompt size crosses
+    /// `context_budget * gc_threshold` (the historical default).
+    #[default]
+    Threshold,
+    /// No estimate-based trigger: on a provider context-overflow error,
+    /// collect to a shrinking budget and retry the same turn.
+    CatchOverflow,
+    /// Collect before every infer call.
+    Eager,
+    /// Collect on every Nth infer call (N >= 1).
+    EveryN(u64),
+}
+
+impl GcTiming {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Threshold => "threshold",
+            Self::CatchOverflow => "catch-overflow",
+            Self::Eager => "eager",
+            Self::EveryN(_) => "every-n",
+        }
+    }
+}
+
+impl std::str::FromStr for GcTiming {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "threshold" => Ok(Self::Threshold),
+            "catch-overflow" => Ok(Self::CatchOverflow),
+            "eager" => Ok(Self::Eager),
+            other => {
+                if let Some(n) = other.strip_prefix("every:") {
+                    let n: u64 = n
+                        .parse()
+                        .map_err(|_| format!("invalid every:N turn count {n:?}"))?;
+                    if n == 0 {
+                        return Err("every:N requires N >= 1".into());
+                    }
+                    return Ok(Self::EveryN(n));
+                }
+                Err(format!(
+                    "unknown gc timing {other:?}; expected threshold, catch-overflow, eager, or every:N"
+                ))
+            }
+        }
+    }
 }
 
 /// Fraction of the budget pinned as the stable cache-prefix region under
@@ -610,6 +673,17 @@ mod tests {
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall::new(id, "shell", serde_json::json!({}))
+    }
+
+    #[test]
+    fn gc_timing_parses_all_forms() {
+        assert_eq!("threshold".parse(), Ok(GcTiming::Threshold));
+        assert_eq!("catch-overflow".parse(), Ok(GcTiming::CatchOverflow));
+        assert_eq!("eager".parse(), Ok(GcTiming::Eager));
+        assert_eq!("every:5".parse(), Ok(GcTiming::EveryN(5)));
+        assert!("every:0".parse::<GcTiming>().is_err());
+        assert!("every:x".parse::<GcTiming>().is_err());
+        assert!("sometimes".parse::<GcTiming>().is_err());
     }
 
     fn read_file_call(id: &str, path: &str) -> ToolCall {

@@ -790,6 +790,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
 mod tests {
     use super::*;
     use crate::gc::GcMode;
+    use crate::gc::GcTiming;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
     use crate::ir::validate_program;
@@ -882,6 +883,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         }
     }

@@ -469,6 +469,7 @@ fn command_from_tool_call(call: &ToolCall) -> std::result::Result<String, Value>
 mod tests {
     use super::*;
     use crate::gc::GcMode;
+    use crate::gc::GcTiming;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{run_sequential, SeqConfig};
     use crate::provider::{ChatProvider, ToolSpec};
@@ -616,6 +617,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         }
     }

@@ -3,6 +3,7 @@
 //! the Op and IR runtimes; where the runtimes deliberately diverge, the
 //! divergence is pinned here so it cannot drift silently.
 
+use agent_core::GcTiming;
 use agent_core::{Block, BlockId, Expr, Instr, Program, ProgramId, Terminator, Var};
 use agent_core::{
     ChatMessage, ChatProvider, EvalConfig, GcMode, HydrationSource, InMemoryStore, Machine, Model,
@@ -72,6 +73,7 @@ fn config(checkpoint_path: Option<PathBuf>) -> SeqConfig {
         gc: GcMode::None,
         gc_threshold: 0.85,
         gc_log: false,
+        gc_timing: GcTiming::Threshold,
         context_budget: 200_000,
     }
 }

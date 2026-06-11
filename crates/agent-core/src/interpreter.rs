@@ -1,4 +1,4 @@
-use crate::gc::{estimate_tokens, truncate_oversized_message, GcMode, GcState};
+use crate::gc::{estimate_tokens, truncate_oversized_message, GcMode, GcState, GcTiming};
 use crate::hydration::{
     PassiveHydrationConfig, PassiveSource, SourceParams, SourceRegistry, SEMANTIC_PREFIX,
     SESSION_STATE_KEY, TEMPORAL_PREFIX,
@@ -225,6 +225,7 @@ pub struct SeqConfig {
     pub gc: GcMode,
     pub gc_threshold: f32,
     pub gc_log: bool,
+    pub gc_timing: GcTiming,
     pub context_budget: usize,
 }
 
@@ -275,7 +276,7 @@ where
             next,
         } => {
             let prompt = hydrate_infer_prompt(config, &state, prompt).await?;
-            let prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
+            let mut prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -290,18 +291,41 @@ where
                 })
                 .await?;
             let started = Instant::now();
-            let result = match &config.replay {
-                Some(replay) => replay.infer_result(op_id, &model.0),
-                None => {
-                    config
-                        .provider
-                        .chat(&model, &config.tool_specs(), &prompt)
-                        .await
+            // Catch-overflow retries stay inside this one InferCall: failed
+            // attempts surface as gc_collect{trigger:context_overflow} events
+            // and the single InferResult/InferError pair reports the outcome,
+            // so traces and replay keep their one-call-one-result contract.
+            let mut overflow_cycles = 0usize;
+            let result = loop {
+                let attempt = match &config.replay {
+                    Some(replay) => replay.infer_result(op_id, &model.0),
+                    None => {
+                        config
+                            .provider
+                            .chat(&model, &config.tool_specs(), &prompt)
+                            .await
+                    }
+                };
+                match attempt {
+                    Err(err)
+                        if config.replay.is_none()
+                            && catch_overflow_active(config)
+                            && crate::provider::is_context_overflow_anyhow(&err)
+                            && overflow_cycles < CATCH_OVERFLOW_MAX_CYCLES =>
+                    {
+                        overflow_cycles += 1;
+                        let (collected, target) =
+                            collect_for_overflow(config, prompt, gc_state, overflow_cycles).await?;
+                        prompt = collected;
+                        gc_state.discovered_budget = Some(target);
+                    }
+                    other => break other,
                 }
             };
             let response = match result {
                 Ok(response) => response,
                 Err(err) => {
+                    let err = annotate_overflow_failure(err, overflow_cycles);
                     config
                         .trace
                         .emit(&Event::InferError {
@@ -502,20 +526,86 @@ where
     }
 }
 
+/// Bounded GC+retry cycles when catch-overflow timing hits a provider
+/// context-overflow error. Each cycle halves the target again, so three
+/// cycles cover an estimate that is off by up to 8x.
+pub(crate) const CATCH_OVERFLOW_MAX_CYCLES: usize = 3;
+
+pub(crate) fn catch_overflow_active(config: &SeqConfig) -> bool {
+    config.gc.enabled() && config.gc_timing == GcTiming::CatchOverflow
+}
+
+/// Shrink the prompt after the provider rejected it (catch-overflow cycle
+/// `cycle`, 1-based): the target is the estimated size halved `cycle` times,
+/// because the estimate just proved unreliable in the dangerous direction.
+/// Returns the collected prompt and the target it was collected to; the
+/// caller records the target as the loop's discovered budget so later turns
+/// collect proactively instead of paying a failed request each.
+pub(crate) async fn collect_for_overflow(
+    config: &SeqConfig,
+    prompt: Prompt,
+    gc_state: &mut GcState,
+    cycle: usize,
+) -> Result<(Prompt, usize)> {
+    let target_budget = (estimate_tokens(&prompt) >> cycle).max(1);
+    let collected = collect_prompt(config, prompt, gc_state, target_budget, Some(cycle)).await?;
+    Ok((collected, target_budget))
+}
+
+/// Wrap a turn that still overflowed after GC retry cycles. The message
+/// keeps the `context_length_exceeded` prefix so the turn lands in the
+/// existing context_overflow taxonomy event, and is non-empty about what
+/// was attempted.
+pub(crate) fn annotate_overflow_failure(err: anyhow::Error, cycles: usize) -> anyhow::Error {
+    if cycles == 0 {
+        return err;
+    }
+    err.context(format!(
+        "context_length_exceeded: prompt still overflows the provider context window after {cycles} catch-overflow GC cycle(s)"
+    ))
+}
+
 pub(crate) async fn maybe_collect_prompt(
     config: &SeqConfig,
-    mut prompt: Prompt,
+    prompt: Prompt,
     gc_state: &mut GcState,
 ) -> Result<Prompt> {
     if !config.gc.enabled() {
         return Ok(prompt);
     }
+    gc_state.infer_calls += 1;
     let before_tokens = estimate_tokens(&prompt);
     let threshold = ((config.context_budget as f32) * config.gc_threshold) as usize;
-    if before_tokens <= threshold {
+    let threshold_target = threshold.max(1);
+    let (should_collect, target_budget) = match config.gc_timing {
+        GcTiming::Threshold => (before_tokens > threshold, threshold_target),
+        GcTiming::Eager => (true, threshold_target),
+        GcTiming::EveryN(n) => (gc_state.infer_calls.is_multiple_of(n), threshold_target),
+        // No estimate-based trigger: the provider is the source of truth.
+        // Proactive collection happens only at a ceiling a real overflow
+        // already taught us (set by collect_for_overflow).
+        GcTiming::CatchOverflow => match gc_state.discovered_budget {
+            Some(budget) => (before_tokens > budget, budget.max(1)),
+            None => (false, threshold_target),
+        },
+    };
+    if !should_collect {
         return Ok(prompt);
     }
-    let target_budget = threshold.max(1);
+    collect_prompt(config, prompt, gc_state, target_budget, None).await
+}
+
+/// Unconditionally truncate + collect `prompt` to `target_budget`, emitting
+/// the gc_truncate/gc_collect events. `overflow_cycle` is set when this
+/// collection was triggered reactively by a provider context overflow.
+async fn collect_prompt(
+    config: &SeqConfig,
+    mut prompt: Prompt,
+    gc_state: &mut GcState,
+    target_budget: usize,
+    overflow_cycle: Option<usize>,
+) -> Result<Prompt> {
+    let before_tokens = estimate_tokens(&prompt);
     let truncated_count = truncate_oversized_message(&mut prompt, target_budget);
     if truncated_count > 0 && config.gc_log {
         // Distinct from gc_collect: one or more single messages exceeded the
@@ -540,19 +630,27 @@ pub(crate) async fn maybe_collect_prompt(
     let dropped_count = before_ids.difference(&after_ids).count();
     let after_tokens = estimate_tokens(&collected);
     if config.gc_log {
+        let mut data = serde_json::json!({
+            "type": "gc_collect",
+            "strategy": config.gc.name(),
+            "timing": config.gc_timing.name(),
+            "target_budget": target_budget,
+            "tokens_before": before_tokens,
+            "tokens_after": after_tokens,
+            "cache_invalidated": gc_state.prefix_invalidated,
+            "dropped_count": dropped_count,
+        });
+        if let Some(cycle) = overflow_cycle {
+            let object = data.as_object_mut().expect("gc_collect data is an object");
+            object.insert("trigger".into(), "context_overflow".into());
+            object.insert("cycle".into(), cycle.into());
+        }
         config
             .trace
             .emit(&Event::Custom {
                 run_id: config.trace.run_id().into(),
                 name: "gc_collect".into(),
-                data: serde_json::json!({
-                    "type": "gc_collect",
-                    "strategy": config.gc.name(),
-                    "tokens_before": before_tokens,
-                    "tokens_after": after_tokens,
-                    "cache_invalidated": gc_state.prefix_invalidated,
-                    "dropped_count": dropped_count,
-                }),
+                data,
                 timestamp: Utc::now(),
             })
             .await?;
@@ -895,6 +993,60 @@ mod tests {
         }
     }
 
+    /// Fails the first `failures` chat calls with `error_message` (a raw
+    /// provider string, the way the codex OAuth path surfaces overflows),
+    /// then serves queued responses.
+    struct OverflowProvider {
+        failures: Mutex<usize>,
+        error_message: String,
+        responses: Mutex<Vec<Response>>,
+        prompts: Mutex<Vec<Prompt>>,
+    }
+
+    impl OverflowProvider {
+        fn new(failures: usize, error_message: &str, mut responses: Vec<Response>) -> Self {
+            responses.reverse();
+            Self {
+                failures: Mutex::new(failures),
+                error_message: error_message.into(),
+                responses: Mutex::new(responses),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<Prompt> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for OverflowProvider {
+        async fn chat(
+            &self,
+            _model: &Model,
+            _tools: &[ToolSpec],
+            messages: &[ChatMessage],
+        ) -> Result<Response> {
+            self.prompts.lock().unwrap().push(messages.to_vec());
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(anyhow!("{}", self.error_message));
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| anyhow!("mock provider exhausted"))
+        }
+    }
+
+    /// Raw codex backend phrasing: never classified by the old
+    /// `context_length_exceeded` prefix check (the smith failure mode).
+    const CODEX_OVERFLOW: &str = "Codex OAuth provider returned 400 Bad Request: \
+        {\"detail\":\"Your input exceeds the context window of this model. \
+        Please adjust your input and try again.\"}";
+
     fn response(content: &str, tool_calls: Vec<ToolCall>) -> Response {
         Response {
             content: content.into(),
@@ -931,6 +1083,7 @@ mod tests {
             gc: crate::gc::GcMode::Ring(crate::gc::RingGc::default()),
             gc_threshold: 0.5,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 100,
         };
         let prompt = vec![
@@ -966,6 +1119,7 @@ mod tests {
             gc: crate::gc::GcMode::Ring(crate::gc::RingGc::default()),
             gc_threshold: 0.5,
             gc_log: true,
+            gc_timing: GcTiming::Threshold,
             context_budget: 100,
         };
         // One message alone larger than the whole budget: only the truncate
@@ -997,6 +1151,225 @@ mod tests {
         Ok(())
     }
 
+    fn timing_config(
+        provider: Arc<dyn ChatProvider>,
+        trace: TraceLogger,
+        timing: GcTiming,
+    ) -> SeqConfig {
+        SeqConfig {
+            provider,
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            checkpoint_path: None,
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: crate::gc::GcMode::Ring(crate::gc::RingGc::default()),
+            gc_threshold: 0.85,
+            gc_log: true,
+            gc_timing: timing,
+            context_budget: 200_000,
+        }
+    }
+
+    async fn gc_collect_events(trace_path: PathBuf) -> Result<Vec<Value>> {
+        if !trace_path.exists() {
+            // The trace file is created lazily on first emit.
+            return Ok(Vec::new());
+        }
+        let events = TraceLogger::read_events(trace_path).await?;
+        Ok(events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_collect" => Some(data.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn eager_timing_collects_on_every_infer_call() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = timing_config(Arc::new(MockProvider::new(vec![])), trace, GcTiming::Eager);
+        // Far below the threshold trigger: only eager timing collects here.
+        let prompt = vec![ChatMessage::system("system"), ChatMessage::user("hi")];
+
+        let mut state = crate::gc::GcState::default();
+        for _ in 0..3 {
+            maybe_collect_prompt(&config, prompt.clone(), &mut state).await?;
+        }
+
+        let collects = gc_collect_events(trace_path).await?;
+        assert_eq!(collects.len(), 3, "eager collects every call: {collects:?}");
+        assert_eq!(collects[0]["timing"], "eager");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_n_timing_collects_on_schedule() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = timing_config(
+            Arc::new(MockProvider::new(vec![])),
+            trace,
+            GcTiming::EveryN(2),
+        );
+        let prompt = vec![ChatMessage::system("system"), ChatMessage::user("hi")];
+
+        let mut state = crate::gc::GcState::default();
+        for _ in 0..4 {
+            maybe_collect_prompt(&config, prompt.clone(), &mut state).await?;
+        }
+
+        let collects = gc_collect_events(trace_path).await?;
+        assert_eq!(
+            collects.len(),
+            2,
+            "every:2 collects on calls 2 and 4: {collects:?}"
+        );
+        assert_eq!(collects[0]["timing"], "every-n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catch_overflow_timing_has_no_estimate_trigger() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = timing_config(
+            Arc::new(MockProvider::new(vec![])),
+            trace,
+            GcTiming::CatchOverflow,
+        );
+        // Estimate is over the threshold trigger; threshold timing would
+        // collect here, catch-overflow must not (the provider is the truth).
+        config.context_budget = 100;
+        config.gc_threshold = 0.5;
+        let prompt = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(90)),
+            ChatMessage::user("y".repeat(90)),
+        ];
+        assert!(estimate_tokens(&prompt) > 50);
+
+        let mut state = crate::gc::GcState::default();
+        let kept = maybe_collect_prompt(&config, prompt.clone(), &mut state).await?;
+
+        assert_eq!(kept.len(), prompt.len());
+        assert!(gc_collect_events(trace_path).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catch_overflow_collects_and_retries_the_same_turn() -> Result<()> {
+        let provider = Arc::new(OverflowProvider::new(
+            1,
+            CODEX_OVERFLOW,
+            vec![response("recovered", vec![])],
+        ));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = timing_config(provider.clone(), trace, GcTiming::CatchOverflow);
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..6).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(200)))));
+
+        let (result, _state) = run_sequential(
+            &config,
+            prompt.clone(),
+            infer::<Prompt>(Model("mock".into()), prompt),
+        )
+        .await?;
+
+        assert_eq!(result.content, "recovered");
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2, "one overflow, one retry");
+        assert!(
+            prompts[1].len() < prompts[0].len(),
+            "the retry prompt must have been collected: {} -> {}",
+            prompts[0].len(),
+            prompts[1].len()
+        );
+        let events = TraceLogger::read_events(trace_path).await?;
+        let infer_calls = events
+            .iter()
+            .filter(|event| matches!(event, Event::InferCall { .. }))
+            .count();
+        let infer_results = events
+            .iter()
+            .filter(|event| matches!(event, Event::InferResult { .. }))
+            .count();
+        assert_eq!(
+            (infer_calls, infer_results),
+            (1, 1),
+            "retries stay inside one InferCall/InferResult pair"
+        );
+        let collects: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_collect" => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(collects.len(), 1);
+        assert_eq!(collects[0]["trigger"], "context_overflow");
+        assert_eq!(collects[0]["timing"], "catch-overflow");
+        assert_eq!(collects[0]["cycle"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catch_overflow_gives_up_cleanly_after_bounded_cycles() -> Result<()> {
+        let provider = Arc::new(OverflowProvider::new(usize::MAX, CODEX_OVERFLOW, vec![]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = timing_config(provider.clone(), trace, GcTiming::CatchOverflow);
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..6).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(200)))));
+
+        let err = run_sequential(
+            &config,
+            prompt.clone(),
+            infer::<Prompt>(Model("mock".into()), prompt),
+        )
+        .await
+        .expect_err("provider never stops overflowing");
+
+        // The terminal message is non-empty about what was attempted and
+        // keeps the prefix the context_overflow taxonomy keys on.
+        let message = err.to_string();
+        assert!(
+            message.starts_with("context_length_exceeded"),
+            "taxonomy prefix preserved: {message}"
+        );
+        assert!(
+            message.contains("3 catch-overflow GC cycle(s)"),
+            "{message}"
+        );
+        assert_eq!(provider.prompts().len(), 1 + CATCH_OVERFLOW_MAX_CYCLES);
+        let events = TraceLogger::read_events(trace_path).await?;
+        let cycles: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_collect" => {
+                    data.get("cycle").cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cycles, vec![json!(1), json!(2), json!(3)]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::InferError { .. }))
+                .count(),
+            1,
+            "one InferError for the instruction, not one per attempt"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn agent_loop_executes_tool_and_feeds_result_back() -> Result<()> {
         let provider = Arc::new(MockProvider::new(vec![
@@ -1023,6 +1396,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let prompt = vec![ChatMessage::user("use echo")];
@@ -1074,6 +1448,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let prompt = vec![ChatMessage::user("do two steps")];
@@ -1112,6 +1487,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1167,6 +1543,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let program = crate::op::put("temporal:history", json!(1))
@@ -1235,6 +1612,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1268,6 +1646,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1310,6 +1689,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let prompt = vec![ChatMessage::user("answer")];
@@ -1359,6 +1739,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1524,6 +1905,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1556,6 +1938,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1590,6 +1973,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
@@ -1611,6 +1995,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
@@ -1638,6 +2023,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
@@ -1688,6 +2074,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
@@ -1723,6 +2110,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
@@ -1757,6 +2145,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 
@@ -1796,6 +2185,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
 

@@ -1,9 +1,10 @@
 use agent_core::{
     agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
-    EvalConfig, Event, GcMode, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink,
-    MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
-    ProviderClient, ProviderConfig, ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind,
-    SourceParams, SourceRegistry, SourceResult, TraceContextEnv, TraceLogger,
+    EvalConfig, Event, GcMode, GcTiming, HydrationSource, InMemoryStore, IrReplayTrace,
+    JsonlTraceSink, MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig,
+    PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc, SeqConfig,
+    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceContextEnv,
+    TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -102,6 +103,13 @@ struct Args {
     /// Emit gc_collect trace events.
     #[arg(long)]
     gc_log: bool,
+    /// When GC runs: `threshold` (default) collects past the estimated
+    /// budget fraction; `catch-overflow` trusts the provider instead of the
+    /// token estimate — on a context-overflow error it collects to a
+    /// shrinking budget and retries the same turn; `eager` collects before
+    /// every infer call; `every:N` collects on every Nth infer call.
+    #[arg(long, default_value = "threshold")]
+    gc_timing: GcTiming,
     /// Enable OpenTelemetry OTLP export to this collector endpoint. Also enabled by OTEL_EXPORTER_OTLP_ENDPOINT.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otel_endpoint: Option<String>,
@@ -421,8 +429,15 @@ async fn main() -> Result<()> {
         },
         gc_threshold: args.gc_threshold,
         gc_log: args.gc_log,
+        gc_timing: args.gc_timing,
         context_budget,
     };
+    if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
+        return Err(anyhow!(
+            "--gc-timing {} requires a GC strategy; pass --gc ring or --gc mark-sweep",
+            args.gc_timing.name()
+        ));
+    }
     let mut runtime = Runtime {
         config,
         trace,
@@ -1148,7 +1163,11 @@ async fn emit_agent_complete(runtime: &mut Runtime, response: &str) -> Result<()
 }
 
 fn is_context_overflow_error(message: &str) -> bool {
-    message.starts_with("context_length_exceeded")
+    // Shared heuristic rather than the bare context_length_exceeded prefix:
+    // the codex OAuth provider surfaces raw backend text ("your input
+    // exceeds the context window of this model") that the prefix check
+    // missed, leaving real overflows untagged in the taxonomy (t-1151).
+    agent_core::is_context_overflow_message(message)
 }
 
 async fn emit_context_overflow(runtime: &mut Runtime, message: &str) -> Result<()> {
@@ -1214,6 +1233,7 @@ async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
         gc: GcMode::None,
         gc_threshold: runtime.gc_threshold,
         gc_log: false,
+        gc_timing: GcTiming::Threshold,
         context_budget: runtime.context_budget,
     };
     let _ = agent_core::run_sequential(

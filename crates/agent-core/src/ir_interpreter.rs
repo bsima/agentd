@@ -1,7 +1,8 @@
 use crate::gc::GcState;
 use crate::interpreter::{
-    hydrate_infer_prompt, maybe_collect_prompt, millis_u64, prompt_preview, response_preview,
-    run_eval_with_env, SeqConfig,
+    annotate_overflow_failure, catch_overflow_active, collect_for_overflow, hydrate_infer_prompt,
+    maybe_collect_prompt, millis_u64, prompt_preview, response_preview, run_eval_with_env,
+    SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectKind,
@@ -450,7 +451,7 @@ async fn execute_instr(
             let model = string_expr(&machine.env, &model, "Infer.model")?;
             let prompt = resolve_prompt(config, &machine.env, prompt)?;
             let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
-            let prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
+            let mut prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -465,21 +466,46 @@ async fn execute_instr(
                 })
                 .await?;
             let started = Instant::now();
-            let result = match ir_replay {
-                Some(replay) => replay.infer_result(&location, &model),
-                None => match &config.replay {
-                    Some(replay) => replay.infer_result(op_id, &model),
-                    None => {
-                        config
-                            .provider
-                            .chat(&Model(model.clone()), &ir_tool_specs(), &prompt)
-                            .await
+            // Catch-overflow retries stay inside this one Infer instruction:
+            // failed attempts surface as gc_collect{trigger:context_overflow}
+            // events and the single InferResult/InferError pair reports the
+            // outcome, so effect-id replay keeps its one-call-one-result
+            // contract (replay branches never engage the retry loop).
+            let live = ir_replay.is_none() && config.replay.is_none();
+            let mut overflow_cycles = 0usize;
+            let result = loop {
+                let attempt = match ir_replay {
+                    Some(replay) => replay.infer_result(&location, &model),
+                    None => match &config.replay {
+                        Some(replay) => replay.infer_result(op_id, &model),
+                        None => {
+                            config
+                                .provider
+                                .chat(&Model(model.clone()), &ir_tool_specs(), &prompt)
+                                .await
+                        }
+                    },
+                };
+                match attempt {
+                    Err(err)
+                        if live
+                            && catch_overflow_active(config)
+                            && crate::provider::is_context_overflow_anyhow(&err)
+                            && overflow_cycles < CATCH_OVERFLOW_MAX_CYCLES =>
+                    {
+                        overflow_cycles += 1;
+                        let (collected, target) =
+                            collect_for_overflow(config, prompt, gc_state, overflow_cycles).await?;
+                        prompt = collected;
+                        gc_state.discovered_budget = Some(target);
                     }
-                },
+                    other => break other,
+                }
             };
             let response = match result {
                 Ok(response) => response,
                 Err(err) => {
+                    let err = annotate_overflow_failure(err, overflow_cycles);
                     config
                         .trace
                         .emit(&Event::InferError {
@@ -981,6 +1007,7 @@ fn pattern_matches(value: &Value, pattern: &Pattern) -> bool {
 mod tests {
     use super::*;
     use crate::gc::GcMode;
+    use crate::gc::GcTiming;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
     use crate::op::{Response, ToolCall};
@@ -1066,6 +1093,7 @@ mod tests {
             gc: GcMode::None,
             gc_threshold: 0.85,
             gc_log: false,
+            gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         }
     }
@@ -1137,6 +1165,107 @@ mod tests {
         let prompts = provider.prompts();
         assert_eq!(prompts.len(), 2);
         assert_eq!(prompts[1][0].content.as_deref(), Some("first"));
+        Ok(())
+    }
+
+    /// Fails the first `failures` chat calls with a raw codex-style overflow
+    /// message, then serves queued responses (mirrors the smith t-1145 shape).
+    struct OverflowProvider {
+        failures: Mutex<usize>,
+        responses: Mutex<Vec<Response>>,
+        prompts: Mutex<Vec<Prompt>>,
+    }
+
+    impl OverflowProvider {
+        fn new(failures: usize, mut responses: Vec<Response>) -> Self {
+            responses.reverse();
+            Self {
+                failures: Mutex::new(failures),
+                responses: Mutex::new(responses),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<Prompt> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for OverflowProvider {
+        async fn chat(
+            &self,
+            _model: &Model,
+            _tools: &[ToolSpec],
+            messages: &[ChatMessage],
+        ) -> Result<Response> {
+            self.prompts.lock().unwrap().push(messages.to_vec());
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(anyhow!(
+                    "Codex OAuth provider returned 400 Bad Request: \
+                     Your input exceeds the context window of this model."
+                ));
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| anyhow!("mock provider exhausted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn ir_infer_catch_overflow_collects_and_retries() -> Result<()> {
+        let provider = Arc::new(OverflowProvider::new(1, vec![response("recovered")]));
+        let mut config = config(provider.clone());
+        config.gc = GcMode::Ring(crate::gc::RingGc::default());
+        config.gc_timing = crate::gc::GcTiming::CatchOverflow;
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..6).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(200)))));
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![Instr::Infer {
+                    out: Var("a".into()),
+                    model: Expr::Value(Value::String("mock".into())),
+                    prompt: PromptRef::Inline(prompt),
+                    policy: Default::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Field {
+                        base: Var("a".into()),
+                        field: "content".into(),
+                    },
+                },
+            },
+        );
+        let machine = Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("overflow-retry".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        };
+
+        let (value, _machine) = run_ir_sequential(&config, machine).await?;
+
+        assert_eq!(value, Value::String("recovered".into()));
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2, "one overflow, one retry");
+        assert!(
+            prompts[1].len() < prompts[0].len(),
+            "the retry prompt must have been collected"
+        );
         Ok(())
     }
 

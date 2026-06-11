@@ -33,6 +33,7 @@ agent --gc-threshold <0.0-1.0> # trigger GC at this fraction of budget (default:
 agent --gc none                # disable GC entirely (hard overflow = error)
 agent --gc-log                 # emit gc_collect trace events (for debugging)
 agent --gc-cache <mode>        # prefix-cache policy: preserve | ignore (default: preserve)
+agent --gc-timing <when>       # threshold | catch-overflow | eager | every:N (default: threshold)
 ```
 
 `--gc none` restores the current behavior and is important for deterministic
@@ -61,6 +62,29 @@ for the full guide):
 Both modes are first-class and supported indefinitely — neither is "the right
 one." Performance-optimizing users and cache-optimizing users have genuinely
 opposed needs, so the toggle is permanent, not a migration step.
+
+`--gc-timing` decouples *when* GC runs from *what* it reclaims (t-1151).
+Token estimates diverge from provider tokenizers, so an estimate-driven
+threshold can sit idle while the provider hard-rejects the prompt (smith died
+exactly this way on t-1145: 261k real tokens against a configured 400k budget
+whose 0.85 trigger never fired). The timings:
+
+- `threshold` (default): collect when the estimate crosses
+  `context_budget * gc_threshold` — the historical behavior.
+- `catch-overflow`: no estimate-based trigger at all; the provider is the
+  source of truth. On an infer error classified as a context overflow, GC
+  collects to `estimate/2` and retries the same turn, halving again per cycle
+  (up to 3 cycles) before failing cleanly. The retry stays inside the one
+  InferCall/InferResult trace pair; each cycle is visible as a
+  `gc_collect{trigger: "context_overflow", cycle: k}` event. A target that
+  the provider accepted is remembered for the rest of the session turn, so
+  later calls collect proactively instead of paying a failed request each.
+  Requires a GC strategy (`--gc ring` or `mark-sweep`).
+- `eager`: collect to the threshold target before every infer call.
+- `every:N`: collect to the threshold target on every Nth infer call.
+
+The gc_collect event carries `timing` and `target_budget` fields so
+`--gc-log` makes all four timings observable.
 
 Strategies (planned, not all implemented at once):
 
@@ -348,7 +372,10 @@ if estimate_tokens(&history) > (budget as f32 * gc_threshold) as usize {
 }
 ```
 
-This avoids the hard overflow and gives the response enough headroom.
+This avoids the hard overflow and gives the response enough headroom — when
+the estimate is honest. `--gc-timing catch-overflow` inverts the policy for
+the case where it isn't: skip the proactive check, let the provider reject,
+then collect and retry inside the same turn (see CLI Flags above).
 
 ---
 
