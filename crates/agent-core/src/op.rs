@@ -317,12 +317,12 @@ pub fn par<S: Send + 'static>(ops: Vec<Op<S, ()>>) -> Op<S, Vec<()>> {
 
 pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, Response> {
     infer(model.clone(), prompt.clone()).and_then(move |response| {
-        let can_stop = response
-            .finish_reason
-            .as_ref()
-            .is_some_and(FinishReason::is_stop)
-            && response.tool_calls.is_empty()
-            && !has_pending_tool_calls(&prompt);
+        // Claude-Code-style turn completion, kept in parity with the IR loop
+        // (t-1134): done is the absence of tool calls; finish_reason is only
+        // a truncation hint ("length" routes to the continuation nudge).
+        let truncated = matches!(response.finish_reason, Some(FinishReason::Length));
+        let can_stop =
+            response.tool_calls.is_empty() && !truncated && !has_pending_tool_calls(&prompt);
         if can_stop || max_turns == 0 {
             Op::pure(response)
         } else if response.tool_calls.is_empty() {
@@ -797,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn agent_loop_nudges_empty_non_stop_turn_instead_of_completing() -> Result<()> {
         let provider = Arc::new(QueueProvider::new(vec![
-            response_with_finish("", Some(FinishReason::Other("length".into()))),
+            response_with_finish("", Some(FinishReason::Length)),
             response_with_finish("done", Some(FinishReason::Stop)),
         ]));
         let op = agent_loop(Model("model".into()), vec![ChatMessage::user("work")], 3);

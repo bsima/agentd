@@ -31,7 +31,8 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let tool_calls = Var("tool_calls".into());
     let no_tool_calls = Var("no_tool_calls".into());
     let finish_reason = Var("finish_reason".into());
-    let is_stop = Var("is_stop".into());
+    let is_truncated = Var("is_truncated".into());
+    let not_truncated = Var("not_truncated".into());
     let has_pending_tool_calls = Var("has_pending_tool_calls".into());
     let no_pending_tool_calls = Var("no_pending_tool_calls".into());
     let can_stop = Var("can_stop".into());
@@ -103,11 +104,27 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                         default: Box::new(Expr::Value(Value::Null)),
                     },
                 },
+                // Claude-Code-style turn completion (t-1134): "done" is the
+                // ABSENCE of pending tool calls, not a token or a counter. A
+                // response carrying tool calls is never terminal; a response
+                // without them ends the turn. finish_reason is demoted to a
+                // truncation hint: only positive evidence of truncation
+                // ("length") routes to the continuation nudge instead of
+                // ending the turn. The turn budget (max_turns) is a pure
+                // safety ceiling — its exhaustion path is the annotated
+                // budget_done branch, never the normal exit.
                 Instr::Let {
-                    out: is_stop.clone(),
+                    out: is_truncated.clone(),
                     expr: Expr::Eq {
                         left: Box::new(Expr::Var(finish_reason)),
-                        right: Box::new(Expr::Value(Value::String("stop".into()))),
+                        right: Box::new(Expr::Value(Value::String("length".into()))),
+                    },
+                },
+                Instr::Let {
+                    out: not_truncated.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(is_truncated)),
+                        right: Box::new(Expr::Value(Value::Bool(false))),
                     },
                 },
                 Instr::Let {
@@ -127,8 +144,8 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                     out: can_stop.clone(),
                     expr: Expr::And {
                         left: Box::new(Expr::And {
-                            left: Box::new(Expr::Var(is_stop)),
-                            right: Box::new(Expr::Var(no_tool_calls.clone())),
+                            left: Box::new(Expr::Var(no_tool_calls.clone())),
+                            right: Box::new(Expr::Var(not_truncated)),
                         }),
                         right: Box::new(Expr::Var(no_pending_tool_calls)),
                     },
@@ -984,6 +1001,89 @@ mod tests {
             value.get("metadata").is_none(),
             "natural stop must not carry budget metadata: {value}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_ends_turn_on_tool_call_free_response_without_finish_reason() -> Result<()>
+    {
+        // t-1134: "done" is the absence of tool calls, not a finish_reason
+        // token. A provider that omits finish_reason entirely must still end
+        // the turn instead of burning the budget on nudges. MockProvider has
+        // exactly one response: a second infer would error.
+        let provider = Arc::new(MockProvider::new(vec![response_with_finish(
+            "final answer",
+            vec![],
+            None,
+        )]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("hi")],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value["content"], Value::String("final answer".into()));
+        assert!(value.get("metadata").is_none(), "natural end_turn: {value}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_ends_turn_on_unrecognized_finish_reason() -> Result<()> {
+        // Only positive truncation evidence ("length") keeps the turn alive;
+        // anything else with no tool calls is a final answer.
+        let provider = Arc::new(MockProvider::new(vec![response_with_finish(
+            "filtered but final",
+            vec![],
+            Some(FinishReason::ContentFilter),
+        )]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("hi")],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value["content"], Value::String("filtered but final".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_never_treats_stop_with_tool_calls_as_terminal() -> Result<()> {
+        // The June-9 'finalize on stop+tool_calls' bug, made structurally
+        // unrepresentable (t-1134): a response carrying a tool call always
+        // executes and loops, whatever its finish_reason says.
+        let provider = Arc::new(MockProvider::new(vec![
+            response_with_finish(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({ "command": "printf t1134" }),
+                )],
+                Some(FinishReason::Stop),
+            ),
+            response("done after tool", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("run it")],
+            4,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(
+            value["content"],
+            Value::String("done after tool".into()),
+            "the tool-call turn must execute and loop, not finalize: {value}"
+        );
+        assert!(value.get("metadata").is_none());
         Ok(())
     }
 

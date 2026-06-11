@@ -796,10 +796,24 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
         tool_calls.push(current.into_tool_call());
     }
 
+    // The codex harness contract (t-1134): a turn ends when the assistant
+    // returns a final response with no pending tool calls — there is no done
+    // tool and no explicit end_turn marker in the SSE stream. Derive the
+    // turn state from the parsed shape instead of hardcoding Stop: reporting
+    // Stop for tool-call turns made every gpt-5.5 turn look like
+    // "finish=stop + tool_call", masking the model's native end-of-turn
+    // signal from the agent loop (the smith/forge empty-response crashes).
+    // TODO(t-1134, Ben): live-verify against a real codex session that a
+    // tool-call-free final message arrives intact through this parser.
+    let finish_reason = if tool_calls.is_empty() {
+        FinishReason::Stop
+    } else {
+        FinishReason::ToolCalls
+    };
     Ok(Response {
         content,
         tool_calls,
-        finish_reason: Some(FinishReason::Stop),
+        finish_reason: Some(finish_reason),
         input_tokens,
         output_tokens,
         total_tokens,
@@ -1033,6 +1047,22 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
             response.tool_calls[0].arguments["command"],
             json!("printf ok")
         );
+        // t-1134: a tool-call turn must report its real turn state, not a
+        // hardcoded Stop that masks the model's end-of-turn signal.
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tool_call_free_final_reports_end_turn() -> Result<()> {
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"the final answer"}]}}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}
+"#;
+        let response = parse_codex_sse_response(sse)?;
+        assert_eq!(response.content, "the final answer");
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.finish_reason, Some(FinishReason::Stop));
         Ok(())
     }
 
