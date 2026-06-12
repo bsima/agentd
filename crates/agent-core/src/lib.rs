@@ -10,6 +10,7 @@ pub mod models;
 pub mod op;
 pub mod prompt_ir;
 pub mod provider;
+pub mod temporal;
 pub mod trace;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
@@ -53,6 +54,7 @@ pub use provider::{
     is_context_overflow_anyhow, is_context_overflow_message, ChatProvider, ContextOverflowError,
     ProviderClient, ProviderConfig,
 };
+pub use temporal::TemporalSource;
 pub use trace::{
     AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, TraceContextEnv, TraceLogger,
     TraceSink, TraceSummary,

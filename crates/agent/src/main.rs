@@ -4,7 +4,7 @@ use agent_core::{
     JsonlTraceSink, MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink,
     PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc,
     SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult,
-    StackFrameGc, TraceContextEnv, TraceLogger,
+    StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -83,6 +83,12 @@ struct Args {
     /// read memories, humans write them (write path is t-1165).
     #[arg(long, env = "AGENT_MEMORY_DIR")]
     memory_dir: Option<PathBuf>,
+    /// Checkpoint directory of a PAST or sibling session, served as
+    /// recent-turn summaries (passive context + semantic queries) for
+    /// cross-session continuity. Do not point it at this session's own
+    /// --checkpoint-dir: the live history already holds those turns.
+    #[arg(long, env = "AGENT_TEMPORAL_DIR")]
+    temporal_dir: Option<PathBuf>,
     /// Timeout for each Eval shell command.
     #[arg(long, default_value_t = 120)]
     eval_timeout_seconds: u64,
@@ -427,6 +433,9 @@ async fn main() -> Result<()> {
         }
         if let Some(path) = args.memory_dir.as_ref() {
             registry = registry.register(MemorySource::new(path.clone()));
+        }
+        if let Some(path) = args.temporal_dir.as_ref() {
+            registry = registry.register(TemporalSource::new(path.clone()));
         }
         registry
     };
