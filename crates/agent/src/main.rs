@@ -641,6 +641,11 @@ struct GcFireStats {
     tokens_after: u64,
     cache_invalidated: bool,
     dropped_count: Option<u64>,
+    // t-1151 fields; absent in traces recorded before timing strategies.
+    timing: Option<String>,
+    target_budget: Option<u64>,
+    trigger: Option<String>,
+    cycle: Option<u64>,
 }
 
 impl GcFireStats {
@@ -691,6 +696,16 @@ impl GcStatsReport {
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false),
                 dropped_count: data.get("dropped_count").and_then(|value| value.as_u64()),
+                timing: data
+                    .get("timing")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                target_budget: data.get("target_budget").and_then(|value| value.as_u64()),
+                trigger: data
+                    .get("trigger")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                cycle: data.get("cycle").and_then(|value| value.as_u64()),
             })
             .collect();
         Self { fires }
@@ -743,22 +758,32 @@ impl GcStatsReport {
         let mut out = String::new();
         out.push_str(&format!("GC fires: {}\n", self.fire_count()));
         out.push_str(
-            "\n#  strategy    tokens before -> after  reduction  cache invalidated  dropped\n",
+            "\n#  strategy    timing          tokens before -> after  reduction  cache invalidated  dropped\n",
         );
         for fire in &self.fires {
             let dropped = fire
                 .dropped_count
                 .map(|count| count.to_string())
                 .unwrap_or_else(|| "n/a".to_owned());
+            let overflow = match (&fire.trigger, fire.cycle, fire.target_budget) {
+                (Some(trigger), cycle, target) if trigger == "context_overflow" => format!(
+                    "  [overflow cycle {} -> target {}]",
+                    cycle.map_or_else(|| "?".into(), |cycle| cycle.to_string()),
+                    target.map_or_else(|| "?".into(), |target| target.to_string()),
+                ),
+                _ => String::new(),
+            };
             out.push_str(&format!(
-                "{:<2} {:<11} {:>8} -> {:<8} {:>6.1}%   {:<17} {}\n",
+                "{:<2} {:<11} {:<15} {:>8} -> {:<8} {:>6.1}%   {:<17} {}{}\n",
                 fire.index,
                 fire.strategy,
+                fire.timing.as_deref().unwrap_or("n/a"),
                 fire.tokens_before,
                 fire.tokens_after,
                 fire.reduction_pct(),
                 fire.cache_invalidated,
-                dropped
+                dropped,
+                overflow
             ));
         }
         out.push_str("\nSummary:\n");
@@ -778,7 +803,56 @@ impl GcStatsReport {
             "  median reduction: {:.1}%\n",
             self.median_reduction_pct().unwrap_or(0.0)
         ));
+        let by_timing = self.fires_by_timing();
+        if !by_timing.is_empty() {
+            let breakdown = by_timing
+                .iter()
+                .map(|(timing, count)| format!("{timing}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!("  fires by timing: {breakdown}\n"));
+        }
+        if let Some(recovery) = self.overflow_recovery_summary() {
+            out.push_str(&format!("  overflow recoveries: {recovery}\n"));
+        }
         out
+    }
+
+    fn fires_by_timing(&self) -> BTreeMap<String, usize> {
+        let mut by_timing = BTreeMap::new();
+        for fire in &self.fires {
+            // Old traces predate the timing field; bucket them visibly
+            // rather than silently inventing a mode.
+            let timing = fire.timing.clone().unwrap_or_else(|| "unreported".into());
+            *by_timing.entry(timing).or_insert(0) += 1;
+        }
+        by_timing
+    }
+
+    /// One line describing the catch-overflow story of this trace: how many
+    /// reactive collections fired, the deepest retry cycle reached, and the
+    /// budget the shrinking converged to (the provider's real ceiling as
+    /// discovered, which is what you tune context_budget against).
+    fn overflow_recovery_summary(&self) -> Option<String> {
+        let overflow_fires: Vec<&GcFireStats> = self
+            .fires
+            .iter()
+            .filter(|fire| fire.trigger.as_deref() == Some("context_overflow"))
+            .collect();
+        if overflow_fires.is_empty() {
+            return None;
+        }
+        let deepest_cycle = overflow_fires.iter().filter_map(|fire| fire.cycle).max();
+        let final_target = overflow_fires
+            .iter()
+            .rev()
+            .find_map(|fire| fire.target_budget);
+        Some(format!(
+            "{} fire(s), deepest cycle {}, final target budget {}",
+            overflow_fires.len(),
+            deepest_cycle.map_or_else(|| "?".into(), |cycle| cycle.to_string()),
+            final_target.map_or_else(|| "?".into(), |target| target.to_string()),
+        ))
     }
 }
 
@@ -1738,5 +1812,68 @@ mod gc_stats_tests {
 
         assert_eq!(report.fire_count(), 0);
         assert_eq!(report.render(), "GC never fired in this trace\n");
+    }
+
+    fn custom_gc_with(data: serde_json::Value) -> Event {
+        Event::Custom {
+            run_id: "run".into(),
+            name: "gc_collect".into(),
+            data,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn gc_stats_surfaces_timing_and_overflow_recovery_fields() {
+        let events = vec![
+            custom_gc_with(serde_json::json!({
+                "type": "gc_collect", "strategy": "ring", "timing": "catch-overflow",
+                "target_budget": 120_000, "trigger": "context_overflow", "cycle": 1,
+                "tokens_before": 240_000, "tokens_after": 110_000,
+                "cache_invalidated": true, "dropped_count": 12,
+            })),
+            custom_gc_with(serde_json::json!({
+                "type": "gc_collect", "strategy": "ring", "timing": "catch-overflow",
+                "target_budget": 60_000, "trigger": "context_overflow", "cycle": 2,
+                "tokens_before": 110_000, "tokens_after": 55_000,
+                "cache_invalidated": true, "dropped_count": 9,
+            })),
+            custom_gc_with(serde_json::json!({
+                "type": "gc_collect", "strategy": "ring", "timing": "threshold",
+                "target_budget": 170_000,
+                "tokens_before": 200_000, "tokens_after": 150_000,
+                "cache_invalidated": false, "dropped_count": 4,
+            })),
+        ];
+
+        let rendered = GcStatsReport::from_events(&events).render();
+
+        assert!(rendered.contains("catch-overflow"), "{rendered}");
+        assert!(
+            rendered.contains("[overflow cycle 2 -> target 60000]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("fires by timing: catch-overflow=2 threshold=1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "overflow recoveries: 2 fire(s), deepest cycle 2, final target budget 60000"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn gc_stats_handles_pre_t1151_traces_without_timing_fields() {
+        let rendered = GcStatsReport::from_events(&[custom_gc(100, 60, false)]).render();
+
+        assert!(rendered.contains("n/a"), "{rendered}");
+        assert!(
+            rendered.contains("fires by timing: unreported=1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("overflow recoveries"), "{rendered}");
     }
 }
