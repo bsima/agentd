@@ -93,7 +93,7 @@ Strategies (planned, not all implemented at once):
 | `none`         | No GC; overflow = hard error                     | implemented |
 | `ring`         | Drop oldest messages when buffer fills           | implemented (default) |
 | `mark-sweep`   | Evict "dead" sections by type annotation         | implemented |
-| `stack`        | Pop completed tool-call frames to summaries      | designed, not implemented |
+| `stack`        | Pop completed tool-call frames to summaries      | implemented |
 | `generational` | Hot/warm/cold compaction (JVM-style)             | future      |
 | `refcount`     | Dependency-graph reachability eviction           | future      |
 

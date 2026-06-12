@@ -83,6 +83,16 @@ models:
     vision: false
     display: Group engagement classifier
 
+  - name: anthropic/claude-haiku-4.5
+    provider: claude-code
+    api_id: claude-haiku-4-5
+    input: 1.0
+    output: 5.0
+    context: 200000
+    thinking: false
+    vision: false
+    display: Claude Haiku 4.5 (agent summaries)
+
   # Direct Anthropic API-key example.
   - name: anthropic-api/claude-opus-4.8
     provider: anthropic

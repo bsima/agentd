@@ -3,8 +3,8 @@ use agent_core::{
     EvalConfig, Event, GcMode, GcTiming, HydrationSource, InMemoryStore, IrReplayTrace,
     JsonlTraceSink, MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig,
     PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc, SeqConfig,
-    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, TraceContextEnv,
-    TraceLogger,
+    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, StackFrameGc,
+    TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -134,6 +134,7 @@ enum GcArg {
     None,
     Ring,
     MarkSweep,
+    Stack,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -425,6 +426,7 @@ async fn main() -> Result<()> {
                 GcArg::None => GcMode::None,
                 GcArg::Ring => GcMode::Ring(RingGc { preserve_prefix }),
                 GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc { preserve_prefix }),
+                GcArg::Stack => GcMode::Stack(StackFrameGc { preserve_prefix }),
             }
         },
         gc_threshold: args.gc_threshold,

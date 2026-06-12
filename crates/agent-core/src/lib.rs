@@ -14,7 +14,7 @@ pub mod trace;
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use gc::{
     estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
-    GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc,
+    GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,
 };
 pub use hydration::{
     HydrationSource, PassiveHydrationConfig, PassiveSource, SourceCapability, SourceKind,

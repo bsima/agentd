@@ -178,11 +178,35 @@ impl Default for MarkSweepGc {
     }
 }
 
+/// Strategy 3 (docs/GC.md): model each tool invocation+result as an
+/// activation frame. When over budget, pop completed frames oldest-first:
+/// the assistant tool-call message is rewritten in place to a one-line
+/// `[frame: tool(args) -> result]` annotation (keeping its stable id) and
+/// the tool result messages are dropped. The semantic record survives at
+/// ~1% of the tokens, which is why this is the space-efficient choice for
+/// tool-heavy agents. Summaries are pure heuristics — no LLM calls (the
+/// `stack-smart` variant is gated on the eval harness).
+#[derive(Debug, Clone, Copy)]
+pub struct StackFrameGc {
+    /// Preserve the cached prefix: only pop frames living entirely after
+    /// the pinned prefix region.
+    pub preserve_prefix: bool,
+}
+
+impl Default for StackFrameGc {
+    fn default() -> Self {
+        Self {
+            preserve_prefix: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum GcMode {
     None,
     Ring(RingGc),
     MarkSweep(MarkSweepGc),
+    Stack(StackFrameGc),
 }
 
 impl GcMode {
@@ -196,6 +220,7 @@ impl GcMode {
             Self::None => messages,
             Self::Ring(gc) => gc.collect(messages, budget, state),
             Self::MarkSweep(gc) => gc.collect(messages, budget, state),
+            Self::Stack(gc) => gc.collect(messages, budget, state),
         }
     }
 
@@ -204,6 +229,7 @@ impl GcMode {
             Self::None => "none",
             Self::Ring(gc) => gc.name(),
             Self::MarkSweep(gc) => gc.name(),
+            Self::Stack(gc) => gc.name(),
         }
     }
 
@@ -212,6 +238,7 @@ impl GcMode {
             Self::None => true,
             Self::Ring(gc) => gc.cache_preserving(),
             Self::MarkSweep(gc) => gc.cache_preserving(),
+            Self::Stack(gc) => gc.cache_preserving(),
         }
     }
 
@@ -482,6 +509,194 @@ impl ContextGc for RingGc {
     }
 }
 
+impl ContextGc for StackFrameGc {
+    fn collect(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
+        let full_boundary = cache_prefix_boundary(&messages, budget).min(messages.len());
+        let prefix_snapshot = messages[..full_boundary].to_vec();
+        let boundary = if self.preserve_prefix {
+            full_boundary
+        } else {
+            0
+        };
+
+        record_frame_statuses(&messages, state);
+
+        let mut keep = vec![true; messages.len()];
+        // Phase 1: pop completed frames oldest-first until under budget.
+        while estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            let Some(frame) = oldest_completed_frame(&messages, &keep, boundary) else {
+                break;
+            };
+            pop_frame(&mut messages, &mut keep, &frame, state);
+        }
+        // Phase 2: frames alone were not enough (open frames, chat-heavy
+        // windows); drop oldest-first from the interior like ring.
+        if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            sweep_ring(&messages, &mut keep, budget, boundary);
+        }
+        // Phase 3 (preserve fallback): the pinned prefix plus the live tail
+        // alone exceed the budget. Overflowing the model is worse than a
+        // cache miss, so degrade to front-drop; the gc_collect event reports
+        // the invalidation via state.prefix_invalidated.
+        if boundary > 0 && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            sweep_ring(&messages, &mut keep, budget, 0);
+        }
+
+        let collected: Vec<ChatMessage> = messages
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(message, _)| message)
+            .collect();
+        state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
+        collected
+    }
+
+    fn name(&self) -> &'static str {
+        "stack"
+    }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
+    }
+}
+
+/// A completed activation frame: the assistant message that issued the
+/// tool calls plus every tool result answering them, all inside the window.
+struct Frame {
+    assistant: usize,
+    results: Vec<usize>,
+}
+
+/// Update `GcState.frames` from what this window shows: a call with a
+/// result in the window is Complete, one still awaiting its result is
+/// Open. Popped is terminal — set by `pop_frame`, never downgraded here.
+fn record_frame_statuses(messages: &[ChatMessage], state: &mut GcState) {
+    let results: BTreeSet<&str> = messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    for message in messages {
+        for call in message.tool_calls.as_deref().unwrap_or_default() {
+            let status = if results.contains(call.id.as_str()) {
+                FrameStatus::Complete
+            } else {
+                FrameStatus::Open
+            };
+            let entry = state.frames.entry(call.id.clone()).or_insert(status);
+            if *entry != FrameStatus::Popped {
+                *entry = status;
+            }
+        }
+    }
+}
+
+/// The oldest kept frame whose every member sits at or past `boundary`.
+/// Frames with any unanswered call are open — never popped, never split.
+/// A frame is only poppable once a later assistant message exists past its
+/// last result: until the model has spoken again, the result is the live
+/// working set, not history (same incorporation rule as mark-sweep).
+fn oldest_completed_frame(
+    messages: &[ChatMessage],
+    keep: &[bool],
+    boundary: usize,
+) -> Option<Frame> {
+    for (index, message) in messages.iter().enumerate().skip(boundary) {
+        if !keep[index] || message.role != "assistant" {
+            continue;
+        }
+        let calls = message.tool_calls.as_deref().unwrap_or_default();
+        if calls.is_empty() {
+            continue;
+        }
+        let results: Vec<usize> = calls
+            .iter()
+            .filter_map(|call| {
+                messages.iter().enumerate().position(|(idx, candidate)| {
+                    keep[idx] && candidate.tool_call_id.as_deref() == Some(call.id.as_str())
+                })
+            })
+            .collect();
+        let incorporated = results.iter().max().is_some_and(|last| {
+            messages
+                .iter()
+                .enumerate()
+                .skip(last + 1)
+                .any(|(idx, later)| keep[idx] && later.role == "assistant")
+        });
+        if results.len() == calls.len()
+            && results.iter().all(|idx| *idx >= boundary)
+            && incorporated
+        {
+            return Some(Frame {
+                assistant: index,
+                results,
+            });
+        }
+    }
+    None
+}
+
+/// Pop a completed frame: rewrite the assistant message in place to the
+/// summary annotation (stable id preserved — no fresh UUIDs, so repeated
+/// collections stay deterministic) and drop the result messages.
+fn pop_frame(messages: &mut [ChatMessage], keep: &mut [bool], frame: &Frame, state: &mut GcState) {
+    let summary = frame_summary(messages, frame);
+    for call in messages[frame.assistant]
+        .tool_calls
+        .as_deref()
+        .unwrap_or_default()
+    {
+        state.frames.insert(call.id.clone(), FrameStatus::Popped);
+    }
+    let assistant = &mut messages[frame.assistant];
+    assistant.content = Some(summary);
+    assistant.tool_calls = None;
+    for index in &frame.results {
+        keep[*index] = false;
+    }
+}
+
+/// `[frame: tool(args) -> result]`, one line per call, prefixed with a
+/// preview of the assistant's own narration when it had any. Pure
+/// heuristics by design — an LLM summarization call here would spend
+/// tokens to save tokens (docs/GC.md reserves that for `stack-smart`).
+fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
+    let assistant = &messages[frame.assistant];
+    let mut lines = Vec::new();
+    if let Some(content) = assistant.content.as_deref() {
+        if !content.trim().is_empty() {
+            lines.push(preview_chars(content.trim(), 120));
+        }
+    }
+    for call in assistant.tool_calls.as_deref().unwrap_or_default() {
+        let args = call
+            .arguments
+            .get("path")
+            .or_else(|| call.arguments.get("file"))
+            .or_else(|| call.arguments.get("command"))
+            .or_else(|| call.arguments.get("prompt"))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| preview_chars(value, 80))
+            .unwrap_or_default();
+        let result = frame
+            .results
+            .iter()
+            .map(|idx| &messages[*idx])
+            .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            .and_then(|message| message.content.as_deref())
+            .map(|content| preview_chars(content.trim(), 120))
+            .unwrap_or_default();
+        lines.push(format!("[frame: {}({args}) -> {result}]", call.name));
+    }
+    lines.join("\n")
+}
+
 fn sweep_ring(messages: &[ChatMessage], keep: &mut [bool], budget: usize, boundary: usize) {
     while estimate_tokens(&kept_messages(messages, keep)) > budget {
         let Some(index) = oldest_droppable_index(messages, keep, boundary) else {
@@ -673,6 +888,189 @@ mod tests {
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall::new(id, "shell", serde_json::json!({}))
+    }
+
+    /// system + user + two completed shell frames with fat results + a
+    /// closing assistant turn. The frames are where the tokens live.
+    fn stack_fixture() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("please run the tests"),
+            ChatMessage::assistant(
+                Some("Running the suite first.".into()),
+                vec![ToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({ "command": "cargo test" }),
+                )],
+            ),
+            ChatMessage::tool("call-1", format!("test output {}", "x".repeat(1200))),
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    "call-2",
+                    "shell",
+                    serde_json::json!({ "command": "cargo clippy" }),
+                )],
+            ),
+            ChatMessage::tool("call-2", format!("clippy output {}", "y".repeat(1200))),
+            ChatMessage::assistant(Some("All checks pass.".into()), vec![]),
+        ]
+    }
+
+    #[test]
+    fn stack_pops_completed_frames_to_summary_annotations() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        let budget = 200;
+
+        let collected = StackFrameGc::default().collect(messages, budget, &mut state);
+
+        assert!(
+            estimate_tokens(&collected) <= budget,
+            "must converge: {} tokens",
+            estimate_tokens(&collected)
+        );
+        assert!(collected.iter().any(|message| message.role == "system"));
+        assert!(
+            collected.iter().all(|message| message.role != "tool"),
+            "popped frames drop their tool results: {collected:?}"
+        );
+        let summary = collected
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("[frame: shell(cargo test)"))
+            })
+            .expect("popped frame leaves a summary annotation");
+        assert!(
+            summary.tool_calls.is_none(),
+            "summary annotations carry no tool calls"
+        );
+        assert_eq!(state.frames.get("call-1"), Some(&FrameStatus::Popped));
+        assert_eq!(state.frames.get("call-2"), Some(&FrameStatus::Popped));
+        // The closing narration survives — frames pop, conversation stays.
+        assert!(collected
+            .iter()
+            .any(|message| message.content.as_deref() == Some("All checks pass.")));
+    }
+
+    #[test]
+    fn stack_never_pops_or_splits_open_frames() {
+        let mut messages = stack_fixture();
+        // A pending call with no result yet: the model is mid-tool-turn.
+        messages.push(ChatMessage::assistant(
+            None,
+            vec![ToolCall::new(
+                "call-3",
+                "shell",
+                serde_json::json!({ "command": "cargo build" }),
+            )],
+        ));
+        let mut state = GcState::default();
+
+        let collected = StackFrameGc::default().collect(messages, 200, &mut state);
+
+        let pending = collected
+            .iter()
+            .find(|message| {
+                message
+                    .tool_calls
+                    .as_deref()
+                    .is_some_and(|calls| calls.iter().any(|call| call.id == "call-3"))
+            })
+            .expect("the open frame's call survives intact");
+        assert!(pending.content.is_none(), "open frames are not rewritten");
+        assert_eq!(state.frames.get("call-3"), Some(&FrameStatus::Open));
+    }
+
+    #[test]
+    fn stack_keeps_unincorporated_trailing_frame() {
+        // The model just got the clippy result back and has not spoken yet:
+        // that result is the live working set, not history. Strip the
+        // closing narration from the fixture so frame 2 is unincorporated,
+        // and fatten the user turn so it exhausts the pinned-prefix
+        // allowance (otherwise pair-pinning absorbs frame 1 into the
+        // prefix, where preserve mode correctly refuses to pop).
+        let mut messages = stack_fixture();
+        messages.pop();
+        messages[1] = ChatMessage::user("context ".repeat(80));
+        let mut state = GcState::default();
+
+        // Roomy enough to hold the live frame once the older one pops;
+        // too tight for both fat results to stay verbatim.
+        let collected = StackFrameGc::default().collect(messages, 600, &mut state);
+
+        assert_eq!(state.frames.get("call-1"), Some(&FrameStatus::Popped));
+        assert!(
+            collected.iter().any(|message| {
+                message.tool_call_id.as_deref() == Some("call-2")
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains("clippy output"))
+            }),
+            "the un-incorporated result must survive intact: {collected:?}"
+        );
+        assert_eq!(state.frames.get("call-2"), Some(&FrameStatus::Complete));
+    }
+
+    #[test]
+    fn stack_falls_back_to_ring_drop_when_no_frames_exist() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("a".repeat(400)),
+            ChatMessage::user("b".repeat(400)),
+            ChatMessage::user("c".repeat(400)),
+        ];
+        let mut state = GcState::default();
+        // Room for the system prompt plus roughly one 400-char message:
+        // the oldest must go, the newest must survive.
+        let budget = 300;
+
+        let collected = StackFrameGc::default().collect(messages, budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(collected.iter().any(|message| message.role == "system"));
+        // Oldest user content goes first, newest survives.
+        assert!(collected.iter().any(|message| message
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with('c'))));
+        assert!(!collected.iter().any(|message| message
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with('a'))));
+    }
+
+    #[test]
+    fn stack_collect_is_idempotent_and_deterministic() {
+        let messages = stack_fixture();
+        let budget = 200;
+
+        let mut state_a = GcState::default();
+        let first = StackFrameGc::default().collect(messages.clone(), budget, &mut state_a);
+        let again = StackFrameGc::default().collect(first.clone(), budget, &mut state_a);
+        assert_eq!(first, again, "collecting collected output is a no-op");
+
+        let mut state_b = GcState::default();
+        let replayed = StackFrameGc::default().collect(messages, budget, &mut state_b);
+        assert_eq!(first, replayed, "same inputs, same output, every run");
+    }
+
+    #[test]
+    fn stack_under_budget_is_untouched_and_cache_preserving() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+
+        let collected = StackFrameGc::default().collect(messages.clone(), 100_000, &mut state);
+
+        assert_eq!(collected, messages);
+        assert!(!state.prefix_invalidated);
+        // Statuses are still recorded even when nothing pops.
+        assert_eq!(state.frames.get("call-1"), Some(&FrameStatus::Complete));
     }
 
     #[test]
