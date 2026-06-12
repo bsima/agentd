@@ -19,9 +19,9 @@ pub use gc::{
     GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,
 };
 pub use hydration::{
-    HydrationSource, PassiveHydrationConfig, PassiveSource, SourceCapability, SourceKind,
-    SourceParams, SourceRegistry, SourceResult, SEMANTIC_PREFIX, SESSION_STATE_KEY,
-    TEMPORAL_PREFIX,
+    HydrationSink, HydrationSource, PassiveHydrationConfig, PassiveSource, Provenance, SinkId,
+    SinkItem, SinkWritePolicy, SourceCapability, SourceKind, SourceParams, SourceRegistry,
+    SourceResult, SEMANTIC_PREFIX, SESSION_STATE_KEY, TEMPORAL_PREFIX,
 };
 pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, ReplayTrace, SeqConfig};
 pub use ir::{

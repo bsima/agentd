@@ -132,9 +132,65 @@ pub trait HydrationSource: Send + Sync {
     async fn retrieve(&self, params: SourceParams) -> Result<SourceResult>;
 }
 
+/// Stable identifier assigned by a sink to a stored item (the memory file
+/// backend uses the slug). Opaque to the runtime; only the assigning sink
+/// can interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SinkId(pub String);
+
+/// Provenance the RUNTIME attaches to every sink write (docs/MEMORY.md):
+/// which run wrote it, through which effect, and when. Universal across
+/// sinks, never the program's job to supply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Provenance {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A sink write: the payload is sink-defined JSON the sink validates
+/// against its own schema, plus runtime-attached provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkItem {
+    pub payload: Value,
+    #[serde(default)]
+    pub provenance: Provenance,
+}
+
+/// Per-sink write policy (docs/MEMORY.md settled question 1): the policy
+/// hook lives at the effect/dispatch layer, not in the model's prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkWritePolicy {
+    /// Writes execute immediately; the trace is the audit.
+    Free,
+    /// Writes require harness-level approval (e.g. the self-prompt sink).
+    RequireApproval,
+}
+
+/// Write side of a backend (docs/MEMORY.md, t-1165). Deliberately a
+/// separate trait from [`HydrationSource`] — std::io `Read`/`Write`
+/// precedent — so writability is a compile-time fact; backends that
+/// persist implement both and register via
+/// [`SourceRegistry::register_backend`].
+#[async_trait]
+pub trait HydrationSink: Send + Sync {
+    fn name(&self) -> &str;
+    /// Sinks share the source kind taxonomy.
+    fn kind(&self) -> SourceKind;
+    fn write_policy(&self) -> SinkWritePolicy {
+        SinkWritePolicy::Free
+    }
+    async fn store(&self, item: SinkItem) -> Result<SinkId>;
+    async fn update(&self, id: &SinkId, item: SinkItem) -> Result<()>;
+    async fn delete(&self, id: &SinkId) -> Result<()>;
+}
+
 #[derive(Clone, Default)]
 pub struct SourceRegistry {
     sources: Vec<Arc<dyn HydrationSource>>,
+    sinks: Vec<Arc<dyn HydrationSink>>,
 }
 
 impl SourceRegistry {
@@ -155,8 +211,48 @@ impl SourceRegistry {
         self
     }
 
+    /// Register a write-only sink.
+    pub fn register_sink<T>(mut self, sink: T) -> Self
+    where
+        T: HydrationSink + 'static,
+    {
+        self.sinks.push(Arc::new(sink));
+        self
+    }
+
+    /// Register a backend that is both source and sink: one object, one
+    /// `Arc`, coerced into both lists.
+    pub fn register_backend<T>(mut self, backend: T) -> Self
+    where
+        T: HydrationSource + HydrationSink + 'static,
+    {
+        let backend = Arc::new(backend);
+        self.sources.push(backend.clone());
+        self.sinks.push(backend);
+        self
+    }
+
     pub fn sources(&self) -> &[Arc<dyn HydrationSource>] {
         &self.sources
+    }
+
+    pub fn sinks(&self) -> &[Arc<dyn HydrationSink>] {
+        &self.sinks
+    }
+
+    /// The sink registered under `name`, if any.
+    pub fn sink(&self, name: &str) -> Option<Arc<dyn HydrationSink>> {
+        self.sinks.iter().find(|sink| sink.name() == name).cloned()
+    }
+
+    /// All sinks of a kind (e.g. the memory sinks the `remember` tool
+    /// targets).
+    pub fn sinks_of_kind(&self, kind: SourceKind) -> Vec<Arc<dyn HydrationSink>> {
+        self.sinks
+            .iter()
+            .filter(|sink| sink.kind() == kind)
+            .cloned()
+            .collect()
     }
 
     pub async fn retrieve_all(&self, params: SourceParams) -> Result<Vec<SourceResult>> {

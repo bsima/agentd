@@ -6,13 +6,22 @@
 //! Code memories use, so a memory directory is human-curated and
 //! agent-readable with no migration. Retrieval is deterministic keyword
 //! scoring over name/description/body: no embeddings, no network, evaluable
-//! offline. READ-ONLY by design — the write path is gated on the Get/Put v2
-//! design (t-1165); until then, agents read memories and humans write them.
+//! offline.
+//!
+//! The write half (t-1178, per the approved docs/MEMORY.md design)
+//! implements [`HydrationSink`]: the payload schema is
+//! `{ name, description, type?, body }` — validated HERE, by the backend,
+//! not by the trait or the IR — and the slug doubles as the [`SinkId`].
+//! Hard delete by decision (memory dirs live in git; history is the
+//! tombstone); write policy is Free (trace-visible) by decision.
 
-use crate::hydration::{HydrationSource, SourceCapability, SourceKind, SourceParams, SourceResult};
-use anyhow::{Context, Result};
+use crate::hydration::{
+    HydrationSink, HydrationSource, Provenance, SinkId, SinkItem, SinkWritePolicy,
+    SourceCapability, SourceKind, SourceParams, SourceResult,
+};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Default cap on rendered memory bytes per retrieval; callers override via
@@ -247,6 +256,134 @@ impl HydrationSource for MemorySource {
     }
 }
 
+/// The memory sink's payload schema (docs/MEMORY.md): validated by the
+/// backend, not the trait. `name` is the slug and the [`SinkId`].
+#[derive(Debug, Deserialize)]
+struct MemoryPayload {
+    name: String,
+    description: String,
+    #[serde(rename = "type", default)]
+    memory_type: Option<String>,
+    body: String,
+}
+
+/// Frontmatter written by the sink; matches what the source half parses,
+/// plus runtime provenance under metadata.
+#[derive(Debug, Serialize)]
+struct FrontmatterOut<'a> {
+    name: &'a str,
+    description: &'a str,
+    metadata: FrontmatterMetadataOut<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct FrontmatterMetadataOut<'a> {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    memory_type: Option<&'a str>,
+    provenance: &'a Provenance,
+}
+
+impl MemoryPayload {
+    fn parse(item: &SinkItem) -> Result<Self> {
+        let payload: Self = serde_json::from_value(item.payload.clone())
+            .context("memory payload must be { name, description, type?, body }")?;
+        // The slug is also the filename: keep it kebab so ids are stable,
+        // shell-safe, and can never traverse out of the memory dir.
+        let valid_slug = !payload.name.is_empty()
+            && payload
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !payload.name.starts_with('-')
+            && !payload.name.ends_with('-');
+        if !valid_slug {
+            return Err(anyhow!(
+                "memory name {:?} must be a kebab-case slug ([a-z0-9-], no leading/trailing dash)",
+                payload.name
+            ));
+        }
+        Ok(payload)
+    }
+
+    fn render(&self, provenance: &Provenance) -> Result<String> {
+        let front = serde_yaml::to_string(&FrontmatterOut {
+            name: &self.name,
+            description: &self.description,
+            metadata: FrontmatterMetadataOut {
+                memory_type: self.memory_type.as_deref(),
+                provenance,
+            },
+        })?;
+        Ok(format!("---\n{front}---\n\n{}\n", self.body.trim()))
+    }
+}
+
+impl MemorySource {
+    fn memory_path(&self, id: &SinkId) -> PathBuf {
+        self.root.join(format!("{}.md", id.0))
+    }
+}
+
+#[async_trait]
+impl HydrationSink for MemorySource {
+    fn name(&self) -> &str {
+        "memory"
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Semantic
+    }
+
+    fn write_policy(&self) -> SinkWritePolicy {
+        // Settled question 1: free but trace-visible; the trace is the audit.
+        SinkWritePolicy::Free
+    }
+
+    async fn store(&self, item: SinkItem) -> Result<SinkId> {
+        let payload = MemoryPayload::parse(&item)?;
+        let id = SinkId(payload.name.clone());
+        let path = self.memory_path(&id);
+        if tokio::fs::try_exists(&path).await? {
+            return Err(anyhow!(
+                "memory {:?} already exists; use Update to revise it",
+                id.0
+            ));
+        }
+        tokio::fs::create_dir_all(&self.root).await?;
+        tokio::fs::write(&path, payload.render(&item.provenance)?)
+            .await
+            .with_context(|| format!("writing memory {}", path.display()))?;
+        Ok(id)
+    }
+
+    async fn update(&self, id: &SinkId, item: SinkItem) -> Result<()> {
+        let payload = MemoryPayload::parse(&item)?;
+        if payload.name != id.0 {
+            return Err(anyhow!(
+                "memory update payload renames {:?} to {:?}; delete and re-create instead",
+                id.0,
+                payload.name
+            ));
+        }
+        let path = self.memory_path(id);
+        if !tokio::fs::try_exists(&path).await? {
+            return Err(anyhow!("no memory {:?} to update", id.0));
+        }
+        tokio::fs::write(&path, payload.render(&item.provenance)?)
+            .await
+            .with_context(|| format!("rewriting memory {}", path.display()))
+    }
+
+    async fn delete(&self, id: &SinkId) -> Result<()> {
+        // Hard delete by decision: memory dirs live in git, history is the
+        // tombstone.
+        let path = self.memory_path(id);
+        tokio::fs::remove_file(&path)
+            .await
+            .with_context(|| format!("deleting memory {:?}", id.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +490,132 @@ mod tests {
         assert!(result.content.contains("### broken"));
         assert!(result.content.contains("the fact survives"));
         assert!(result.content.contains("### plain"));
+    }
+
+    fn item(payload: serde_json::Value) -> SinkItem {
+        SinkItem {
+            payload,
+            provenance: Provenance {
+                run_id: "run-test".into(),
+                effect_id: Some("effect-1".into()),
+                timestamp: None,
+            },
+        }
+    }
+
+    fn note(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "description": "a test note",
+            "type": "project",
+            "body": "the fact to keep",
+        })
+    }
+
+    #[tokio::test]
+    async fn store_then_retrieve_round_trips_with_provenance() {
+        let dir = temp_memory_dir();
+        let backend = MemorySource::new(dir.clone());
+
+        let id = backend.store(item(note("test-note"))).await.unwrap();
+        assert_eq!(id, SinkId("test-note".into()));
+
+        let written = tokio::fs::read_to_string(dir.join("test-note.md"))
+            .await
+            .unwrap();
+        assert!(written.contains("run_id: run-test"), "{written}");
+        assert!(written.contains("effect_id: effect-1"), "{written}");
+
+        let result = backend
+            .retrieve(SourceParams::new("fact to keep"))
+            .await
+            .unwrap();
+        assert!(result
+            .content
+            .contains("### test-note (project) — a test note"));
+        assert!(result.content.contains("the fact to keep"));
+    }
+
+    #[tokio::test]
+    async fn store_refuses_duplicates_and_update_revises_in_place() {
+        let backend = MemorySource::new(temp_memory_dir());
+        let id = backend.store(item(note("twice"))).await.unwrap();
+
+        let err = backend.store(item(note("twice"))).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        let mut revised = note("twice");
+        revised["body"] = "the revised fact".into();
+        backend.update(&id, item(revised)).await.unwrap();
+        let result = backend
+            .retrieve(SourceParams::new("revised"))
+            .await
+            .unwrap();
+        assert!(result.content.contains("the revised fact"));
+
+        let rename = backend
+            .update(&id, item(note("renamed")))
+            .await
+            .unwrap_err();
+        assert!(rename.to_string().contains("renames"), "{rename}");
+        let missing = backend
+            .update(&SinkId("ghost".into()), item(note("ghost")))
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("no memory"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn delete_is_hard_and_unrelated_memories_survive() {
+        let dir = temp_memory_dir();
+        write_memory(&dir, "keeper.md", RUST_MEMORY).await;
+        let backend = MemorySource::new(dir.clone());
+        let id = backend.store(item(note("goner"))).await.unwrap();
+
+        backend.delete(&id).await.unwrap();
+
+        assert!(!dir.join("goner.md").exists());
+        assert!(dir.join("keeper.md").exists());
+        assert!(backend.delete(&id).await.is_err(), "double delete errors");
+    }
+
+    #[tokio::test]
+    async fn payload_schema_and_slug_are_validated() {
+        let backend = MemorySource::new(temp_memory_dir());
+
+        let bad_schema = backend
+            .store(item(serde_json::json!({ "name": "x" })))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{bad_schema:#}").contains("name, description, type?, body"),
+            "{bad_schema:#}"
+        );
+
+        for bad_name in ["../escape", "Has Spaces", "", "-lead", "trail-"] {
+            let mut payload = note("placeholder");
+            payload["name"] = bad_name.into();
+            let err = backend.store(item(payload)).await.unwrap_err();
+            assert!(
+                err.to_string().contains("kebab-case"),
+                "{bad_name:?} must be rejected: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn register_backend_serves_both_halves() {
+        use crate::hydration::SourceRegistry;
+
+        let registry = SourceRegistry::new().register_backend(MemorySource::new(temp_memory_dir()));
+
+        assert_eq!(registry.sources().len(), 1);
+        assert_eq!(registry.sinks().len(), 1);
+        let sink = registry.sink("memory").expect("sink registered by name");
+        assert_eq!(sink.kind(), SourceKind::Semantic);
+        assert_eq!(sink.write_policy(), SinkWritePolicy::Free);
+        assert_eq!(registry.sinks_of_kind(SourceKind::Semantic).len(), 1);
+        assert!(registry.sinks_of_kind(SourceKind::Temporal).is_empty());
     }
 
     #[tokio::test]

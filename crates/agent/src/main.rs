@@ -79,8 +79,8 @@ struct Args {
     #[arg(long, env = "AGENT_HYDRATION_DIR")]
     hydration_dir: Option<PathBuf>,
     /// Memory directory: markdown files with frontmatter served to
-    /// `semantic:<query>` Gets via keyword retrieval. Read-only — agents
-    /// read memories, humans write them (write path is t-1165).
+    /// `semantic:<query>` Gets via keyword retrieval, and registered as a
+    /// write sink (reachable once the Store effect lands — t-1179).
     #[arg(long, env = "AGENT_MEMORY_DIR")]
     memory_dir: Option<PathBuf>,
     /// Checkpoint directory of a PAST or sibling session, served as
@@ -432,7 +432,8 @@ async fn main() -> Result<()> {
             registry = registry.register(LocalFileSource::new(path.clone()));
         }
         if let Some(path) = args.memory_dir.as_ref() {
-            registry = registry.register(MemorySource::new(path.clone()));
+            // Both halves: source for retrieval, sink for the Store effect.
+            registry = registry.register_backend(MemorySource::new(path.clone()));
         }
         if let Some(path) = args.temporal_dir.as_ref() {
             registry = registry.register(TemporalSource::new(path.clone()));
