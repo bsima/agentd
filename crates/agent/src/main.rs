@@ -1,10 +1,10 @@
 use agent_core::{
     agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
     EvalConfig, Event, GcMode, GcTiming, HydrationSource, InMemoryStore, IrReplayTrace,
-    JsonlTraceSink, MarkSweepGc, ModelRegistry, OtelTraceSink, PassiveHydrationConfig,
-    PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc, SeqConfig,
-    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, StackFrameGc,
-    TraceContextEnv, TraceLogger,
+    JsonlTraceSink, MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink,
+    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc,
+    SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult,
+    StackFrameGc, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -78,6 +78,11 @@ struct Args {
     /// Directory to read into passive hydration context.
     #[arg(long, env = "AGENT_HYDRATION_DIR")]
     hydration_dir: Option<PathBuf>,
+    /// Memory directory: markdown files with frontmatter served to
+    /// `semantic:<query>` Gets via keyword retrieval. Read-only — agents
+    /// read memories, humans write them (write path is t-1165).
+    #[arg(long, env = "AGENT_MEMORY_DIR")]
+    memory_dir: Option<PathBuf>,
     /// Timeout for each Eval shell command.
     #[arg(long, default_value_t = 120)]
     eval_timeout_seconds: u64,
@@ -399,9 +404,15 @@ async fn main() -> Result<()> {
         .checkpoint_dir
         .as_ref()
         .map(|dir| dir.join("session-latest.json"));
-    let hydration = match args.hydration_dir.as_ref() {
-        Some(path) => SourceRegistry::new().register(LocalFileSource::new(path.clone())),
-        None => SourceRegistry::new(),
+    let hydration = {
+        let mut registry = SourceRegistry::new();
+        if let Some(path) = args.hydration_dir.as_ref() {
+            registry = registry.register(LocalFileSource::new(path.clone()));
+        }
+        if let Some(path) = args.memory_dir.as_ref() {
+            registry = registry.register(MemorySource::new(path.clone()));
+        }
+        registry
     };
     let (history, checkpoint_sequence) = match checkpoint {
         Some(cp) => (cp.messages, cp.sequence),

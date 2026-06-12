@@ -25,6 +25,13 @@ Notes:
   session store), but the observable put-then-get contract is identical.
 - `semantic:` reads are queries, not storage. Writing to `semantic:*` is
   reserved and currently undefined; do not rely on it.
+- The first shipped `semantic:` backend is `MemorySource` (`--memory-dir`,
+  t-1160): a directory of markdown memory files with frontmatter, served by
+  deterministic keyword retrieval. It is read-only by design — a `memory:`
+  write namespace is deliberately **not** defined here yet; that contract is
+  the subject of the Get/Put v2 design (t-1165, docs/MEMORY.md when it
+  lands), which proposes splitting retrieval and memory mutation out of the
+  Get/Put KV verbs entirely.
 
 ## Keys outside the guaranteed namespaces
 
