@@ -28,6 +28,7 @@ pub enum Event {
         model: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<Prompt>,
+        #[serde(default)]
         prompt_preview: String,
         timestamp: DateTime<Utc>,
     },
@@ -38,6 +39,7 @@ pub enum Event {
         parent_op_id: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         response: Option<Response>,
+        #[serde(default)]
         response_preview: String,
         input_tokens: u32,
         output_tokens: u32,
@@ -109,6 +111,7 @@ pub enum Event {
         /// Replay never needs it; `value_preview` is always recorded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<Value>,
+        #[serde(default)]
         value_preview: String,
         source_count: usize,
         timestamp: DateTime<Utc>,
@@ -119,6 +122,7 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_op_id: Option<u64>,
         key: String,
+        #[serde(default)]
         value_preview: String,
         timestamp: DateTime<Utc>,
     },
@@ -147,6 +151,7 @@ pub enum Event {
         source: String,
         kind: String,
         bytes: usize,
+        #[serde(default)]
         content_preview: String,
         metadata: Value,
         timestamp: DateTime<Utc>,

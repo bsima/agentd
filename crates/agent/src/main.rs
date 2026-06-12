@@ -873,7 +873,91 @@ impl GcStatsReport {
 async fn run_gc_stats_command(trace: &Path) -> Result<()> {
     let events = TraceLogger::read_events(trace).await?;
     print!("{}", GcStatsReport::from_events(&events).render());
+    print!("{}", CalibrationReport::from_events(&events).render());
     Ok(())
+}
+
+/// estimate_tokens drift against provider-reported usage (t-1163). Every
+/// InferResult carries the provider's real input_tokens; when the trace
+/// also recorded full prompts (--trace-full-payloads) we can re-estimate
+/// each one and measure how far off the estimator is per model. This is
+/// the proactive complement to catch-overflow: a calibrated estimator
+/// makes threshold timing trustworthy again. Measurement only — no
+/// correction factor is applied anywhere automatically.
+#[derive(Debug, Clone, PartialEq)]
+struct CalibrationReport {
+    /// (model, estimated, provider-reported), one per usable infer pair.
+    samples: Vec<(String, u64, u64)>,
+}
+
+impl CalibrationReport {
+    fn from_events(events: &[Event]) -> Self {
+        let mut estimates: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+        for event in events {
+            if let Event::InferCall {
+                op_id,
+                model,
+                prompt: Some(prompt),
+                ..
+            } = event
+            {
+                estimates.insert(
+                    *op_id,
+                    (model.clone(), agent_core::estimate_tokens(prompt) as u64),
+                );
+            }
+        }
+        let samples = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::InferResult {
+                    op_id,
+                    input_tokens,
+                    ..
+                } if *input_tokens > 0 => estimates
+                    .get(op_id)
+                    .map(|(model, estimate)| (model.clone(), *estimate, u64::from(*input_tokens))),
+                _ => None,
+            })
+            .collect();
+        Self { samples }
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("\nEstimator calibration (estimate_tokens vs provider input_tokens):\n");
+        if self.samples.is_empty() {
+            out.push_str(
+                "  no samples: trace lacks full prompts (record with --trace-full-payloads) \
+                 or the provider reported no input_tokens\n",
+            );
+            return out;
+        }
+        let mut by_model: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
+        for (model, estimated, actual) in &self.samples {
+            by_model
+                .entry(model.as_str())
+                .or_default()
+                .push((*estimated, *actual));
+        }
+        for (model, pairs) in by_model {
+            let ratios: Vec<f64> = pairs
+                .iter()
+                .map(|(estimated, actual)| *estimated as f64 / *actual as f64)
+                .collect();
+            let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+            let min = ratios.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            // The factor a tuned estimator would multiply by; reported for
+            // a human to consider, never applied.
+            let correction = if mean > 0.0 { 1.0 / mean } else { 0.0 };
+            out.push_str(&format!(
+                "  {model}: {} sample(s), est/actual mean {mean:.2} (min {min:.2}, max {max:.2}), suggested correction x{correction:.2}\n",
+                pairs.len(),
+            ));
+        }
+        out
+    }
 }
 
 async fn run_command(command: &Command) -> Result<()> {
@@ -1899,6 +1983,72 @@ mod gc_stats_tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn calibration_reports_per_model_drift_from_paired_infer_events() {
+        let prompt = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("x".repeat(400)),
+        ];
+        let estimate = agent_core::estimate_tokens(&prompt) as u64;
+        let infer_call = |op_id: u64, model: &str| Event::InferCall {
+            run_id: "run".into(),
+            op_id,
+            parent_op_id: None,
+            model: model.into(),
+            prompt: Some(prompt.clone()),
+            prompt_preview: String::new(),
+            timestamp: Utc::now(),
+        };
+        let infer_result = |op_id: u64, input_tokens: u32| Event::InferResult {
+            run_id: "run".into(),
+            op_id,
+            parent_op_id: None,
+            response: None,
+            response_preview: String::new(),
+            input_tokens,
+            output_tokens: 1,
+            total_tokens: input_tokens + 1,
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        };
+        let actual = (estimate * 2) as u32; // estimator reads half the truth
+        let events = vec![
+            infer_call(1, "gpt-5.5"),
+            infer_result(1, actual),
+            infer_call(2, "gpt-5.5"),
+            infer_result(2, actual),
+            // Preview-only call (no full prompt): contributes no sample.
+            Event::InferCall {
+                run_id: "run".into(),
+                op_id: 3,
+                parent_op_id: None,
+                model: "gpt-5.5".into(),
+                prompt: None,
+                prompt_preview: String::new(),
+                timestamp: Utc::now(),
+            },
+            infer_result(3, 100),
+        ];
+
+        let report = CalibrationReport::from_events(&events);
+        assert_eq!(report.samples.len(), 2);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("gpt-5.5: 2 sample(s), est/actual mean 0.50"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("suggested correction x2.00"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn calibration_without_full_prompts_explains_itself() {
+        let rendered = CalibrationReport::from_events(&[]).render();
+        assert!(rendered.contains("--trace-full-payloads"), "{rendered}");
     }
 
     #[test]
