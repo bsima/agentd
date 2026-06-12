@@ -114,6 +114,13 @@ impl TokenStore {
         })
     }
 
+    /// A store backed by an explicit file instead of the XDG default.
+    /// Lets tests exercise import/save semantics without touching the
+    /// process environment or the real credential file.
+    pub fn with_path(provider: OAuthProviderKind, path: PathBuf) -> Self {
+        Self { provider, path }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -244,15 +251,45 @@ impl OAuthChatProvider {
     }
 
     async fn access_token(&self) -> Result<String> {
-        let token = self.store.load().await?.ok_or_else(|| {
-            anyhow!(
-                "missing OAuth token for {}; run `agent auth login {}`",
-                self.kind.key(),
-                self.kind.name()
-            )
-        })?;
+        let token = match self.store.load().await? {
+            Some(token) => token,
+            // No stored codex token: fall through to the Codex CLI's
+            // session before failing — avoids token drift between the two
+            // tools and makes a fresh `codex login` just work (t-1170).
+            None if self.kind == OAuthProviderKind::Codex => {
+                let source = codex_cli_auth_file()?;
+                import_codex_cli_from(&source, &self.store)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "missing OAuth token for {} and no Codex CLI session to import",
+                            self.kind.key()
+                        )
+                    })?
+            }
+            None => {
+                return Err(anyhow!(
+                    "missing OAuth token for {}; run `agent auth login {}`",
+                    self.kind.key(),
+                    self.kind.name()
+                ))
+            }
+        };
         if token.is_expired() {
-            return Ok(self.refresh_token().await?.access_token);
+            let refreshed = self.refresh_token().await;
+            return match refreshed {
+                Ok(token) => Ok(token.access_token),
+                // Refresh failed: the Codex CLI may hold a fresher session
+                // (the user refreshes it whenever they use the CLI).
+                Err(refresh_err) if self.kind == OAuthProviderKind::Codex => {
+                    let source = codex_cli_auth_file()?;
+                    match import_codex_cli_from(&source, &self.store).await {
+                        Ok(imported) if !imported.is_expired() => Ok(imported.access_token),
+                        _ => Err(refresh_err),
+                    }
+                }
+                Err(err) => Err(err),
+            };
         }
         Ok(token.access_token)
     }
@@ -278,6 +315,20 @@ impl OAuthChatProvider {
     }
 
     async fn login(&self) -> Result<OAuthToken> {
+        if self.kind == OAuthProviderKind::Codex {
+            // The OpenAI device-code endpoint this command used to call
+            // returns 404 (t-1170). The supported path is the Codex CLI's
+            // own login flow; we import its session rather than guessing
+            // at unverified endpoints and client params.
+            let source = codex_cli_auth_file()?;
+            let token = import_codex_cli_from(&source, &self.store).await?;
+            eprintln!(
+                "imported Codex CLI credentials from {} into {}",
+                source.display(),
+                self.store.path().display()
+            );
+            return Ok(token);
+        }
         tracing::info!(provider = self.kind.name(), "starting OAuth device login");
         let device = self.start_device_login().await?;
         eprintln!(
@@ -505,6 +556,82 @@ pub async fn status_all() -> Result<Vec<TokenStatus>> {
         statuses.push(TokenStore::new(kind)?.status().await?);
     }
     Ok(statuses)
+}
+
+/// Where the Codex CLI keeps its credentials: `$CODEX_HOME/auth.json`,
+/// defaulting to `~/.codex/auth.json`.
+pub fn codex_cli_auth_file() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(home).join("auth.json"));
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".codex/auth.json"))
+        .ok_or_else(|| anyhow!("could not determine home directory"))
+}
+
+/// Import the Codex CLI's credentials (`codex login` writes them) into the
+/// agent token store under `openai-codex`, preserving every other entry.
+/// This replaced device-code login for codex (t-1170): the device endpoint
+/// agentd used returned 404, and reusing the CLI's session avoids token
+/// drift between the two tools anyway.
+pub async fn import_codex_cli() -> Result<OAuthToken> {
+    let source = codex_cli_auth_file()?;
+    let store = TokenStore::new(OAuthProviderKind::Codex)?;
+    import_codex_cli_from(&source, &store).await
+}
+
+pub async fn import_codex_cli_from(source: &Path, store: &TokenStore) -> Result<OAuthToken> {
+    let raw = match tokio::fs::read_to_string(source).await {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "no Codex CLI credentials at {}; run `codex login` first, then `agent auth import codex`",
+                source.display()
+            ));
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading Codex CLI auth file {}", source.display()))
+        }
+    };
+    let token = token_from_codex_cli(&raw)
+        .with_context(|| format!("parsing Codex CLI auth file {}", source.display()))?;
+    store.save(&token).await?;
+    Ok(token)
+}
+
+/// Parse the Codex CLI auth.json shape: `tokens.access_token` and
+/// `tokens.refresh_token`, with expiry derived from the access token's JWT
+/// `exp` claim (the CLI file does not store an expiry of its own).
+fn token_from_codex_cli(raw: &str) -> Result<OAuthToken> {
+    let value: Value = serde_json::from_str(raw).context("decoding JSON")?;
+    let tokens = value
+        .get("tokens")
+        .ok_or_else(|| anyhow!("missing `tokens` object"))?;
+    let access_token = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing `tokens.access_token`"))?
+        .to_string();
+    let refresh_token = tokens
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(OAuthToken {
+        expires_at: extract_jwt_expiry(&access_token),
+        access_token,
+        refresh_token,
+        token_type: None,
+    })
+}
+
+/// The `exp` claim (seconds since epoch) from a JWT's payload, if any.
+fn extract_jwt_expiry(token: &str) -> Option<DateTime<Utc>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64_url_decode(payload)?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = value.get("exp")?.as_i64()?;
+    Utc.timestamp_opt(exp, 0).single()
 }
 
 pub fn provider_base_url_for_tag(tag: &str) -> Option<&'static str> {
@@ -963,6 +1090,110 @@ fn base64_value(byte: u8) -> Option<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A syntactically valid JWT whose payload carries the given claims.
+    fn fake_jwt(payload: Value) -> String {
+        let header = base64url_no_pad(br#"{"alg":"none","typ":"JWT"}"#);
+        let body = base64url_no_pad(payload.to_string().as_bytes());
+        format!("{header}.{body}.sig")
+    }
+
+    fn codex_cli_auth_json(access: &str) -> String {
+        json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "unused",
+                "access_token": access,
+                "refresh_token": "refresh-123",
+                "account_id": "acct-1",
+            },
+            "last_refresh": "2026-06-12T00:00:00Z",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn codex_cli_token_extracts_tokens_and_jwt_expiry() {
+        let access = fake_jwt(json!({ "exp": 1893456000i64 }));
+        let token = token_from_codex_cli(&codex_cli_auth_json(&access)).unwrap();
+
+        assert_eq!(token.access_token, access);
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-123"));
+        assert_eq!(
+            token.expires_at,
+            Utc.timestamp_opt(1893456000, 0).single(),
+            "expiry comes from the JWT exp claim"
+        );
+    }
+
+    #[test]
+    fn codex_cli_token_without_exp_claim_has_no_expiry() {
+        let access = fake_jwt(json!({ "sub": "user" }));
+        let token = token_from_codex_cli(&codex_cli_auth_json(&access)).unwrap();
+        assert!(token.expires_at.is_none());
+    }
+
+    #[test]
+    fn codex_cli_token_requires_access_token() {
+        let err = token_from_codex_cli(r#"{"tokens":{}}"#).unwrap_err();
+        assert!(err.to_string().contains("access_token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn import_replaces_only_the_codex_entry() {
+        let dir = std::env::temp_dir().join(format!("agent-oauth-test-{}", uuid_suffix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let store_path = dir.join("auth.json");
+        // Pre-seed the agent store with an unrelated entry and a stale
+        // codex entry; import must replace only the latter.
+        tokio::fs::write(
+            &store_path,
+            json!({
+                "anthropic": { "access": "claude-token", "refresh": null, "expires": null },
+                "openai-codex": { "access": "stale", "refresh": null, "expires": null },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let source = dir.join("codex-cli-auth.json");
+        let access = fake_jwt(json!({ "exp": 1893456000i64 }));
+        tokio::fs::write(&source, codex_cli_auth_json(&access))
+            .await
+            .unwrap();
+
+        let store = TokenStore::with_path(OAuthProviderKind::Codex, store_path.clone());
+        let imported = import_codex_cli_from(&source, &store).await.unwrap();
+        assert_eq!(imported.access_token, access);
+
+        let written: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&store_path).await.unwrap()).unwrap();
+        assert_eq!(
+            written["anthropic"]["access"], "claude-token",
+            "unrelated entries are preserved"
+        );
+        assert_eq!(written["openai-codex"]["access"], access.as_str());
+        assert_eq!(written["openai-codex"]["refresh"], "refresh-123");
+    }
+
+    #[tokio::test]
+    async fn import_with_missing_source_says_run_codex_login() {
+        let dir = std::env::temp_dir().join(format!("agent-oauth-test-{}", uuid_suffix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let store = TokenStore::with_path(OAuthProviderKind::Codex, dir.join("auth.json"));
+
+        let err = import_codex_cli_from(&dir.join("missing.json"), &store)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("codex login"), "{err}");
+    }
+
+    fn uuid_suffix() -> String {
+        let mut bytes = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        base64url_no_pad(&bytes)
+    }
 
     #[test]
     fn pkce_generation_has_expected_lengths() {

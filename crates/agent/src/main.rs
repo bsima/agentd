@@ -180,7 +180,15 @@ enum Command {
 #[cfg(feature = "oauth")]
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    Login { provider: String },
+    Login {
+        provider: String,
+    },
+    /// Import credentials from an external CLI's session (codex only:
+    /// reads `$CODEX_HOME/auth.json` / `~/.codex/auth.json` written by
+    /// `codex login`).
+    Import {
+        provider: String,
+    },
     Status,
 }
 
@@ -815,6 +823,22 @@ async fn run_auth_command(command: &AuthCommand) -> Result<()> {
             println!(
                 "logged in to {}; token expires {}",
                 kind.name(),
+                token
+                    .expires_at
+                    .map(|expires_at| expires_at.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+        }
+        AuthCommand::Import { provider } => {
+            let kind = agent_oauth::OAuthProviderKind::from_name(provider)?;
+            if kind != agent_oauth::OAuthProviderKind::Codex {
+                return Err(anyhow!(
+                    "auth import is only supported for codex (reads the Codex CLI session)"
+                ));
+            }
+            let token = agent_oauth::import_codex_cli().await?;
+            println!(
+                "imported codex credentials; token expires {}",
                 token
                     .expires_at
                     .map(|expires_at| expires_at.to_rfc3339())
