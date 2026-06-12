@@ -53,6 +53,8 @@ pub enum EffectKind {
     Get,
     Put,
     Emit,
+    Retrieve,
+    Store,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +112,55 @@ pub enum Instr {
     Emit {
         event: Expr,
     },
+    /// Ranked read from registered hydration sources (docs/MEMORY.md).
+    /// Full bodies under `max_bytes` by decision; `kind` narrows to one
+    /// source kind (e.g. Semantic for the recall tool).
+    Retrieve {
+        out: Var,
+        query: Expr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<crate::hydration::SourceKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<usize>,
+    },
+    /// Write to a registered hydration sink (docs/MEMORY.md). `sink`
+    /// selects the target by registered name; `item` is the sink-schema
+    /// payload; the runtime attaches provenance. Replay never mutates.
+    Store {
+        out: Var,
+        sink: Expr,
+        op: StoreOp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<Expr>,
+        item: Expr,
+        #[serde(default)]
+        policy: StorePolicy,
+    },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreOp {
+    Create,
+    Update,
+    Delete,
+}
+
+impl StoreOp {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Per-instruction policy slot, mirroring InferPolicy/EvalPolicy. The
+/// per-SINK write policy (Free vs RequireApproval) lives on the sink
+/// itself; this slot is for site-level overrides if they ever matter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePolicy {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Terminator {
@@ -398,7 +448,9 @@ fn instr_out(instr: &Instr) -> Option<&Var> {
         Instr::Let { out, .. }
         | Instr::Infer { out, .. }
         | Instr::Eval { out, .. }
-        | Instr::Get { out, .. } => Some(out),
+        | Instr::Get { out, .. }
+        | Instr::Retrieve { out, .. }
+        | Instr::Store { out, .. } => Some(out),
         Instr::Put { .. } | Instr::Emit { .. } => None,
     }
 }
@@ -421,6 +473,14 @@ fn validate_instr_vars(
             validate_expr_vars(value, defined, block_id)
         }
         Instr::Emit { event } => validate_expr_vars(event, defined, block_id),
+        Instr::Retrieve { query, .. } => validate_expr_vars(query, defined, block_id),
+        Instr::Store { sink, id, item, .. } => {
+            validate_expr_vars(sink, defined, block_id)?;
+            if let Some(id) = id {
+                validate_expr_vars(id, defined, block_id)?;
+            }
+            validate_expr_vars(item, defined, block_id)
+        }
     }
 }
 

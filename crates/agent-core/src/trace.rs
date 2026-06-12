@@ -134,6 +134,79 @@ pub enum Event {
         key: String,
         timestamp: DateTime<Utc>,
     },
+    RetrieveCall {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    RetrieveResult {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        /// Full results, always recorded: replay returns them verbatim.
+        results: Value,
+        #[serde(default)]
+        result_preview: String,
+        source_count: usize,
+        bytes: usize,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// Terminal failure of a Retrieve effect (source error, replay
+    /// divergence). Closes the matching RetrieveCall.
+    RetrieveError {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        error: String,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
+    StoreCall {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        sink: String,
+        store_op: String,
+        #[serde(default)]
+        item_preview: String,
+        /// Hash of the payload so replay can detect same-site divergence
+        /// without recording the full item.
+        content_hash: String,
+        timestamp: DateTime<Utc>,
+    },
+    StoreResult {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        sink: String,
+        /// Sink-assigned id, always recorded: replay returns it without
+        /// touching the sink.
+        sink_id: String,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// Terminal failure of a Store effect (validation, policy, sink error,
+    /// replay divergence). Closes the matching StoreCall.
+    StoreError {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        sink: String,
+        error: String,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
     HydrationStart {
         run_id: String,
         op_id: u64,
@@ -226,6 +299,12 @@ impl Event {
             | Self::GetResult { run_id, .. }
             | Self::PutCall { run_id, .. }
             | Self::PutResult { run_id, .. }
+            | Self::RetrieveCall { run_id, .. }
+            | Self::RetrieveResult { run_id, .. }
+            | Self::RetrieveError { run_id, .. }
+            | Self::StoreCall { run_id, .. }
+            | Self::StoreResult { run_id, .. }
+            | Self::StoreError { run_id, .. }
             | Self::HydrationStart { run_id, .. }
             | Self::HydrationSection { run_id, .. }
             | Self::HydrationEnd { run_id, .. }
@@ -250,6 +329,12 @@ impl Event {
             | Self::GetResult { op_id, .. }
             | Self::PutCall { op_id, .. }
             | Self::PutResult { op_id, .. }
+            | Self::RetrieveCall { op_id, .. }
+            | Self::RetrieveResult { op_id, .. }
+            | Self::RetrieveError { op_id, .. }
+            | Self::StoreCall { op_id, .. }
+            | Self::StoreResult { op_id, .. }
+            | Self::StoreError { op_id, .. }
             | Self::HydrationStart { op_id, .. }
             | Self::HydrationSection { op_id, .. }
             | Self::HydrationEnd { op_id, .. }
@@ -274,6 +359,12 @@ impl Event {
             | Self::GetResult { parent_op_id, .. }
             | Self::PutCall { parent_op_id, .. }
             | Self::PutResult { parent_op_id, .. }
+            | Self::RetrieveCall { parent_op_id, .. }
+            | Self::RetrieveResult { parent_op_id, .. }
+            | Self::RetrieveError { parent_op_id, .. }
+            | Self::StoreCall { parent_op_id, .. }
+            | Self::StoreResult { parent_op_id, .. }
+            | Self::StoreError { parent_op_id, .. }
             | Self::HydrationStart { parent_op_id, .. }
             | Self::HydrationSection { parent_op_id, .. }
             | Self::HydrationEnd { parent_op_id, .. }
@@ -292,6 +383,10 @@ impl Event {
             Self::EvalCall { .. } | Self::EvalResult { .. } | Self::EvalError { .. } => "Eval",
             Self::GetCall { .. } | Self::GetResult { .. } => "Get",
             Self::PutCall { .. } | Self::PutResult { .. } => "Put",
+            Self::RetrieveCall { .. }
+            | Self::RetrieveResult { .. }
+            | Self::RetrieveError { .. } => "Retrieve",
+            Self::StoreCall { .. } | Self::StoreResult { .. } | Self::StoreError { .. } => "Store",
             Self::HydrationStart { .. } | Self::HydrationEnd { .. } => "Hydration",
             Self::HydrationSection { .. } => "HydrationSection",
             Self::ParStart { .. } | Self::ParEnd { .. } => "Par",
@@ -316,6 +411,8 @@ impl Event {
                 | Self::EvalCall { .. }
                 | Self::GetCall { .. }
                 | Self::PutCall { .. }
+                | Self::RetrieveCall { .. }
+                | Self::StoreCall { .. }
                 | Self::HydrationStart { .. }
                 | Self::ParStart { .. }
         )
@@ -330,6 +427,10 @@ impl Event {
                 | Self::EvalError { .. }
                 | Self::GetResult { .. }
                 | Self::PutResult { .. }
+                | Self::RetrieveResult { .. }
+                | Self::RetrieveError { .. }
+                | Self::StoreResult { .. }
+                | Self::StoreError { .. }
                 | Self::HydrationEnd { .. }
                 | Self::ParEnd { .. }
         )
@@ -347,6 +448,12 @@ impl Event {
             | Self::GetResult { timestamp, .. }
             | Self::PutCall { timestamp, .. }
             | Self::PutResult { timestamp, .. }
+            | Self::RetrieveCall { timestamp, .. }
+            | Self::RetrieveResult { timestamp, .. }
+            | Self::RetrieveError { timestamp, .. }
+            | Self::StoreCall { timestamp, .. }
+            | Self::StoreResult { timestamp, .. }
+            | Self::StoreError { timestamp, .. }
             | Self::HydrationStart { timestamp, .. }
             | Self::HydrationSection { timestamp, .. }
             | Self::HydrationEnd { timestamp, .. }
@@ -464,6 +571,52 @@ impl Event {
                 attrs.push(KeyValue::new("source_count", *source_count as i64));
             }
             Self::PutResult { key, .. } => attrs.push(KeyValue::new("key", key.clone())),
+            Self::RetrieveCall { query, kind, .. } => {
+                attrs.push(KeyValue::new("query", query.clone()));
+                if let Some(kind) = kind {
+                    attrs.push(KeyValue::new("agent.source_kind", kind.clone()));
+                }
+            }
+            Self::RetrieveResult {
+                source_count,
+                bytes,
+                duration_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("source_count", *source_count as i64));
+                attrs.push(KeyValue::new("bytes", *bytes as i64));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
+            Self::RetrieveError {
+                error, duration_ms, ..
+            } => {
+                attrs.push(KeyValue::new("error", error.clone()));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
+            Self::StoreCall { sink, store_op, .. } => {
+                attrs.push(KeyValue::new("agent.sink", sink.clone()));
+                attrs.push(KeyValue::new("agent.store_op", store_op.clone()));
+            }
+            Self::StoreResult {
+                sink,
+                sink_id,
+                duration_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.sink", sink.clone()));
+                attrs.push(KeyValue::new("agent.sink_id", sink_id.clone()));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
+            Self::StoreError {
+                sink,
+                error,
+                duration_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.sink", sink.clone()));
+                attrs.push(KeyValue::new("error", error.clone()));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
             Self::HydrationStart {
                 sources, max_bytes, ..
             } => {

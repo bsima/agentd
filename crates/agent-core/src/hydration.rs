@@ -278,6 +278,20 @@ impl SourceRegistry {
         .await
     }
 
+    /// QUERY-capable sources, optionally narrowed to one kind — the
+    /// Retrieve effect's dispatch (docs/MEMORY.md).
+    pub async fn retrieve_query_of_kind(
+        &self,
+        params: SourceParams,
+        kind: Option<SourceKind>,
+    ) -> Result<Vec<SourceResult>> {
+        self.retrieve_matching(params, |source| {
+            source.capabilities().contains(SourceCapability::QUERY)
+                && kind.is_none_or(|kind| source.kind() == kind)
+        })
+        .await
+    }
+
     async fn retrieve_matching<F>(
         &self,
         params: SourceParams,

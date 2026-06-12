@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -28,6 +29,12 @@ pub struct IrReplayTrace {
     eval_calls: BTreeMap<String, IrEvalCall>,
     eval_results: BTreeMap<String, Value>,
     eval_errors: BTreeMap<String, String>,
+    retrieve_queries: BTreeMap<String, String>,
+    retrieve_results: BTreeMap<String, Value>,
+    retrieve_errors: BTreeMap<String, String>,
+    store_hashes: BTreeMap<String, String>,
+    store_results: BTreeMap<String, String>,
+    store_errors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,13 +60,21 @@ impl IrReplayTrace {
         let mut last_location: Option<EffectLocation> = None;
         let mut last_infer_id: Option<String> = None;
         let mut last_eval_id: Option<String> = None;
+        let mut last_retrieve_id: Option<String> = None;
+        let mut last_store_id: Option<String> = None;
 
         for event in events {
             match event {
                 Event::Custom { name, data, .. } if name == "ir_effect" => {
                     let location: EffectLocation = serde_json::from_value(data.clone())?;
-                    last_location = matches!(location.kind, EffectKind::Infer | EffectKind::Eval)
-                        .then_some(location);
+                    last_location = matches!(
+                        location.kind,
+                        EffectKind::Infer
+                            | EffectKind::Eval
+                            | EffectKind::Retrieve
+                            | EffectKind::Store
+                    )
+                    .then_some(location);
                 }
                 Event::InferCall { model, .. } => {
                     let location = take_location(&mut last_location, EffectKind::Infer)?;
@@ -106,6 +121,42 @@ impl IrReplayTrace {
                 Event::EvalError { error, .. } => {
                     if let Some(effect_id) = last_eval_id.take() {
                         replay.eval_errors.insert(effect_id, error.clone());
+                    }
+                }
+                Event::RetrieveCall { query, .. } => {
+                    let location = take_location(&mut last_location, EffectKind::Retrieve)?;
+                    let effect_id = location.effect_id.0.clone();
+                    replay
+                        .retrieve_queries
+                        .insert(effect_id.clone(), query.clone());
+                    last_retrieve_id = Some(effect_id);
+                }
+                Event::RetrieveResult { results, .. } => {
+                    if let Some(effect_id) = last_retrieve_id.take() {
+                        replay.retrieve_results.insert(effect_id, results.clone());
+                    }
+                }
+                Event::RetrieveError { error, .. } => {
+                    if let Some(effect_id) = last_retrieve_id.take() {
+                        replay.retrieve_errors.insert(effect_id, error.clone());
+                    }
+                }
+                Event::StoreCall { content_hash, .. } => {
+                    let location = take_location(&mut last_location, EffectKind::Store)?;
+                    let effect_id = location.effect_id.0.clone();
+                    replay
+                        .store_hashes
+                        .insert(effect_id.clone(), content_hash.clone());
+                    last_store_id = Some(effect_id);
+                }
+                Event::StoreResult { sink_id, .. } => {
+                    if let Some(effect_id) = last_store_id.take() {
+                        replay.store_results.insert(effect_id, sink_id.clone());
+                    }
+                }
+                Event::StoreError { error, .. } => {
+                    if let Some(effect_id) = last_store_id.take() {
+                        replay.store_errors.insert(effect_id, error.clone());
                     }
                 }
                 _ => {}
@@ -174,6 +225,60 @@ impl IrReplayTrace {
             .get(effect_id)
             .cloned()
             .ok_or_else(|| anyhow!("AgentIR replay missing EvalResult for effect {effect_id}"))
+    }
+
+    fn retrieve_result(&self, location: &EffectLocation, query: &str) -> Result<Value> {
+        let effect_id = &location.effect_id.0;
+        let recorded_query = self.retrieve_queries.get(effect_id).ok_or_else(|| {
+            anyhow!(
+                "AgentIR replay missing RetrieveCall for effect {} at block {:?} instruction {}",
+                effect_id,
+                location.site.block,
+                location.site.instruction_index
+            )
+        })?;
+        if recorded_query != query {
+            return Err(anyhow!(
+                "AgentIR replay diverged at effect {effect_id}: expected Retrieve query {recorded_query:?}, observed {query:?}"
+            ));
+        }
+        if let Some(error) = self.retrieve_errors.get(effect_id) {
+            return Err(anyhow!(
+                "AgentIR replaying recorded Retrieve failure at effect {effect_id}: {error}"
+            ));
+        }
+        self.retrieve_results
+            .get(effect_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("AgentIR replay missing RetrieveResult for effect {effect_id}"))
+    }
+
+    /// Replay never mutates a sink: the recorded id is returned, and the
+    /// recorded payload hash guards against same-site divergence.
+    fn store_result(&self, location: &EffectLocation, content_hash: &str) -> Result<String> {
+        let effect_id = &location.effect_id.0;
+        let recorded_hash = self.store_hashes.get(effect_id).ok_or_else(|| {
+            anyhow!(
+                "AgentIR replay missing StoreCall for effect {} at block {:?} instruction {}",
+                effect_id,
+                location.site.block,
+                location.site.instruction_index
+            )
+        })?;
+        if recorded_hash != content_hash {
+            return Err(anyhow!(
+                "AgentIR replay diverged at effect {effect_id}: Store payload hash changed (recorded {recorded_hash}, observed {content_hash})"
+            ));
+        }
+        if let Some(error) = self.store_errors.get(effect_id) {
+            return Err(anyhow!(
+                "AgentIR replaying recorded Store failure at effect {effect_id}: {error}"
+            ));
+        }
+        self.store_results
+            .get(effect_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("AgentIR replay missing StoreResult for effect {effect_id}"))
     }
 }
 
@@ -699,8 +804,213 @@ async fn execute_instr(
                 serde_json::from_value(value).context("decoding AgentIR Emit event")?;
             config.trace.emit(&event).await?;
         }
+        Instr::Retrieve {
+            out,
+            query,
+            kind,
+            max_bytes,
+        } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Retrieve,
+                site,
+                dynamic_path.clone(),
+            )?;
+            emit_ir_effect(config, &location).await?;
+            let query = string_expr(&machine.env, &query, "Retrieve.query")?;
+            let op_id = config.trace.next_op_id();
+            config
+                .trace
+                .emit(&Event::RetrieveCall {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    parent_op_id: None,
+                    query: query.clone(),
+                    kind: kind.map(|kind| format!("{kind:?}")),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            let started = Instant::now();
+            let result = match ir_replay {
+                Some(replay) => replay.retrieve_result(&location, &query),
+                None => {
+                    let params = crate::hydration::SourceParams {
+                        query: Some(query.clone()),
+                        max_bytes,
+                    };
+                    config
+                        .hydration
+                        .retrieve_query_of_kind(params, kind)
+                        .await
+                        .and_then(|results| serde_json::to_value(results).map_err(Into::into))
+                }
+            };
+            let results = match result {
+                Ok(results) => results,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::RetrieveError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id: None,
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    return Err(err);
+                }
+            };
+            let rendered = results.to_string();
+            config
+                .trace
+                .emit(&Event::RetrieveResult {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    parent_op_id: None,
+                    results: results.clone(),
+                    result_preview: crate::trace::preview(&rendered, 512),
+                    source_count: results.as_array().map_or(0, Vec::len),
+                    bytes: rendered.len(),
+                    duration_ms: millis_u64(started.elapsed()),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            machine.env.insert(out, results);
+        }
+        Instr::Store {
+            out,
+            sink,
+            op: store_op,
+            id,
+            item,
+            policy: _,
+        } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Store,
+                site,
+                dynamic_path.clone(),
+            )?;
+            emit_ir_effect(config, &location).await?;
+            let sink_name = string_expr(&machine.env, &sink, "Store.sink")?;
+            let item_value = eval_expr(&machine.env, &item)?;
+            let id_value = id
+                .map(|id| string_expr(&machine.env, &id, "Store.id"))
+                .transpose()?;
+            // Hash over the payload only (provenance is runtime-attached and
+            // legitimately differs between record and replay).
+            let content_hash = format!("{:x}", Sha256::digest(item_value.to_string().as_bytes()));
+            let op_id = config.trace.next_op_id();
+            config
+                .trace
+                .emit(&Event::StoreCall {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    parent_op_id: None,
+                    sink: sink_name.clone(),
+                    store_op: store_op.name().into(),
+                    item_preview: crate::trace::preview(&item_value.to_string(), 256),
+                    content_hash: content_hash.clone(),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            let started = Instant::now();
+            let result = match ir_replay {
+                // Replay never mutates: the recorded id is the result.
+                Some(replay) => replay.store_result(&location, &content_hash),
+                None => {
+                    execute_store_live(
+                        config,
+                        &location,
+                        &sink_name,
+                        store_op,
+                        id_value.as_deref(),
+                        item_value,
+                    )
+                    .await
+                }
+            };
+            let sink_id = match result {
+                Ok(sink_id) => sink_id,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::StoreError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id: None,
+                            sink: sink_name.clone(),
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    return Err(err);
+                }
+            };
+            config
+                .trace
+                .emit(&Event::StoreResult {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    parent_op_id: None,
+                    sink: sink_name,
+                    sink_id: sink_id.clone(),
+                    duration_ms: millis_u64(started.elapsed()),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            machine.env.insert(out, Value::String(sink_id));
+        }
     }
     Ok(())
+}
+
+/// Execute a live Store against the registry: resolve the sink, enforce its
+/// write policy, attach provenance, run the op. Returns the sink id (for
+/// Update/Delete, the caller-supplied id echoed back).
+async fn execute_store_live(
+    config: &SeqConfig,
+    location: &EffectLocation,
+    sink_name: &str,
+    store_op: crate::ir::StoreOp,
+    id: Option<&str>,
+    payload: Value,
+) -> Result<String> {
+    use crate::hydration::{Provenance, SinkId, SinkItem, SinkWritePolicy};
+
+    let sink = config
+        .hydration
+        .sink(sink_name)
+        .ok_or_else(|| anyhow!("no sink {sink_name:?} registered"))?;
+    if sink.write_policy() == SinkWritePolicy::RequireApproval {
+        return Err(anyhow!(
+            "sink {sink_name:?} requires approval; the approval flow is not implemented yet (docs/MEMORY.md)"
+        ));
+    }
+    let item = SinkItem {
+        payload,
+        provenance: Provenance {
+            run_id: config.trace.run_id().into(),
+            effect_id: Some(location.effect_id.0.clone()),
+            timestamp: Some(Utc::now()),
+        },
+    };
+    match store_op {
+        crate::ir::StoreOp::Create => Ok(sink.store(item).await?.0),
+        crate::ir::StoreOp::Update => {
+            let id = id.ok_or_else(|| anyhow!("Store update requires an id"))?;
+            sink.update(&SinkId(id.into()), item).await?;
+            Ok(id.into())
+        }
+        crate::ir::StoreOp::Delete => {
+            let id = id.ok_or_else(|| anyhow!("Store delete requires an id"))?;
+            sink.delete(&SinkId(id.into())).await?;
+            Ok(id.into())
+        }
+    }
 }
 
 async fn branch_to_block(machine: &mut Machine, block_id: BlockId) -> Result<()> {
@@ -1392,6 +1702,199 @@ mod tests {
         assert!(
             prompts[2].len() < prompt.len(),
             "turn 2's prompt was proactively collected to the learned ceiling"
+        );
+        Ok(())
+    }
+
+    fn memory_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent-ir-memory-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Store a note into the memory sink, then Retrieve it back, in one
+    /// program: the full active write/read round trip of docs/MEMORY.md.
+    fn store_then_retrieve_machine() -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Store {
+                        out: Var("stored".into()),
+                        sink: Expr::Value(Value::String("memory".into())),
+                        op: crate::ir::StoreOp::Create,
+                        id: None,
+                        item: Expr::Value(serde_json::json!({
+                            "name": "round-trip",
+                            "description": "stored by the Store effect",
+                            "body": "the remembered fact",
+                        })),
+                        policy: Default::default(),
+                    },
+                    Instr::Retrieve {
+                        out: Var("hits".into()),
+                        query: Expr::Value(Value::String("remembered fact".into())),
+                        kind: Some(crate::hydration::SourceKind::Semantic),
+                        max_bytes: None,
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("hits".into())),
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("store-retrieve".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_retrieve_effects_round_trip_against_the_memory_backend() -> Result<()> {
+        let dir = memory_dir();
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = config_with_trace(Arc::new(MockProvider::new(vec![])), trace);
+        config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir.clone()));
+
+        let (value, _machine) = run_ir_sequential(&config, store_then_retrieve_machine()).await?;
+
+        let written = std::fs::read_to_string(dir.join("round-trip.md"))?;
+        assert!(
+            written.contains("provenance"),
+            "the runtime attaches provenance: {written}"
+        );
+        let hits = value.as_array().expect("retrieve returns a result list");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("the remembered fact"));
+
+        let events = crate::trace::TraceLogger::read_events(trace_path).await?;
+        let names: Vec<&str> = events.iter().map(|event| event.name()).collect();
+        assert!(names.contains(&"Store"), "{names:?}");
+        assert!(names.contains(&"Retrieve"), "{names:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_store_and_retrieve_never_touch_the_backend() -> Result<()> {
+        let dir = memory_dir();
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = config_with_trace(Arc::new(MockProvider::new(vec![])), trace);
+        config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir.clone()));
+        let (live_value, _) = run_ir_sequential(&config, store_then_retrieve_machine()).await?;
+
+        // Remove the backend entirely: a replay that touched it would
+        // re-create the directory — assert the same result AND an untouched
+        // filesystem.
+        std::fs::remove_dir_all(&dir)?;
+        let events = crate::trace::TraceLogger::read_events(&trace_path).await?;
+        let replay = IrReplayTrace::from_events(&events)?;
+        let replay_trace = test_trace();
+        let mut replay_config =
+            config_with_trace(Arc::new(MockProvider::new(vec![])), replay_trace);
+        replay_config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir.clone()));
+
+        let mut store = InMemoryStore::new();
+        let (replayed_value, _) = run_ir_sequential_with_store_and_replay(
+            &replay_config,
+            store_then_retrieve_machine(),
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+
+        assert_eq!(replayed_value, live_value);
+        assert!(!dir.exists(), "replay must never write to the sink");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_store_detects_payload_divergence() -> Result<()> {
+        let dir = memory_dir();
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = config_with_trace(Arc::new(MockProvider::new(vec![])), trace);
+        config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir.clone()));
+        run_ir_sequential(&config, store_then_retrieve_machine()).await?;
+
+        let _ = trace_path;
+        // Same program (same effect ids), different RUNTIME payload: the
+        // recorded content hash must catch it. An edited program would
+        // change the effect id and miss earlier — dynamic divergence is
+        // exactly what the hash exists for.
+        let mut diverged = store_then_retrieve_machine();
+        if let Some(block) = diverged.program.blocks.get_mut(&BlockId(0)) {
+            // Env-seeded vars are declared as entry params.
+            block.params = vec![Var("note".into())];
+            if let Instr::Store { item, .. } = &mut block.instructions[0] {
+                *item = Expr::Var(Var("note".into()));
+            }
+        }
+        let mut recorded = diverged.clone();
+        recorded.env.insert(
+            Var("note".into()),
+            serde_json::json!({
+                "name": "dynamic",
+                "description": "from env",
+                "body": "recorded payload",
+            }),
+        );
+        let dir2 = memory_dir();
+        let trace2 = test_trace();
+        let trace2_path = trace2.path().clone();
+        let mut config2 = config_with_trace(Arc::new(MockProvider::new(vec![])), trace2);
+        config2.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir2));
+        run_ir_sequential(&config2, recorded).await?;
+        let replay = IrReplayTrace::from_events(
+            &crate::trace::TraceLogger::read_events(&trace2_path).await?,
+        )?;
+
+        diverged.env.insert(
+            Var("note".into()),
+            serde_json::json!({
+                "name": "dynamic",
+                "description": "from env",
+                "body": "a DIFFERENT payload",
+            }),
+        );
+        let mut store = InMemoryStore::new();
+        let err =
+            run_ir_sequential_with_store_and_replay(&config, diverged, &mut store, Some(&replay))
+                .await
+                .expect_err("payload divergence must fail replay");
+        assert!(err.to_string().contains("hash"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_against_unregistered_sink_fails_with_a_clear_error() -> Result<()> {
+        let config = config(Arc::new(MockProvider::new(vec![])));
+        let err = run_ir_sequential(&config, store_then_retrieve_machine())
+            .await
+            .expect_err("no sink registered");
+        assert!(
+            format!("{err:#}").contains("no sink \"memory\" registered"),
+            "{err:#}"
         );
         Ok(())
     }
