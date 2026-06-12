@@ -213,6 +213,10 @@ struct Checkpoint {
     messages: Vec<ChatMessage>,
     trace_path: PathBuf,
     timestamp: DateTime<Utc>,
+    /// The provider context ceiling catch-overflow discovered (t-1151);
+    /// absent in checkpoints written before t-1162.
+    #[serde(default)]
+    discovered_budget: Option<usize>,
 }
 
 struct ReplayOnlyProvider;
@@ -249,6 +253,10 @@ struct Runtime {
     ir_effect_visits: BTreeMap<String, u64>,
     gc_threshold: f32,
     context_budget: usize,
+    /// Session-lived GC state (t-1162): the discovered provider ceiling
+    /// (catch-overflow), frame lifecycles, and the every-N cadence survive
+    /// across turns instead of being relearned per turn.
+    gc_state: agent_core::GcState,
 }
 
 #[tokio::main]
@@ -422,9 +430,9 @@ async fn main() -> Result<()> {
         }
         registry
     };
-    let (history, checkpoint_sequence) = match checkpoint {
-        Some(cp) => (cp.messages, cp.sequence),
-        None => (initial_history(system_prompt), 0),
+    let (history, checkpoint_sequence, resumed_discovered_budget) = match checkpoint {
+        Some(cp) => (cp.messages, cp.sequence, cp.discovered_budget),
+        None => (initial_history(system_prompt), 0, None),
     };
     let config = SeqConfig {
         provider,
@@ -477,6 +485,12 @@ async fn main() -> Result<()> {
         ir_effect_visits: BTreeMap::new(),
         gc_threshold: args.gc_threshold,
         context_budget,
+        gc_state: agent_core::GcState {
+            // The discovered ceiling is knowledge about the provider, not
+            // the process: a resumed session keeps it.
+            discovered_budget: resumed_discovered_budget,
+            ..Default::default()
+        },
     };
 
     tracing::info!(%model, trace = %trace_path.display(), %run_id, provider = %reported_provider_url, "agent runtime starting");
@@ -1111,11 +1125,12 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
     let (response, mut new_history) = {
         let mut machine = agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
         machine.effect_visits = runtime.ir_effect_visits.clone();
-        let (value, machine) = agent_core::run_ir_sequential_with_store_and_replay(
+        let (value, machine) = agent_core::run_ir_sequential_with_gc(
             &runtime.config,
             machine,
             &mut runtime.ir_store,
             runtime.ir_replay.as_ref(),
+            &mut runtime.gc_state,
         )
         .await?;
         runtime.ir_effect_visits = machine.effect_visits.clone();
@@ -1403,6 +1418,7 @@ fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoin
         messages: runtime.history.clone(),
         trace_path: runtime.trace_path.clone(),
         timestamp: Utc::now(),
+        discovered_budget: runtime.gc_state.discovered_budget,
     })
 }
 
@@ -1723,6 +1739,25 @@ mod tests {
         assert!(err.contains("models.yaml"), "got: {err}");
     }
 
+    #[test]
+    fn checkpoint_discovered_budget_round_trips_and_old_checkpoints_load() {
+        // A pre-t-1162 checkpoint has no discovered_budget field.
+        let old = serde_json::json!({
+            "run_id": "run", "sequence": 1, "model": "m",
+            "provider_url": "https://example.com",
+            "messages": [], "trace_path": "/tmp/t.jsonl",
+            "timestamp": "2026-06-12T00:00:00Z",
+        });
+        let loaded: Checkpoint = serde_json::from_value(old).unwrap();
+        assert_eq!(loaded.discovered_budget, None);
+
+        let mut with_budget = loaded;
+        with_budget.discovered_budget = Some(120_000);
+        let round_tripped: Checkpoint =
+            serde_json::from_str(&serde_json::to_string(&with_budget).unwrap()).unwrap();
+        assert_eq!(round_tripped.discovered_budget, Some(120_000));
+    }
+
     #[tokio::test]
     async fn load_checkpoint_repairs_trailing_tool_call() -> Result<()> {
         let path = std::env::temp_dir().join(format!("agent-checkpoint-{}.json", Uuid::new_v4()));
@@ -1745,6 +1780,7 @@ mod tests {
             ],
             trace_path: path.with_extension("jsonl"),
             timestamp: Utc::now(),
+            discovered_budget: None,
         };
         tokio::fs::write(&path, serde_json::to_vec_pretty(&checkpoint)?).await?;
 

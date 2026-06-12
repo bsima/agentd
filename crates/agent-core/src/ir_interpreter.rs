@@ -305,7 +305,25 @@ pub async fn run_ir_sequential_with_store_and_replay(
     store: &mut dyn IrStore,
     ir_replay: Option<&IrReplayTrace>,
 ) -> Result<(Value, Machine)> {
-    match run_ir_steps_with_store_and_replay(config, machine, store, ir_replay, None).await? {
+    let mut gc_state = GcState::default();
+    run_ir_sequential_with_gc(config, machine, store, ir_replay, &mut gc_state).await
+}
+
+/// Like [`run_ir_sequential_with_store_and_replay`], but GC state is owned
+/// by the caller so it survives across loop runs. A session turn is one
+/// loop run; what GC learned during it — the provider's real context
+/// ceiling (`discovered_budget`, t-1151), frame lifecycles, the every-N
+/// cadence — is knowledge about the *session*, not the turn. Resetting it
+/// per turn made catch-overflow pay one failed provider call per user turn
+/// to relearn the same ceiling (t-1162).
+pub async fn run_ir_sequential_with_gc(
+    config: &SeqConfig,
+    machine: Machine,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&IrReplayTrace>,
+    gc_state: &mut GcState,
+) -> Result<(Value, Machine)> {
+    match run_ir_steps_with_gc(config, machine, store, ir_replay, None, gc_state).await? {
         IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
         IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
     }
@@ -323,15 +341,34 @@ pub async fn run_ir_steps(
 
 pub async fn run_ir_steps_with_store_and_replay(
     config: &SeqConfig,
-    mut machine: Machine,
+    machine: Machine,
     store: &mut dyn IrStore,
     ir_replay: Option<&IrReplayTrace>,
     max_instructions: Option<usize>,
 ) -> Result<IrStepOutcome> {
+    let mut gc_state = GcState::default();
+    run_ir_steps_with_gc(
+        config,
+        machine,
+        store,
+        ir_replay,
+        max_instructions,
+        &mut gc_state,
+    )
+    .await
+}
+
+pub async fn run_ir_steps_with_gc(
+    config: &SeqConfig,
+    mut machine: Machine,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&IrReplayTrace>,
+    max_instructions: Option<usize>,
+    gc_state: &mut GcState,
+) -> Result<IrStepOutcome> {
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
     let mut instructions_executed = 0usize;
-    let mut gc_state = GcState::default();
 
     loop {
         if max_instructions.is_some_and(|max| instructions_executed >= max) {
@@ -365,7 +402,7 @@ pub async fn run_ir_steps_with_store_and_replay(
                 dynamic_path,
                 ir_replay,
                 instr,
-                &mut gc_state,
+                gc_state,
             )
             .await?;
             machine.pc += 1;
@@ -1265,6 +1302,96 @@ mod tests {
         assert!(
             prompts[1].len() < prompts[0].len(),
             "the retry prompt must have been collected"
+        );
+        Ok(())
+    }
+
+    fn overflow_test_machine(name: &str, prompt: Vec<ChatMessage>) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![Instr::Infer {
+                    out: Var("a".into()),
+                    model: Expr::Value(Value::String("mock".into())),
+                    prompt: PromptRef::Inline(prompt),
+                    policy: Default::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Field {
+                        base: Var("a".into()),
+                        field: "content".into(),
+                    },
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId(name.into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_budget_survives_across_loop_runs() -> Result<()> {
+        // Turn 1 overflows once and learns the real ceiling; turn 2 (same
+        // caller-owned GcState) must collect proactively and never see a
+        // failed provider call (t-1162).
+        let provider = Arc::new(OverflowProvider::new(
+            1,
+            vec![response("turn-one"), response("turn-two")],
+        ));
+        let mut config = config(provider.clone());
+        config.gc = GcMode::Ring(crate::gc::RingGc::default());
+        config.gc_timing = crate::gc::GcTiming::CatchOverflow;
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..6).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(200)))));
+
+        let mut gc_state = crate::gc::GcState::default();
+        let mut store = InMemoryStore::new();
+        let (value, _) = run_ir_sequential_with_gc(
+            &config,
+            overflow_test_machine("turn-1", prompt.clone()),
+            &mut store,
+            None,
+            &mut gc_state,
+        )
+        .await?;
+        assert_eq!(value, Value::String("turn-one".into()));
+        let ceiling = gc_state
+            .discovered_budget
+            .expect("turn 1 learned the ceiling");
+
+        let mut store = InMemoryStore::new();
+        let (value, _) = run_ir_sequential_with_gc(
+            &config,
+            overflow_test_machine("turn-2", prompt.clone()),
+            &mut store,
+            None,
+            &mut gc_state,
+        )
+        .await?;
+        assert_eq!(value, Value::String("turn-two".into()));
+        assert_eq!(gc_state.discovered_budget, Some(ceiling));
+
+        let prompts = provider.prompts();
+        assert_eq!(
+            prompts.len(),
+            3,
+            "turn 1: overflow + retry; turn 2: exactly one call, no relearning"
+        );
+        assert!(
+            prompts[2].len() < prompt.len(),
+            "turn 2's prompt was proactively collected to the learned ceiling"
         );
         Ok(())
     }
