@@ -6,6 +6,20 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine {
+    agent_loop_ir_with_options(model, prompt, max_turns, false)
+}
+
+/// The agent loop with the model-initiated memory tools (docs/MEMORY.md
+/// settled question 6) toggled by `memory_tools`. Including the tools
+/// changes the program (and so its hash) — callers decide based on whether
+/// a memory backend is registered, and the plain [`agent_loop_ir`] stays
+/// byte-identical for existing fixtures.
+pub fn agent_loop_ir_with_options(
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    memory_tools: bool,
+) -> Machine {
     let entry = BlockId(0);
     let done = BlockId(1);
     let prepare_tools = BlockId(2);
@@ -24,6 +38,12 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let nudge_turn = BlockId(15);
     let route_done = BlockId(16);
     let budget_done = BlockId(17);
+    let remember_dispatch = BlockId(18);
+    let remember_tool = BlockId(19);
+    let recall_dispatch = BlockId(20);
+    let recall_tool = BlockId(21);
+    let remember_store = BlockId(22);
+    let recall_retrieve = BlockId(23);
 
     let history = Var("history".into());
     let turns_left = Var("turns_left".into());
@@ -70,6 +90,18 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
     let next_history = Var("next_history".into());
     let next_i = Var("next_i".into());
     let next_turns_left = Var("next_turns_left".into());
+    let is_remember_tool = Var("is_remember_tool".into());
+    let is_recall_tool = Var("is_recall_tool".into());
+    let memory_name = Var("memory_name".into());
+    let memory_content = Var("memory_content".into());
+    let missing_memory_name = Var("missing_memory_name".into());
+    let missing_memory_content = Var("missing_memory_content".into());
+    let invalid_memory_arguments = Var("invalid_memory_arguments".into());
+    let memory_item = Var("memory_item".into());
+    let stored_id = Var("stored_id".into());
+    let recall_query = Var("recall_query".into());
+    let missing_recall_query = Var("missing_recall_query".into());
+    let recall_hits = Var("recall_hits".into());
 
     let mut blocks = BTreeMap::new();
     blocks.insert(
@@ -481,7 +513,11 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
             terminator: Terminator::If {
                 cond: Expr::Var(is_shell_tool),
                 then_block: shell_tool,
-                else_block: invalid_tool,
+                else_block: if memory_tools {
+                    remember_dispatch
+                } else {
+                    invalid_tool
+                },
             },
         },
     );
@@ -665,7 +701,11 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                 expr: Expr::Value(serde_json::json!({
                     "ok": false,
                     "error": "unknown_tool",
-                    "message": "unknown tool; available tools: shell, infer"
+                    "message": if memory_tools {
+                        "unknown tool; available tools: shell, infer, remember, recall"
+                    } else {
+                        "unknown tool; available tools: shell, infer"
+                    }
                 })),
             }],
             terminator: Terminator::Goto {
@@ -714,7 +754,7 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
                                 field: "id".into(),
                             },
                         ),
-                        ("content".into(), Expr::Var(tool_content)),
+                        ("content".into(), Expr::Var(tool_content.clone())),
                     ])),
                 },
                 Instr::Let {
@@ -761,6 +801,229 @@ pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine 
             },
         },
     );
+
+    if memory_tools {
+        blocks.insert(
+            remember_dispatch,
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Let {
+                    out: is_remember_tool.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(function_name.clone())),
+                        right: Box::new(Expr::Value(Value::String("remember".into()))),
+                    },
+                }],
+                terminator: Terminator::If {
+                    cond: Expr::Var(is_remember_tool),
+                    then_block: remember_tool,
+                    else_block: recall_dispatch,
+                },
+            },
+        );
+        blocks.insert(
+            remember_tool,
+            Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Let {
+                        out: memory_name.clone(),
+                        expr: Expr::StringOr {
+                            value: Box::new(Expr::FieldOr {
+                                base: arguments.clone(),
+                                field: "name".into(),
+                                default: Box::new(Expr::Value(Value::String("".into()))),
+                            }),
+                            default: Box::new(Expr::Value(Value::String("".into()))),
+                        },
+                    },
+                    Instr::Let {
+                        out: memory_content.clone(),
+                        expr: Expr::StringOr {
+                            value: Box::new(Expr::FieldOr {
+                                base: arguments.clone(),
+                                field: "content".into(),
+                                default: Box::new(Expr::Value(Value::String("".into()))),
+                            }),
+                            default: Box::new(Expr::Value(Value::String("".into()))),
+                        },
+                    },
+                    Instr::Let {
+                        out: missing_memory_name.clone(),
+                        expr: Expr::IsEmpty {
+                            base: memory_name.clone(),
+                        },
+                    },
+                    Instr::Let {
+                        out: missing_memory_content.clone(),
+                        expr: Expr::IsEmpty {
+                            base: memory_content.clone(),
+                        },
+                    },
+                    Instr::Let {
+                        out: invalid_memory_arguments.clone(),
+                        expr: Expr::Or {
+                            left: Box::new(Expr::Var(missing_memory_name)),
+                            right: Box::new(Expr::Var(missing_memory_content.clone())),
+                        },
+                    },
+                ],
+                terminator: Terminator::If {
+                    cond: Expr::Var(invalid_memory_arguments),
+                    then_block: invalid_arguments,
+                    else_block: remember_store,
+                },
+            },
+        );
+        blocks.insert(
+            remember_store,
+            Block {
+                params: vec![],
+                instructions: vec![
+                    // The tool schema maps onto the memory sink's payload
+                    // schema; description defaults to the empty string and
+                    // type passes through when given.
+                    Instr::Let {
+                        out: memory_item.clone(),
+                        expr: Expr::Object(BTreeMap::from([
+                            ("name".into(), Expr::Var(memory_name.clone())),
+                            (
+                                "description".into(),
+                                Expr::StringOr {
+                                    value: Box::new(Expr::FieldOr {
+                                        base: arguments.clone(),
+                                        field: "description".into(),
+                                        default: Box::new(Expr::Value(Value::String("".into()))),
+                                    }),
+                                    default: Box::new(Expr::Value(Value::String("".into()))),
+                                },
+                            ),
+                            (
+                                "type".into(),
+                                Expr::FieldOr {
+                                    base: arguments.clone(),
+                                    field: "type".into(),
+                                    default: Box::new(Expr::Value(Value::Null)),
+                                },
+                            ),
+                            ("body".into(), Expr::Var(memory_content.clone())),
+                        ])),
+                    },
+                    Instr::Store {
+                        out: stored_id.clone(),
+                        sink: Expr::Value(Value::String("memory".into())),
+                        op: crate::ir::StoreOp::Create,
+                        id: None,
+                        item: Expr::Var(memory_item),
+                        policy: Default::default(),
+                    },
+                    Instr::Let {
+                        out: tool_content.clone(),
+                        expr: Expr::ToString {
+                            value: Box::new(Expr::Var(stored_id)),
+                        },
+                    },
+                ],
+                terminator: Terminator::Goto {
+                    block: append_tool,
+                    args: vec![Expr::Var(tool_content.clone())],
+                },
+            },
+        );
+        blocks.insert(
+            recall_dispatch,
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Let {
+                    out: is_recall_tool.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(function_name.clone())),
+                        right: Box::new(Expr::Value(Value::String("recall".into()))),
+                    },
+                }],
+                terminator: Terminator::If {
+                    cond: Expr::Var(is_recall_tool),
+                    then_block: recall_tool,
+                    else_block: invalid_tool,
+                },
+            },
+        );
+        blocks.insert(
+            recall_tool,
+            Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Let {
+                        out: recall_query.clone(),
+                        expr: Expr::StringOr {
+                            value: Box::new(Expr::FieldOr {
+                                base: arguments.clone(),
+                                field: "query".into(),
+                                default: Box::new(Expr::Value(Value::String("".into()))),
+                            }),
+                            default: Box::new(Expr::Value(Value::String("".into()))),
+                        },
+                    },
+                    Instr::Let {
+                        out: missing_recall_query.clone(),
+                        expr: Expr::IsEmpty {
+                            base: recall_query.clone(),
+                        },
+                    },
+                ],
+                terminator: Terminator::If {
+                    cond: Expr::Var(missing_recall_query),
+                    then_block: invalid_arguments,
+                    else_block: recall_retrieve,
+                },
+            },
+        );
+        blocks.insert(
+            recall_retrieve,
+            Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Retrieve {
+                        out: recall_hits.clone(),
+                        query: Expr::Var(recall_query),
+                        kind: Some(crate::hydration::SourceKind::Semantic),
+                        max_bytes: Some(16 * 1024),
+                    },
+                    Instr::Let {
+                        out: tool_content.clone(),
+                        expr: Expr::ToString {
+                            value: Box::new(Expr::Var(recall_hits)),
+                        },
+                    },
+                ],
+                terminator: Terminator::Goto {
+                    block: append_tool,
+                    args: vec![Expr::Var(tool_content.clone())],
+                },
+            },
+        );
+    } else {
+        let _ = (
+            remember_dispatch,
+            remember_tool,
+            recall_dispatch,
+            recall_tool,
+            remember_store,
+            recall_retrieve,
+            is_remember_tool,
+            is_recall_tool,
+            memory_name,
+            memory_content,
+            missing_memory_name,
+            missing_memory_content,
+            invalid_memory_arguments,
+            memory_item,
+            stored_id,
+            recall_query,
+            missing_recall_query,
+            recall_hits,
+        );
+    }
 
     Machine {
         program: Program {
@@ -1188,6 +1451,193 @@ mod tests {
 
         assert_eq!(value["content"], Value::String("recovered".into()));
         Ok(())
+    }
+
+    fn memory_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent-loop-memory-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn memory_config(provider: Arc<dyn ChatProvider>, dir: std::path::PathBuf) -> SeqConfig {
+        let mut config = config(provider);
+        config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir));
+        config
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_remember_then_recall_round_trips() -> Result<()> {
+        let dir = memory_dir();
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "remember",
+                    serde_json::json!({
+                        "name": "deploy-window",
+                        "description": "when deploys are allowed",
+                        "type": "project",
+                        "content": "deploys only on tuesdays",
+                    }),
+                )],
+            ),
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-2",
+                    "recall",
+                    serde_json::json!({ "query": "when can we deploy" }),
+                )],
+            ),
+            response("deploys happen on tuesdays", vec![]),
+        ]));
+        let config = memory_config(provider.clone(), dir.clone());
+        let machine = agent_loop_ir_with_options(
+            Model("mock".into()),
+            vec![ChatMessage::user("note the deploy window, then check it")],
+            8,
+            true,
+        );
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+        let response: Response = serde_json::from_value(value)?;
+        assert_eq!(response.content, "deploys happen on tuesdays");
+
+        // The remember call wrote a real memory file...
+        assert!(dir.join("deploy-window.md").exists());
+        // ...the remember tool result echoed the sink id...
+        let prompts = provider.prompts();
+        let remember_result = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("remember tool result fed back");
+        assert!(
+            remember_result
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("deploy-window"),
+            "{remember_result:?}"
+        );
+        // ...and the recall tool result carried the stored fact back in.
+        let recall_result = prompts[2]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-2"))
+            .expect("recall tool result fed back");
+        assert!(
+            recall_result
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("deploys only on tuesdays"),
+            "{recall_result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_remember_with_missing_arguments_does_not_abort_turn() -> Result<()> {
+        let dir = memory_dir();
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "remember",
+                    serde_json::json!({ "content": "fact without a name" }),
+                )],
+            ),
+            response("noted the problem", vec![]),
+        ]));
+        let config = memory_config(provider.clone(), dir.clone());
+        let machine = agent_loop_ir_with_options(
+            Model("mock".into()),
+            vec![ChatMessage::user("remember badly")],
+            4,
+            true,
+        );
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+        let response: Response = serde_json::from_value(value)?;
+        assert_eq!(response.content, "noted the problem");
+
+        let prompts = provider.prompts();
+        let tool_result = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("invalid-arguments result fed back");
+        assert!(
+            tool_result
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("invalid_arguments"),
+            "{tool_result:?}"
+        );
+        assert!(
+            std::fs::read_dir(&dir)?.next().is_none(),
+            "nothing was written"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_without_memory_tools_treats_remember_as_unknown() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "remember",
+                    serde_json::json!({ "name": "x", "content": "y" }),
+                )],
+            ),
+            response("ok", vec![]),
+        ]));
+        let config = config(provider.clone());
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::user("hallucinate a tool")],
+            4,
+        );
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+        let response: Response = serde_json::from_value(value)?;
+        assert_eq!(response.content, "ok");
+
+        let prompts = provider.prompts();
+        let tool_result = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("unknown-tool result fed back");
+        assert!(
+            tool_result
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("unknown_tool"),
+            "{tool_result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_tools_only_change_the_program_when_enabled() {
+        let plain = agent_loop_ir(Model("m".into()), vec![], 4);
+        let plain_again = agent_loop_ir_with_options(Model("m".into()), vec![], 4, false);
+        assert_eq!(
+            crate::ir::program_hash(&plain.program).unwrap(),
+            crate::ir::program_hash(&plain_again.program).unwrap(),
+            "the default loop is byte-identical with tools off"
+        );
+        let with_tools = agent_loop_ir_with_options(Model("m".into()), vec![], 4, true);
+        assert_ne!(
+            crate::ir::program_hash(&plain.program).unwrap(),
+            crate::ir::program_hash(&with_tools.program).unwrap(),
+        );
+        validate_program(&with_tools.program).expect("tool variant validates");
     }
 
     #[tokio::test]

@@ -1217,7 +1217,19 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
     runtime.history.push(ChatMessage::user(message));
     let prompt = runtime.history.clone();
     let (response, mut new_history) = {
-        let mut machine = agent_loop_ir(runtime.model.clone(), prompt.clone(), runtime.max_turns);
+        // The remember/recall tools ride with the memory backend (settled
+        // question 6): registering --memory-dir changes the loop program.
+        let memory_tools = !runtime
+            .config
+            .hydration
+            .sinks_of_kind(agent_core::SourceKind::Semantic)
+            .is_empty();
+        let mut machine = agent_core::agent_loop_ir_with_options(
+            runtime.model.clone(),
+            prompt.clone(),
+            runtime.max_turns,
+            memory_tools,
+        );
         machine.effect_visits = runtime.ir_effect_visits.clone();
         let (value, machine) = agent_core::run_ir_sequential_with_gc(
             &runtime.config,

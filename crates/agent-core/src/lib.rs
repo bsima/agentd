@@ -30,7 +30,7 @@ pub use ir::{
     Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program, ProgramHash, ProgramId,
     PromptRef, Terminator, Var,
 };
-pub use ir_agent::agent_loop_ir;
+pub use ir_agent::{agent_loop_ir, agent_loop_ir_with_options};
 pub use ir_interpreter::{
     run_ir_sequential, run_ir_sequential_with_gc, run_ir_sequential_with_store,
     run_ir_sequential_with_store_and_replay, run_ir_steps, run_ir_steps_with_gc,

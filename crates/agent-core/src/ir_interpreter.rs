@@ -623,7 +623,7 @@ async fn execute_instr(
                         None => {
                             config
                                 .provider
-                                .chat(&Model(model.clone()), &ir_tool_specs(), &prompt)
+                                .chat(&Model(model.clone()), &ir_tool_specs(config), &prompt)
                                 .await
                         }
                     },
@@ -1055,7 +1055,65 @@ async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -
     Ok(())
 }
 
-fn ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
+/// Tool list shown to the provider: shell + infer always; remember/recall
+/// appear automatically whenever a memory backend is registered (settled
+/// question 6 — an unreachable sink is a trap, so registration IS the
+/// exposure switch).
+fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
+    let mut specs = base_ir_tool_specs();
+    if !config
+        .hydration
+        .sinks_of_kind(crate::hydration::SourceKind::Semantic)
+        .is_empty()
+    {
+        specs.push(crate::provider::ToolSpec {
+            kind: "function".into(),
+            function: crate::provider::ToolFunctionSpec {
+                name: "remember".into(),
+                description: "Save a fact to persistent memory for future sessions. \
+                              Use when something is worth keeping beyond this conversation."
+                    .into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "kebab-case slug identifying the memory"
+                        },
+                        "content": { "type": "string", "description": "the fact to keep" },
+                        "description": {
+                            "type": "string",
+                            "description": "one-line summary used for recall relevance"
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["user", "feedback", "project", "reference"]
+                        }
+                    },
+                    "required": ["name", "content"]
+                }),
+            },
+        });
+        specs.push(crate::provider::ToolSpec {
+            kind: "function".into(),
+            function: crate::provider::ToolFunctionSpec {
+                name: "recall".into(),
+                description: "Search persistent memory by keywords and return matching notes."
+                    .into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        });
+    }
+    specs
+}
+
+fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
     vec![
         crate::provider::ToolSpec {
             kind: "function".into(),
@@ -1897,6 +1955,25 @@ mod tests {
             "{err:#}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn memory_tools_ride_with_backend_registration() {
+        let bare = config(Arc::new(MockProvider::new(vec![])));
+        let names: Vec<String> = ir_tool_specs(&bare)
+            .iter()
+            .map(|spec| spec.function.name.clone())
+            .collect();
+        assert_eq!(names, vec!["shell", "infer"]);
+
+        let mut with_memory = config(Arc::new(MockProvider::new(vec![])));
+        with_memory.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(memory_dir()));
+        let names: Vec<String> = ir_tool_specs(&with_memory)
+            .iter()
+            .map(|spec| spec.function.name.clone())
+            .collect();
+        assert_eq!(names, vec!["shell", "infer", "remember", "recall"]);
     }
 
     #[tokio::test]
