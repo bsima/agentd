@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod chat_history;
 pub mod gc;
 pub mod hydration;
 pub mod interpreter;
@@ -14,6 +15,7 @@ pub mod temporal;
 pub mod trace;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use chat_history::ChatHistory;
 pub use gc::{
     estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
     GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,

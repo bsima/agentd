@@ -48,7 +48,7 @@ fn state_path_put_then_get_same_key() {
     let scenario = Scenario {
         name: "state-put-get",
         prompt: "Use the shell tool once for a tiny deterministic check: run `printf runtime_state_probe`. Then finish with a concise answer. This should exercise the agent's state path around tool execution.".to_owned(),
-        predicate: has_session_state_checkpoint_put,
+        predicate: has_session_checkpoint,
     };
     assert_scenario_passes(&config, scenario, RUNS_PER_SCENARIO, PASS_THRESHOLD);
 }
@@ -227,12 +227,13 @@ fn has_nested_infer_call(events: &[Event]) -> bool {
     false
 }
 
-fn has_session_state_checkpoint_put(events: &[Event]) -> bool {
+fn has_session_checkpoint(events: &[Event]) -> bool {
     // The IR loop keeps history in the machine env, so the durable state
-    // path per turn is the session:state checkpoint Put.
+    // path per turn is the turn-completion checkpoint — now a passive
+    // ChatHistory sink write (t-1181), traced as a Checkpoint event.
     events
         .iter()
-        .any(|event| matches!(event, Event::PutCall { key, .. } if key == "session:state"))
+        .any(|event| matches!(event, Event::Checkpoint { .. }))
 }
 
 fn has_eval_call(events: &[Event]) -> bool {

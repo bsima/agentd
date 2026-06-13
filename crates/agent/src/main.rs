@@ -1,7 +1,7 @@
 use agent_core::{
-    agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatMessage, EnvPolicy,
-    EvalConfig, Event, GcMode, GcTiming, HydrationSource, InMemoryStore, IrReplayTrace,
-    JsonlTraceSink, MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink,
+    agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatHistory, ChatMessage,
+    EnvPolicy, EvalConfig, Event, GcMode, GcTiming, HydrationSink, HydrationSource, InMemoryStore,
+    IrReplayTrace, JsonlTraceSink, MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink,
     PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc,
     SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult,
     StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
@@ -249,7 +249,6 @@ struct Runtime {
     provider_url: String,
     trace_path: PathBuf,
     checkpoint_dir: Option<PathBuf>,
-    checkpoint_path: Option<PathBuf>,
     checkpoint_sequence: u64,
     history: Vec<ChatMessage>,
     debug: bool,
@@ -257,8 +256,6 @@ struct Runtime {
     ir_store: InMemoryStore,
     ir_replay: Option<IrReplayTrace>,
     ir_effect_visits: BTreeMap<String, u64>,
-    gc_threshold: f32,
-    context_budget: usize,
     /// Session-lived GC state (t-1162): the discovered provider ceiling
     /// (catch-overflow), frame lifecycles, and the every-N cadence survive
     /// across turns instead of being relearned per turn.
@@ -485,7 +482,6 @@ async fn main() -> Result<()> {
         provider_url: reported_provider_url.clone(),
         trace_path: trace_path.clone(),
         checkpoint_dir: args.checkpoint_dir,
-        checkpoint_path,
         checkpoint_sequence,
         history,
         debug: args.debug,
@@ -493,8 +489,6 @@ async fn main() -> Result<()> {
         ir_store: InMemoryStore::new(),
         ir_replay,
         ir_effect_visits: BTreeMap::new(),
-        gc_threshold: args.gc_threshold,
-        context_budget,
         gc_state: agent_core::GcState {
             // The discovered ceiling is knowledge about the provider, not
             // the process: a resumed session keeps it.
@@ -1271,8 +1265,7 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
         );
     }
     runtime.history = new_history;
-    put_checkpoint(runtime).await?;
-    save_checkpoint(runtime).await?;
+    persist_session(runtime).await;
     Ok(response)
 }
 
@@ -1443,73 +1436,75 @@ async fn emit_custom_event(
     Ok(())
 }
 
-async fn put_checkpoint(runtime: &mut Runtime) -> Result<()> {
-    let Some(path) = runtime.checkpoint_path.clone() else {
-        return Ok(());
+/// Persist the session at turn completion via the ChatHistory sink
+/// (docs/MEMORY.md, t-1181). This is the design's passive-sink channel:
+/// runtime-initiated at a lifecycle point, outside the program's effect
+/// stream, suppressed under replay, and failures log-and-continue — a
+/// failing sink must never fail the turn. It absorbs the former
+/// put_checkpoint (a redundant session:state Put, removed) and writes the
+/// exact same files and schema as before, so the Haskell agentd and the
+/// persistence eval are unaffected.
+async fn persist_session(runtime: &mut Runtime) {
+    let Some(dir) = runtime.checkpoint_dir.clone() else {
+        return;
     };
-    let Some(checkpoint) = checkpoint_from_runtime(runtime, runtime.checkpoint_sequence + 1) else {
-        tracing::warn!(run_id = %runtime.run_id, "skipping session:state checkpoint with pending tool calls");
-        return Ok(());
-    };
-    let value = serde_json::to_value(checkpoint)?;
-    let config = SeqConfig {
-        provider: runtime.config.provider.clone(),
-        hydration: runtime.config.hydration.clone(),
-        passive_hydration: PassiveHydrationConfig::default(),
-        checkpoint_path: Some(path),
-        trace: runtime.trace.clone(),
-        eval: runtime.config.eval.clone(),
-        replay: runtime.config.replay.clone(),
-        trace_full_prompt_ir: runtime.config.trace_full_prompt_ir,
-        trace_full_payloads: runtime.config.trace_full_payloads,
-        gc: GcMode::None,
-        gc_threshold: runtime.gc_threshold,
-        gc_log: false,
-        gc_timing: GcTiming::Threshold,
-        context_budget: runtime.context_budget,
-    };
-    let _ = agent_core::run_sequential(
-        &config,
-        runtime.history.clone(),
-        agent_core::put("session:state", value),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn save_checkpoint(runtime: &mut Runtime) -> Result<()> {
-    let Some(dir) = &runtime.checkpoint_dir else {
-        return Ok(());
-    };
+    // Replay re-runs a recorded session deterministically; writing would
+    // clobber the real session's checkpoint with replayed state.
+    if runtime.ir_replay.is_some() || runtime.config.replay.is_some() {
+        return;
+    }
     let sequence = runtime.checkpoint_sequence + 1;
     let Some(checkpoint) = checkpoint_from_runtime(runtime, sequence) else {
         tracing::warn!(run_id = %runtime.run_id, "skipping checkpoint with pending tool calls");
-        return Ok(());
+        return;
     };
-    runtime.checkpoint_sequence = sequence;
-    tokio::fs::create_dir_all(dir).await?;
-    let bytes = serde_json::to_vec_pretty(&checkpoint)?;
-    let path = dir.join(format!(
-        "checkpoint-{:06}-{}.json",
-        checkpoint.sequence, runtime.run_id
-    ));
-    tokio::fs::write(&path, &bytes).await?;
-    tokio::fs::write(dir.join("latest.json"), &bytes).await?;
-    tokio::fs::write(dir.join("session-latest.json"), bytes).await?;
-    runtime
-        .trace
-        .emit(&Event::Checkpoint {
-            run_id: runtime.run_id.clone(),
-            name: format!("checkpoint-{:06}", checkpoint.sequence),
-            path: Some(path.display().to_string()),
-            timestamp: Utc::now(),
+    let payload = match serde_json::to_value(&checkpoint) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(run_id = %runtime.run_id, error = %err, "serializing checkpoint");
+            return;
+        }
+    };
+    let sink = ChatHistory::new(dir);
+    match sink
+        .store(agent_core::SinkItem {
+            payload,
+            provenance: agent_core::Provenance {
+                run_id: runtime.run_id.clone(),
+                effect_id: None,
+                timestamp: Some(Utc::now()),
+            },
         })
-        .await?;
-    tracing::info!(run_id = %runtime.run_id, checkpoint = %path.display(), "checkpoint saved");
-    if runtime.debug {
-        eprintln!("checkpoint: {}", path.display());
+        .await
+    {
+        Ok(_) => {
+            runtime.checkpoint_sequence = sequence;
+            let name = format!("checkpoint-{sequence:06}");
+            if let Err(err) = runtime
+                .trace
+                .emit(&Event::Checkpoint {
+                    run_id: runtime.run_id.clone(),
+                    name: name.clone(),
+                    path: runtime
+                        .checkpoint_dir
+                        .as_ref()
+                        .map(|dir| dir.join("session-latest.json").display().to_string()),
+                    timestamp: Utc::now(),
+                })
+                .await
+            {
+                tracing::error!(run_id = %runtime.run_id, error = %err, "emitting checkpoint event");
+            }
+            tracing::info!(run_id = %runtime.run_id, %name, "checkpoint saved");
+            if runtime.debug {
+                eprintln!("checkpoint: {name}");
+            }
+        }
+        Err(err) => {
+            // Log-and-continue: a failed passive write must not fail the turn.
+            tracing::error!(run_id = %runtime.run_id, error = %format!("{err:#}"), "checkpoint write failed");
+        }
     }
-    Ok(())
 }
 
 fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoint> {
@@ -1896,6 +1891,43 @@ mod tests {
         assert_eq!(repaired.messages.len(), 2);
         let on_disk: Checkpoint = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
         assert_eq!(on_disk.messages.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_history_sink_write_resumes_through_load_checkpoint() -> Result<()> {
+        // The cross-boundary contract of t-1181: a checkpoint written by the
+        // ChatHistory sink (the passive turn-completion path) is byte-schema
+        // compatible with the resume reader, so --resume keeps working.
+        let dir = std::env::temp_dir().join(format!("agent-resume-{}", Uuid::new_v4()));
+        let checkpoint = Checkpoint {
+            run_id: "run-resume".into(),
+            sequence: 4,
+            model: "model".into(),
+            provider_url: "https://chatgpt.com/backend-api".into(),
+            messages: vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("remember this"),
+                ChatMessage::assistant(Some("noted".into()), vec![]),
+            ],
+            trace_path: dir.join("trace.jsonl"),
+            timestamp: Utc::now(),
+            discovered_budget: Some(123_000),
+        };
+
+        let sink = ChatHistory::new(dir.clone());
+        sink.store(agent_core::SinkItem {
+            payload: serde_json::to_value(&checkpoint)?,
+            provenance: Default::default(),
+        })
+        .await?;
+
+        // session-latest.json is what --resume reads.
+        let resumed = load_checkpoint(&dir.join("session-latest.json")).await?;
+        assert_eq!(resumed.run_id, "run-resume");
+        assert_eq!(resumed.sequence, 4);
+        assert_eq!(resumed.discovered_budget, Some(123_000));
+        assert_eq!(resumed.messages.len(), 3);
         Ok(())
     }
 }
