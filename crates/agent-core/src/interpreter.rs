@@ -1,8 +1,5 @@
 use crate::gc::{estimate_tokens, truncate_oversized_message, GcMode, GcState, GcTiming};
-use crate::hydration::{
-    PassiveHydrationConfig, PassiveSource, SourceParams, SourceRegistry, SEMANTIC_PREFIX,
-    SESSION_STATE_KEY, TEMPORAL_PREFIX,
-};
+use crate::hydration::{PassiveHydrationConfig, PassiveSource, SourceParams, SourceRegistry};
 use crate::op::{ChatMessage, Op, OpF, Prompt, Response};
 use crate::prompt_ir::{compile_prompt_ir, PromptIR, RetrievalTiming, Section};
 use crate::provider::{ChatProvider, ToolFunctionSpec, ToolSpec};
@@ -212,7 +209,6 @@ pub struct SeqConfig {
     pub provider: Arc<dyn ChatProvider>,
     pub hydration: SourceRegistry,
     pub passive_hydration: PassiveHydrationConfig,
-    pub checkpoint_path: Option<PathBuf>,
     pub trace: TraceLogger,
     pub eval: EvalConfig,
     pub replay: Option<ReplayTrace>,
@@ -429,60 +425,6 @@ where
                 })
                 .await?;
             run_sequential_inner(config, state, next(result), gc_state, parent_op_id).await
-        }
-        OpF::Get { key, next } => {
-            let op_id = config.trace.next_op_id();
-            config
-                .trace
-                .emit(&Event::GetCall {
-                    run_id: config.trace.run_id().into(),
-                    op_id,
-                    parent_op_id,
-                    key: key.clone(),
-                    timestamp: Utc::now(),
-                })
-                .await?;
-            let value = dispatch_get(config, &state, &key).await?;
-            config
-                .trace
-                .emit(&Event::GetResult {
-                    run_id: config.trace.run_id().into(),
-                    op_id,
-                    parent_op_id,
-                    key,
-                    source_count: value.as_array().map(Vec::len).unwrap_or(0),
-                    value_preview: preview(&value.to_string(), 512),
-                    value: config.trace_full_payloads.then(|| value.clone()),
-                    timestamp: Utc::now(),
-                })
-                .await?;
-            run_sequential_inner(config, state, next(value), gc_state, parent_op_id).await
-        }
-        OpF::Put { key, value, next } => {
-            let op_id = config.trace.next_op_id();
-            config
-                .trace
-                .emit(&Event::PutCall {
-                    run_id: config.trace.run_id().into(),
-                    op_id,
-                    parent_op_id,
-                    key: key.clone(),
-                    value_preview: preview(&value.to_string(), 512),
-                    timestamp: Utc::now(),
-                })
-                .await?;
-            let state = dispatch_put(config, state, &key, value).await?;
-            config
-                .trace
-                .emit(&Event::PutResult {
-                    run_id: config.trace.run_id().into(),
-                    op_id,
-                    parent_op_id,
-                    key,
-                    timestamp: Utc::now(),
-                })
-                .await?;
-            run_sequential_inner(config, state, next, gc_state, parent_op_id).await
         }
         OpF::Emit { event, next } => {
             config.trace.emit(&event).await?;
@@ -887,61 +829,6 @@ where
     Ok(prompt)
 }
 
-pub(crate) async fn dispatch_get<S>(config: &SeqConfig, state: &S, key: &str) -> Result<Value>
-where
-    S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-{
-    if key.starts_with(TEMPORAL_PREFIX) {
-        return serde_json::to_value(state).map_err(Into::into);
-    }
-    if key.starts_with(SEMANTIC_PREFIX) {
-        let query = key.trim_start_matches(SEMANTIC_PREFIX);
-        let results = config
-            .hydration
-            .retrieve_query(SourceParams::new(query))
-            .await?;
-        return serde_json::to_value(results).map_err(Into::into);
-    }
-    if key == SESSION_STATE_KEY {
-        let Some(path) = &config.checkpoint_path else {
-            return Ok(Value::Null);
-        };
-        match tokio::fs::read_to_string(path).await {
-            Ok(content) => serde_json::from_str(&content).map_err(Into::into),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
-            Err(err) => Err(err.into()),
-        }
-    } else {
-        Err(anyhow!("unknown Get key: {key}"))
-    }
-}
-
-pub(crate) async fn dispatch_put<S>(
-    config: &SeqConfig,
-    state: S,
-    key: &str,
-    value: Value,
-) -> Result<S>
-where
-    S: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-{
-    if key.starts_with(TEMPORAL_PREFIX) {
-        return serde_json::from_value(value).map_err(Into::into);
-    }
-    if key == SESSION_STATE_KEY {
-        let Some(path) = &config.checkpoint_path else {
-            return Ok(state);
-        };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(path, serde_json::to_vec_pretty(&value)?).await?;
-        Ok(state)
-    } else {
-        Err(anyhow!("unknown Put key: {key}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,7 +961,6 @@ mod tests {
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
@@ -1110,7 +996,6 @@ mod tests {
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -1160,7 +1045,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -1387,7 +1271,6 @@ mod tests {
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
@@ -1401,7 +1284,7 @@ mod tests {
         };
         let prompt = vec![ChatMessage::user("use echo")];
 
-        let (result, state) = run_sequential(
+        let (result, _state) = run_sequential(
             &config,
             prompt.clone(),
             agent_loop(Model("mock".into()), prompt, 4),
@@ -1410,7 +1293,10 @@ mod tests {
 
         assert_eq!(result.content, "done");
         assert_eq!(provider.prompt_count(), 2);
-        assert!(state.iter().any(|msg| msg.role == "tool"));
+        // History threads through the continuation (t-1182): the second
+        // inference sees the tool result fed back.
+        let prompts = provider.prompts();
+        assert!(prompts[1].iter().any(|msg| msg.role == "tool"));
         Ok(())
     }
 
@@ -1439,7 +1325,6 @@ mod tests {
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
@@ -1453,7 +1338,7 @@ mod tests {
         };
         let prompt = vec![ChatMessage::user("do two steps")];
 
-        let (result, state) = run_sequential(
+        let (result, _state) = run_sequential(
             &config,
             prompt.clone(),
             agent_loop(Model("mock".into()), prompt, 4),
@@ -1462,7 +1347,12 @@ mod tests {
 
         assert_eq!(result.content, "finished");
         assert_eq!(provider.prompt_count(), 3);
-        assert_eq!(state.iter().filter(|msg| msg.role == "tool").count(), 2);
+        // By the final inference both tool results have been fed back.
+        let prompts = provider.prompts();
+        assert_eq!(
+            prompts[2].iter().filter(|msg| msg.role == "tool").count(),
+            2
+        );
         Ok(())
     }
 
@@ -1478,7 +1368,6 @@ mod tests {
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -1527,40 +1416,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn get_put_and_par_are_interpreted_sequentially() -> Result<()> {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let config = SeqConfig {
-            provider,
-            hydration: SourceRegistry::new(),
-            passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
-            trace: test_trace(),
-            eval: EvalConfig::default(),
-            replay: None,
-            trace_full_prompt_ir: false,
-            trace_full_payloads: false,
-            gc: GcMode::None,
-            gc_threshold: 0.85,
-            gc_log: false,
-            gc_timing: GcTiming::Threshold,
-            context_budget: 200_000,
-        };
-        let program = crate::op::put("temporal:history", json!(1))
-            .and_then(|_| {
-                crate::op::par(vec![
-                    crate::op::put("temporal:history", json!(2)),
-                    crate::op::put("temporal:history", json!(3)),
-                ])
-            })
-            .and_then(|_| crate::op::get("temporal:history"));
-
-        let (result, state) = run_sequential(&config, 0, program).await?;
-
-        assert_eq!(result, json!(3));
-        assert_eq!(state, 3);
-        Ok(())
-    }
     struct StaticSource {
         name: &'static str,
         kind: SourceKind,
@@ -1595,76 +1450,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_get_reads_checkpoint_json() -> Result<()> {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let path = std::env::temp_dir().join(format!("agent-core-session-{}.json", Uuid::new_v4()));
-        tokio::fs::write(&path, serde_json::to_vec(&json!({ "checkpoint": 7 }))?).await?;
-        let config = SeqConfig {
-            provider,
-            hydration: SourceRegistry::new(),
-            passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: Some(path),
-            trace: test_trace(),
-            eval: EvalConfig::default(),
-            replay: None,
-            trace_full_prompt_ir: false,
-            trace_full_payloads: false,
-            gc: GcMode::None,
-            gc_threshold: 0.85,
-            gc_log: false,
-            gc_timing: GcTiming::Threshold,
-            context_budget: 200_000,
-        };
-
-        let initial_state = vec![ChatMessage::user("state")];
-        let (value, state) = run_sequential(
-            &config,
-            initial_state.clone(),
-            crate::op::get("session:state"),
-        )
-        .await?;
-
-        assert_eq!(value, json!({ "checkpoint": 7 }));
-        assert_eq!(state, initial_state);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn session_state_put_writes_checkpoint_json() -> Result<()> {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let path = std::env::temp_dir().join(format!("agent-core-session-{}.json", Uuid::new_v4()));
-        let config = SeqConfig {
-            provider,
-            hydration: SourceRegistry::new(),
-            passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: Some(path.clone()),
-            trace: test_trace(),
-            eval: EvalConfig::default(),
-            replay: None,
-            trace_full_prompt_ir: false,
-            trace_full_payloads: false,
-            gc: GcMode::None,
-            gc_threshold: 0.85,
-            gc_log: false,
-            gc_timing: GcTiming::Threshold,
-            context_budget: 200_000,
-        };
-
-        let initial_state = vec![ChatMessage::user("state")];
-        let (_, state) = run_sequential(
-            &config,
-            initial_state.clone(),
-            crate::op::put("session:state", json!({ "checkpoint": 8 })),
-        )
-        .await?;
-        let content: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-
-        assert_eq!(content, json!({ "checkpoint": 8 }));
-        assert_eq!(state, initial_state);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn infer_injects_configured_passive_context_without_agent_get() -> Result<()> {
         let provider = Arc::new(MockProvider::new(vec![response("ok", vec![])]));
         let queries = Arc::new(Mutex::new(Vec::new()));
@@ -1680,7 +1465,6 @@ mod tests {
             passive_hydration: PassiveHydrationConfig::with_sources([
                 PassiveSource::SessionContext,
             ]),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: None,
@@ -1723,7 +1507,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig {
                 shell: "/bin/sh".into(),
@@ -1885,7 +1668,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig {
                 shell: "/bin/sh".into(),
@@ -1929,7 +1711,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -1964,7 +1745,6 @@ mod tests {
             provider: record_provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: record_trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -1986,7 +1766,6 @@ mod tests {
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: Some(replay),
@@ -2014,7 +1793,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -2026,31 +1804,20 @@ mod tests {
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
         };
-        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
-            .and_then(|_| crate::op::get("temporal:history"));
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
 
         let _ = run_sequential(&config, vec![ChatMessage::user("hello")], program).await?;
 
         let events = TraceLogger::read_events(trace_path).await?;
         for event in &events {
-            match event {
-                Event::InferCall {
-                    prompt,
-                    prompt_preview,
-                    ..
-                } => {
-                    assert!(prompt.is_none(), "full prompt must be opt-in");
-                    assert!(!prompt_preview.is_empty());
-                }
-                Event::GetResult {
-                    value,
-                    value_preview,
-                    ..
-                } => {
-                    assert!(value.is_none(), "full Get value must be opt-in");
-                    assert!(!value_preview.is_empty());
-                }
-                _ => {}
+            if let Event::InferCall {
+                prompt,
+                prompt_preview,
+                ..
+            } = event
+            {
+                assert!(prompt.is_none(), "full prompt must be opt-in");
+                assert!(!prompt_preview.is_empty());
             }
         }
         Ok(())
@@ -2065,7 +1832,6 @@ mod tests {
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: record_trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -2101,7 +1867,6 @@ mod tests {
             provider: live_provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: test_trace(),
             eval: EvalConfig::default(),
             replay: Some(replay),
@@ -2133,7 +1898,6 @@ mod tests {
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig {
                 shell: "/nonexistent-shell-for-eval-error-test".into(),
@@ -2159,40 +1923,6 @@ mod tests {
             ),
             "failed eval must record an EvalError event: {events:?}"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn active_semantic_get_uses_query_capable_backend() -> Result<()> {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let queries = Arc::new(Mutex::new(Vec::new()));
-        let config = SeqConfig {
-            provider,
-            hydration: SourceRegistry::new().register(StaticSource {
-                name: "semantic-store",
-                kind: SourceKind::Semantic,
-                capabilities: SourceCapability::QUERY,
-                content: "semantic result",
-                queries: queries.clone(),
-            }),
-            passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
-            trace: test_trace(),
-            eval: EvalConfig::default(),
-            replay: None,
-            trace_full_prompt_ir: false,
-            trace_full_payloads: false,
-            gc: GcMode::None,
-            gc_threshold: 0.85,
-            gc_log: false,
-            gc_timing: GcTiming::Threshold,
-            context_budget: 200_000,
-        };
-
-        let (value, _) = run_sequential(&config, (), crate::op::get("semantic:topic")).await?;
-
-        assert_eq!(queries.lock().unwrap().as_slice(), &[Some("topic".into())]);
-        assert_eq!(value[0]["content"], json!("semantic result"));
         Ok(())
     }
 }

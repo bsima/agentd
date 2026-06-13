@@ -195,15 +195,6 @@ pub enum OpF<S, A> {
         command: String,
         next: Box<dyn FnOnce(Value) -> Op<S, A> + Send>,
     },
-    Get {
-        key: String,
-        next: Box<dyn FnOnce(Value) -> Op<S, A> + Send>,
-    },
-    Put {
-        key: String,
-        value: Value,
-        next: Op<S, A>,
-    },
     Emit {
         event: crate::trace::Event,
         next: Op<S, A>,
@@ -242,15 +233,6 @@ impl<S: Send + 'static, A: Send + 'static> Op<S, A> {
                 command,
                 next: Box::new(move |v| next(v).and_then(f)),
             })),
-            OpF::Get { key, next } => Op(Box::new(OpF::Get {
-                key,
-                next: Box::new(move |v| next(v).and_then(f)),
-            })),
-            OpF::Put { key, value, next } => Op(Box::new(OpF::Put {
-                key,
-                value,
-                next: next.and_then(f),
-            })),
             OpF::Emit { event, next } => Op(Box::new(OpF::Emit {
                 event,
                 next: next.and_then(f),
@@ -286,21 +268,6 @@ pub fn eval<S: Send + 'static>(command: impl Into<String>) -> Op<S, Value> {
     }))
 }
 
-pub fn get<S: Send + 'static>(key: impl Into<String>) -> Op<S, Value> {
-    Op(Box::new(OpF::Get {
-        key: key.into(),
-        next: Box::new(Op::pure),
-    }))
-}
-
-pub fn put<S: Send + 'static>(key: impl Into<String>, value: Value) -> Op<S, ()> {
-    Op(Box::new(OpF::Put {
-        key: key.into(),
-        value,
-        next: Op::pure(()),
-    }))
-}
-
 pub fn emit<S: Send + 'static>(event: crate::trace::Event) -> Op<S, ()> {
     Op(Box::new(OpF::Emit {
         event,
@@ -326,6 +293,10 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
         if can_stop || max_turns == 0 {
             Op::pure(response)
         } else if response.tool_calls.is_empty() {
+            // History threads through the continuation directly (t-1182): the
+            // old put/get("temporal:history") round-tripped it through the
+            // store, but it is already in scope — the same way the IR loop
+            // keeps history in machine env.
             let mut history = prompt.clone();
             if !response.content.is_empty() {
                 history.push(ChatMessage::assistant(
@@ -334,42 +305,33 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
                 ));
             }
             history.push(ChatMessage::user(CONTINUE_NUDGE));
-            let value = serde_json::to_value(&history).unwrap_or(Value::Null);
-            put("temporal:history", value)
-                .and_then(move |_| agent_loop(model, history, max_turns - 1))
+            agent_loop(model, history, max_turns - 1)
         } else {
             let calls = response.tool_calls.clone();
-            get("temporal:history").and_then(move |value| {
-                let mut history: Prompt =
-                    serde_json::from_value(value).unwrap_or_else(|_| prompt.clone());
-                history.push(ChatMessage::assistant(
-                    (!response.content.is_empty()).then_some(response.content.clone()),
-                    response.tool_calls.clone(),
-                ));
+            let mut history = prompt.clone();
+            history.push(ChatMessage::assistant(
+                (!response.content.is_empty()).then_some(response.content.clone()),
+                response.tool_calls.clone(),
+            ));
 
-                let mut program = Op::pure(history);
-                for call in calls {
-                    program = program.and_then(move |mut acc| {
-                        let id = call.id.clone();
-                        match command_from_tool_call(&call) {
-                            Ok(command) => eval(command).map(move |result| {
-                                acc.push(ChatMessage::tool(id, result.to_string()));
-                                acc
-                            }),
-                            Err(error) => Op::pure({
-                                acc.push(ChatMessage::tool(id, error.to_string()));
-                                acc
-                            }),
-                        }
-                    });
-                }
+            let mut program = Op::pure(history);
+            for call in calls {
+                program = program.and_then(move |mut acc| {
+                    let id = call.id.clone();
+                    match command_from_tool_call(&call) {
+                        Ok(command) => eval(command).map(move |result| {
+                            acc.push(ChatMessage::tool(id, result.to_string()));
+                            acc
+                        }),
+                        Err(error) => Op::pure({
+                            acc.push(ChatMessage::tool(id, error.to_string()));
+                            acc
+                        }),
+                    }
+                });
+            }
 
-                program.and_then(move |history| {
-                    let value = serde_json::to_value(&history).unwrap_or(Value::Null);
-                    put("temporal:history", value)
-                        .and_then(move |_| agent_loop(model, history, max_turns - 1))
-                })
-            })
+            program.and_then(move |history| agent_loop(model, history, max_turns - 1))
         }
     })
 }
@@ -608,7 +570,6 @@ mod tests {
             provider: Arc::new(NoopProvider),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace: TraceLogger::new(Uuid::new_v4().to_string(), path),
             eval: crate::interpreter::EvalConfig::default(),
             replay: None,
@@ -837,20 +798,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_put_and_emit_round_trip_through_sequential_interpreter() -> Result<()> {
+    async fn emit_and_pure_round_trip_through_sequential_interpreter() -> Result<()> {
         let event = crate::trace::Event::AgentDone {
             run_id: "op-test".into(),
             timestamp: chrono::Utc::now(),
         };
-        let program = get::<i32>("temporal:history").and_then(move |value| {
-            let state: i32 = serde_json::from_value(value).unwrap();
-            put("temporal:history", serde_json::json!(state + 1))
-                .and_then(move |_| emit(event).and_then(move |_| get::<i32>("temporal:history")))
-                .map(|value| serde_json::from_value(value).unwrap())
-        });
+        let program = emit::<i32>(event).and_then(move |_| Op::pure(42));
 
         let observed = run_sequential(&seq_config(), 41, program).await?;
-        assert_eq!(observed, (42, 42));
+        // State threads through untouched; the program returns its value.
+        assert_eq!(observed, (42, 41));
         Ok(())
     }
 }

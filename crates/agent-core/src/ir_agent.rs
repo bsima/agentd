@@ -1137,7 +1137,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,

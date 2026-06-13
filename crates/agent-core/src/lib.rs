@@ -23,7 +23,7 @@ pub use gc::{
 pub use hydration::{
     HydrationSink, HydrationSource, PassiveHydrationConfig, PassiveSource, Provenance, SinkId,
     SinkItem, SinkWritePolicy, SourceCapability, SourceKind, SourceParams, SourceRegistry,
-    SourceResult, SEMANTIC_PREFIX, SESSION_STATE_KEY, TEMPORAL_PREFIX,
+    SourceResult,
 };
 pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, ReplayTrace, SeqConfig};
 pub use ir::{
@@ -42,7 +42,7 @@ pub use ir_interpreter::{
 pub use memory::MemorySource;
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
-    agent_loop, close_pending_tool_calls, emit, eval, get, has_pending_tool_calls, infer, par, put,
+    agent_loop, close_pending_tool_calls, emit, eval, has_pending_tool_calls, infer, par,
     repair_trailing_pending_tool_calls, ChatMessage, FinishReason, Model, Op, OpF, Prompt,
     Response, ToolCall,
 };

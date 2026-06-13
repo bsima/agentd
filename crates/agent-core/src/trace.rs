@@ -93,47 +93,6 @@ pub enum Event {
         duration_ms: u64,
         timestamp: DateTime<Utc>,
     },
-    GetCall {
-        run_id: String,
-        op_id: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_op_id: Option<u64>,
-        key: String,
-        timestamp: DateTime<Utc>,
-    },
-    GetResult {
-        run_id: String,
-        op_id: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_op_id: Option<u64>,
-        key: String,
-        /// Full value, present only when full-payload tracing is enabled.
-        /// Replay never needs it; `value_preview` is always recorded.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        value: Option<Value>,
-        #[serde(default)]
-        value_preview: String,
-        source_count: usize,
-        timestamp: DateTime<Utc>,
-    },
-    PutCall {
-        run_id: String,
-        op_id: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_op_id: Option<u64>,
-        key: String,
-        #[serde(default)]
-        value_preview: String,
-        timestamp: DateTime<Utc>,
-    },
-    PutResult {
-        run_id: String,
-        op_id: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_op_id: Option<u64>,
-        key: String,
-        timestamp: DateTime<Utc>,
-    },
     RetrieveCall {
         run_id: String,
         op_id: u64,
@@ -295,10 +254,6 @@ impl Event {
             | Self::EvalCall { run_id, .. }
             | Self::EvalError { run_id, .. }
             | Self::EvalResult { run_id, .. }
-            | Self::GetCall { run_id, .. }
-            | Self::GetResult { run_id, .. }
-            | Self::PutCall { run_id, .. }
-            | Self::PutResult { run_id, .. }
             | Self::RetrieveCall { run_id, .. }
             | Self::RetrieveResult { run_id, .. }
             | Self::RetrieveError { run_id, .. }
@@ -325,10 +280,6 @@ impl Event {
             | Self::EvalCall { op_id, .. }
             | Self::EvalError { op_id, .. }
             | Self::EvalResult { op_id, .. }
-            | Self::GetCall { op_id, .. }
-            | Self::GetResult { op_id, .. }
-            | Self::PutCall { op_id, .. }
-            | Self::PutResult { op_id, .. }
             | Self::RetrieveCall { op_id, .. }
             | Self::RetrieveResult { op_id, .. }
             | Self::RetrieveError { op_id, .. }
@@ -355,10 +306,6 @@ impl Event {
             | Self::EvalCall { parent_op_id, .. }
             | Self::EvalError { parent_op_id, .. }
             | Self::EvalResult { parent_op_id, .. }
-            | Self::GetCall { parent_op_id, .. }
-            | Self::GetResult { parent_op_id, .. }
-            | Self::PutCall { parent_op_id, .. }
-            | Self::PutResult { parent_op_id, .. }
             | Self::RetrieveCall { parent_op_id, .. }
             | Self::RetrieveResult { parent_op_id, .. }
             | Self::RetrieveError { parent_op_id, .. }
@@ -381,8 +328,6 @@ impl Event {
         match self {
             Self::InferCall { .. } | Self::InferResult { .. } | Self::InferError { .. } => "Infer",
             Self::EvalCall { .. } | Self::EvalResult { .. } | Self::EvalError { .. } => "Eval",
-            Self::GetCall { .. } | Self::GetResult { .. } => "Get",
-            Self::PutCall { .. } | Self::PutResult { .. } => "Put",
             Self::RetrieveCall { .. }
             | Self::RetrieveResult { .. }
             | Self::RetrieveError { .. } => "Retrieve",
@@ -409,8 +354,6 @@ impl Event {
             self,
             Self::InferCall { .. }
                 | Self::EvalCall { .. }
-                | Self::GetCall { .. }
-                | Self::PutCall { .. }
                 | Self::RetrieveCall { .. }
                 | Self::StoreCall { .. }
                 | Self::HydrationStart { .. }
@@ -425,8 +368,6 @@ impl Event {
                 | Self::InferError { .. }
                 | Self::EvalResult { .. }
                 | Self::EvalError { .. }
-                | Self::GetResult { .. }
-                | Self::PutResult { .. }
                 | Self::RetrieveResult { .. }
                 | Self::RetrieveError { .. }
                 | Self::StoreResult { .. }
@@ -444,10 +385,6 @@ impl Event {
             | Self::EvalCall { timestamp, .. }
             | Self::EvalError { timestamp, .. }
             | Self::EvalResult { timestamp, .. }
-            | Self::GetCall { timestamp, .. }
-            | Self::GetResult { timestamp, .. }
-            | Self::PutCall { timestamp, .. }
-            | Self::PutResult { timestamp, .. }
             | Self::RetrieveCall { timestamp, .. }
             | Self::RetrieveResult { timestamp, .. }
             | Self::RetrieveError { timestamp, .. }
@@ -561,16 +498,6 @@ impl Event {
                 attrs.push(KeyValue::new("error", error.clone()));
                 attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
             }
-            Self::GetCall { key, .. } | Self::PutCall { key, .. } => {
-                attrs.push(KeyValue::new("key", key.clone()))
-            }
-            Self::GetResult {
-                key, source_count, ..
-            } => {
-                attrs.push(KeyValue::new("key", key.clone()));
-                attrs.push(KeyValue::new("source_count", *source_count as i64));
-            }
-            Self::PutResult { key, .. } => attrs.push(KeyValue::new("key", key.clone())),
             Self::RetrieveCall { query, kind, .. } => {
                 attrs.push(KeyValue::new("query", query.clone()));
                 if let Some(kind) = kind {
@@ -1072,8 +999,8 @@ pub struct TraceSummary {
     pub total_tokens: u32,
     pub infer_calls: usize,
     pub eval_calls: usize,
-    pub get_calls: usize,
-    pub put_calls: usize,
+    pub retrieve_calls: usize,
+    pub store_calls: usize,
 }
 
 impl TraceSummary {
@@ -1084,8 +1011,8 @@ impl TraceSummary {
                 Event::InferCall { .. } => summary.infer_calls += 1,
                 Event::InferResult { total_tokens, .. } => summary.total_tokens += *total_tokens,
                 Event::EvalCall { .. } => summary.eval_calls += 1,
-                Event::GetCall { .. } => summary.get_calls += 1,
-                Event::PutCall { .. } => summary.put_calls += 1,
+                Event::RetrieveCall { .. } => summary.retrieve_calls += 1,
+                Event::StoreCall { .. } => summary.store_calls += 1,
                 _ => {}
             }
         }

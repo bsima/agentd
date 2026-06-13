@@ -20,8 +20,8 @@ The OTel sink maps typed trace events to spans:
 
 - `InferCall` / `InferResult` (or `InferError`) -> `Infer` span
 - `EvalCall` / `EvalResult` (or `EvalError`) -> `Eval` span
-- `GetCall` / `GetResult` -> `Get` span
-- `PutCall` / `PutResult` -> `Put` span
+- `RetrieveCall` / `RetrieveResult` -> `Retrieve` span
+- `StoreCall` / `StoreResult` -> `Store` span
 - `HydrationStart` / `HydrationEnd` -> `Hydration` span
 - `ParStart` / `ParEnd` -> `Par` span
 - custom and lifecycle events become instant spans
@@ -66,7 +66,7 @@ Span-level, mapped straight off the existing `Event` fields:
 - Eval: `tool.name` (sanitized, low-cardinality, e.g. `cargo build`),
   `command` (full string, detail only — not a group-by key), `exit_code`/`ok`,
   `attempt` / `retry.count`, `cwd`, `timeout_ms`, `truncated_*`.
-- Get / Put: `key`, `source_count`.
+- Retrieve: `query`, `source_count`, `bytes`. Store: `agent.sink`, `agent.store_op`, `agent.sink_id`.
 - Par: `branch_count`.
 
 Span status: an `Eval` that exits nonzero sets span status `ERROR`, and an

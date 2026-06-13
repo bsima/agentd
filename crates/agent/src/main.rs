@@ -68,7 +68,7 @@ struct Args {
     /// Store full PromptIR section content in traces instead of previews/hashes only.
     #[arg(long, env = "AGENT_TRACE_FULL_PROMPT_IR")]
     trace_full_prompt_ir: bool,
-    /// Store full Infer prompts and Get values in traces. Off by default:
+    /// Store full Infer prompts and Retrieve results in traces. Off by default:
     /// full prompts repeat the whole conversation per call (O(n^2) trace
     /// growth) and replay only needs recorded results. Previews are always
     /// stored. Enable when recording fixtures that need full prompts (e.g.
@@ -79,8 +79,8 @@ struct Args {
     #[arg(long, env = "AGENT_HYDRATION_DIR")]
     hydration_dir: Option<PathBuf>,
     /// Memory directory: markdown files with frontmatter served to
-    /// `semantic:<query>` Gets via keyword retrieval, and registered as a
-    /// write sink (reachable once the Store effect lands — t-1179).
+    /// the `recall` tool / Retrieve effect via keyword retrieval, and
+    /// registered as a write sink for `remember` / Store.
     #[arg(long, env = "AGENT_MEMORY_DIR")]
     memory_dir: Option<PathBuf>,
     /// Checkpoint directory of a PAST or sibling session, served as
@@ -419,10 +419,6 @@ async fn main() -> Result<()> {
             })),
         }
     };
-    let checkpoint_path = args
-        .checkpoint_dir
-        .as_ref()
-        .map(|dir| dir.join("session-latest.json"));
     let hydration = {
         let mut registry = SourceRegistry::new();
         if let Some(path) = args.hydration_dir.as_ref() {
@@ -448,7 +444,6 @@ async fn main() -> Result<()> {
             PassiveSource::TemporalHistory,
             PassiveSource::SessionContext,
         ]),
-        checkpoint_path: checkpoint_path.clone(),
         trace: trace.clone(),
         eval: eval_config,
         replay: None,

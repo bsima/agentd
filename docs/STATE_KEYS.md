@@ -1,56 +1,17 @@
-# Get/Put key-namespace contract
+# Get/Put key-namespace contract — RETIRED
 
-Status: normative for the Op and IR runtimes; enforced by
-`crates/agent-core/tests/state_keys.rs`.
+Status: **retired (t-1182).** Get/Put no longer exists.
 
-`Get(key)` and `Put(key, value)` are the agent's interface for context and
-state. The interpreter decides *how* each key is backed, but the observable
-behavior of the guaranteed namespaces below is part of the runtime contract:
-an agent program that uses only these namespaces must behave the same under
-any interpreter. If you change a runtime's key behavior, update this document
-and the conformance test in the same change.
+The stringly-keyed Get/Put interface — with its `temporal:`, `semantic:`,
+and `session:state` magic prefixes — was deleted in favor of typed,
+sink/source-generic effects. See **[MEMORY.md](MEMORY.md)** for the design
+and the migration table; the short version:
 
-## Guaranteed namespaces
+| Old key | Replacement |
+|---|---|
+| `semantic:<query>` Get | the `Retrieve` IR effect (kind = Semantic), or the model's `recall` tool |
+| `temporal:*` Get/Put | machine env (history lives in the loop's `history` var); cross-session recall is `Retrieve` (kind = Temporal) |
+| `session:state` Get/Put | the passive `ChatHistory` sink, written at turn completion |
+| IR session-local KV (unknown keys) | machine env vars |
 
-| Key | Get | Put | Durability |
-|---|---|---|---|
-| `session:state` | Read the checkpoint JSON (null if no checkpoint is configured or none exists) | Write the checkpoint JSON | Durable: survives process restarts via `SeqConfig::checkpoint_path` |
-| `temporal:*` | Return the last value written to the key (the conversation history in the standard agent loops) | Replace the value | Session-lived |
-| `semantic:<query>` | Dispatch `<query>` to every QUERY-capable `HydrationSource` and return the list of `SourceResult`s | — (reserved) | Read-only view over registered sources |
-
-Notes:
-
-- `temporal:*` is backed differently per runtime (the Op interpreter stores it
-  in the typed interpreter state `S`; the IR interpreter stores it in the
-  session store), but the observable put-then-get contract is identical.
-- `semantic:` reads are queries, not storage. Writing to `semantic:*` is
-  reserved and currently undefined; do not rely on it.
-- The first shipped `semantic:` backend is `MemorySource` (`--memory-dir`,
-  t-1160): a directory of markdown memory files with frontmatter, served by
-  deterministic keyword retrieval. It is read-only by design — a `memory:`
-  write namespace is deliberately **not** defined here yet; that contract is
-  the subject of the Get/Put v2 design (t-1165, docs/MEMORY.md when it
-  lands), which proposes splitting retrieval and memory mutation out of the
-  Get/Put KV verbs entirely.
-
-## Keys outside the guaranteed namespaces
-
-This is a **pinned divergence** between the runtimes, not an accident — it is
-asserted by the conformance test so it cannot drift silently:
-
-- The **Op runtime** rejects unknown keys with an `unknown Get key` /
-  `unknown Put key` error. Its state is a single typed value, so there is
-  nowhere to put arbitrary keys.
-- The **IR runtime** treats unknown keys as **session-local KV**: `Put` stores
-  the value in the session store, `Get` returns the last value written, and a
-  key that was never written reads as `null`.
-
-Portable agent programs should stick to the guaranteed namespaces. Programs
-that use session-local KV are IR-only by construction.
-
-## Adding a namespace
-
-1. Define the contract here (Get semantics, Put semantics, durability).
-2. Implement it in every shipped runtime (`interpreter.rs` `dispatch_get`/
-   `dispatch_put`, `ir_interpreter.rs` `InMemoryStore`).
-3. Add a conformance test to `tests/state_keys.rs` exercising both runtimes.
+This file is kept only so existing links resolve.

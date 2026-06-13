@@ -50,8 +50,6 @@ pub struct EffectId(pub String);
 pub enum EffectKind {
     Infer,
     Eval,
-    Get,
-    Put,
     Emit,
     Retrieve,
     Store,
@@ -100,14 +98,6 @@ pub enum Instr {
         request: EvalRequest,
         #[serde(default)]
         policy: EvalPolicy,
-    },
-    Get {
-        out: Var,
-        key: Expr,
-    },
-    Put {
-        key: Expr,
-        value: Expr,
     },
     Emit {
         event: Expr,
@@ -448,10 +438,9 @@ fn instr_out(instr: &Instr) -> Option<&Var> {
         Instr::Let { out, .. }
         | Instr::Infer { out, .. }
         | Instr::Eval { out, .. }
-        | Instr::Get { out, .. }
         | Instr::Retrieve { out, .. }
         | Instr::Store { out, .. } => Some(out),
-        Instr::Put { .. } | Instr::Emit { .. } => None,
+        Instr::Emit { .. } => None,
     }
 }
 
@@ -467,11 +456,6 @@ fn validate_instr_vars(
             validate_prompt_ref_vars(prompt, defined, block_id)
         }
         Instr::Eval { request, .. } => validate_eval_request_vars(request, defined, block_id),
-        Instr::Get { key, .. } => validate_expr_vars(key, defined, block_id),
-        Instr::Put { key, value } => {
-            validate_expr_vars(key, defined, block_id)?;
-            validate_expr_vars(value, defined, block_id)
-        }
         Instr::Emit { event } => validate_expr_vars(event, defined, block_id),
         Instr::Retrieve { query, .. } => validate_expr_vars(query, defined, block_id),
         Instr::Store { sink, id, item, .. } => {
@@ -742,9 +726,11 @@ mod tests {
                 BlockId(0),
                 Block {
                     params: vec![],
-                    instructions: vec![Instr::Get {
+                    instructions: vec![Instr::Retrieve {
                         out: Var("x".into()),
-                        key: Expr::Value(Value::String("k".into())),
+                        query: Expr::Value(Value::String("k".into())),
+                        kind: None,
+                        max_bytes: None,
                     }],
                     terminator: Terminator::Return {
                         value: Expr::Var(Var("x".into())),
@@ -759,21 +745,21 @@ mod tests {
         };
         let first = effect_location(
             hash.clone(),
-            EffectKind::Get,
+            EffectKind::Retrieve,
             site,
             DynamicPath::with_visit(site, 0),
         )
         .unwrap();
         let first_again = effect_location(
             hash.clone(),
-            EffectKind::Get,
+            EffectKind::Retrieve,
             site,
             DynamicPath::with_visit(site, 0),
         )
         .unwrap();
         let second_visit = effect_location(
             hash,
-            EffectKind::Get,
+            EffectKind::Retrieve,
             site,
             DynamicPath::with_visit(site, 1),
         )

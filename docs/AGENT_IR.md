@@ -13,7 +13,7 @@ whether reality has caught up.
 | Failure semantics: error events with stable IDs | Implemented (`InferError`/`EvalError` trace events; replay reproduces failures) |
 | `agent_loop` ported with feature parity | Implemented (`agent_loop_ir`, including stalled-turn nudge) |
 | CLI switched to AgentIR | Implemented; the CLI is IR-only (`--runtime` removed; the Op layer remains a library builder/test API) |
-| In-memory **STM** store with transactional Get/Put | Not implemented — `InMemoryStore` is a plain map; see docs/STATE_KEYS.md for the key contract |
+| In-memory **STM** store with transactional Get/Put | Removed (t-1182): Get/Put deleted in favor of the Retrieve/Store hydration effects; `InMemoryStore` now only backs instruction-limit checkpoints. See docs/MEMORY.md |
 | Normalization pass for canonical hashing | Not implemented — hashing uses the serde encoding of the (BTreeMap-ordered) program |
 | `Par` semantics | Not implemented — the IR runtime rejects `Par` until the open questions below are settled |
 
@@ -40,7 +40,7 @@ validated / normalized
         ↓
 small-step interpreter
         ↓
-effect handlers: Infer, Eval, Get, Put, Emit, Par
+effect handlers: Infer, Eval, Retrieve, Store, Emit, Par
 ```
 
 `Infer` is the novel operation. The interpreter/compiler machinery should otherwise use boring, proven techniques: explicit control flow, variable binding, effect handlers, stable IDs, replay logs, and serializable machine snapshots.
@@ -68,8 +68,8 @@ pub enum Instr {
     Let { out: Var, expr: Expr },
     Infer { out: Var, model: Expr, prompt: PromptRef, policy: InferPolicy },
     Eval { out: Var, request: EvalRequest, policy: EvalPolicy },
-    Get { out: Var, key: Expr },
-    Put { key: Expr, value: Expr },
+    Retrieve { out: Var, query: Expr, kind: Option<SourceKind>, max_bytes: Option<usize> },
+    Store { out: Var, sink: Expr, op: StoreOp, id: Option<Expr>, item: Expr, policy: StorePolicy },
     Emit { event: Expr },
 }
 
@@ -88,7 +88,7 @@ The first version can use `serde_json::Value` for runtime values. A richer type 
 
 ## Validation and normalization
 
-AgentIR should be validated before execution. A malformed program should fail before any `Infer`, `Eval`, `Get`, `Put`, or `Emit` occurs.
+AgentIR should be validated before execution. A malformed program should fail before any `Infer`, `Eval`, `Retrieve`, `Store`, or `Emit` occurs.
 
 At minimum validation should check:
 
@@ -131,13 +131,13 @@ AgentIR has local machine state and interpreter-owned durable state.
 
 ```text
 env   = local execution state inside the machine
-store = interpreter-owned state accessed through Get / Put
+hydration backends (sources + sinks) accessed through Retrieve / Store
 trace = append-only execution history
 ```
 
 The store backend is not part of AgentIR. The same program should be able to run with an in-memory STM store, SQLite, a distributed KV store, a replay store, or a read-only inspection store.
 
-The default runtime should use an in-memory STM store. `Get` and `Put` are transactional operations against that store. Interpreters decide the isolation level, persistence, checkpoint cadence, and conflict semantics.
+`Retrieve` reads from registered hydration sources; `Store` writes to registered hydration sinks (docs/MEMORY.md). The runtime attaches provenance and decides persistence, checkpoint cadence, and replay semantics (replay never mutates a sink).
 
 A serialized `Machine` checkpoint contains enough local execution state to resume the program. It may also contain or reference a store snapshot, depending on the backend.
 
@@ -198,8 +198,8 @@ AgentIR execution should map cleanly to trace events.
 ```text
 Instr::Infer -> InferCall / InferResult / InferError
 Instr::Eval  -> EvalCall / EvalResult / EvalError
-Instr::Get   -> GetCall / GetResult / GetError
-Instr::Put   -> PutCall / PutResult / PutError
+Instr::Retrieve -> RetrieveCall / RetrieveResult / RetrieveError
+Instr::Store    -> StoreCall / StoreResult / StoreError
 Instr::Emit  -> emitted event plus source location metadata
 ```
 
@@ -215,7 +215,7 @@ AgentIR is the control/effect IR. PromptIR and Intent are payload IRs.
 AgentIR
   Infer(PromptIR) -> Response
   Eval(EvalRequest::Shell | EvalRequest::Intent) -> Value
-  Get/Put/Emit/Par -> runtime effects
+  Retrieve/Store/Emit/Par -> runtime effects
 ```
 
 PromptIR is the structured payload for `Infer`: sourced, labeled, budgeted context sections that can later be optimized.

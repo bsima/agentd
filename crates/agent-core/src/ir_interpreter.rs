@@ -312,11 +312,12 @@ pub enum IrStepOutcome {
     Suspended { checkpoint: IrCheckpoint },
 }
 
+/// Backing store for the IR interpreter's instruction-limit checkpoints
+/// (`in_memory_snapshot`). The Get/Put key-value methods were removed with
+/// the Get/Put effects (t-1182); session state and retrieval now flow
+/// through the passive ChatHistory sink and the Retrieve/Store effects.
 #[async_trait]
 pub trait IrStore: Send {
-    async fn get(&mut self, config: &SeqConfig, key: &str) -> Result<Value>;
-    async fn put(&mut self, config: &SeqConfig, key: &str, value: Value) -> Result<()>;
-
     fn in_memory_snapshot(&self) -> Option<InMemoryStore> {
         None
     }
@@ -345,46 +346,6 @@ impl InMemoryStore {
 impl IrStore for InMemoryStore {
     fn in_memory_snapshot(&self) -> Option<InMemoryStore> {
         Some(self.clone())
-    }
-
-    async fn get(&mut self, config: &SeqConfig, key: &str) -> Result<Value> {
-        if let Some(value) = self.values.get(key) {
-            return Ok(value.clone());
-        }
-        if key.starts_with(crate::SEMANTIC_PREFIX) {
-            let query = key.trim_start_matches(crate::SEMANTIC_PREFIX);
-            return serde_json::to_value(
-                config
-                    .hydration
-                    .retrieve_query(crate::SourceParams::new(query))
-                    .await?,
-            )
-            .map_err(Into::into);
-        }
-        if key == crate::SESSION_STATE_KEY {
-            let Some(path) = &config.checkpoint_path else {
-                return Ok(Value::Null);
-            };
-            return match tokio::fs::read_to_string(path).await {
-                Ok(content) => serde_json::from_str(&content).map_err(Into::into),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
-                Err(err) => Err(err.into()),
-            };
-        }
-        Ok(Value::Null)
-    }
-
-    async fn put(&mut self, config: &SeqConfig, key: &str, value: Value) -> Result<()> {
-        if key == crate::SESSION_STATE_KEY {
-            if let Some(path) = &config.checkpoint_path {
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                tokio::fs::write(path, serde_json::to_vec_pretty(&value)?).await?;
-            }
-        }
-        self.values.insert(key.to_string(), value);
-        Ok(())
     }
 }
 
@@ -501,7 +462,6 @@ pub async fn run_ir_steps_with_gc(
             execute_instr(
                 config,
                 &mut machine,
-                store,
                 &program_hash,
                 site,
                 dynamic_path,
@@ -564,7 +524,6 @@ pub async fn run_ir_steps_with_gc(
 async fn execute_instr(
     config: &SeqConfig,
     machine: &mut Machine,
-    store: &mut dyn IrStore,
     program_hash: &ProgramHash,
     site: EffectSite,
     dynamic_path: DynamicPath,
@@ -770,30 +729,6 @@ async fn execute_instr(
                 })
                 .await?;
             machine.env.insert(out, result);
-        }
-        Instr::Get { out, key } => {
-            let location = effect_location(
-                program_hash.clone(),
-                EffectKind::Get,
-                site,
-                dynamic_path.clone(),
-            )?;
-            emit_ir_effect(config, &location).await?;
-            let key = string_expr(&machine.env, &key, "Get.key")?;
-            let value = store.get(config, &key).await?;
-            machine.env.insert(out, value);
-        }
-        Instr::Put { key, value } => {
-            let location = effect_location(
-                program_hash.clone(),
-                EffectKind::Put,
-                site,
-                dynamic_path.clone(),
-            )?;
-            emit_ir_effect(config, &location).await?;
-            let key = string_expr(&machine.env, &key, "Put.key")?;
-            let value = eval_expr(&machine.env, &value)?;
-            store.put(config, &key, value).await?;
         }
         Instr::Emit { event } => {
             let location =
@@ -1489,7 +1424,6 @@ mod tests {
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
-            checkpoint_path: None,
             trace,
             eval: EvalConfig::default(),
             replay: None,
@@ -1986,9 +1920,11 @@ mod tests {
             BlockId(0),
             crate::ir::Block {
                 params: vec![],
-                instructions: vec![Instr::Get {
+                instructions: vec![Instr::Retrieve {
                     out: Var("a".into()),
-                    key: Expr::Value(Value::String("missing".into())),
+                    query: Expr::Value(Value::String("missing".into())),
+                    kind: None,
+                    max_bytes: None,
                 }],
                 terminator: Terminator::Return {
                     value: Expr::Var(Var("a".into())),
@@ -2022,7 +1958,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].kind, EffectKind::Get);
+        assert_eq!(locations[0].kind, EffectKind::Retrieve);
         assert_eq!(locations[0].site.block, BlockId(0));
         assert_eq!(locations[0].site.instruction_index, 0);
         Ok(())
@@ -2199,52 +2135,6 @@ mod tests {
             continuation_stack: vec![],
             budgets: Default::default(),
         }
-    }
-
-    #[tokio::test]
-    async fn ir_get_put_use_interpreter_store_not_machine_state() -> Result<()> {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let mut blocks = BTreeMap::new();
-        blocks.insert(
-            BlockId(0),
-            crate::ir::Block {
-                params: vec![],
-                instructions: vec![
-                    Instr::Put {
-                        key: Expr::Value(Value::String("answer".into())),
-                        value: Expr::Value(Value::Number(42.into())),
-                    },
-                    Instr::Get {
-                        out: Var("value".into()),
-                        key: Expr::Value(Value::String("answer".into())),
-                    },
-                ],
-                terminator: Terminator::Return {
-                    value: Expr::Var(Var("value".into())),
-                },
-            },
-        );
-        let machine = Machine {
-            program: crate::ir::Program {
-                id: crate::ir::ProgramId("store".into()),
-                entry: BlockId(0),
-                blocks,
-            },
-            block: BlockId(0),
-            pc: 0,
-            env: BTreeMap::new(),
-            effect_visits: BTreeMap::new(),
-            continuation_stack: vec![],
-            budgets: Default::default(),
-        };
-        let mut store = InMemoryStore::new();
-
-        let (value, _machine) =
-            run_ir_sequential_with_store(&config(provider), machine, &mut store).await?;
-
-        assert_eq!(value, Value::Number(42.into()));
-        assert_eq!(store.get_local("answer"), Value::Number(42.into()));
-        Ok(())
     }
 
     #[tokio::test]

@@ -5,10 +5,6 @@ use serde_json::Value;
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::Arc;
 
-pub const TEMPORAL_PREFIX: &str = "temporal:";
-pub const SEMANTIC_PREFIX: &str = "semantic:";
-pub const SESSION_STATE_KEY: &str = "session:state";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceKind {
     Temporal,
