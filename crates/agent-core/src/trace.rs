@@ -101,6 +101,8 @@ pub enum Event {
         query: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<usize>,
         timestamp: DateTime<Utc>,
     },
     RetrieveResult {
@@ -135,6 +137,10 @@ pub enum Event {
         parent_op_id: Option<u64>,
         sink: String,
         store_op: String,
+        /// The id argument (Update/Delete target), recorded so replay can
+        /// detect a dynamically-computed id diverging from the recording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        store_id: Option<String>,
         #[serde(default)]
         item_preview: String,
         /// Hash of the payload so replay can detect same-site divergence

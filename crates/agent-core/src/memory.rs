@@ -10,10 +10,13 @@
 //!
 //! The write half (t-1178, per the approved docs/MEMORY.md design)
 //! implements [`HydrationSink`]: the payload schema is
-//! `{ name, description, type?, body }` — validated HERE, by the backend,
-//! not by the trait or the IR — and the slug doubles as the [`SinkId`].
-//! Hard delete by decision (memory dirs live in git; history is the
-//! tombstone); write policy is Free (trace-visible) by decision.
+//! `{ name?, description?, type?, body }` — validated HERE, by the backend,
+//! not by the trait or the IR. The slug doubles as the [`SinkId`]; it is
+//! optional and, when absent, derived deterministically from the
+//! description (else body) so the `remember { content, name? }` surface
+//! works and replay stays deterministic. Hard delete by decision (memory
+//! dirs live in git; history is the tombstone); write policy is Free
+//! (trace-visible) by decision.
 
 use crate::hydration::{
     HydrationSink, HydrationSource, Provenance, SinkId, SinkItem, SinkWritePolicy,
@@ -257,14 +260,64 @@ impl HydrationSource for MemorySource {
 }
 
 /// The memory sink's payload schema (docs/MEMORY.md): validated by the
-/// backend, not the trait. `name` is the slug and the [`SinkId`].
+/// backend, not the trait. `name` is the slug and the [`SinkId`]; it is
+/// optional — when absent, the slug is derived deterministically from the
+/// description (else the body), so the documented `remember { content,
+/// name? }` surface works (t-1180) and replay stays deterministic.
 #[derive(Debug, Deserialize)]
 struct MemoryPayload {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     description: String,
     #[serde(rename = "type", default)]
     memory_type: Option<String>,
     body: String,
+}
+
+/// A valid memory slug: the filename stem, so it must be kebab-case and
+/// can never traverse out of the memory dir. Enforced on every
+/// path-building operation — store, update, AND delete (t-1182 review:
+/// delete previously trusted the id and `SinkId("../foo")` escaped root).
+fn is_valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+}
+
+fn validate_slug(slug: &str) -> Result<()> {
+    if is_valid_slug(slug) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "memory id {slug:?} must be a kebab-case slug ([a-z0-9-], no leading/trailing dash)"
+        ))
+    }
+}
+
+/// Deterministically derive a kebab slug from free text: lowercase, runs of
+/// non-alphanumerics collapse to single dashes, trimmed, capped. Determinism
+/// matters — the slug becomes the recorded SinkId, and a non-deterministic
+/// one (random/timestamp) would diverge on replay.
+fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = true; // suppress leading dash
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    slug.trim_matches('-').to_string()
 }
 
 /// Frontmatter written by the sink; matches what the source half parses,
@@ -285,29 +338,36 @@ struct FrontmatterMetadataOut<'a> {
 
 impl MemoryPayload {
     fn parse(item: &SinkItem) -> Result<Self> {
-        let payload: Self = serde_json::from_value(item.payload.clone())
-            .context("memory payload must be { name, description, type?, body }")?;
-        // The slug is also the filename: keep it kebab so ids are stable,
-        // shell-safe, and can never traverse out of the memory dir.
-        let valid_slug = !payload.name.is_empty()
-            && payload
-                .name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            && !payload.name.starts_with('-')
-            && !payload.name.ends_with('-');
-        if !valid_slug {
-            return Err(anyhow!(
-                "memory name {:?} must be a kebab-case slug ([a-z0-9-], no leading/trailing dash)",
-                payload.name
-            ));
-        }
-        Ok(payload)
+        serde_json::from_value(item.payload.clone())
+            .context("memory payload must be { name?, description?, type?, body }")
     }
 
-    fn render(&self, provenance: &Provenance) -> Result<String> {
+    /// The slug for this payload: the given `name` if present, else derived
+    /// from the description, else the body. Validated to kebab.
+    fn slug(&self) -> Result<String> {
+        let slug = match self.name.as_deref() {
+            Some(name) if !name.trim().is_empty() => name.to_string(),
+            _ => {
+                let derived = slugify(&self.description);
+                if derived.is_empty() {
+                    slugify(&self.body)
+                } else {
+                    derived
+                }
+            }
+        };
+        if slug.is_empty() {
+            return Err(anyhow!(
+                "memory has no name and none could be derived from its description or body"
+            ));
+        }
+        validate_slug(&slug)?;
+        Ok(slug)
+    }
+
+    fn render(&self, name: &str, provenance: &Provenance) -> Result<String> {
         let front = serde_yaml::to_string(&FrontmatterOut {
-            name: &self.name,
+            name,
             description: &self.description,
             metadata: FrontmatterMetadataOut {
                 memory_type: self.memory_type.as_deref(),
@@ -341,42 +401,48 @@ impl HydrationSink for MemorySource {
 
     async fn store(&self, item: SinkItem) -> Result<SinkId> {
         let payload = MemoryPayload::parse(&item)?;
-        let id = SinkId(payload.name.clone());
+        let slug = payload.slug()?;
+        let id = SinkId(slug.clone());
         let path = self.memory_path(&id);
         if tokio::fs::try_exists(&path).await? {
             return Err(anyhow!(
-                "memory {:?} already exists; use Update to revise it",
-                id.0
+                "memory {slug:?} already exists; use Update to revise it"
             ));
         }
         tokio::fs::create_dir_all(&self.root).await?;
-        tokio::fs::write(&path, payload.render(&item.provenance)?)
+        tokio::fs::write(&path, payload.render(&slug, &item.provenance)?)
             .await
             .with_context(|| format!("writing memory {}", path.display()))?;
         Ok(id)
     }
 
     async fn update(&self, id: &SinkId, item: SinkItem) -> Result<()> {
+        validate_slug(&id.0)?;
         let payload = MemoryPayload::parse(&item)?;
-        if payload.name != id.0 {
-            return Err(anyhow!(
-                "memory update payload renames {:?} to {:?}; delete and re-create instead",
-                id.0,
-                payload.name
-            ));
+        // If the payload names a slug, it must match the target id; an empty
+        // name updates in place under the given id.
+        if let Some(name) = payload.name.as_deref() {
+            if !name.trim().is_empty() && name != id.0 {
+                return Err(anyhow!(
+                    "memory update payload renames {:?} to {name:?}; delete and re-create instead",
+                    id.0
+                ));
+            }
         }
         let path = self.memory_path(id);
         if !tokio::fs::try_exists(&path).await? {
             return Err(anyhow!("no memory {:?} to update", id.0));
         }
-        tokio::fs::write(&path, payload.render(&item.provenance)?)
+        tokio::fs::write(&path, payload.render(&id.0, &item.provenance)?)
             .await
             .with_context(|| format!("rewriting memory {}", path.display()))
     }
 
     async fn delete(&self, id: &SinkId) -> Result<()> {
-        // Hard delete by decision: memory dirs live in git, history is the
-        // tombstone.
+        // Validate before building the path: an unvalidated id like
+        // "../foo" would otherwise delete files outside the memory dir
+        // (t-1182 review). Hard delete by decision — git is the tombstone.
+        validate_slug(&id.0)?;
         let path = self.memory_path(id);
         tokio::fs::remove_file(&path)
             .await
@@ -580,19 +646,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_rejects_path_traversal_ids() {
+        // t-1182 review: delete must validate the id before building a path,
+        // or SinkId("../victim") escapes the memory dir. Use a dedicated
+        // enclosing dir so the sibling "victim.md" can't collide with other
+        // (parallel) tests sharing the temp root.
+        let enclosing =
+            std::env::temp_dir().join(format!("agent-memory-traversal-{}", uuid::Uuid::new_v4()));
+        let dir = enclosing.join("memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = enclosing.join("victim.md");
+        tokio::fs::write(&outside, "do not delete me")
+            .await
+            .unwrap();
+
+        let backend = MemorySource::new(dir);
+        let err = backend
+            .delete(&SinkId("../victim".into()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("kebab-case"), "{err}");
+        assert!(outside.exists(), "the file outside the memory dir survives");
+        std::fs::remove_dir_all(&enclosing).ok();
+    }
+
+    #[tokio::test]
+    async fn name_is_optional_and_slugged_from_description() {
+        let dir = temp_memory_dir();
+        let backend = MemorySource::new(dir.clone());
+
+        // No name: the slug is derived from the description, deterministically.
+        let id = backend
+            .store(item(serde_json::json!({
+                "description": "Deploy Window Rules!",
+                "body": "deploys only on tuesdays",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(id, SinkId("deploy-window-rules".into()));
+        assert!(dir.join("deploy-window-rules.md").exists());
+
+        // Re-deriving from the same inputs yields the same slug (replay-safe).
+        let again = backend
+            .store(item(serde_json::json!({
+                "description": "Deploy Window Rules!",
+                "body": "x",
+            })))
+            .await
+            .unwrap_err();
+        assert!(again.to_string().contains("already exists"), "{again}");
+    }
+
+    #[tokio::test]
     async fn payload_schema_and_slug_are_validated() {
         let backend = MemorySource::new(temp_memory_dir());
 
+        // body is the only required field.
         let bad_schema = backend
-            .store(item(serde_json::json!({ "name": "x" })))
+            .store(item(serde_json::json!({ "description": "x" })))
             .await
             .unwrap_err();
         assert!(
-            format!("{bad_schema:#}").contains("name, description, type?, body"),
+            format!("{bad_schema:#}").contains("name?, description?, type?, body"),
             "{bad_schema:#}"
         );
 
-        for bad_name in ["../escape", "Has Spaces", "", "-lead", "trail-"] {
+        // A provided name must be a valid slug (an empty/absent name instead
+        // derives one, covered above).
+        for bad_name in ["../escape", "Has Spaces", "-lead", "trail-"] {
             let mut payload = note("placeholder");
             payload["name"] = bad_name.into();
             let err = backend.store(item(payload)).await.unwrap_err();

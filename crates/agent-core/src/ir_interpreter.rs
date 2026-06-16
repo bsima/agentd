@@ -29,12 +29,35 @@ pub struct IrReplayTrace {
     eval_calls: BTreeMap<String, IrEvalCall>,
     eval_results: BTreeMap<String, Value>,
     eval_errors: BTreeMap<String, String>,
-    retrieve_queries: BTreeMap<String, String>,
+    retrieve_calls: BTreeMap<String, IrRetrieveCall>,
     retrieve_results: BTreeMap<String, Value>,
     retrieve_errors: BTreeMap<String, String>,
-    store_hashes: BTreeMap<String, String>,
+    store_calls: BTreeMap<String, IrStoreCall>,
     store_results: BTreeMap<String, String>,
     store_errors: BTreeMap<String, String>,
+}
+
+/// The Retrieve identity recorded for replay-divergence detection. `kind`
+/// and `max_bytes` are static program fields (so an edit also changes the
+/// program hash and effect id), but recording them makes divergence
+/// errors specific rather than a bare "missing call" (t-1182 review).
+#[derive(Debug, Clone, PartialEq)]
+struct IrRetrieveCall {
+    query: String,
+    kind: Option<String>,
+    max_bytes: Option<usize>,
+}
+
+/// The Store identity recorded for replay-divergence detection. `sink` and
+/// `id` are dynamic (evaluated from Exprs), so a same-site call computing a
+/// different target must be caught here — the payload `content_hash` alone
+/// does not cover them.
+#[derive(Debug, Clone, PartialEq)]
+struct IrStoreCall {
+    sink: String,
+    op: String,
+    id: Option<String>,
+    content_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,12 +146,22 @@ impl IrReplayTrace {
                         replay.eval_errors.insert(effect_id, error.clone());
                     }
                 }
-                Event::RetrieveCall { query, .. } => {
+                Event::RetrieveCall {
+                    query,
+                    kind,
+                    max_bytes,
+                    ..
+                } => {
                     let location = take_location(&mut last_location, EffectKind::Retrieve)?;
                     let effect_id = location.effect_id.0.clone();
-                    replay
-                        .retrieve_queries
-                        .insert(effect_id.clone(), query.clone());
+                    replay.retrieve_calls.insert(
+                        effect_id.clone(),
+                        IrRetrieveCall {
+                            query: query.clone(),
+                            kind: kind.clone(),
+                            max_bytes: *max_bytes,
+                        },
+                    );
                     last_retrieve_id = Some(effect_id);
                 }
                 Event::RetrieveResult { results, .. } => {
@@ -141,12 +174,24 @@ impl IrReplayTrace {
                         replay.retrieve_errors.insert(effect_id, error.clone());
                     }
                 }
-                Event::StoreCall { content_hash, .. } => {
+                Event::StoreCall {
+                    sink,
+                    store_op,
+                    store_id,
+                    content_hash,
+                    ..
+                } => {
                     let location = take_location(&mut last_location, EffectKind::Store)?;
                     let effect_id = location.effect_id.0.clone();
-                    replay
-                        .store_hashes
-                        .insert(effect_id.clone(), content_hash.clone());
+                    replay.store_calls.insert(
+                        effect_id.clone(),
+                        IrStoreCall {
+                            sink: sink.clone(),
+                            op: store_op.clone(),
+                            id: store_id.clone(),
+                            content_hash: content_hash.clone(),
+                        },
+                    );
                     last_store_id = Some(effect_id);
                 }
                 Event::StoreResult { sink_id, .. } => {
@@ -227,9 +272,9 @@ impl IrReplayTrace {
             .ok_or_else(|| anyhow!("AgentIR replay missing EvalResult for effect {effect_id}"))
     }
 
-    fn retrieve_result(&self, location: &EffectLocation, query: &str) -> Result<Value> {
+    fn retrieve_result(&self, location: &EffectLocation, key: &IrRetrieveCall) -> Result<Value> {
         let effect_id = &location.effect_id.0;
-        let recorded_query = self.retrieve_queries.get(effect_id).ok_or_else(|| {
+        let recorded = self.retrieve_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
                 "AgentIR replay missing RetrieveCall for effect {} at block {:?} instruction {}",
                 effect_id,
@@ -237,9 +282,9 @@ impl IrReplayTrace {
                 location.site.instruction_index
             )
         })?;
-        if recorded_query != query {
+        if recorded != key {
             return Err(anyhow!(
-                "AgentIR replay diverged at effect {effect_id}: expected Retrieve query {recorded_query:?}, observed {query:?}"
+                "AgentIR replay diverged at effect {effect_id}: expected Retrieve {recorded:?}, observed {key:?}"
             ));
         }
         if let Some(error) = self.retrieve_errors.get(effect_id) {
@@ -253,11 +298,13 @@ impl IrReplayTrace {
             .ok_or_else(|| anyhow!("AgentIR replay missing RetrieveResult for effect {effect_id}"))
     }
 
-    /// Replay never mutates a sink: the recorded id is returned, and the
-    /// recorded payload hash guards against same-site divergence.
-    fn store_result(&self, location: &EffectLocation, content_hash: &str) -> Result<String> {
+    /// Replay never mutates a sink: the recorded id is returned. The full
+    /// Store identity (sink, op, id, payload hash) is checked so a same-site
+    /// call computing a different sink/op/id/payload diverges instead of
+    /// silently replaying a stale result.
+    fn store_result(&self, location: &EffectLocation, key: &IrStoreCall) -> Result<String> {
         let effect_id = &location.effect_id.0;
-        let recorded_hash = self.store_hashes.get(effect_id).ok_or_else(|| {
+        let recorded = self.store_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
                 "AgentIR replay missing StoreCall for effect {} at block {:?} instruction {}",
                 effect_id,
@@ -265,9 +312,9 @@ impl IrReplayTrace {
                 location.site.instruction_index
             )
         })?;
-        if recorded_hash != content_hash {
+        if recorded != key {
             return Err(anyhow!(
-                "AgentIR replay diverged at effect {effect_id}: Store payload hash changed (recorded {recorded_hash}, observed {content_hash})"
+                "AgentIR replay diverged at effect {effect_id}: expected Store {recorded:?}, observed {key:?}"
             ));
         }
         if let Some(error) = self.store_errors.get(effect_id) {
@@ -753,6 +800,11 @@ async fn execute_instr(
             )?;
             emit_ir_effect(config, &location).await?;
             let query = string_expr(&machine.env, &query, "Retrieve.query")?;
+            let retrieve_key = IrRetrieveCall {
+                query: query.clone(),
+                kind: kind.map(|kind| format!("{kind:?}")),
+                max_bytes,
+            };
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -761,13 +813,14 @@ async fn execute_instr(
                     op_id,
                     parent_op_id: None,
                     query: query.clone(),
-                    kind: kind.map(|kind| format!("{kind:?}")),
+                    kind: retrieve_key.kind.clone(),
+                    max_bytes,
                     timestamp: Utc::now(),
                 })
                 .await?;
             let started = Instant::now();
             let result = match ir_replay {
-                Some(replay) => replay.retrieve_result(&location, &query),
+                Some(replay) => replay.retrieve_result(&location, &retrieve_key),
                 None => {
                     let params = crate::hydration::SourceParams {
                         query: Some(query.clone()),
@@ -837,6 +890,14 @@ async fn execute_instr(
             // Hash over the payload only (provenance is runtime-attached and
             // legitimately differs between record and replay).
             let content_hash = format!("{:x}", Sha256::digest(item_value.to_string().as_bytes()));
+            // The full Store identity: sink and id are dynamic (Expr), so
+            // replay must check them, not just the payload hash (t-1182 review).
+            let store_key = IrStoreCall {
+                sink: sink_name.clone(),
+                op: store_op.name().into(),
+                id: id_value.clone(),
+                content_hash: content_hash.clone(),
+            };
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -846,6 +907,7 @@ async fn execute_instr(
                     parent_op_id: None,
                     sink: sink_name.clone(),
                     store_op: store_op.name().into(),
+                    store_id: id_value.clone(),
                     item_preview: crate::trace::preview(&item_value.to_string(), 256),
                     content_hash: content_hash.clone(),
                     timestamp: Utc::now(),
@@ -854,7 +916,7 @@ async fn execute_instr(
             let started = Instant::now();
             let result = match ir_replay {
                 // Replay never mutates: the recorded id is the result.
-                Some(replay) => replay.store_result(&location, &content_hash),
+                Some(replay) => replay.store_result(&location, &store_key),
                 None => {
                     execute_store_live(
                         config,
@@ -1011,11 +1073,11 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "content": { "type": "string", "description": "the fact to keep" },
                         "name": {
                             "type": "string",
-                            "description": "kebab-case slug identifying the memory"
+                            "description": "optional kebab-case slug; derived from the description or content when omitted"
                         },
-                        "content": { "type": "string", "description": "the fact to keep" },
                         "description": {
                             "type": "string",
                             "description": "one-line summary used for recall relevance"
@@ -1025,7 +1087,7 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
                             "enum": ["user", "feedback", "project", "reference"]
                         }
                     },
-                    "required": ["name", "content"]
+                    "required": ["content"]
                 }),
             },
         });
@@ -1875,6 +1937,84 @@ mod tests {
                 .await
                 .expect_err("payload divergence must fail replay");
         assert!(err.to_string().contains("hash"), "{err}");
+        Ok(())
+    }
+
+    /// t-1182 review: the Store sink is dynamic (an Expr), so a same-site
+    /// call computing a different sink must diverge on replay even when the
+    /// payload (and thus content_hash) is byte-identical — the old hash-only
+    /// check would have replayed a stale result against the wrong sink.
+    #[tokio::test]
+    async fn replayed_store_detects_sink_divergence_with_identical_payload() -> Result<()> {
+        fn dynamic_sink_machine() -> Machine {
+            let mut blocks = BTreeMap::new();
+            blocks.insert(
+                BlockId(0),
+                crate::ir::Block {
+                    params: vec![Var("sink".into())],
+                    instructions: vec![Instr::Store {
+                        out: Var("id".into()),
+                        sink: Expr::Var(Var("sink".into())),
+                        op: crate::ir::StoreOp::Create,
+                        id: None,
+                        item: Expr::Value(serde_json::json!({
+                            "name": "fixed",
+                            "description": "identical payload",
+                            "body": "same bytes either run",
+                        })),
+                        policy: Default::default(),
+                    }],
+                    terminator: Terminator::Return {
+                        value: Expr::Var(Var("id".into())),
+                    },
+                },
+            );
+            Machine {
+                program: crate::ir::Program {
+                    id: crate::ir::ProgramId("dynamic-sink".into()),
+                    entry: BlockId(0),
+                    blocks,
+                },
+                block: BlockId(0),
+                pc: 0,
+                env: BTreeMap::new(),
+                effect_visits: BTreeMap::new(),
+                continuation_stack: vec![],
+                budgets: Default::default(),
+            }
+        }
+
+        // Record a run that stores to the "memory" sink.
+        let dir = memory_dir();
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = config_with_trace(Arc::new(MockProvider::new(vec![])), trace);
+        config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(dir));
+        let mut recorded = dynamic_sink_machine();
+        recorded
+            .env
+            .insert(Var("sink".into()), Value::String("memory".into()));
+        run_ir_sequential(&config, recorded).await?;
+        let replay = IrReplayTrace::from_events(
+            &crate::trace::TraceLogger::read_events(&trace_path).await?,
+        )?;
+
+        // Replay the same program/site with the sink computed differently.
+        let mut diverged = dynamic_sink_machine();
+        diverged
+            .env
+            .insert(Var("sink".into()), Value::String("elsewhere".into()));
+        let mut store = InMemoryStore::new();
+        let err =
+            run_ir_sequential_with_store_and_replay(&config, diverged, &mut store, Some(&replay))
+                .await
+                .expect_err("sink divergence must fail replay even with identical payload");
+        let message = err.to_string();
+        assert!(
+            message.contains("memory") && message.contains("elsewhere"),
+            "{message}"
+        );
         Ok(())
     }
 

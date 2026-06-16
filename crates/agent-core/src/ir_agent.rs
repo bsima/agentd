@@ -94,9 +94,7 @@ pub fn agent_loop_ir_with_options(
     let is_recall_tool = Var("is_recall_tool".into());
     let memory_name = Var("memory_name".into());
     let memory_content = Var("memory_content".into());
-    let missing_memory_name = Var("missing_memory_name".into());
     let missing_memory_content = Var("missing_memory_content".into());
-    let invalid_memory_arguments = Var("invalid_memory_arguments".into());
     let memory_item = Var("memory_item".into());
     let stored_id = Var("stored_id".into());
     let recall_query = Var("recall_query".into());
@@ -848,28 +846,18 @@ pub fn agent_loop_ir_with_options(
                             default: Box::new(Expr::Value(Value::String("".into()))),
                         },
                     },
-                    Instr::Let {
-                        out: missing_memory_name.clone(),
-                        expr: Expr::IsEmpty {
-                            base: memory_name.clone(),
-                        },
-                    },
+                    // Only `content` is required (docs/MEMORY.md tool surface
+                    // remember {content, name?, type?}): an absent name is
+                    // slugged from the description/body by the memory sink.
                     Instr::Let {
                         out: missing_memory_content.clone(),
                         expr: Expr::IsEmpty {
                             base: memory_content.clone(),
                         },
                     },
-                    Instr::Let {
-                        out: invalid_memory_arguments.clone(),
-                        expr: Expr::Or {
-                            left: Box::new(Expr::Var(missing_memory_name)),
-                            right: Box::new(Expr::Var(missing_memory_content.clone())),
-                        },
-                    },
                 ],
                 terminator: Terminator::If {
-                    cond: Expr::Var(invalid_memory_arguments),
+                    cond: Expr::Var(missing_memory_content.clone()),
                     then_block: invalid_arguments,
                     else_block: remember_store,
                 },
@@ -1014,9 +1002,7 @@ pub fn agent_loop_ir_with_options(
             is_recall_tool,
             memory_name,
             memory_content,
-            missing_memory_name,
             missing_memory_content,
-            invalid_memory_arguments,
             memory_item,
             stored_id,
             recall_query,
@@ -1537,7 +1523,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_ir_remember_with_missing_arguments_does_not_abort_turn() -> Result<()> {
+    async fn agent_loop_ir_remember_without_name_derives_a_slug() -> Result<()> {
+        // The documented surface is remember {content, name?}: a content-only
+        // call must succeed, deriving the slug from the description/content
+        // (t-1182 review finding #3).
         let dir = memory_dir();
         let provider = Arc::new(MockProvider::new(vec![
             response(
@@ -1545,7 +1534,55 @@ mod tests {
                 vec![ToolCall::new(
                     "call-1",
                     "remember",
-                    serde_json::json!({ "content": "fact without a name" }),
+                    serde_json::json!({
+                        "content": "deploys only on tuesdays",
+                        "description": "Deploy Window",
+                    }),
+                )],
+            ),
+            response("noted", vec![]),
+        ]));
+        let config = memory_config(provider.clone(), dir.clone());
+        let machine = agent_loop_ir_with_options(
+            Model("mock".into()),
+            vec![ChatMessage::user("remember the deploy window")],
+            4,
+            true,
+        );
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+        let response: Response = serde_json::from_value(value)?;
+        assert_eq!(response.content, "noted");
+
+        // A memory file was written under the derived slug, and the tool
+        // result echoed that slug back (no invalid_arguments).
+        assert!(
+            dir.join("deploy-window.md").exists(),
+            "slug derived from description"
+        );
+        let prompts = provider.prompts();
+        let tool_result = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("remember tool result fed back");
+        let content = tool_result.content.as_deref().unwrap();
+        assert!(content.contains("deploy-window"), "{tool_result:?}");
+        assert!(!content.contains("invalid_arguments"), "{tool_result:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_remember_without_content_is_invalid() -> Result<()> {
+        // content is the one required field; its absence is the only
+        // invalid-arguments case for remember.
+        let dir = memory_dir();
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "remember",
+                    serde_json::json!({ "name": "no-body" }),
                 )],
             ),
             response("noted the problem", vec![]),
