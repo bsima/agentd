@@ -5,9 +5,9 @@ use crate::interpreter::{
     SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
 };
 use crate::ir::{
-    effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectKind,
-    EffectLocation, EffectSite, EvalRequest, Expr, Instr, Machine, MatchArm, Pattern, ProgramHash,
-    PromptRef, Terminator, Var,
+    effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectErrorMode,
+    EffectKind, EffectLocation, EffectSite, EvalRequest, Expr, Instr, Machine, MatchArm, Pattern,
+    ProgramHash, PromptRef, Terminator, Var,
 };
 use crate::op::{ChatMessage, Model, Prompt};
 use crate::prompt_ir::{collect_prompt_ir_sections, compile_prompt_ir, PromptIR};
@@ -587,7 +587,7 @@ async fn execute_instr(
             out,
             model,
             prompt,
-            policy: _,
+            policy,
         } => {
             let location = effect_location(
                 program_hash.clone(),
@@ -665,6 +665,13 @@ async fn execute_instr(
                             timestamp: Utc::now(),
                         })
                         .await?;
+                    // Errors-as-values (t-1222): a Bind site converts the
+                    // failure into a tool-visible value instead of unwinding
+                    // the turn. Abort (default) propagates.
+                    if policy.on_error == EffectErrorMode::Bind {
+                        machine.env.insert(out, effect_error_value(&err));
+                        return Ok(());
+                    }
                     return Err(err);
                 }
             };
@@ -791,6 +798,7 @@ async fn execute_instr(
             query,
             kind,
             max_bytes,
+            policy,
         } => {
             let location = effect_location(
                 program_hash.clone(),
@@ -847,6 +855,10 @@ async fn execute_instr(
                             timestamp: Utc::now(),
                         })
                         .await?;
+                    if policy.on_error == EffectErrorMode::Bind {
+                        machine.env.insert(out, effect_error_value(&err));
+                        return Ok(());
+                    }
                     return Err(err);
                 }
             };
@@ -873,7 +885,7 @@ async fn execute_instr(
             op: store_op,
             id,
             item,
-            policy: _,
+            policy,
         } => {
             let location = effect_location(
                 program_hash.clone(),
@@ -944,6 +956,10 @@ async fn execute_instr(
                             timestamp: Utc::now(),
                         })
                         .await?;
+                    if policy.on_error == EffectErrorMode::Bind {
+                        machine.env.insert(out, effect_error_value(&err));
+                        return Ok(());
+                    }
                     return Err(err);
                 }
             };
@@ -963,6 +979,14 @@ async fn execute_instr(
         }
     }
     Ok(())
+}
+
+/// The value an effect binds to its `out` when `on_error: Bind` and the
+/// effect failed (t-1222). A small, model-legible envelope mirroring the
+/// shell tool's failure shape so the agent loop surfaces it as a tool
+/// result the model can read and recover from.
+fn effect_error_value(err: &anyhow::Error) -> Value {
+    serde_json::json!({ "ok": false, "error": format!("{err:#}") })
 }
 
 /// Execute a live Store against the registry: resolve the sink, enforce its
@@ -1792,6 +1816,7 @@ mod tests {
                         query: Expr::Value(Value::String("remembered fact".into())),
                         kind: Some(crate::hydration::SourceKind::Semantic),
                         max_bytes: None,
+                        policy: Default::default(),
                     },
                 ],
                 terminator: Terminator::Return {
@@ -2065,6 +2090,7 @@ mod tests {
                     query: Expr::Value(Value::String("missing".into())),
                     kind: None,
                     max_bytes: None,
+                    policy: Default::default(),
                 }],
                 terminator: Terminator::Return {
                     value: Expr::Var(Var("a".into())),

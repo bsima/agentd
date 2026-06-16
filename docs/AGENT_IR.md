@@ -160,9 +160,23 @@ Replay then feeds recorded `Infer` and `Eval` results back at matching effect ID
 
 AgentIR needs an explicit failure model. Effects can fail because of provider errors, timeouts, denied sandbox operations, invalid values, failed evals, canceled branches, or replay divergence.
 
-The initial runtime can treat these as typed machine errors that abort execution. If agent programs need to recover from failures, AgentIR should add explicit control-flow support rather than hiding recovery inside interpreters. Likely options are result-shaped effect outputs, error edges, or a `Try`-like terminator.
+Each effect (`Infer`/`Store`/`Retrieve`) carries an `on_error` mode on its policy with two settings:
 
-The important rule is that failure behavior must be visible in traces and replay. A failed effect should have a stable effect ID and an error event, not just a missing result.
+- **`Abort` (default)** — the error propagates and unwinds the program. Correct for the main inference and program-sited effects, where a provider failure is genuinely fatal.
+- **`Bind`** — *errors as values* (t-1222): the failure is converted to `{"ok": false, "error": <msg>}` and bound to the effect's `out`, so the surrounding IR branches on it like any other value. The model-initiated tool dispatches (`infer`/`remember`/`recall`) use `Bind`, so a bad tool argument (e.g. a hallucinated model id, or a duplicate memory slug) becomes a tool result the model can read and recover from within the same turn, instead of aborting the whole run.
+
+This deliberately stays within the IR's "no hidden control flow" character: `Bind` adds no new control-flow construct — the error is just data flowing through the existing `Match`/`If` terminators. We chose it over a `Try`/`Catch` terminator precisely because exception-style stack-unwinding is the thing AgentIR avoids.
+
+### Future: resumable handlers
+
+`Bind` lets a program *observe and branch on* a failure, but not *resume the failed effect*. The principled upgrade — when a program (or the model, via a policy) should retry an effect with a corrected argument rather than just see that it failed — is a **resumable handler**, in either of two PL framings:
+
+- **Algebraic effects / handlers** (Koka, OCaml 5, Unison abilities): a handler installed by an enclosing block intercepts the effect failure *holding the delimited continuation*, and may `resume` the computation with a substitute value (e.g. re-run `Infer` against the default model). `Bind` is the degenerate handler that never resumes; `Abort` is the handler that always re-raises.
+- **Conditions and restarts** (Common Lisp): the effect site declares named restarts (`use-default-model`, `skip`, `retry`); a handler higher up runs *without unwinding* and selects one at the point of failure — recovery policy decided high, applied low.
+
+Both map cleanly onto the existing effect/handler vocabulary and the stable-effect-id machinery: a resume is a new attempt at the same effect site, recordable and replayable like any other. The migration path is additive — `Abort`/`Bind` remain the common cases; a `Handle { effect, with: BlockId }` construct (or an effect-row on blocks) would layer on top without changing them. Not built yet; recorded here so the IR shape does not preclude it.
+
+The important rule, unchanged across all of these: failure behavior must be visible in traces and replay. A failed effect always has a stable effect ID and an error event (`InferError`/`StoreError`/`RetrieveError`), whether it then aborts, binds, or (in future) resumes — not just a missing result.
 
 ## `Par` semantics
 

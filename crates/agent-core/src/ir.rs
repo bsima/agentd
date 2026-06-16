@@ -112,6 +112,8 @@ pub enum Instr {
         kind: Option<crate::hydration::SourceKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<usize>,
+        #[serde(default)]
+        policy: RetrievePolicy,
     },
     /// Write to a registered hydration sink (docs/MEMORY.md). `sink`
     /// selects the target by registered name; `item` is the sink-schema
@@ -146,11 +148,39 @@ impl StoreOp {
     }
 }
 
+/// What the interpreter does when an effect (Infer/Store/Retrieve) fails.
+/// `Abort` (default) propagates the error and unwinds the program — correct
+/// for the main inference and program-sited effects, where a provider
+/// failure is fatal. `Bind` converts the failure into a value
+/// (`{"ok": false, "error": <msg>}`) bound to the effect's `out`, so the
+/// surrounding IR can branch on it — this is errors-as-values, used by the
+/// model-initiated tool dispatches (infer/remember/recall) so a bad tool
+/// argument becomes a tool result the model can recover from instead of
+/// killing the whole turn (t-1222). See docs/AGENT_IR.md for the future
+/// path to resumable (algebraic-effect / restart) handlers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectErrorMode {
+    #[default]
+    Abort,
+    Bind,
+}
+
 /// Per-instruction policy slot, mirroring InferPolicy/EvalPolicy. The
 /// per-SINK write policy (Free vs RequireApproval) lives on the sink
-/// itself; this slot is for site-level overrides if they ever matter.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorePolicy {}
+/// itself; `on_error` chooses abort-vs-bind for this site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePolicy {
+    #[serde(default)]
+    pub on_error: EffectErrorMode,
+}
+
+/// Per-Retrieve policy slot; `on_error` chooses abort-vs-bind for this site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievePolicy {
+    #[serde(default)]
+    pub on_error: EffectErrorMode,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Terminator {
@@ -284,6 +314,9 @@ pub enum PromptRef {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferPolicy {
     pub max_turns: Option<usize>,
+    /// Abort (default) vs bind-error-as-value for this Infer site.
+    #[serde(default)]
+    pub on_error: EffectErrorMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -731,6 +764,7 @@ mod tests {
                         query: Expr::Value(Value::String("k".into())),
                         kind: None,
                         max_bytes: None,
+                        policy: Default::default(),
                     }],
                     terminator: Terminator::Return {
                         value: Expr::Var(Var("x".into())),

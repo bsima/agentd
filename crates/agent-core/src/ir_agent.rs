@@ -1,5 +1,6 @@
 use crate::ir::{
-    Block, BlockId, Expr, Instr, Machine, Program, ProgramId, PromptRef, Terminator, Var,
+    Block, BlockId, EffectErrorMode, Expr, InferPolicy, Instr, Machine, Program, ProgramId,
+    PromptRef, RetrievePolicy, StorePolicy, Terminator, Var,
 };
 use crate::op::{Model, Prompt};
 use serde_json::Value;
@@ -648,7 +649,13 @@ pub fn agent_loop_ir_with_options(
                     out: infer_result.clone(),
                     model: Expr::Var(infer_model),
                     prompt: PromptRef::Var(infer_prompt),
-                    policy: Default::default(),
+                    // Errors-as-values (t-1222): a bad sub-infer model (e.g.
+                    // a hallucinated id) becomes a tool result the model can
+                    // recover from, not a turn-aborting error.
+                    policy: InferPolicy {
+                        on_error: EffectErrorMode::Bind,
+                        ..Default::default()
+                    },
                 },
                 // Feed back the sub-response *text*, not the serialized
                 // Response envelope (token counts, finish_reason, ids) — the
@@ -903,7 +910,11 @@ pub fn agent_loop_ir_with_options(
                         op: crate::ir::StoreOp::Create,
                         id: None,
                         item: Expr::Var(memory_item),
-                        policy: Default::default(),
+                        // Errors-as-values (t-1222): a rejected write (e.g. a
+                        // duplicate slug) becomes a tool result, not a fatal turn.
+                        policy: StorePolicy {
+                            on_error: EffectErrorMode::Bind,
+                        },
                     },
                     Instr::Let {
                         out: tool_content.clone(),
@@ -976,6 +987,11 @@ pub fn agent_loop_ir_with_options(
                         query: Expr::Var(recall_query),
                         kind: Some(crate::hydration::SourceKind::Semantic),
                         max_bytes: Some(16 * 1024),
+                        // Errors-as-values (t-1222): a failed recall becomes a
+                        // tool result, not a turn-aborting error.
+                        policy: RetrievePolicy {
+                            on_error: EffectErrorMode::Bind,
+                        },
                     },
                     Instr::Let {
                         out: tool_content.clone(),
@@ -1616,6 +1632,137 @@ mod tests {
             std::fs::read_dir(&dir)?.next().is_none(),
             "nothing was written"
         );
+        Ok(())
+    }
+
+    /// Provider that 404s for one model id (a dead/hallucinated model) and
+    /// serves queued responses otherwise — mirrors the t-1221 trigger.
+    struct DeadModelProvider {
+        dead_model: String,
+        responses: Mutex<Vec<Response>>,
+        prompts: Mutex<Vec<Prompt>>,
+    }
+
+    #[async_trait]
+    impl ChatProvider for DeadModelProvider {
+        async fn chat(
+            &self,
+            model: &Model,
+            _tools: &[ToolSpec],
+            messages: &[ChatMessage],
+        ) -> Result<Response> {
+            if model.0 == self.dead_model {
+                return Err(anyhow!(
+                    "provider returned 404 Not Found: model: {}",
+                    self.dead_model
+                ));
+            }
+            self.prompts.lock().unwrap().push(messages.to_vec());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| anyhow!("mock provider exhausted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_infer_tool_failure_becomes_a_recoverable_tool_result() -> Result<()> {
+        // t-1222: the model calls the infer sub-tool with a dead model id.
+        // The 404 must become a tool result the model sees, and the turn
+        // must continue — not abort the whole run (the t-1221 impact).
+        let mut queued = vec![
+            // turn 1: call the dead-model infer tool.
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "infer",
+                    serde_json::json!({
+                        "model": "claude-sonnet-4-20250514",
+                        "prompt": "sub-question",
+                    }),
+                )],
+            ),
+            // turn 2: having seen the error tool result, finish.
+            response("recovered from the bad infer", vec![]),
+        ];
+        queued.reverse();
+        let provider = Arc::new(DeadModelProvider {
+            dead_model: "claude-sonnet-4-20250514".into(),
+            responses: Mutex::new(queued),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let machine = agent_loop_ir(
+            Model("mock-main".into()),
+            vec![ChatMessage::user("use infer, then answer")],
+            6,
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+        let response: Response = serde_json::from_value(value)?;
+
+        // The run completed instead of aborting on the 404.
+        assert_eq!(response.content, "recovered from the bad infer");
+        // The infer tool's failure was fed back as a tool result the model
+        // saw on turn 2 (errors-as-values, not a turn-aborting error). Only
+        // the two main-model calls are recorded; the dead-model sub-infer
+        // errored before recording, so turn 2's prompt is index 1.
+        let turn_two = provider.prompts.lock().unwrap()[1].clone();
+        let tool_result = turn_two
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("the infer failure was fed back as a tool result");
+        let content = tool_result.content.as_deref().unwrap();
+        assert!(content.contains("\"ok\":false"), "{content}");
+        assert!(content.contains("404"), "{content}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_remember_store_failure_becomes_a_recoverable_tool_result() -> Result<()>
+    {
+        // t-1222 (Store side): a rejected write — here a duplicate slug —
+        // becomes a tool result the model can react to, not a fatal turn.
+        let dir = memory_dir();
+        tokio::fs::write(
+            dir.join("taken.md"),
+            "---\nname: taken\n---\n\nalready here",
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "remember",
+                    serde_json::json!({ "name": "taken", "content": "collides with an existing slug" }),
+                )],
+            ),
+            response("acknowledged the collision", vec![]),
+        ]));
+        let config = memory_config(provider.clone(), dir);
+        let machine = agent_loop_ir_with_options(
+            Model("mock".into()),
+            vec![ChatMessage::user("remember a colliding note, then answer")],
+            6,
+            true,
+        );
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+        let response: Response = serde_json::from_value(value)?;
+        assert_eq!(response.content, "acknowledged the collision");
+
+        let turn_two = &provider.prompts()[1];
+        let tool_result = turn_two
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("the store failure was fed back as a tool result");
+        let content = tool_result.content.as_deref().unwrap();
+        assert!(content.contains("\"ok\":false"), "{content}");
+        assert!(content.contains("already exists"), "{content}");
         Ok(())
     }
 
