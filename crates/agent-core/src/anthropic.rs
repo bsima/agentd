@@ -1,7 +1,7 @@
 use crate::op::{ChatMessage, FinishReason, Model, Response, ToolCall};
 use crate::provider::{
-    chat_with_retries, is_context_overflow, retry_after_delay, ChatProvider, ProviderError,
-    ToolSpec, CONTINUE_NUDGE,
+    chat_with_retries, is_context_overflow, is_model_not_found, retry_after_delay, ChatProvider,
+    ProviderError, ToolSpec, CONTINUE_NUDGE,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -109,6 +109,9 @@ impl AnthropicProvider {
         if !status.is_success() {
             if is_context_overflow(status, &text) {
                 return Err(ProviderError::ContextOverflow { status, text });
+            }
+            if is_model_not_found(status, &text) {
+                return Err(ProviderError::ModelNotFound { status, text });
             }
             return Err(ProviderError::Http {
                 status,

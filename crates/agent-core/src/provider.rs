@@ -256,6 +256,9 @@ async fn send_chat_request(
             if is_context_overflow(status, &text) {
                 return Err(ProviderError::ContextOverflow { status, text });
             }
+            if is_model_not_found(status, &text) {
+                return Err(ProviderError::ModelNotFound { status, text });
+            }
             return Err(ProviderError::Http {
                 status,
                 text,
@@ -337,6 +340,15 @@ pub(crate) enum ProviderError {
         status: StatusCode,
         text: String,
     },
+    /// The provider rejected the requested model id as unknown (a 404
+    /// not_found). Permanently un-retryable: a model that does not exist
+    /// will never exist on retry, so failing fast keeps a bad/stale model
+    /// id (e.g. a hallucinated `infer` tool argument) from quietly eating a
+    /// run's wall-clock budget through retries (t-1221).
+    ModelNotFound {
+        status: StatusCode,
+        text: String,
+    },
     /// Provider returned a 200 OK with neither content nor tool calls. Carries
     /// the raw response body for diagnostics.
     EmptyCompletion {
@@ -360,6 +372,8 @@ impl ProviderError {
                 *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
             Self::ContextOverflow { .. } => false,
+            // A non-existent model never becomes existent on retry.
+            Self::ModelNotFound { .. } => false,
             Self::EmptyCompletion { .. } => true,
             Self::Other(_) => false,
         }
@@ -379,6 +393,9 @@ impl ProviderError {
             Self::ContextOverflow { status, text } => {
                 anyhow::Error::new(ContextOverflowError { status, text })
             }
+            Self::ModelNotFound { status, text } => anyhow!(
+                "requested model not found (provider returned {status}); check --model and your models.yaml. Provider response: {text}"
+            ),
             Self::EmptyCompletion { raw } => {
                 anyhow!("provider returned an empty completion (no content or tool calls) after retries; raw response body: {raw}")
             }
@@ -449,6 +466,21 @@ pub(crate) fn is_context_overflow(status: StatusCode, text: &str) -> bool {
                 || lower.contains("length")
                 || lower.contains("too long")
                 || lower.contains("maximum")))
+}
+
+/// A 404 whose body names a model/not-found error: the requested model id
+/// is unknown to the provider (t-1221). Covers the Anthropic shape
+/// (`{"error":{"type":"not_found_error","message":"model: ..."}}`) and the
+/// OpenAI-compatible `model_not_found`/`does not exist` phrasings.
+pub(crate) fn is_model_not_found(status: StatusCode, text: &str) -> bool {
+    if status != StatusCode::NOT_FOUND {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("not_found")
+        || lower.contains("model_not_found")
+        || lower.contains("model")
+        || lower.contains("does not exist")
 }
 
 pub(crate) fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
@@ -805,6 +837,58 @@ mod tests {
         .await;
 
         assert_eq!(*calls.borrow(), 1, "4xx must not be retried");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn model_not_found_is_classified_and_never_retryable() {
+        // The Anthropic not_found_error shape from t-1221.
+        let anthropic = r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-sonnet-4-20250514"}}"#;
+        assert!(is_model_not_found(StatusCode::NOT_FOUND, anthropic));
+        // OpenAI-compatible phrasing.
+        assert!(is_model_not_found(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"code":"model_not_found"}}"#
+        ));
+        // Not a 404 -> not classified here (overflow/other paths handle it).
+        assert!(!is_model_not_found(StatusCode::BAD_REQUEST, anthropic));
+        // A 404 unrelated to models stays a generic Http error.
+        assert!(!is_model_not_found(StatusCode::NOT_FOUND, "page missing"));
+
+        let err = ProviderError::ModelNotFound {
+            status: StatusCode::NOT_FOUND,
+            text: anthropic.into(),
+        };
+        assert!(
+            !err.is_retryable(),
+            "a dead model id never recovers on retry"
+        );
+        let message = err.into_anyhow().to_string();
+        assert!(message.contains("model not found"), "{message}");
+        assert!(message.contains("models.yaml"), "actionable: {message}");
+    }
+
+    // t-1221: a dead model id (e.g. a hallucinated `infer` tool argument)
+    // must fail on the first attempt, never burning the retry budget.
+    #[tokio::test(start_paused = true)]
+    async fn model_not_found_is_not_retried() {
+        let calls = RefCell::new(0usize);
+        let result = chat_with_retries(
+            |nudge| build_chat_body(&model(), &[], &convo(), nudge),
+            |_body| {
+                *calls.borrow_mut() += 1;
+                async {
+                    Err(ProviderError::ModelNotFound {
+                        status: StatusCode::NOT_FOUND,
+                        text: r#"{"error":{"type":"not_found_error","message":"model: dead"}}"#
+                            .into(),
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(*calls.borrow(), 1, "model-not-found must fail fast");
         assert!(result.is_err());
     }
 }
