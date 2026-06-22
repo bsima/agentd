@@ -41,6 +41,14 @@ impl OAuthProviderKind {
     }
 }
 
+/// OAuth client_id for the OpenAI/Codex token endpoint. Mirrors
+/// `codexClientId` in Omni/Agent/Auth.hs. Required on the refresh_token grant.
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// OAuth client_id for the Anthropic/Claude Code token endpoint. Mirrors
+/// `clientId` in Omni/Agent/Auth.hs.
+const CLAUDE_CODE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthToken {
     #[serde(rename = "access")]
@@ -352,12 +360,21 @@ impl OAuthChatProvider {
             OAuthProviderKind::Codex => "https://auth.openai.com/oauth/token",
             OAuthProviderKind::ClaudeCode => "https://claude.ai/oauth/token",
         };
+        // The token endpoints require the client_id on the refresh_token grant.
+        // Omitting it yields a 400 "Missing 'client_id'". These values mirror
+        // the Haskell implementation in Omni/Agent/Auth.hs (codexClientId /
+        // clientId).
+        let client_id = match self.kind {
+            OAuthProviderKind::Codex => CODEX_CLIENT_ID,
+            OAuthProviderKind::ClaudeCode => CLAUDE_CODE_CLIENT_ID,
+        };
         let response = self
             .client
             .post(endpoint)
             .json(&json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
+                "client_id": client_id,
             }))
             .send()
             .await
@@ -964,6 +981,17 @@ fn base64_value(byte: u8) -> Option<i16> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn refresh_client_ids_match_haskell_constants() {
+        // These must stay in lockstep with Omni/Agent/Auth.hs (codexClientId /
+        // clientId). The Codex token endpoint rejects a refresh_token grant
+        // that omits client_id with 400 "Missing 'client_id'".
+        assert_eq!(CODEX_CLIENT_ID, "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(
+            CLAUDE_CODE_CLIENT_ID,
+            "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        );
+    }
     #[test]
     fn pkce_generation_has_expected_lengths() {
         let pkce = generate_pkce();
