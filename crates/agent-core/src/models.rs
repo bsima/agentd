@@ -62,26 +62,28 @@ impl ModelRegistry {
 
     pub fn resolve(&self, requested: Option<&str>) -> Result<ResolvedModel> {
         let alias = requested.unwrap_or(&self.default_model);
-        match self.models.iter().find(|entry| entry.name == alias) {
-            Some(entry) => Ok(ResolvedModel {
-                alias: entry.name.clone(),
-                provider: Some(entry.provider.clone()),
-                api_id: entry.api_id.clone().unwrap_or_else(|| entry.name.clone()),
-                base_url: entry.base_url.clone(),
-                api_key: expand_api_key(entry.api_key.as_deref())?,
-                context: entry.context,
-                max_tokens: entry.max_tokens,
-            }),
-            None => Ok(ResolvedModel {
-                alias: alias.to_string(),
-                provider: None,
-                api_id: alias.to_string(),
-                base_url: None,
-                api_key: None,
-                context: default_context(),
-                max_tokens: None,
-            }),
-        }
+        let Some(entry) = self.models.iter().find(|entry| entry.name == alias) else {
+            let mut known = self
+                .models
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>();
+            known.sort_unstable();
+            return Err(anyhow!(
+                "unknown model alias {alias:?}; known model names: {}",
+                known.join(", ")
+            ));
+        };
+
+        Ok(ResolvedModel {
+            alias: entry.name.clone(),
+            provider: Some(entry.provider.clone()),
+            api_id: entry.api_id.clone().unwrap_or_else(|| entry.name.clone()),
+            base_url: entry.base_url.clone(),
+            api_key: expand_api_key(entry.api_key.as_deref())?,
+            context: entry.context,
+            max_tokens: entry.max_tokens,
+        })
     }
 }
 
@@ -159,16 +161,19 @@ models:
     }
 
     #[test]
-    fn default_model_and_unknown_alias_are_supported() -> Result<()> {
+    fn default_model_known_alias_and_unknown_alias_error() -> Result<()> {
         let registry = ModelRegistry::from_yaml_str(MODELS)?;
         assert_eq!(
             registry.resolve(None)?.api_id,
             "parasail-qwen3-235b-a22b-instruct-2507"
         );
-        assert_eq!(
-            registry.resolve(Some("unknown/model"))?.api_id,
-            "unknown/model"
-        );
+        let err = registry
+            .resolve(Some("unknown/model"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown/model"), "got: {err}");
+        assert!(err.contains("direct-name"), "got: {err}");
+        assert!(err.contains("parasail/qwen3-235b"), "got: {err}");
         assert_eq!(registry.resolve(Some("direct-name"))?.api_id, "direct-name");
         Ok(())
     }
