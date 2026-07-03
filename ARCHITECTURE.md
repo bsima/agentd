@@ -22,14 +22,14 @@ An agent needs both. It infers from text, history, files, and command output. Th
 
 The loop is the agent.
 
-`agentd` encodes that loop with a small effect algebra — `Infer`, `Eval`, `Get`, `Put`, `Emit`, `Par` — shared by two program representations:
+`agentd` encodes that loop with a small effect algebra — `Infer`, `Eval`, `Retrieve`, `Store`, `Emit` — carried by two program representations:
 
 | Representation | Module | Status |
 |---|---|---|
 | **AgentIR** — serializable block/instruction CFG with an explicit machine | `agent-core::ir`, `ir_interpreter` | Stable runtime; the CLI's only runtime |
 | **Op** — free monad with Rust closure continuations | `agent-core::op`, `interpreter` | Library-level builder/test API; no CLI runtime mode |
 
-The effect algebra, not either encoding, is the architectural constraint. Interpreters must preserve explicit `Infer`/`Eval`/`Get`/`Put`/`Emit`/`Par` effects regardless of how programs are authored.
+The effect algebra, not either encoding, is the architectural constraint. Interpreters must preserve explicit `Infer`/`Eval`/`Retrieve`/`Store`/`Emit` effects regardless of how programs are authored. (The Op builder covers the `Infer`/`Eval`/`Emit`/`Par` subset; `Retrieve` and `Store` exist only in the IR. Their key-based predecessor, `Get`/`Put`, was deleted — see [docs/MEMORY.md](./docs/MEMORY.md).)
 
 ## AgentIR: programs are data, literally
 
@@ -43,12 +43,12 @@ pub struct Program {
 }
 
 pub enum Instr {
-    Let   { out, expr },
-    Infer { out, model, prompt, policy },   // LLM call: infer(unstructured)
-    Eval  { out, request, policy },         // process call: eval(structured)
-    Get   { out, key },                     // state/context read
-    Put   { key, value },                   // state/context write
-    Emit  { event },                        // trace
+    Let      { out, expr },
+    Infer    { out, model, prompt, policy },  // LLM call: infer(unstructured)
+    Eval     { out, request, policy },        // process call: eval(structured)
+    Emit     { event },                       // trace
+    Retrieve { out, query, kind, max_bytes, policy },  // ranked read from hydration sources
+    Store    { out, sink, op, id, item, policy },      // write to a hydration sink
 }
 ```
 
@@ -57,7 +57,7 @@ Execution is an explicit machine — `{program, block, pc, env, budgets}` — st
 - programs round-trip through JSON and are validated (block refs, arity, use-before-def, shadowing) before any effect runs
 - checkpoints can snapshot a machine **mid-turn** and resume without re-running completed effects
 - every effect has a stable id derived from `hash(program_hash, effect_site, dynamic_path)`, so replay keys on program identity rather than incidental sequence numbers, and divergence errors name the block and instruction
-- a failed effect closes with an `InferError`/`EvalError` trace event, so failed runs replay as the same failure
+- a failed effect closes with an error trace event (`InferError`/`EvalError`/`RetrieveError`/`StoreError`), so failed runs replay as the same failure
 
 The design is specified in [docs/AGENT_IR.md](./docs/AGENT_IR.md).
 
@@ -69,8 +69,6 @@ The original encoding is a free monad over `OpF`, with `and_then`/`map` and clos
 pub enum OpF<S, A> {
     Infer { model, prompt, next },
     Eval  { command, next },
-    Get   { key, next },
-    Put   { key, value, next },
     Emit  { event, next },
     Par   { ops, next },
     Pure(A),
@@ -99,37 +97,42 @@ Today `Eval` forks the configured shell with `-c <command>`. The default shell i
 
 It also gives one sandboxing hook. You do not sandbox each tool. You sandbox the evaluator. The interpreter can wrap every `Eval` with `bwrap`, a container, a VM, a remote worker, or a hermetic PATH.
 
-## Get/Put is the hydration model
+## Retrieve/Store is the hydration model
 
-`Get` and `Put` are not just state plumbing. They are the interface for context.
+`Retrieve` and `Store` are not just state plumbing. They are the interface for context.
 
-Every context source is a keyed read:
+A context read is a query, not a key lookup; a context write is a mutation with real semantics, not a blind put:
 
 ```text
-Get("temporal:history")   -> conversation history
-Get("semantic:topic")     -> vector search or other semantic recall
-Get("session:state")      -> current checkpoint
-Put("session:state", v)   -> write checkpoint
+Retrieve { query, kind?, max_bytes? }
+    -> [{source, kind, content, metadata}]   one hit per source, best matches first within it
+
+Store { sink, op: create | update | delete, id?, item }
+    -> sink-assigned stable id
 ```
 
-The interpreter decides how each key is backed, but the guaranteed namespaces — `session:state`, `temporal:*`, `semantic:*` — have a fixed observable contract that every runtime must satisfy. The contract, including the one deliberate divergence (unknown keys), is specified in [docs/STATE_KEYS.md](./docs/STATE_KEYS.md) and enforced by a conformance test against both runtimes.
+`Retrieve` fans out to every registered query-capable source, optionally narrowed to one `SourceKind` (`Temporal` | `Semantic` | `Knowledge`), and returns full bodies under `max_bytes` — no second round-trip. `Store` targets one sink by registered name; the runtime — never the program — attaches provenance (run id, effect id, timestamp) to every write, and each sink declares a write policy (`Free` writes execute immediately with the trace as the audit; `RequireApproval` sinks refuse until the approval flow exists).
 
-This gives one model for passive context injection and active recall:
+Both are effects in the full sense: stable effect ids, `RetrieveCall`/`RetrieveResult` and `StoreCall`/`StoreResult` trace events, and deterministic replay. A replayed `Retrieve` returns the recorded hits without touching any source; a replayed `Store` returns the recorded id without mutating the sink — replay never writes.
 
-|            | Passive, interpreter-owned | Active, agent-emitted |
-|------------|----------------------------|------------------------|
-| `Get`      | inject context before turn  | query a source by key   |
-| `Put`      | write checkpoints/traces    | mutate state by key     |
+This gives one model for passive context injection and active recall, split by initiator:
+
+|            | Source (read) | Sink (write) |
+|------------|---------------|--------------|
+| **Passive** (runtime-initiated) | prompt-assembly hydration before each turn; program-sited `Retrieve` | turn-completion persistence (checkpointing); program-sited `Store` |
+| **Active** (model-initiated) | `recall` tool -> `Retrieve` | `remember` tool -> `Store` |
 
 Passive mode is ordinary context construction. The interpreter gathers recent history, semantic matches, workspace facts, or session data before `Infer`.
 
-Active mode is agent-driven recall. If the passive window is not enough, the program can emit `Get("semantic:prior architecture decisions")`.
+Active mode is model-driven: the agent loop exposes `remember`/`recall` tools alongside `shell` and `infer`, and its tool-dispatch arm compiles them onto the same `Store`/`Retrieve` effects. The tools appear automatically whenever a memory backend is registered. If the passive window is not enough, the model can ask.
 
-Same operation. Different timing.
+Same operations. Different initiator.
 
-## Hydration sources
+The design, including why the key-based `Get`/`Put` predecessor was deleted, is specified in [docs/MEMORY.md](./docs/MEMORY.md).
 
-The interpreter maps passive hydration and active `Get` keys to `HydrationSource` implementations:
+## Hydration sources and sinks
+
+The interpreter maps passive hydration, `Retrieve`, and `Store` to `HydrationSource`/`HydrationSink` implementations registered in one `SourceRegistry`:
 
 ```rust
 pub trait HydrationSource: Send + Sync {
@@ -138,9 +141,20 @@ pub trait HydrationSource: Send + Sync {
     fn capabilities(&self) -> SourceCapability;   // SESSION_CONTEXT | QUERY | WORKSPACE
     async fn retrieve(&self, params: SourceParams) -> Result<SourceResult>;
 }
+
+pub trait HydrationSink: Send + Sync {
+    fn name(&self) -> &str;
+    fn kind(&self) -> SourceKind;                 // sinks share the source kind taxonomy
+    fn write_policy(&self) -> SinkWritePolicy;    // Free | RequireApproval
+    async fn store(&self, item: SinkItem) -> Result<SinkId>;
+    async fn update(&self, id: &SinkId, item: SinkItem) -> Result<()>;
+    async fn delete(&self, id: &SinkId) -> Result<()>;
+}
 ```
 
-`SeqConfig::passive_hydration` selects passive sources before each `Infer`. Active reads use the same `Get` shape: `Get("semantic:topic")` dispatches to query-capable sources.
+They are deliberately separate traits (the std::io `Read`/`Write` precedent), so writability is a compile-time fact. A backend that persists implements both and can register once via `register_backend` — the file-backed memory backend (`--memory-dir`) registers this way, serving retrieval and writes from one object. The `ChatHistory` session backend also implements both halves: its sink half writes checkpoints, its source half is the recency-windowed temporal reader. The payload schema belongs to each sink, not to the trait or the IR.
+
+`SeqConfig::passive_hydration` selects passive sources before each `Infer`. `Retrieve` dispatches to query-capable sources, optionally filtered by kind; `Store` looks up its sink by name.
 
 Passively hydrated sections are assembled through PromptIR — labeled, sourced, budgeted sections compiled to provider messages — so every context chunk has a key, source, and hash in the trace. See [docs/PROMPT_IR.md](./docs/PROMPT_IR.md).
 
@@ -159,7 +173,7 @@ A FIFO works because it is boring:
 
 No broker is required. No coordinator is required.
 
-Checkpoints are written after turns through `Put("session:state", ...)` and mirrored to checkpoint files by the CLI. A crashed agent can restart from the latest checkpoint with history intact; checkpoints with dangling tool calls are repaired on load.
+Checkpoints are written at turn completion through the `ChatHistory` sink — the passive write channel, not a program effect: it consumes no effect id, a failing sink logs and never fails the turn, and it is suppressed entirely under replay (replay never writes). A crashed agent can restart from the latest checkpoint with history intact; checkpoints with dangling tool calls are repaired on load.
 
 ## Provider neutrality
 
@@ -202,9 +216,9 @@ Every effect execution appends JSONL events with a run id, operation id, and —
 {"event":"EvalError",  "op_id":4, "error":"..."}
 ```
 
-Failures close their call with `InferError`/`EvalError`, so failed runs are as inspectable and replayable as successful ones. Replay mode re-runs the same program and feeds recorded results (or failures) back at matching effect ids instead of calling providers or executing shell commands.
+Failures close their call with `InferError`/`EvalError` (or `RetrieveError`/`StoreError` for the hydration effects), so failed runs are as inspectable and replayable as successful ones. Replay mode re-runs the same program and feeds recorded results (or failures) back at matching effect ids instead of calling providers, executing shell commands, or touching sources and sinks.
 
-Full prompts and `Get` values are opt-in (`--trace-full-payloads`); by default traces carry previews, keeping trace growth linear in session length.
+Full prompts are opt-in (`--trace-full-payloads`); by default traces carry previews, keeping trace growth linear in session length. Two deliberate exceptions: `Retrieve` results are always recorded in full, because replay returns them verbatim, and `Store` records a payload preview plus a content hash, so replay can detect same-site divergence without recording the item.
 
 ## Non-goals
 

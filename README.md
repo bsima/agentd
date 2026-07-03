@@ -39,15 +39,13 @@ An agent alternates between the two. It infers from context, evaluates effects a
 pub enum OpF<S, A> {
     Infer { model, prompt, next },  // LLM call: infer(unstructured)
     Eval  { command, next },        // process call: eval(structured), currently $SHELL -c
-    Get   { key, next },            // state/context read
-    Put   { key, value, next },     // state/context write
     Emit  { event, next },          // trace
     Par   { ops, next },            // parallel effects
     Pure(A),
 }
 ```
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the longer version.
+The CLI's actual runtime is the serializable AgentIR, which carries the same `Infer`/`Eval`/`Emit` core and adds two hydration effects: `Retrieve` (a ranked, query-based read over registered context sources) and `Store` (a create/update/delete write to a registered sink). See [ARCHITECTURE.md](./ARCHITECTURE.md) for the longer version and [docs/MEMORY.md](./docs/MEMORY.md) for the retrieval/memory design.
 
 ### Infer can call Infer
 
@@ -61,21 +59,21 @@ This is the SICP meta-circular idea applied to agents. `eval` calling `eval` col
 
 The durable history is an append-only record (checkpoints, traces, replay all
 depend on that). What the *model sees per turn* is a managed window over it:
-`agent-core` models context as keyed reads and writes, hydrates passively
-before each turn, and garbage-collects the outbound window under budget
-pressure (see `docs/GC.md`). This is similar to RLM.
+`agent-core` models context reads as queries over registered hydration
+sources, hydrates passively before each turn, and garbage-collects the
+outbound window under budget pressure (see `docs/GC.md`). This is similar to RLM.
 
 There are really only 2 ways to lookup content for context: temporally via chat history, and semantically via similarity search; these operations work on any unstructured text.
 Similarly, there are 2 times during an agentic turn that an agent can build context: it can be injected passively into the LLM prompt, or the agent can actively use a tool call to find more context.
 This gives us a neat 2x2 matrix for the design space.
 
-|                | Passive                    | Active                  |
-|----------------|----------------------------|-------------------------|
-| Temporal       | recent messages/history    | `Get("temporal:query")` |
-| Semantic       | RAG/static workspace       | `Get("semantic:topic")` |
+|                | Passive                    | Active                          |
+|----------------|----------------------------|---------------------------------|
+| Temporal       | recent messages/history    | `Retrieve` (kind = Temporal)    |
+| Semantic       | RAG/static workspace       | `Retrieve` (kind = Semantic)    |
 
 Passive sources run before the model sees a turn, like traditional RAG or appending chat messages.
-Active sources are available when the agent decides it needs them.
+Active sources are available when the agent decides it needs them: the loop exposes a `recall` tool that compiles onto the `Retrieve` effect. Writes mirror this — a `remember` tool compiles onto the `Store` effect, and the runtime writes session checkpoints passively at turn completion through the same sink interface.
 
 ### Sessions are Unix processes
 
@@ -215,7 +213,7 @@ See [ROADMAP.md](./ROADMAP.md) for the Rust port plan.
 
 ## Status
 
-M1 and the AgentIR track are implemented: single-agent CLI, the serializable AgentIR runtime (the CLI's only runtime; the closure-based `Op` layer remains a library builder/test API), bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces with error events, stable-effect-id replay (including replay of failures), mid-turn IR checkpoints, context GC (`ring`, `mark-sweep`), hydration registry with PromptIR provenance, and optional model registry loading.
+M1 and the AgentIR track are implemented: single-agent CLI, the serializable AgentIR runtime (the CLI's only runtime; the closure-based `Op` layer remains a library builder/test API), bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces with error events, stable-effect-id replay (including replay of failures), mid-turn IR checkpoints, context GC (`ring`, `mark-sweep`), hydration registry with PromptIR provenance, `Retrieve`/`Store` effects with a file-backed memory backend (`--memory-dir`) and model-facing `remember`/`recall` tools, turn-completion checkpointing through the `ChatHistory` sink, and optional model registry loading.
 
 Active development:
 

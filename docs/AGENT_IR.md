@@ -267,5 +267,5 @@ The closure-based `Op` representation can remain as a compatibility layer or bui
 - Replay is keyed by stable effect IDs, not incidental sequence numbers.
 - Replay divergence reports expected and observed effect locations.
 - Mid-turn checkpoints can resume without replaying completed effects.
-- `Get` / `Put` run against the default in-memory STM store.
+- `Retrieve` / `Store` run against registered hydration sources and sinks (docs/MEMORY.md).
 - Docs stop relying on closure-based `Op` as the final program representation.
