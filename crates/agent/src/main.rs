@@ -245,6 +245,67 @@ impl agent_core::ChatProvider for ReplayOnlyProvider {
     }
 }
 
+/// A parsed session turn frame (t-1308.2; docs/SUPERVISOR.md "Turn envelope").
+///
+/// Classification happens at the frame boundary: a NUL-framed turn that
+/// parses as a JSON object with `"v": 1` and a string `"input"` field is a
+/// turn envelope; any other frame is a raw prompt, byte-for-byte. A raw
+/// prompt that happens to be a valid v1 envelope must be wrapped by the
+/// caller (`{"v":1,"input":"<that text>"}`) to be sent literally.
+#[derive(Debug, Clone, PartialEq)]
+struct TurnFrame {
+    /// Caller-supplied correlation id, echoed on the turn's machine events.
+    /// `None` means the agent mints one (see `mint_turn_id`).
+    turn_id: Option<String>,
+    /// The prompt text delivered to the agent loop.
+    input: String,
+    /// Opaque caller data, echoed verbatim on the turn's `agent_complete`.
+    metadata: Option<serde_json::Value>,
+}
+
+impl TurnFrame {
+    fn raw(input: String) -> Self {
+        Self {
+            turn_id: None,
+            input,
+            metadata: None,
+        }
+    }
+}
+
+fn parse_turn_frame(frame: &str) -> TurnFrame {
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str(frame) else {
+        return TurnFrame::raw(frame.to_owned());
+    };
+    // `"v"` must be exactly the integer 1: strings, floats, and future
+    // versions all fall through to raw-prompt compatibility.
+    if object.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+        return TurnFrame::raw(frame.to_owned());
+    }
+    let Some(serde_json::Value::String(input)) = object.remove("input") else {
+        return TurnFrame::raw(frame.to_owned());
+    };
+    TurnFrame {
+        // Classification depends only on `v` and `input`; a malformed
+        // (non-string) turn_id is ignored and an id is minted instead of
+        // demoting the whole frame to a raw prompt.
+        turn_id: object
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        input,
+        metadata: object.remove("metadata"),
+    }
+}
+
+/// Deterministic per-run turn id for frames that don't supply one:
+/// `<run_id>-t<seq>`, where seq is the 0-based turn ordinal within the run.
+/// Resumed sessions continue the ordinal from the checkpoint sequence, so a
+/// resumed run does not re-mint ids already used by completed turns.
+fn mint_turn_id(run_id: &str, seq: u64) -> String {
+    format!("{run_id}-t{seq}")
+}
+
 struct Runtime {
     config: SeqConfig,
     trace: TraceLogger,
@@ -254,6 +315,11 @@ struct Runtime {
     trace_path: PathBuf,
     checkpoint_dir: Option<PathBuf>,
     checkpoint_sequence: u64,
+    /// 0-based ordinal of the next turn, used to mint turn ids for frames
+    /// that don't carry one (t-1308.2). Seeded from the checkpoint sequence
+    /// so resumed sessions keep minting fresh ids; increments on every turn,
+    /// supplied id or not, so minted ids always name the turn's ordinal.
+    turn_seq: u64,
     history: Vec<ChatMessage>,
     debug: bool,
     max_turns: usize,
@@ -482,6 +548,7 @@ async fn main() -> Result<()> {
         trace_path: trace_path.clone(),
         checkpoint_dir: args.checkpoint_dir,
         checkpoint_sequence,
+        turn_seq: checkpoint_sequence,
         history,
         debug: args.debug,
         max_turns,
@@ -1049,7 +1116,7 @@ async fn run_auth_command(command: &AuthCommand) -> Result<()> {
 }
 
 async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
-    let response = run_turn_with_status(runtime, prompt).await?;
+    let response = run_turn_with_status(runtime, TurnFrame::raw(prompt)).await?;
     runtime
         .trace
         .emit(&Event::AgentDone {
@@ -1171,7 +1238,7 @@ where
 }
 
 async fn write_session_response(runtime: &mut Runtime, message: String) -> Result<()> {
-    let response = run_turn_with_status(runtime, message).await?;
+    let response = run_turn_with_status(runtime, parse_turn_frame(&message)).await?;
     if !runtime.debug {
         let mut stdout = tokio::io::stdout();
         stdout.write_all(response.content.as_bytes()).await?;
@@ -1183,24 +1250,38 @@ async fn write_session_response(runtime: &mut Runtime, message: String) -> Resul
 
 async fn run_turn_with_status(
     runtime: &mut Runtime,
-    message: String,
+    frame: TurnFrame,
 ) -> Result<agent_core::Response> {
-    emit_agent_start(runtime).await?;
-    match run_turn(runtime, message).await {
+    let TurnFrame {
+        turn_id,
+        input,
+        metadata,
+    } = frame;
+    // Every turn boundary carries a turn id, supplied or minted, so the
+    // supervisor can correlate agent_complete/agent_error to its send.
+    let turn_id = turn_id.unwrap_or_else(|| mint_turn_id(&runtime.run_id, runtime.turn_seq));
+    runtime.turn_seq += 1;
+    emit_agent_start(runtime, &turn_id).await?;
+    match run_turn(runtime, input).await {
         Ok(response) => {
             // A turn-budget stop with empty content must not look like a
             // crash: surface a clear terminal notice instead (t-1133).
             let completion = terminal_response(runtime, &response);
-            emit_agent_complete(runtime, &completion).await?;
+            emit_custom_event(
+                runtime,
+                "agent_complete",
+                agent_complete_data(&completion, &turn_id, metadata.as_ref()),
+            )
+            .await?;
             Ok(response)
         }
         Err(err) => {
             let message = err.to_string();
-            tracing::error!(run_id = %runtime.run_id, error = %message, "agent turn failed");
+            tracing::error!(run_id = %runtime.run_id, %turn_id, error = %message, "agent turn failed");
             if is_context_overflow_error(&message) {
                 emit_context_overflow(runtime, &message).await?;
             }
-            emit_agent_error(runtime, &message).await?;
+            emit_custom_event(runtime, "agent_error", agent_error_data(&message, &turn_id)).await?;
             Err(err)
         }
     }
@@ -1360,11 +1441,12 @@ async fn emit_done(runtime: &mut Runtime) -> Result<()> {
         .await
 }
 
-async fn emit_agent_start(runtime: &mut Runtime) -> Result<()> {
+async fn emit_agent_start(runtime: &mut Runtime, turn_id: &str) -> Result<()> {
     emit_custom_event(
         runtime,
         "agent_start",
         serde_json::json!({
+            "turn_id": turn_id,
             "config": {
                 "run_id": runtime.run_id,
                 "model": runtime.model.0,
@@ -1377,13 +1459,24 @@ async fn emit_agent_start(runtime: &mut Runtime) -> Result<()> {
     .await
 }
 
-async fn emit_agent_complete(runtime: &mut Runtime, response: &str) -> Result<()> {
-    emit_custom_event(
-        runtime,
-        "agent_complete",
-        serde_json::json!({ "response": response }),
-    )
-    .await
+/// agent_complete payload: the terminal response plus the turn id, and the
+/// envelope's opaque metadata echoed back when the caller supplied one.
+fn agent_complete_data(
+    response: &str,
+    turn_id: &str,
+    metadata: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({ "response": response, "turn_id": turn_id });
+    if let Some(metadata) = metadata {
+        data["metadata"] = metadata.clone();
+    }
+    data
+}
+
+/// agent_error payload: an errored turn must still correlate, so the turn id
+/// rides on the error event exactly like on agent_complete.
+fn agent_error_data(message: &str, turn_id: &str) -> serde_json::Value {
+    serde_json::json!({ "message": message, "turn_id": turn_id })
 }
 
 fn is_context_overflow_error(message: &str) -> bool {
@@ -1398,15 +1491,6 @@ async fn emit_context_overflow(runtime: &mut Runtime, message: &str) -> Result<(
     emit_custom_event(
         runtime,
         "context_overflow",
-        serde_json::json!({ "message": message }),
-    )
-    .await
-}
-
-async fn emit_agent_error(runtime: &mut Runtime, message: &str) -> Result<()> {
-    emit_custom_event(
-        runtime,
-        "agent_error",
         serde_json::json!({ "message": message }),
     )
     .await
@@ -1714,6 +1798,123 @@ mod tests {
             total_tokens: 0,
             metadata,
         }
+    }
+
+    // Turn envelope classification (t-1308.2): the frame boundary decides
+    // envelope vs raw prompt, and the decision must be byte-preserving for
+    // every pre-envelope sender.
+    #[test]
+    fn plain_text_frame_is_a_raw_prompt() {
+        assert_eq!(
+            parse_turn_frame("run the tests"),
+            TurnFrame::raw("run the tests".into())
+        );
+    }
+
+    #[test]
+    fn json_looking_prompts_without_the_envelope_shape_stay_raw() {
+        // Valid JSON objects that lack v:1 + string input are prompts,
+        // byte-for-byte: the model was probably meant to see them.
+        for frame in [
+            r#"{"input":"hi"}"#,                     // no version tag
+            r#"{"v":2,"input":"hi"}"#,               // future version
+            r#"{"v":"1","input":"hi"}"#,             // version is a string
+            r#"{"v":1.0,"input":"hi"}"#,             // version is a float
+            r#"{"v":1}"#,                            // no input
+            r#"{"v":1,"input":42}"#,                 // input is not a string
+            r#"[{"v":1,"input":"hi"}]"#,             // not an object
+            r#"{"v":1,"input":"hi""#,                // not JSON at all
+            "explain this JSON: {\"v\":1, \"x\":2}", // prose containing JSON
+        ] {
+            assert_eq!(
+                parse_turn_frame(frame),
+                TurnFrame::raw(frame.into()),
+                "frame: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_frame_carries_id_input_and_metadata() {
+        let frame = parse_turn_frame(
+            r#"{"v":1,"turn_id":"send-7","input":"run tests","metadata":{"sender":"ben"}}"#,
+        );
+        assert_eq!(
+            frame,
+            TurnFrame {
+                turn_id: Some("send-7".into()),
+                input: "run tests".into(),
+                metadata: Some(serde_json::json!({"sender":"ben"})),
+            }
+        );
+    }
+
+    #[test]
+    fn envelope_turn_id_and_metadata_are_optional() {
+        assert_eq!(
+            parse_turn_frame(r#"{"v":1,"input":"hi"}"#),
+            TurnFrame {
+                turn_id: None,
+                input: "hi".into(),
+                metadata: None,
+            }
+        );
+    }
+
+    #[test]
+    fn envelope_with_malformed_turn_id_still_parses_as_envelope() {
+        // Classification depends only on v + input; a non-string turn_id is
+        // dropped (an id gets minted) rather than demoting the frame to a
+        // raw prompt.
+        assert_eq!(
+            parse_turn_frame(r#"{"v":1,"turn_id":42,"input":"hi"}"#),
+            TurnFrame {
+                turn_id: None,
+                input: "hi".into(),
+                metadata: None,
+            }
+        );
+    }
+
+    #[test]
+    fn envelope_shaped_prompt_must_be_wrapped_to_be_literal() {
+        // The documented edge: to deliver text that IS a valid v1 envelope
+        // as a prompt, wrap it in an envelope. The outer envelope parses;
+        // the inner text arrives untouched as the input.
+        let literal = r#"{"v":1,"input":"hi"}"#;
+        let wrapped = serde_json::json!({"v": 1, "input": literal}).to_string();
+        assert_eq!(parse_turn_frame(&wrapped).input, literal);
+        // Unwrapped, the same bytes are treated as an envelope — the caller
+        // contract, not a bug.
+        assert_eq!(parse_turn_frame(literal).input, "hi");
+    }
+
+    #[test]
+    fn minted_turn_ids_are_deterministic_per_run_ordinal() {
+        assert_eq!(mint_turn_id("run-abc", 0), "run-abc-t0");
+        assert_eq!(mint_turn_id("run-abc", 7), "run-abc-t7");
+        // Same run + ordinal always mints the same id.
+        assert_eq!(mint_turn_id("run-abc", 0), mint_turn_id("run-abc", 0));
+    }
+
+    #[test]
+    fn completion_and_error_events_both_carry_the_turn_id() {
+        // A turn that errors must still correlate to its sender.
+        let complete = agent_complete_data("done", "send-7", None);
+        assert_eq!(complete["turn_id"], "send-7");
+        assert_eq!(complete["response"], "done");
+        assert!(complete.get("metadata").is_none());
+
+        let error = agent_error_data("provider exploded", "send-7");
+        assert_eq!(error["turn_id"], "send-7");
+        assert_eq!(error["message"], "provider exploded");
+    }
+
+    #[test]
+    fn completion_event_echoes_envelope_metadata() {
+        let metadata = serde_json::json!({"sender":"eval","nested":{"k":[1,2]}});
+        let complete = agent_complete_data("done", "send-7", Some(&metadata));
+        assert_eq!(complete["metadata"], metadata);
     }
 
     #[test]

@@ -57,13 +57,41 @@ Decision: run sessions with `--json` and capture stdout to
 `agent_error`) are the supervisor's interface; `agentd send` works by:
 
 1. recording the current `stdout.jsonl` offset,
-2. writing the NUL-framed turn to the FIFO (under a per-session flock —
+2. writing the NUL-framed turn — a v1 turn envelope carrying a
+   supervisor-generated `turn_id` — to the FIFO (under a per-session flock —
    FIFO writes from concurrent senders interleave beyond `PIPE_BUF`),
-3. tailing `stdout.jsonl` from the offset until the matching
-   `agent_complete`/`agent_error` arrives, then printing the response.
+3. tailing `stdout.jsonl` from the offset until the
+   `agent_complete`/`agent_error` event carrying that `turn_id` arrives,
+   then printing the response.
 
-This keeps the agent binary unchanged and makes `send` restartable: if the
-sender dies, the response is still on disk.
+This makes `send` restartable: if the sender dies, the response is still on
+disk, keyed by an id the sender can recompute or persist.
+
+### Turn envelope (v1) — shipped agent-side (t-1308.2)
+
+A NUL-framed session turn (FIFO or `--session` stdin) is either a raw
+prompt or a turn envelope:
+
+```json
+{"v": 1, "turn_id": "send-4f2a", "input": "run tests", "metadata": {"sender": "ben"}}
+```
+
+- A frame that parses as a JSON object with `"v": 1` (exactly the integer
+  1) and a string `"input"` field is an envelope; `input` is the prompt.
+  **Any other frame is a raw prompt, byte-for-byte** — full backward
+  compatibility with pre-envelope senders.
+- `turn_id` (optional string): echoed in the `data` of the turn's
+  `agent_start`, `agent_complete`, and `agent_error` machine events. When
+  absent — including for every raw frame — the agent mints
+  `<run_id>-t<seq>`, where `seq` is the 0-based turn ordinal within the run
+  (continued across `--resume` from the checkpoint sequence). Every
+  completion or error event therefore carries a `turn_id`, supplied or
+  minted.
+- `metadata` (optional, opaque JSON): echoed verbatim as `metadata` on the
+  turn's `agent_complete` event. Not present on `agent_error`.
+- Edge case: a raw prompt whose text happens to be a valid v1 envelope
+  will be parsed as one. To deliver such text literally, wrap it:
+  `{"v": 1, "input": "<that text>"}`.
 
 ## Lifecycle
 
@@ -108,13 +136,17 @@ impossible:
 
 ## Open questions (settle before implementing)
 
-1. **Concurrent `send` semantics.** Turns queue in the FIFO and the agent
-   processes them serially; two senders' responses must be matched to their
-   turns. Option A: tag each turn with a supervisor-generated turn id the
-   agent echoes (requires an agent change — a `turn_id` field in the framing
-   or a `{"turn": ...}` envelope). Option B: serialize senders entirely under
-   the flock, matching responses by order. B is simpler and likely sufficient;
-   A is needed only if concurrent senders matter.
+1. **Concurrent `send` semantics. Decided: Option A** (2026-07-03) — tag
+   each turn with a supervisor-generated turn id the agent echoes, via the
+   v1 turn envelope specified above. Option B (serialize senders under the
+   flock, match responses by order) was rejected: order-based matching
+   breaks under send timeouts — a timed-out sender that stops tailing
+   desyncs the order ledger for everyone behind it — and gives silent
+   misattribution when the agent crashes and restarts mid-queue (quiet
+   corruption, versus a detectably unmatched id under Option A). Approvals,
+   the trace schema (S.2b), and SDK futures all need a turn id anyway. The
+   per-session flock is retained regardless of this decision: it guarantees
+   frame atomicity beyond `PIPE_BUF`, which is orthogonal to correlation.
 2. **Should `send` have a timeout?** A wedged turn currently blocks the
    sender forever. Probably: `--timeout` with the turn left running.
 3. **Haskell compatibility.** Does the Rust `agentd` need to read the Haskell
@@ -135,8 +167,9 @@ impossible:
 ## Acceptance
 
 - `start`/`send`/`logs`/`stop`/`status`/`resume` work against the shipped
-  `agent` binary with no agent-side changes (or with the turn-id change if
-  option A is chosen — decided, not drifted into).
+  `agent` binary; the only agent-side change is the turn-id envelope
+  (option A — decided 2026-07-03 and shipped in t-1308.2, not drifted
+  into).
 - A SIGTERM'd or crashed session resumes from its latest checkpoint with
   history intact, including the dangling-tool-call repair path.
 - `evals/agentd-persistent.sh` (or its Rust replacement) passes against the
