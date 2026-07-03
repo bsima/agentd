@@ -1,11 +1,15 @@
 [package]
 name = "agent-oauth"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "OAuth (PKCE) provider auth for the agent runtime: Claude and Codex subscription tokens"
+keywords = ["agent", "llm", "oauth", "pkce", "authentication"]
+categories = ["authentication", "api-bindings"]
 
 [dependencies]
-agent-core = { path = "../agent-core" }
+agent-core = { path = "../agent-core", version = "0.1.0" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

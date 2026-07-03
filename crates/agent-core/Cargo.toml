@@ -1,8 +1,12 @@
 [package]
 name = "agent-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Free-monad agent runtime: Infer/Eval/Emit effects, serializable AgentIR, hydration, replay"
+keywords = ["agent", "llm", "free-monad", "runtime", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 anyhow.workspace = true
