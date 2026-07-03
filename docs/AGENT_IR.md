@@ -14,7 +14,7 @@ whether reality has caught up.
 | `agent_loop` ported with feature parity | Implemented (`agent_loop_ir`, including stalled-turn nudge) |
 | CLI switched to AgentIR | Implemented; the CLI is IR-only (`--runtime` removed; the Op layer remains a library builder/test API) |
 | In-memory **STM** store with transactional Get/Put | Removed (t-1182): Get/Put deleted in favor of the Retrieve/Store hydration effects; `InMemoryStore` now only backs instruction-limit checkpoints. See docs/MEMORY.md |
-| Normalization pass for canonical hashing | Not implemented — hashing uses the serde encoding of the (BTreeMap-ordered) program |
+| Normalization pass for canonical hashing | Implemented (`ir_normalize`): programs normalize to strict SSA (existing params/args preserved, implicit dominator-scoped uses become params) and `program_hash` hashes the canonical form, so alpha-equivalent programs share identity |
 | `Par` semantics | Not implemented — the IR runtime rejects `Par` until the open questions below are settled |
 
 AgentIR is the serializable core representation for `agentd` programs.
