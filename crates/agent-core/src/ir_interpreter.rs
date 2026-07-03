@@ -1,8 +1,8 @@
 use crate::gc::GcState;
 use crate::interpreter::{
     annotate_overflow_failure, catch_overflow_active, collect_for_overflow, hydrate_infer_prompt,
-    maybe_collect_prompt, millis_u64, prompt_preview, response_preview, run_eval_with_env,
-    SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
+    maybe_collect_prompt, millis_u64, prompt_preview, response_preview, run_eval_argv_with_env,
+    run_eval_with_env, SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectErrorMode,
@@ -66,10 +66,16 @@ struct IrInferCall {
     model: String,
 }
 
+/// The Eval identity recorded for replay-divergence detection: the display
+/// command plus, for direct-exec Evals, the exact argv. Both are compared —
+/// a shell recording never satisfies an argv replay even if the rendered
+/// command strings coincide, and a dynamically-computed argv element that
+/// changed between record and replay diverges loudly.
 #[derive(Debug, Clone, PartialEq)]
 struct IrEvalCall {
     location: EffectLocation,
     command: String,
+    argv: Option<Vec<String>>,
 }
 
 impl IrReplayTrace {
@@ -127,6 +133,7 @@ impl IrReplayTrace {
                 Event::EvalCall {
                     op_id,
                     command,
+                    argv,
                     effect,
                     ..
                 } => {
@@ -137,6 +144,7 @@ impl IrReplayTrace {
                         IrEvalCall {
                             location: location.clone(),
                             command: command.clone(),
+                            argv: argv.clone(),
                         },
                     );
                     effect_by_op.insert(*op_id, effect_id);
@@ -256,7 +264,12 @@ impl IrReplayTrace {
             .ok_or_else(|| anyhow!("AgentIR replay missing InferResult for effect {effect_id}"))
     }
 
-    fn eval_result(&self, location: &EffectLocation, command: &str) -> Result<Value> {
+    fn eval_result(
+        &self,
+        location: &EffectLocation,
+        command: &str,
+        argv: Option<&[String]>,
+    ) -> Result<Value> {
         let effect_id = &location.effect_id.0;
         let call = self.eval_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
@@ -265,13 +278,15 @@ impl IrReplayTrace {
                 location_desc(location)
             )
         })?;
-        if call.command != command {
+        if call.command != command || call.argv.as_deref() != argv {
             return Err(anyhow!(
-                "AgentIR replay diverged at effect {}: expected Eval command {:?} at {}, observed {:?}",
+                "AgentIR replay diverged at effect {}: expected Eval command {:?} (argv {:?}) at {}, observed {:?} (argv {:?})",
                 effect_id,
                 call.command,
+                call.argv,
                 location_desc(&call.location),
-                command
+                command,
+                argv
             ));
         }
         if let Some(error) = self.eval_errors.get(effect_id) {
@@ -771,9 +786,19 @@ async fn execute_instr(
                 site,
                 dynamic_path.clone(),
             )?;
-            let command = match request {
+            // Evaluate the request to its runtime identity: the display
+            // command (trace/otel) and, for direct-exec requests, the exact
+            // argv (execution + replay identity).
+            let (command, argv) = match request {
                 EvalRequest::Shell { command } => {
-                    string_expr(&machine.env, &command, "Eval.command")?
+                    (string_expr(&machine.env, &command, "Eval.command")?, None)
+                }
+                EvalRequest::Argv { argv } => {
+                    let argv = argv
+                        .iter()
+                        .map(|arg| string_expr(&machine.env, arg, "Eval.argv element"))
+                        .collect::<Result<Vec<_>>>()?;
+                    (crate::op::render_argv(&argv), Some(argv))
                 }
             };
             let op_id = config.trace.next_op_id();
@@ -784,6 +809,7 @@ async fn execute_instr(
                     op_id,
                     parent_op_id: None,
                     command: command.clone(),
+                    argv: argv.clone(),
                     cwd: config
                         .eval
                         .cwd
@@ -797,13 +823,27 @@ async fn execute_instr(
                 .await?;
             let started = Instant::now();
             let result = match ir_replay {
-                Some(replay) => replay.eval_result(&location, &command),
+                Some(replay) => replay.eval_result(&location, &command, argv.as_deref()),
                 None => match &config.replay {
-                    Some(replay) => replay.eval_result(op_id, &command),
-                    None => {
-                        run_eval_with_env(&config.eval, &command, config.trace.trace_context_env())
+                    Some(replay) => replay.eval_result(op_id, &command, argv.as_deref()),
+                    None => match &argv {
+                        Some(argv) => {
+                            run_eval_argv_with_env(
+                                &config.eval,
+                                argv,
+                                config.trace.trace_context_env(),
+                            )
                             .await
-                    }
+                        }
+                        None => {
+                            run_eval_with_env(
+                                &config.eval,
+                                &command,
+                                config.trace.trace_context_env(),
+                            )
+                            .await
+                        }
+                    },
                 },
             };
             let result = match result {
@@ -2257,6 +2297,159 @@ mod tests {
         assert_eq!(eval_effect.kind, EffectKind::Eval);
         assert_eq!(eval_effect.site.instruction_index, 1);
         assert_ne!(infer_effect.effect_id, eval_effect.effect_id);
+        Ok(())
+    }
+
+    /// One Eval(Argv) whose last element is dynamic (a block param), so
+    /// record and replay share a program hash while the argv can differ.
+    fn argv_eval_machine(payload: &str) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![Var("payload".into())],
+                instructions: vec![Instr::Eval {
+                    out: Var("result".into()),
+                    request: EvalRequest::Argv {
+                        argv: vec![
+                            Expr::Value(Value::String("/bin/sh".into())),
+                            Expr::Value(Value::String("-c".into())),
+                            Expr::Value(Value::String(r#"printf %s "$0""#.into())),
+                            Expr::Var(Var("payload".into())),
+                        ],
+                    },
+                    policy: Default::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("result".into())),
+                },
+            },
+        );
+        machine_with_env(
+            "argv-eval",
+            blocks,
+            BTreeMap::from([(Var("payload".into()), Value::String(payload.into()))]),
+        )
+    }
+
+    /// Direct-exec Evals: the spaced, `$`-laden argv element arrives at the
+    /// child as one verbatim argument (no shell splitting or expansion — the
+    /// child /bin/sh just prints its `$0`), and the EvalCall trace event
+    /// records the argv faithfully with a quoted display command.
+    #[tokio::test]
+    async fn ir_argv_eval_executes_directly_and_records_argv() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let machine = argv_eval_machine("one arg $HOME");
+
+        let (value, _) = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), trace),
+            machine,
+        )
+        .await?;
+        assert_eq!(value["ok"], Value::Bool(true));
+        assert_eq!(value["stdout"], Value::String("one arg $HOME".into()));
+
+        let events = TraceLogger::read_events(trace_path).await?;
+        let (command, argv, effect) = events
+            .iter()
+            .find_map(|event| match event {
+                Event::EvalCall {
+                    command,
+                    argv,
+                    effect,
+                    ..
+                } => Some((command.clone(), argv.clone(), effect.clone())),
+                _ => None,
+            })
+            .expect("argv Eval emits an EvalCall");
+        assert_eq!(
+            argv.as_deref(),
+            Some(
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".into(),
+                    r#"printf %s "$0""#.into(),
+                    "one arg $HOME".into(),
+                ][..]
+            )
+        );
+        assert_eq!(command, r#"/bin/sh -c 'printf %s "$0"' 'one arg $HOME'"#);
+        assert_eq!(
+            effect.expect("IR EvalCall carries effect identity").kind,
+            EffectKind::Eval
+        );
+        Ok(())
+    }
+
+    /// Argv Evals replay exactly like shell Evals: the recorded result is
+    /// returned without executing, and a same-site call whose dynamic argv
+    /// changed diverges loudly instead of replaying a stale result.
+    #[tokio::test]
+    async fn ir_argv_eval_replays_recorded_result_and_detects_argv_divergence() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let _ = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), trace),
+            argv_eval_machine("recorded-payload"),
+        )
+        .await?;
+
+        // Swap the recorded EvalResult for a sentinel: if replay returns it,
+        // the value provably came from the recording, not a re-execution.
+        let events: Vec<Event> = TraceLogger::read_events(trace_path)
+            .await?
+            .into_iter()
+            .map(|event| match event {
+                Event::EvalResult {
+                    run_id,
+                    op_id,
+                    parent_op_id,
+                    command,
+                    result: _,
+                    duration_ms,
+                    truncated_stdout,
+                    truncated_stderr,
+                    timestamp,
+                } => Event::EvalResult {
+                    run_id,
+                    op_id,
+                    parent_op_id,
+                    command,
+                    result: serde_json::json!({ "ok": true, "stdout": "from-recording" }),
+                    duration_ms,
+                    truncated_stdout,
+                    truncated_stderr,
+                    timestamp,
+                },
+                other => other,
+            })
+            .collect();
+        let replay = IrReplayTrace::from_events(&events)?;
+
+        let mut store = InMemoryStore::new();
+        let (replayed, _) = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            argv_eval_machine("recorded-payload"),
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+        assert_eq!(replayed["stdout"], Value::String("from-recording".into()));
+
+        let mut store = InMemoryStore::new();
+        let err = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            argv_eval_machine("changed-payload"),
+            &mut store,
+            Some(&replay),
+        )
+        .await
+        .expect_err("a changed argv element must not replay");
+        let message = err.to_string();
+        assert!(message.contains("AgentIR replay diverged"), "{message}");
+        assert!(message.contains("argv"), "{message}");
+        assert!(message.contains("changed-payload"), "{message}");
         Ok(())
     }
 

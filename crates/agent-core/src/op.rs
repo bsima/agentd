@@ -185,6 +185,59 @@ impl<'de> Deserialize<'de> for ToolCall {
     }
 }
 
+/// The payload of an Eval op, mirroring `ir::EvalRequest` with values in
+/// place of expressions: `Shell` runs a freeform command string via
+/// `$SHELL -c` (the model-issued path); `Argv` execs `argv[0]` directly with
+/// `argv[1..]` as arguments — no shell, no quoting/injection surface — the
+/// normal path for typed tool calls (SDK DR-3). Both share the interpreter's
+/// env policy, timeout, output caps, and cwd handling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvalSpec {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+impl EvalSpec {
+    /// Human-readable command line: the shell string verbatim, or the argv
+    /// rendered with minimal quoting. Used for the trace `command` field and
+    /// otel attributes; the faithful argv rides the trace's `argv` field.
+    pub fn display_command(&self) -> String {
+        match self {
+            Self::Shell(command) => command.clone(),
+            Self::Argv(argv) => render_argv(argv),
+        }
+    }
+
+    /// The exec argv, when this is a direct-exec request.
+    pub fn argv(&self) -> Option<&[String]> {
+        match self {
+            Self::Shell(_) => None,
+            Self::Argv(argv) => Some(argv),
+        }
+    }
+}
+
+/// Render an argv as a single display line, quoting only elements that need
+/// it (whitespace, quotes, shell metacharacters, or empty). Display-only:
+/// execution and replay identity use the argv vector itself, never this
+/// rendering.
+pub(crate) fn render_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            let safe = !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+            if safe {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub enum OpF<S, A> {
     Infer {
         model: Model,
@@ -192,7 +245,7 @@ pub enum OpF<S, A> {
         next: Box<dyn FnOnce(Response) -> Op<S, A> + Send>,
     },
     Eval {
-        command: String,
+        request: EvalSpec,
         next: Box<dyn FnOnce(Value) -> Op<S, A> + Send>,
     },
     Emit {
@@ -229,8 +282,8 @@ impl<S: Send + 'static, A: Send + 'static> Op<S, A> {
                 prompt,
                 next: Box::new(move |r| next(r).and_then(f)),
             })),
-            OpF::Eval { command, next } => Op(Box::new(OpF::Eval {
-                command,
+            OpF::Eval { request, next } => Op(Box::new(OpF::Eval {
+                request,
                 next: Box::new(move |v| next(v).and_then(f)),
             })),
             OpF::Emit { event, next } => Op(Box::new(OpF::Emit {
@@ -263,7 +316,19 @@ pub fn infer<S: Send + 'static>(model: Model, prompt: Prompt) -> Op<S, Response>
 
 pub fn eval<S: Send + 'static>(command: impl Into<String>) -> Op<S, Value> {
     Op(Box::new(OpF::Eval {
-        command: command.into(),
+        request: EvalSpec::Shell(command.into()),
+        next: Box::new(Op::pure),
+    }))
+}
+
+/// Direct-exec Eval: `argv[0]` is spawned with `argv[1..]` as arguments, no
+/// shell in between (SDK DR-3). The argv must be non-empty; the interpreter
+/// rejects an empty argv when it runs.
+pub fn eval_argv<S: Send + 'static>(
+    argv: impl IntoIterator<Item = impl Into<String>>,
+) -> Op<S, Value> {
+    Op(Box::new(OpF::Eval {
+        request: EvalSpec::Argv(argv.into_iter().map(Into::into).collect()),
         next: Box::new(Op::pure),
     }))
 }
@@ -651,9 +716,45 @@ mod tests {
     #[test]
     fn eval_wraps_in_eval_node() {
         match *eval::<()>("printf ok").0 {
-            OpF::Eval { command, .. } => assert_eq!(command, "printf ok"),
+            OpF::Eval { request, .. } => assert_eq!(request, EvalSpec::Shell("printf ok".into())),
             _ => panic!("eval() did not create OpF::Eval"),
         }
+    }
+
+    #[test]
+    fn eval_argv_wraps_in_eval_node_with_argv_request() {
+        match *eval_argv::<()>(["some-tool", "call", "id-1"]).0 {
+            OpF::Eval { request, .. } => {
+                assert_eq!(
+                    request,
+                    EvalSpec::Argv(vec!["some-tool".into(), "call".into(), "id-1".into()])
+                );
+                assert_eq!(request.argv().unwrap().len(), 3);
+            }
+            _ => panic!("eval_argv() did not create OpF::Eval"),
+        }
+    }
+
+    #[test]
+    fn argv_display_rendering_quotes_only_what_needs_it() {
+        assert_eq!(
+            render_argv(&[
+                "some-tool".into(),
+                "call".into(),
+                "hello world".into(),
+                "it's".into(),
+                "".into(),
+            ]),
+            r#"some-tool call 'hello world' 'it'\''s' ''"#
+        );
+        assert_eq!(
+            EvalSpec::Argv(vec!["echo".into(), "plain".into()]).display_command(),
+            "echo plain"
+        );
+        assert_eq!(
+            EvalSpec::Shell("printf ok".into()).display_command(),
+            "printf ok"
+        );
     }
 
     #[test]

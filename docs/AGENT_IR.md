@@ -207,6 +207,8 @@ Governance lives outside `Infer` and outside LLM-visible program semantics. The 
 
 `Eval` is the main environment effect. Interpreters may route it through a shell, sandbox, container, VM, or remote executor. The IR records that an eval was requested; the interpreter decides whether and how it is allowed to run.
 
+`EvalRequest` has two variants, one per trust model. `Shell { command }` runs a freeform string via `$SHELL -c` — the model-issued shell tool path, with the quoting/injection surface that implies. `Argv { argv }` execs `argv[0]` directly with `argv[1..]` as arguments — no shell, no re-parsing, so typed tool calls never compile to shell templates (`Eval(argv=["some-tool", "call", tool_id, payload_ref])`). Both share the same env policy (credential stripping), timeout, output caps, and cwd handling; an empty argv is rejected by `validate_program` before any effect runs. Trace `EvalCall` events record the argv verbatim (it is the replay identity for argv Evals) alongside a quoted display `command`.
+
 `Infer` is also interpreter-mediated, but model choice, quota, tenant policy, provider credentials, and network access are runtime concerns. They are not delegated to the LLM.
 
 Inspection can still report what the program syntactically requests, but authorization is enforced by the runtime environment.
@@ -234,13 +236,13 @@ AgentIR is the control/effect IR. PromptIR and Intent are payload IRs.
 ```text
 AgentIR
   Infer(PromptIR) -> Response
-  Eval(EvalRequest::Shell | EvalRequest::Intent) -> Value
+  Eval(EvalRequest::Shell | EvalRequest::Argv | EvalRequest::Intent) -> Value
   Retrieve/Store/Emit/Par -> runtime effects
 ```
 
 PromptIR is the structured payload for `Infer`: sourced, labeled, budgeted context sections that can later be optimized.
 
-Intent is the structured payload for `Eval`: deterministic/verifiable work that can replace shell strings for high-assurance workloads.
+Intent is the planned structured payload for `Eval`: deterministic/verifiable work that can replace shell strings for high-assurance workloads. `Argv` (implemented) is the step before it: still an opaque external program, but invoked without a shell.
 
 These should stay separate. AgentIR says when effects happen. PromptIR says what context is given to inference. Intent says what deterministic workload is evaluated.
 

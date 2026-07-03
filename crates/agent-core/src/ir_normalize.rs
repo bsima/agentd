@@ -576,6 +576,11 @@ fn collect_prompt_vars(prompt: &PromptRef, out: &mut BTreeSet<Var>) {
 fn collect_eval_request_vars(req: &EvalRequest, out: &mut BTreeSet<Var>) {
     match req {
         EvalRequest::Shell { command } => collect_expr_vars(command, out),
+        EvalRequest::Argv { argv } => {
+            for arg in argv {
+                collect_expr_vars(arg, out);
+            }
+        }
     }
 }
 
@@ -770,6 +775,9 @@ fn rename_eval_request(req: &EvalRequest, env: &BTreeMap<Var, Var>) -> Result<Ev
     Ok(match req {
         EvalRequest::Shell { command } => EvalRequest::Shell {
             command: rename_expr(command, env)?,
+        },
+        EvalRequest::Argv { argv } => EvalRequest::Argv {
+            argv: rename_exprs(argv, env)?,
         },
     })
 }

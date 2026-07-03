@@ -72,6 +72,12 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_op_id: Option<u64>,
         command: String,
+        /// Exec argv for direct (no-shell) Evals, recorded verbatim — it is
+        /// the replay identity for argv requests, so no preview truncation.
+        /// `command` then carries a display rendering. Absent for shell
+        /// Evals; old traces (which predate argv) deserialize to None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        argv: Option<Vec<String>>,
         cwd: Option<String>,
         env_policy: String,
         timeout_ms: u64,
@@ -1082,6 +1088,7 @@ mod tests {
             op_id: 2,
             parent_op_id: None,
             command: "true".into(),
+            argv: None,
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
@@ -1097,6 +1104,51 @@ mod tests {
             // And a line without the field round-trips (old traces parse).
             assert_eq!(serde_json::from_str::<Event>(&json)?, event);
         }
+        Ok(())
+    }
+
+    /// Shell EvalCalls (and every trace written before argv Evals existed)
+    /// carry no `argv` field: the JSON stays byte-compatible and old lines
+    /// deserialize to `argv: None`. Argv EvalCalls record the argv verbatim
+    /// and round-trip.
+    #[test]
+    fn eval_call_argv_field_is_absent_for_shell_and_round_trips_for_argv() -> Result<()> {
+        let shell = Event::EvalCall {
+            run_id: "run".into(),
+            op_id: 1,
+            parent_op_id: None,
+            command: "printf ok".into(),
+            argv: None,
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            effect: None,
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&shell)?;
+        assert!(!json.contains("\"argv\""), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json)?, shell);
+
+        let argv = Event::EvalCall {
+            run_id: "run".into(),
+            op_id: 2,
+            parent_op_id: None,
+            command: "some-tool call id-1 'hello world'".into(),
+            argv: Some(vec![
+                "some-tool".into(),
+                "call".into(),
+                "id-1".into(),
+                "hello world".into(),
+            ]),
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            effect: None,
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&argv)?;
+        assert!(json.contains("\"argv\""), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json)?, argv);
         Ok(())
     }
 
@@ -1260,6 +1312,7 @@ mod tests {
             op_id: 2,
             parent_op_id: Some(1),
             command: "printf ok".into(),
+            argv: None,
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
@@ -1343,6 +1396,7 @@ mod tests {
             op_id: 11,
             parent_op_id: Some(10),
             command: "printf interleaved".into(),
+            argv: None,
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
@@ -1375,6 +1429,7 @@ mod tests {
             op_id: 3,
             parent_op_id: None,
             command: "cargo build --quiet".into(),
+            argv: None,
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
@@ -1399,6 +1454,7 @@ mod tests {
             op_id: 4,
             parent_op_id: None,
             command: "cargo build --quiet".into(),
+            argv: None,
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,

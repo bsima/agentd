@@ -117,12 +117,22 @@ impl Default for EvalConfig {
     }
 }
 
+/// The Eval identity recorded for op-layer replay-divergence detection: the
+/// display command plus, for direct-exec Evals, the exact argv. Both are
+/// compared, so a shell command whose rendering happens to match an argv
+/// rendering can never satisfy an argv replay (or vice versa).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordedEvalCall {
+    command: String,
+    argv: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ReplayTrace {
     infer_calls: BTreeMap<u64, String>,
     infer_results: BTreeMap<u64, Response>,
     infer_errors: BTreeMap<u64, String>,
-    eval_calls: BTreeMap<u64, String>,
+    eval_calls: BTreeMap<u64, RecordedEvalCall>,
     eval_results: BTreeMap<u64, Value>,
     eval_errors: BTreeMap<u64, String>,
 }
@@ -146,8 +156,19 @@ impl ReplayTrace {
                 Event::InferError { op_id, error, .. } => {
                     replay.infer_errors.insert(*op_id, error.clone());
                 }
-                Event::EvalCall { op_id, command, .. } => {
-                    replay.eval_calls.insert(*op_id, command.clone());
+                Event::EvalCall {
+                    op_id,
+                    command,
+                    argv,
+                    ..
+                } => {
+                    replay.eval_calls.insert(
+                        *op_id,
+                        RecordedEvalCall {
+                            command: command.clone(),
+                            argv: argv.clone(),
+                        },
+                    );
                 }
                 Event::EvalResult { op_id, result, .. } => {
                     replay.eval_results.insert(*op_id, result.clone());
@@ -185,11 +206,18 @@ impl ReplayTrace {
             .ok_or_else(|| anyhow!("replay trace has no InferResult for op {op_id}"))
     }
 
-    pub(crate) fn eval_result(&self, op_id: u64, command: &str) -> Result<Value> {
-        if let Some(recorded_command) = self.eval_calls.get(&op_id) {
-            if recorded_command != command {
+    pub(crate) fn eval_result(
+        &self,
+        op_id: u64,
+        command: &str,
+        argv: Option<&[String]>,
+    ) -> Result<Value> {
+        if let Some(recorded) = self.eval_calls.get(&op_id) {
+            if recorded.command != command || recorded.argv.as_deref() != argv {
                 return Err(anyhow!(
-                    "replay diverged at Eval op {op_id}: recorded command '{recorded_command}', requested '{command}'"
+                    "replay diverged at Eval op {op_id}: recorded command '{}' (argv {:?}), requested '{command}' (argv {argv:?})",
+                    recorded.command,
+                    recorded.argv,
                 ));
             }
         }
@@ -356,7 +384,8 @@ where
                 .await?;
             run_sequential_inner(config, state, next(response), gc_state, parent_op_id).await
         }
-        OpF::Eval { command, next } => {
+        OpF::Eval { request, next } => {
+            let command = request.display_command();
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -365,6 +394,7 @@ where
                     op_id,
                     parent_op_id,
                     command: command.clone(),
+                    argv: request.argv().map(<[String]>::to_vec),
                     cwd: config
                         .eval
                         .cwd
@@ -378,10 +408,9 @@ where
                 .await?;
             let started = Instant::now();
             let result = match &config.replay {
-                Some(replay) => replay.eval_result(op_id, &command),
+                Some(replay) => replay.eval_result(op_id, &command, request.argv()),
                 None => {
-                    run_eval_with_env(&config.eval, &command, config.trace.trace_context_env())
-                        .await
+                    run_eval_request(&config.eval, &request, config.trace.trace_context_env()).await
                 }
             };
             let result = match result {
@@ -604,14 +633,56 @@ async fn collect_prompt(
     Ok(collected)
 }
 
+/// Dispatch an op-layer Eval request to its execution path: shell string via
+/// `$SHELL -c`, argv via direct exec. Both share [`run_eval_process`].
+pub(crate) async fn run_eval_request(
+    config: &EvalConfig,
+    request: &crate::op::EvalSpec,
+    extra_env: BTreeMap<String, String>,
+) -> Result<Value> {
+    match request {
+        crate::op::EvalSpec::Shell(command) => run_eval_with_env(config, command, extra_env).await,
+        crate::op::EvalSpec::Argv(argv) => run_eval_argv_with_env(config, argv, extra_env).await,
+    }
+}
+
 pub(crate) async fn run_eval_with_env(
     config: &EvalConfig,
     command: &str,
     extra_env: BTreeMap<String, String>,
 ) -> Result<Value> {
-    let started = Instant::now();
     let mut process = Command::new(&config.shell);
     process.arg("-c").arg(command);
+    run_eval_process(config, process, extra_env).await
+}
+
+/// Direct exec: `argv[0]` spawned with `argv[1..]` as arguments — no
+/// `$SHELL -c`, so nothing re-parses the arguments (SDK DR-3). Env policy,
+/// timeout, output caps, and cwd apply exactly as for shell Evals. An empty
+/// argv is rejected by `validate_program` (IR) before execution; the check
+/// here is a defensive backstop for callers that skip validation.
+pub(crate) async fn run_eval_argv_with_env(
+    config: &EvalConfig,
+    argv: &[String],
+    extra_env: BTreeMap<String, String>,
+) -> Result<Value> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("Eval argv must not be empty"))?;
+    let mut process = Command::new(program);
+    process.args(args);
+    run_eval_process(config, process, extra_env).await
+}
+
+/// Shared tail of every Eval execution: cwd, env policy (credential
+/// stripping under Inherit), trace-context env, detached stdin, timeout, and
+/// capped stdout/stderr decoding.
+async fn run_eval_process(
+    config: &EvalConfig,
+    mut process: Command,
+    extra_env: BTreeMap<String, String>,
+) -> Result<Value> {
+    let started = Instant::now();
     if let Some(cwd) = &config.cwd {
         process.current_dir(cwd);
     }
@@ -1658,6 +1729,141 @@ mod tests {
 
         assert_eq!(result?["stdout"], json!(traceparent));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn argv_eval_execs_directly_without_shell_interpretation() -> Result<()> {
+        // The spaced, $-laden element must arrive as ONE argv entry, verbatim:
+        // no word splitting, no variable expansion — there is no shell between
+        // the interpreter and the child. (/bin/sh is the child here only as a
+        // portable printf; it prints its $0 argument without re-parsing it.)
+        let result = run_eval_argv_with_env(
+            &EvalConfig {
+                shell: "/nonexistent-shell-must-not-be-used".into(),
+                ..EvalConfig::default()
+            },
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf %s "$0""#.into(),
+                "hello $HOME world".into(),
+            ],
+            BTreeMap::new(),
+        )
+        .await?;
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["stdout"], json!("hello $HOME world"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn argv_eval_rejects_empty_argv() {
+        let err = run_eval_argv_with_env(&EvalConfig::default(), &[], BTreeMap::new())
+            .await
+            .expect_err("empty argv has no program to exec");
+        assert!(err.to_string().contains("argv must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn inherit_policy_strips_credentials_from_argv_children() -> Result<()> {
+        // EnvPolicy::Inherit reads the real process env, so plant a uniquely
+        // named fake credential there for the duration of this test.
+        std::env::set_var("AGENT_TEST_ARGV_STRIP_API_KEY", "leaked");
+        let result = run_eval_argv_with_env(
+            &EvalConfig {
+                env: EnvPolicy::Inherit,
+                ..EvalConfig::default()
+            },
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf %s "${AGENT_TEST_ARGV_STRIP_API_KEY-stripped}""#.into(),
+            ],
+            BTreeMap::new(),
+        )
+        .await;
+        std::env::remove_var("AGENT_TEST_ARGV_STRIP_API_KEY");
+
+        assert_eq!(result?["stdout"], json!("stripped"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn op_layer_argv_eval_records_argv_and_replays_with_divergence_detection() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = SeqConfig {
+            trace,
+            ..seq_config_for_eval()
+        };
+        let argv = ["/bin/sh", "-c", r#"printf %s "$0""#, "argv-ok"];
+        let (recorded, _) = run_sequential(&config, (), crate::op::eval_argv(argv)).await?;
+        assert_eq!(recorded["stdout"], json!("argv-ok"));
+
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let recorded_argv = events
+            .iter()
+            .find_map(|event| match event {
+                Event::EvalCall { argv, .. } => argv.clone(),
+                _ => None,
+            })
+            .expect("argv Evals record their argv on EvalCall");
+        assert_eq!(recorded_argv, argv.map(String::from));
+
+        // Replay returns the recorded result without executing…
+        let replay = ReplayTrace::from_events(&events);
+        let config = SeqConfig {
+            replay: Some(replay.clone()),
+            ..seq_config_for_eval()
+        };
+        let (replayed, _) = run_sequential(&config, (), crate::op::eval_argv(argv)).await?;
+        assert_eq!(replayed, recorded);
+
+        // …a different argv diverges…
+        let config = SeqConfig {
+            replay: Some(replay.clone()),
+            ..seq_config_for_eval()
+        };
+        let err = run_sequential(
+            &config,
+            (),
+            crate::op::eval_argv(["/bin/sh", "-c", r#"printf %s "$0""#, "argv-changed"]),
+        )
+        .await
+        .expect_err("changed argv must not replay");
+        assert!(err.to_string().contains("replay diverged at Eval"), "{err}");
+
+        // …and a shell Eval whose rendered command matches the argv rendering
+        // still diverges: the identities are distinct.
+        let config = SeqConfig {
+            replay: Some(replay),
+            ..seq_config_for_eval()
+        };
+        let rendered = crate::op::EvalSpec::Argv(argv.map(String::from).to_vec()).display_command();
+        let err = run_sequential(&config, (), crate::op::eval(rendered))
+            .await
+            .expect_err("a shell Eval must not satisfy an argv recording");
+        assert!(err.to_string().contains("replay diverged at Eval"), "{err}");
+        Ok(())
+    }
+
+    fn seq_config_for_eval() -> SeqConfig {
+        SeqConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            gc_timing: GcTiming::Threshold,
+            context_budget: 200_000,
+        }
     }
 
     #[tokio::test]

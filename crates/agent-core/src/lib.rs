@@ -44,9 +44,9 @@ pub use ir_normalize::{normalize_program, validate_strict_ssa_program};
 pub use memory::MemorySource;
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{
-    agent_loop, close_pending_tool_calls, emit, eval, has_pending_tool_calls, infer, par,
-    repair_trailing_pending_tool_calls, ChatMessage, FinishReason, Model, Op, OpF, Prompt,
-    Response, ToolCall,
+    agent_loop, close_pending_tool_calls, emit, eval, eval_argv, has_pending_tool_calls, infer,
+    par, repair_trailing_pending_tool_calls, ChatMessage, EvalSpec, FinishReason, Model, Op, OpF,
+    Prompt, Response, ToolCall,
 };
 pub use prompt_ir::{
     collect_prompt_ir_sections, compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash,

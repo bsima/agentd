@@ -393,9 +393,28 @@ pub struct InferPolicy {
     pub on_error: EffectErrorMode,
 }
 
+/// The payload of an `Instr::Eval`. Two variants, one per trust model:
+///
+/// * `Shell` — a freeform command string run via `$SHELL -c`, for
+///   model-issued commands (the shell tool). The string is data to the
+///   shell, so it carries the usual quoting/injection surface.
+/// * `Argv` — direct exec: `argv[0]` is spawned with `argv[1..]` as
+///   arguments, no shell in between and therefore no quoting/injection
+///   surface. This is the normal path for typed tool calls (SDK DR-3):
+///   `Eval(argv=["some-tool", "call", tool_id, payload_ref])` instead of
+///   compiling to a shell template. Each element must evaluate to a string
+///   and the list must be non-empty (`validate_program` rejects it before
+///   any effect runs).
+///
+/// Both variants share the interpreter's `EvalPolicy`/`EvalConfig`
+/// treatment: env policy (credential stripping under Inherit), timeout,
+/// output caps, and cwd. How a request is executed remains an interpreter
+/// decision (see docs/AGENT_IR.md "Runtime policy and sandbox boundary");
+/// pluggable Eval backends would dispatch on this same enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EvalRequest {
     Shell { command: Expr },
+    Argv { argv: Vec<Expr> },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +613,20 @@ fn validate_eval_request_vars(
 ) -> Result<()> {
     match request {
         EvalRequest::Shell { command } => validate_expr_vars(command, defined, block_id),
+        EvalRequest::Argv { argv } => {
+            // Empty argv has no program to exec: a static program error,
+            // caught here (validate_program) rather than at spawn time.
+            if argv.is_empty() {
+                return Err(anyhow!(
+                    "AgentIR Eval argv must not be empty in block {:?}",
+                    block_id
+                ));
+            }
+            for arg in argv {
+                validate_expr_vars(arg, defined, block_id)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -913,6 +946,60 @@ mod tests {
         let legacy_null = r#"{"max_turns":null}"#;
         let policy: InferPolicy = serde_json::from_str(legacy_null).unwrap();
         assert_eq!(policy, InferPolicy::default());
+    }
+
+    /// EvalRequest grew the Argv variant (t-1308.5). Programs and traces
+    /// serialized before that carry only the externally-tagged Shell shape,
+    /// which must keep deserializing unchanged — and the new Argv shape must
+    /// round-trip.
+    #[test]
+    fn eval_request_tolerates_legacy_shell_shape_and_round_trips_argv() {
+        let legacy = r#"{"Shell":{"command":{"Value":"true"}}}"#;
+        let request: EvalRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            request,
+            EvalRequest::Shell {
+                command: Expr::Value(Value::String("true".into())),
+            }
+        );
+        // Shell requests keep serializing byte-identically to the old shape.
+        assert_eq!(serde_json::to_string(&request).unwrap(), legacy);
+
+        let argv = EvalRequest::Argv {
+            argv: vec![
+                Expr::Value(Value::String("some-tool".into())),
+                Expr::Var(Var("payload".into())),
+            ],
+        };
+        let encoded = serde_json::to_string(&argv).unwrap();
+        let decoded: EvalRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, argv);
+    }
+
+    #[test]
+    fn validation_rejects_empty_eval_argv() {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Eval {
+                    out: Var("result".into()),
+                    request: EvalRequest::Argv { argv: vec![] },
+                    policy: EvalPolicy::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("result".into())),
+                },
+            },
+        );
+        let program = Program {
+            id: ProgramId("bad-argv".into()),
+            entry: BlockId(0),
+            blocks,
+        };
+        let err = validate_program(&program).unwrap_err().to_string();
+        assert!(err.contains("argv must not be empty"), "{err}");
     }
 
     #[test]
