@@ -191,12 +191,18 @@ pub enum Terminator {
     If {
         cond: Expr,
         then_block: BlockId,
+        #[serde(default)]
+        then_args: Vec<Expr>,
         else_block: BlockId,
+        #[serde(default)]
+        else_args: Vec<Expr>,
     },
     Match {
         value: Expr,
         arms: Vec<MatchArm>,
         default: Option<BlockId>,
+        #[serde(default)]
+        default_args: Vec<Expr>,
     },
     Return {
         value: Expr,
@@ -211,6 +217,8 @@ pub enum Terminator {
 pub struct MatchArm {
     pub pattern: Pattern,
     pub block: BlockId,
+    #[serde(default)]
+    pub args: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,9 +367,7 @@ pub struct Budgets {
 }
 
 pub fn program_hash(program: &Program) -> Result<ProgramHash> {
-    let bytes = serde_json::to_vec(program)?;
-    let digest = Sha256::digest(bytes);
-    Ok(ProgramHash(format!("sha256:{digest:x}")))
+    crate::ir_normalize::canonical_program_hash(program)
 }
 
 pub fn effect_location(
@@ -564,8 +570,35 @@ fn validate_terminator_vars(
             }
             Ok(())
         }
-        Terminator::If { cond, .. } => validate_expr_vars(cond, defined, block_id),
-        Terminator::Match { value, .. } => validate_expr_vars(value, defined, block_id),
+        Terminator::If {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
+            validate_expr_vars(cond, defined, block_id)?;
+            for arg in then_args.iter().chain(else_args) {
+                validate_expr_vars(arg, defined, block_id)?;
+            }
+            Ok(())
+        }
+        Terminator::Match {
+            value,
+            arms,
+            default_args,
+            ..
+        } => {
+            validate_expr_vars(value, defined, block_id)?;
+            for arm in arms {
+                for arg in &arm.args {
+                    validate_expr_vars(arg, defined, block_id)?;
+                }
+            }
+            for arg in default_args {
+                validate_expr_vars(arg, defined, block_id)?;
+            }
+            Ok(())
+        }
         Terminator::Return { value } => validate_expr_vars(value, defined, block_id),
         Terminator::Par { .. } => Ok(()),
     }
@@ -593,19 +626,68 @@ fn terminator_successors(
         }
         Terminator::If {
             then_block,
+            then_args,
             else_block,
+            else_args,
             ..
-        } => Ok(vec![
-            (*then_block, defined.clone()),
-            (*else_block, defined.clone()),
-        ]),
-        Terminator::Match { arms, default, .. } => {
-            let mut out = arms
-                .iter()
-                .map(|arm| (arm.block, defined.clone()))
-                .collect::<Vec<_>>();
+        } => {
+            let then_target = program.blocks.get(then_block).expect("block ref checked");
+            if then_target.params.len() != then_args.len() {
+                return Err(anyhow!(
+                    "AgentIR If then branch to {:?} expected {} args, got {}",
+                    then_block,
+                    then_target.params.len(),
+                    then_args.len()
+                ));
+            }
+            let else_target = program.blocks.get(else_block).expect("block ref checked");
+            if else_target.params.len() != else_args.len() {
+                return Err(anyhow!(
+                    "AgentIR If else branch to {:?} expected {} args, got {}",
+                    else_block,
+                    else_target.params.len(),
+                    else_args.len()
+                ));
+            }
+            Ok(vec![
+                (*then_block, defined.clone()),
+                (*else_block, defined.clone()),
+            ])
+        }
+        Terminator::Match {
+            arms,
+            default,
+            default_args,
+            ..
+        } => {
+            let mut out = Vec::new();
+            for arm in arms {
+                let target = program.blocks.get(&arm.block).expect("block ref checked");
+                if target.params.len() != arm.args.len() {
+                    return Err(anyhow!(
+                        "AgentIR Match arm to {:?} expected {} args, got {}",
+                        arm.block,
+                        target.params.len(),
+                        arm.args.len()
+                    ));
+                }
+                out.push((arm.block, defined.clone()));
+            }
             if let Some(default) = default {
+                let target = program.blocks.get(default).expect("block ref checked");
+                if target.params.len() != default_args.len() {
+                    return Err(anyhow!(
+                        "AgentIR Match default to {:?} expected {} args, got {}",
+                        default,
+                        target.params.len(),
+                        default_args.len()
+                    ));
+                }
                 out.push((*default, defined.clone()));
+            } else if !default_args.is_empty() {
+                return Err(anyhow!(
+                    "AgentIR Match default args provided without default block"
+                ));
             }
             Ok(out)
         }

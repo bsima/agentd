@@ -6,6 +6,7 @@ pub mod interpreter;
 pub mod ir;
 pub mod ir_agent;
 pub mod ir_interpreter;
+pub mod ir_normalize;
 pub mod memory;
 pub mod models;
 pub mod op;
@@ -39,6 +40,7 @@ pub use ir_interpreter::{
     run_ir_steps_with_store_and_replay, InMemoryStore, IrCheckpoint, IrReplayTrace, IrStepOutcome,
     IrStore,
 };
+pub use ir_normalize::{normalize_program, validate_strict_ssa_program};
 pub use memory::MemorySource;
 pub use models::{ModelEntry, ModelRegistry, ResolvedModel};
 pub use op::{

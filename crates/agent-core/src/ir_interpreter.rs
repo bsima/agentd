@@ -533,26 +533,32 @@ pub async fn run_ir_steps_with_gc(
             Terminator::If {
                 cond,
                 then_block,
+                then_args,
                 else_block,
+                else_args,
             } => {
                 let cond = eval_expr(&machine.env, &cond)?;
-                let target = match cond {
-                    Value::Bool(true) => then_block,
-                    Value::Bool(false) => else_block,
+                let (target, args) = match cond {
+                    Value::Bool(true) => (then_block, then_args),
+                    Value::Bool(false) => (else_block, else_args),
                     other => return Err(anyhow!("AgentIR If condition must be bool, got {other}")),
                 };
-                branch_to_block(&mut machine, target).await?;
+                goto_block(&mut machine, target, args).await?;
             }
             Terminator::Match {
                 value,
                 arms,
                 default,
+                default_args,
             } => {
                 let value = eval_expr(&machine.env, &value)?;
-                let target = match_match_arms(&value, &arms).or(default).ok_or_else(|| {
-                    anyhow!("AgentIR Match had no matching arm and no default for {value}")
-                })?;
-                branch_to_block(&mut machine, target).await?;
+                let (target, args) = match_match_arm(&value, &arms)
+                    .map(|arm| (arm.block, arm.args.clone()))
+                    .or_else(|| default.map(|target| (target, default_args)))
+                    .ok_or_else(|| {
+                        anyhow!("AgentIR Match had no matching arm and no default for {value}")
+                    })?;
+                goto_block(&mut machine, target, args).await?;
             }
             Terminator::Par { .. } => {
                 return Err(anyhow!(
@@ -1034,24 +1040,6 @@ async fn execute_store_live(
     }
 }
 
-async fn branch_to_block(machine: &mut Machine, block_id: BlockId) -> Result<()> {
-    let target = machine
-        .program
-        .blocks
-        .get(&block_id)
-        .with_context(|| format!("unknown AgentIR block {block_id:?}"))?;
-    if !target.params.is_empty() {
-        return Err(anyhow!(
-            "AgentIR branch to {:?} expected target with no params, got {}",
-            block_id,
-            target.params.len()
-        ));
-    }
-    machine.block = block_id;
-    machine.pc = 0;
-    Ok(())
-}
-
 async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -> Result<()> {
     let target = machine
         .program
@@ -1410,10 +1398,8 @@ fn resolve_prompt(
     }
 }
 
-fn match_match_arms(value: &Value, arms: &[MatchArm]) -> Option<BlockId> {
-    arms.iter()
-        .find(|arm| pattern_matches(value, &arm.pattern))
-        .map(|arm| arm.block)
+fn match_match_arm<'a>(value: &Value, arms: &'a [MatchArm]) -> Option<&'a MatchArm> {
+    arms.iter().find(|arm| pattern_matches(value, &arm.pattern))
 }
 
 fn pattern_matches(value: &Value, pattern: &Pattern) -> bool {

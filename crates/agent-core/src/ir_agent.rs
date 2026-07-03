@@ -216,7 +216,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(should_return),
                 then_block: route_done,
+                then_args: vec![],
                 else_block: route,
+                else_args: vec![],
             },
         },
     );
@@ -233,7 +235,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(can_stop),
                 then_block: done,
+                then_args: vec![],
                 else_block: budget_done,
+                else_args: vec![],
             },
         },
     );
@@ -311,7 +315,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(no_tool_calls.clone()),
                 then_block: nudge_turn,
+                then_args: vec![],
                 else_block: prepare_tools,
+                else_args: vec![],
             },
         },
     );
@@ -446,7 +452,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(keep_looping),
                 then_block: tool_body,
+                then_args: vec![],
                 else_block: next_turn,
+                else_args: vec![],
             },
         },
     );
@@ -493,7 +501,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(is_infer_tool),
                 then_block: infer_tool,
+                then_args: vec![],
                 else_block: shell_dispatch,
+                else_args: vec![],
             },
         },
     );
@@ -512,11 +522,13 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(is_shell_tool),
                 then_block: shell_tool,
+                then_args: vec![],
                 else_block: if memory_tools {
                     remember_dispatch
                 } else {
                     invalid_tool
                 },
+                else_args: vec![],
             },
         },
     );
@@ -547,7 +559,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(missing_command),
                 then_block: invalid_arguments,
+                then_args: vec![],
                 else_block: shell_eval,
+                else_args: vec![],
             },
         },
     );
@@ -628,7 +642,9 @@ pub fn agent_loop_ir_with_options(
             terminator: Terminator::If {
                 cond: Expr::Var(invalid_infer_arguments),
                 then_block: invalid_arguments,
+                then_args: vec![],
                 else_block: infer_eval,
+                else_args: vec![],
             },
         },
     );
@@ -822,7 +838,9 @@ pub fn agent_loop_ir_with_options(
                 terminator: Terminator::If {
                     cond: Expr::Var(is_remember_tool),
                     then_block: remember_tool,
+                    then_args: vec![],
                     else_block: recall_dispatch,
+                    else_args: vec![],
                 },
             },
         );
@@ -866,7 +884,9 @@ pub fn agent_loop_ir_with_options(
                 terminator: Terminator::If {
                     cond: Expr::Var(missing_memory_content.clone()),
                     then_block: invalid_arguments,
+                    then_args: vec![],
                     else_block: remember_store,
+                    else_args: vec![],
                 },
             },
         );
@@ -943,7 +963,9 @@ pub fn agent_loop_ir_with_options(
                 terminator: Terminator::If {
                     cond: Expr::Var(is_recall_tool),
                     then_block: recall_tool,
+                    then_args: vec![],
                     else_block: invalid_tool,
+                    else_args: vec![],
                 },
             },
         );
@@ -973,7 +995,9 @@ pub fn agent_loop_ir_with_options(
                 terminator: Terminator::If {
                     cond: Expr::Var(missing_recall_query),
                     then_block: invalid_arguments,
+                    then_args: vec![],
                     else_block: recall_retrieve,
+                    else_args: vec![],
                 },
             },
         );
