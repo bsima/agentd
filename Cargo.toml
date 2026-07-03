@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/agent-core", "crates/agent-oauth", "crates/agent"]
+members = [
+    "crates/agent-core",
+    "crates/agent-oauth",
+    "crates/agent",
+    "crates/agent-sdk",
+]
 resolver = "2"
 
 [workspace.package]
@@ -26,6 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
