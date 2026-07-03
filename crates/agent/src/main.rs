@@ -73,6 +73,17 @@ struct Args {
     /// (see agent_core::output_contract).
     #[arg(long, env = "AGENT_OUTPUT_SCHEMA")]
     output_schema: Option<PathBuf>,
+    /// System prompt override as literal text. Primarily for session modes
+    /// (--session/--fifo), which have no prompt file whose frontmatter could
+    /// carry one; takes precedence over a prompt file's `system_prompt`.
+    /// Ignored on --resume (the checkpoint's history already carries the
+    /// session's system message).
+    #[arg(long, env = "AGENT_SYSTEM_PROMPT")]
+    system_prompt: Option<String>,
+    /// Soft turn ceiling per session turn (default 100). Takes precedence
+    /// over prompt frontmatter `max_iterations`.
+    #[arg(long, env = "AGENT_MAX_TURNS")]
+    max_turns: Option<usize>,
     /// Store full PromptIR section content in traces instead of previews/hashes only.
     #[arg(long, env = "AGENT_TRACE_FULL_PROMPT_IR")]
     trace_full_prompt_ir: bool,
@@ -350,18 +361,23 @@ async fn main() -> Result<()> {
         .provider
         .clone()
         .or_else(|| frontmatter.and_then(|meta| meta.provider.clone()));
-    let max_turns = frontmatter
-        .and_then(|meta| meta.max_iterations)
+    let max_turns = args
+        .max_turns
+        .or_else(|| frontmatter.and_then(|meta| meta.max_iterations))
         .unwrap_or(DEFAULT_MAX_TURNS);
-    let system_prompt_override = match loaded_prompt.as_ref() {
-        Some(prompt) => {
+    let system_prompt_override = match (args.system_prompt.clone(), loaded_prompt.as_ref()) {
+        // The explicit flag wins: it is how flag-only launches (sessions
+        // spawned by agent-sdk or a supervisor) express instructions that
+        // one-shot runs carry in prompt-file frontmatter.
+        (Some(text), _) => Some(text),
+        (None, Some(prompt)) => {
             frontmatter::resolve_system_prompt(
                 &prompt.base_dir,
                 frontmatter.and_then(|meta| meta.system_prompt.as_deref()),
             )
             .await?
         }
-        None => None,
+        (None, None) => None,
     };
     let system_prompt = build_system_prompt(system_prompt_override).await?;
 
