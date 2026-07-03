@@ -57,6 +57,12 @@ pub struct EventStream {
 }
 
 impl EventStream {
+    /// Wrap a receiver; used by both [`Runner::start`] (in-process sink)
+    /// and [`crate::Session::events`] (trace-file tail).
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<PublicEvent>) -> Self {
+        Self { rx }
+    }
+
     /// The next public event, or `None` once the run has finished and the
     /// feed is drained. The final event of a successful run is
     /// `run.completed`.
