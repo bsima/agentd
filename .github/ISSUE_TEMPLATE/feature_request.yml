@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose an improvement or new capability
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `ROADMAP.md` and the design docs in `docs/` first — the idea may
+        already be planned (M2 supervisor, M3 sandboxing, M4 parallel
+        interpreter, M5 distributed).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that agentd doesn't support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        How you imagine it working. For runtime features, say how it fits the
+        IR/effect model (new effect? interpreter concern? CLI flag?).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, other designs you rejected.

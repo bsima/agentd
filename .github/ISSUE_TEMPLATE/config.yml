@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Architecture and design questions
+    url: https://github.com/bsima/agentd/blob/main/ARCHITECTURE.md
+    about: Read ARCHITECTURE.md and the docs/ design notes before filing a design question as an issue.

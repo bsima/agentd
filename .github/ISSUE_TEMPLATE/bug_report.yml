@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in agentd misbehaves
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A trace file plus the exact CLI invocation is
+        usually the fastest path to a fix.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead.
+      placeholder: |
+        Ran `agent --model openrouter/auto "..."` and ...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, minimal prompt/models.yaml if relevant.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: Trace / logs
+      description: |
+        Relevant excerpt of the JSONL trace (`~/.local/share/agent/traces/<run-id>.jsonl`)
+        or stderr output. **Redact API keys, tokens, and anything sensitive that
+        command output may have captured.**
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: agentd version / commit
+      placeholder: v0.1.0, or `git rev-parse HEAD`
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: e.g. Linux x86_64 (NixOS 25.05), macOS 15 aarch64
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Provider / model
+      placeholder: e.g. openrouter/auto, anthropic claude-sonnet-4-5
