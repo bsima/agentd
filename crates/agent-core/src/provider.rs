@@ -39,6 +39,25 @@ pub trait ChatProvider: Send + Sync {
     ) -> Result<Response>;
 }
 
+/// Provider for replay-only runs: every Infer must be satisfied from the
+/// recorded trace before the provider is consulted, so any call that
+/// reaches it is a replay divergence (a missing or mismatched recording).
+pub struct ReplayOnlyProvider;
+
+#[async_trait]
+impl ChatProvider for ReplayOnlyProvider {
+    async fn chat(
+        &self,
+        _model: &Model,
+        _tools: &[ToolSpec],
+        _messages: &[ChatMessage],
+    ) -> Result<Response> {
+        Err(anyhow!(
+            "replay provider was called; trace is missing a recorded InferResult for this op"
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct ProviderClient {
     client: Client,

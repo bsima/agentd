@@ -1,6 +1,6 @@
 # Public Trace Event Schema
 
-`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.1**, see the version history at the end)
+`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.2**, see the version history at the end)
 
 This document is the contract for consumers of agentd trace data: the SDK
 trace adapter, dashboard ingest, and any external tooling. It defines a
@@ -145,6 +145,12 @@ file:
   (never the full payload); the public event mirrors that
   (`payload_preview`, `attrs.content_hash`). The sink-assigned id is on
   `store.completed` (`attrs.sink_id`).
+- **Tool** (native tools, since 1.2): the runtime records the model-supplied
+  arguments and the handler result **in full** (they are the replay
+  identity: replay checks the arguments and returns the result verbatim
+  without invoking the handler); the public events carry previews only
+  (arguments preview on `tool.requested`, result preview on
+  `tool.completed`).
 
 `payload_ref` is reserved for a future out-of-band payload store; until
 then, consumers needing full payloads read the runtime trace line with the
@@ -168,10 +174,25 @@ same `run_id`/`op_id`.
 | `store.started` | `StoreCall` | `started` | item preview | `content_hash`, `sink`, `store_id`?, `store_op` |
 | `store.completed` | `StoreResult` | `completed` | — | `duration_ms`, `sink`, `sink_id` |
 | `store.failed` | `StoreError` | `failed` | — | `duration_ms`, `sink` |
+| `tool.requested` | `ToolCall` | `started` | arguments preview | `name` |
+| `tool.completed` | `ToolResult` | `completed` | result preview | `duration_ms`, `name` |
+| `tool.failed` | `ToolError` | `failed` | — | `duration_ms`, `name` |
 | `run.completed` | `AgentDone` | `completed` | — | — |
 | `output.validation_failed` | `Custom { name: "output_validation_failed" }` | `failed` | invalid final-output excerpt | `attempt` (1-based), `errors` (string[], capped at 8) |
 
 (`?` = present only when the runtime recorded a value.)
+
+`tool.requested` / `tool.completed` / `tool.failed` (since 1.2, t-1308.7):
+model-initiated dispatch of a **registered native tool** — an in-process
+async handler registered with the runtime (`agent_core::tool::ToolRegistry`,
+surfaced by the SDK). These are the previously-reserved names, now emitted
+by the runtime `ToolCall`/`ToolResult`/`ToolError` events. The built-in
+tools are unchanged: shell/infer/remember/recall still surface as the
+`eval.*` / `infer.*` / `store.*` / `retrieve.*` effects they compile to.
+`tool.requested` carries the stable IR effect identity (`effect`, kind
+`Tool`); `attrs.name` on all three is the registered tool name. Handler
+failures ride the loop's errors-as-values convention, so a `tool.failed` is
+usually followed by the model reacting to the error, not by run failure.
 
 `output.validation_failed` (since 1.1, t-1308.4): the run has an output
 contract (`--output-schema`) and a natural final response failed JSON
@@ -192,9 +213,6 @@ Consumers must accept these without a schema bump when they start flowing:
 - `turn.started`, `turn.completed` — turns exist in the session protocol
   (machine events carry `turn_id`), but the runtime trace does not yet
   record turn boundaries.
-- `tool.requested`, `tool.completed`, `tool.failed` — model-initiated tool
-  dispatch as a first-class public event (today tools surface as the
-  `eval.*` / `retrieve.*` / `store.*` effects they compile to).
 - `approval.requested`, `approval.resolved` — human-in-the-loop approval
   gates.
 
@@ -254,6 +272,11 @@ neither constrains the other today.
 
 ## Version history
 
+- **1.2** (t-1308.7) — additive: the reserved `tool.requested` /
+  `tool.completed` / `tool.failed` are now emitted (projected from the new
+  runtime `ToolCall`/`ToolResult`/`ToolError` events) for registered native
+  tools, with `attrs.name` and effect identity on `tool.requested`. Wire
+  `schema_version` stays `1` per the compatibility policy.
 - **1.1** (t-1308.4) — additive: the reserved `output.validation_failed`
   is now emitted (projected from the runtime `Custom` event
   `output_validation_failed`), with `attempt`/`errors` attrs. Wire

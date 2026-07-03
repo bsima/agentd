@@ -632,6 +632,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("agent-core-op-test-{}.jsonl", Uuid::new_v4()));
         SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(NoopProvider),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),

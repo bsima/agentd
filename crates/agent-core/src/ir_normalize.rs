@@ -414,7 +414,8 @@ fn instr_out_public(instr: &Instr) -> Option<&Var> {
         | Instr::Infer { out, .. }
         | Instr::Eval { out, .. }
         | Instr::Retrieve { out, .. }
-        | Instr::Store { out, .. } => Some(out),
+        | Instr::Store { out, .. }
+        | Instr::Tool { out, .. } => Some(out),
         Instr::Emit { .. } => None,
     }
 }
@@ -425,7 +426,8 @@ fn instr_out_mut(instr: &mut Instr) -> Option<&mut Var> {
         | Instr::Infer { out, .. }
         | Instr::Eval { out, .. }
         | Instr::Retrieve { out, .. }
-        | Instr::Store { out, .. } => Some(out),
+        | Instr::Store { out, .. }
+        | Instr::Tool { out, .. } => Some(out),
         Instr::Emit { .. } => None,
     }
 }
@@ -448,6 +450,7 @@ fn instr_uses(instr: &Instr) -> BTreeSet<Var> {
             }
             collect_expr_vars(item, &mut out);
         }
+        Instr::Tool { arguments, .. } => collect_expr_vars(arguments, &mut out),
     }
     out
 }
@@ -706,6 +709,17 @@ fn rename_instr_uses(instr: &Instr, env: &BTreeMap<Var, Var>) -> Result<Instr> {
             op: *op,
             id: id.as_ref().map(|e| rename_expr(e, env)).transpose()?,
             item: rename_expr(item, env)?,
+            policy: *policy,
+        },
+        Instr::Tool {
+            out,
+            name,
+            arguments,
+            policy,
+        } => Instr::Tool {
+            out: out.clone(),
+            name: name.clone(),
+            arguments: rename_expr(arguments, env)?,
             policy: *policy,
         },
     })

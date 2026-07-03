@@ -2,7 +2,7 @@ use crate::gc::GcState;
 use crate::interpreter::SeqConfig;
 use crate::ir::{
     Block, BlockId, EffectErrorMode, Expr, InferPolicy, Instr, Machine, Program, ProgramId,
-    PromptRef, RetrievePolicy, StorePolicy, Terminator, Var,
+    PromptRef, RetrievePolicy, StorePolicy, Terminator, ToolPolicy, Var,
 };
 use crate::ir_interpreter::{IrReplayTrace, IrStore};
 use crate::op::{Model, Prompt};
@@ -31,6 +31,26 @@ pub fn agent_loop_ir_with_options(
     max_turns: usize,
     memory_tools: bool,
 ) -> Machine {
+    agent_loop_ir_with_tools(model, prompt, max_turns, memory_tools, &[])
+}
+
+/// The agent loop with native tool dispatch arms (t-1308.7). Each name in
+/// `native_tools` — the registered [`crate::tool::ToolRegistry`] names, in
+/// registry order — gets its own dispatch arm ahead of the unknown-tool
+/// fallthrough, executing as an [`Instr::Tool`] effect with `on_error:
+/// Bind` (a failed handler is a tool result the model can read, not a turn
+/// abort — t-1222). Like the memory tools, the tool set is part of the
+/// program: changing it changes the program hash, so replay against a
+/// different tool set diverges. Dispatch is by exact name match, entirely
+/// apart from the shell arm: a native tool call is never executed via
+/// `$SHELL -c`.
+pub fn agent_loop_ir_with_tools(
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    memory_tools: bool,
+    native_tools: &[String],
+) -> Machine {
     let entry = BlockId(0);
     let done = BlockId(1);
     let prepare_tools = BlockId(2);
@@ -55,6 +75,19 @@ pub fn agent_loop_ir_with_options(
     let recall_tool = BlockId(21);
     let remember_store = BlockId(22);
     let recall_retrieve = BlockId(23);
+    // Native tool dispatch arms (t-1308.7): a dispatch/body block pair per
+    // registered tool, from block id 24 up.
+    let native_base = 24u32;
+    let native_dispatch = |index: usize| BlockId(native_base + 2 * index as u32);
+    let native_body = |index: usize| BlockId(native_base + 2 * index as u32 + 1);
+    // Where an unmatched name falls through to after the built-in arms:
+    // the first native dispatch arm when tools are registered, else the
+    // unknown-tool response.
+    let first_native_or_invalid = if native_tools.is_empty() {
+        invalid_tool
+    } else {
+        native_dispatch(0)
+    };
 
     let history = Var("history".into());
     let turns_left = Var("turns_left".into());
@@ -536,7 +569,7 @@ pub fn agent_loop_ir_with_options(
                 else_block: if memory_tools {
                     remember_dispatch
                 } else {
-                    invalid_tool
+                    first_native_or_invalid
                 },
                 else_args: vec![],
             },
@@ -722,6 +755,15 @@ pub fn agent_loop_ir_with_options(
         },
     );
 
+    let available_tools = {
+        let mut names: Vec<&str> = vec!["shell", "infer"];
+        if memory_tools {
+            names.push("remember");
+            names.push("recall");
+        }
+        names.extend(native_tools.iter().map(String::as_str));
+        names.join(", ")
+    };
     blocks.insert(
         invalid_tool,
         Block {
@@ -731,11 +773,7 @@ pub fn agent_loop_ir_with_options(
                 expr: Expr::Value(serde_json::json!({
                     "ok": false,
                     "error": "unknown_tool",
-                    "message": if memory_tools {
-                        "unknown tool; available tools: shell, infer, remember, recall"
-                    } else {
-                        "unknown tool; available tools: shell, infer"
-                    }
+                    "message": format!("unknown tool; available tools: {available_tools}")
                 })),
             }],
             terminator: Terminator::Goto {
@@ -973,7 +1011,7 @@ pub fn agent_loop_ir_with_options(
                     cond: Expr::Var(is_recall_tool),
                     then_block: recall_tool,
                     then_args: vec![],
-                    else_block: invalid_tool,
+                    else_block: first_native_or_invalid,
                     else_args: vec![],
                 },
             },
@@ -1060,6 +1098,71 @@ pub fn agent_loop_ir_with_options(
         );
     }
 
+    let is_native_tool = Var("is_native_tool".into());
+    let native_tool_result = Var("native_tool_result".into());
+    for (index, tool_name) in native_tools.iter().enumerate() {
+        let fallthrough = if index + 1 < native_tools.len() {
+            native_dispatch(index + 1)
+        } else {
+            invalid_tool
+        };
+        blocks.insert(
+            native_dispatch(index),
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Let {
+                    out: is_native_tool.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(function_name.clone())),
+                        right: Box::new(Expr::Value(Value::String(tool_name.clone()))),
+                    },
+                }],
+                terminator: Terminator::If {
+                    cond: Expr::Var(is_native_tool.clone()),
+                    then_block: native_body(index),
+                    then_args: vec![],
+                    else_block: fallthrough,
+                    else_args: vec![],
+                },
+            },
+        );
+        blocks.insert(
+            native_body(index),
+            Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Tool {
+                        out: native_tool_result.clone(),
+                        name: tool_name.clone(),
+                        arguments: Expr::Var(arguments.clone()),
+                        // Errors-as-values (t-1222): a failed handler becomes
+                        // a tool result the model can recover from.
+                        policy: ToolPolicy {
+                            on_error: EffectErrorMode::Bind,
+                        },
+                    },
+                    // String results feed back verbatim; anything else is
+                    // serialized JSON (a bare ToString of a string would
+                    // hand the model a quoted literal).
+                    Instr::Let {
+                        out: tool_content.clone(),
+                        expr: Expr::StringOr {
+                            value: Box::new(Expr::Var(native_tool_result.clone())),
+                            default: Box::new(Expr::ToString {
+                                value: Box::new(Expr::Var(native_tool_result.clone())),
+                            }),
+                        },
+                    },
+                ],
+                terminator: Terminator::Goto {
+                    block: append_tool,
+                    args: vec![Expr::Var(tool_content.clone())],
+                },
+            },
+        );
+    }
+    let _ = (is_native_tool, native_tool_result);
+
     Machine {
         program: Program {
             id: ProgramId("agent-loop".into()),
@@ -1094,6 +1197,11 @@ pub struct AgentLoopOptions {
     /// Include the model-initiated remember/recall tools (docs/MEMORY.md);
     /// see [`agent_loop_ir_with_options`].
     pub memory_tools: bool,
+    /// Registered native tool names (t-1308.7), in registry order — pass
+    /// [`crate::tool::ToolRegistry::names`] of the registry carried on the
+    /// `SeqConfig`. Each name gets a dispatch arm in the loop program; see
+    /// [`agent_loop_ir_with_tools`].
+    pub tool_names: Vec<String>,
     /// Validate the loop's final response against a JSON Schema, with
     /// bounded repair (t-1308.4, DR-2).
     pub output_contract: Option<OutputContract>,
@@ -1154,8 +1262,13 @@ pub async fn run_agent_loop(
             .await?;
     }
 
-    let mut machine =
-        agent_loop_ir_with_options(model.clone(), prompt, max_turns, options.memory_tools);
+    let mut machine = agent_loop_ir_with_tools(
+        model.clone(),
+        prompt,
+        max_turns,
+        options.memory_tools,
+        &options.tool_names,
+    );
     machine.effect_visits = effect_visits;
     let mut attempt = 0usize;
     loop {
@@ -1207,6 +1320,7 @@ pub async fn run_agent_loop(
             model.clone(),
             max_turns,
             options.memory_tools,
+            &options.tool_names,
         );
     }
 }
@@ -1223,6 +1337,7 @@ fn turn_budget_exhausted(value: &Value) -> bool {
 /// history plus the invalid assistant answer and a user repair message,
 /// with a full turn budget and the effect-visit counters carried forward
 /// (same shape as a new session turn in the runtime).
+#[allow(clippy::too_many_arguments)] // mirrors run_agent_loop's axes: loop identity vs repair state
 fn repair_machine(
     done: &Machine,
     content: &str,
@@ -1230,6 +1345,7 @@ fn repair_machine(
     model: Model,
     max_turns: usize,
     memory_tools: bool,
+    tool_names: &[String],
 ) -> Machine {
     let mut history = done
         .env
@@ -1242,7 +1358,7 @@ fn repair_machine(
         }
         messages.push(serde_json::json!({ "role": "user", "content": repair_prompt(errors) }));
     }
-    let mut machine = agent_loop_ir_with_options(model, vec![], max_turns, memory_tools);
+    let mut machine = agent_loop_ir_with_tools(model, vec![], max_turns, memory_tools, tool_names);
     machine.env.insert(Var("history".into()), history);
     machine.effect_visits = done.effect_visits.clone();
     machine
@@ -1369,6 +1485,7 @@ mod tests {
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -2039,6 +2156,296 @@ mod tests {
         Ok(())
     }
 
+    // ---- native tools (t-1308.7) ----
+
+    fn native_tool_config(
+        provider: Arc<dyn ChatProvider>,
+        trace: TraceLogger,
+        tool: crate::tool::NativeTool,
+    ) -> SeqConfig {
+        let mut config = config_with_trace(provider, trace);
+        config.tools.register(tool).unwrap();
+        config
+    }
+
+    fn weather_tool(calls: Arc<std::sync::atomic::AtomicUsize>) -> crate::tool::NativeTool {
+        crate::tool::NativeTool::from_fn(
+            "get_weather",
+            "Current weather for a city.",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            }),
+            move |arguments| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let city = arguments["city"].as_str().unwrap_or("nowhere").to_owned();
+                    Ok(Value::String(format!("sunny in {city}")))
+                }
+            },
+        )
+    }
+
+    fn weather_turns() -> Vec<Response> {
+        vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "get_weather",
+                    serde_json::json!({ "city": "sf" }),
+                )],
+            ),
+            response("done: sunny in sf", vec![]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_dispatches_native_tool_with_effect_identity() -> Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(weather_turns()));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = native_tool_config(provider.clone(), trace, weather_tool(calls.clone()));
+        let machine = agent_loop_ir_with_tools(
+            Model("mock".into()),
+            vec![ChatMessage::user("what's the weather in sf?")],
+            4,
+            false,
+            &["get_weather".into()],
+        );
+        validate_program(&machine.program)?;
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+
+        assert_eq!(value["content"], Value::String("done: sunny in sf".into()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The handler's string result feeds back verbatim (not JSON-quoted).
+        let prompts = provider.prompts();
+        let tool_message = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("native tool result fed back");
+        assert_eq!(tool_message.content.as_deref(), Some("sunny in sf"));
+
+        // The dispatch rode a Tool effect with stable identity — and never
+        // the shell: no Eval events at all.
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let tool_call = events
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCall {
+                    name,
+                    arguments,
+                    effect,
+                    ..
+                } => Some((name.clone(), arguments.clone(), effect.clone())),
+                _ => None,
+            })
+            .expect("ToolCall event recorded");
+        assert_eq!(tool_call.0, "get_weather");
+        assert_eq!(tool_call.1, serde_json::json!({ "city": "sf" }));
+        let effect = tool_call.2.expect("Tool effect identity recorded");
+        assert_eq!(effect.kind, crate::ir::EffectKind::Tool);
+        assert!(effect.effect_id.0.starts_with("sha256:"));
+        let tool_result = events
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolResult { name, result, .. } => Some((name.clone(), result.clone())),
+                _ => None,
+            })
+            .expect("ToolResult event recorded");
+        assert_eq!(tool_result.0, "get_weather");
+        assert_eq!(tool_result.1, Value::String("sunny in sf".into()));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::EvalCall { .. })),
+            "a native tool call must never become an Eval/shell execution"
+        );
+        let _ = std::fs::remove_file(&trace_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_native_tool_replays_by_effect_id_without_invoking_handler() -> Result<()>
+    {
+        // Record a run with a live handler...
+        let record_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let recorded_value = {
+            let provider = Arc::new(MockProvider::new(weather_turns()));
+            let config = native_tool_config(provider, trace, weather_tool(record_calls.clone()));
+            let machine = agent_loop_ir_with_tools(
+                Model("mock".into()),
+                vec![ChatMessage::user("what's the weather in sf?")],
+                4,
+                false,
+                &["get_weather".into()],
+            );
+            let (value, _machine) =
+                crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+            value
+        };
+        assert_eq!(record_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // ...then replay: same program, exhausted provider, a handler that
+        // must not run. The recorded result comes back by effect id.
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let replay = IrReplayTrace::from_events(&events)?;
+        let replay_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let config = native_tool_config(provider, test_trace(), weather_tool(replay_calls.clone()));
+        let machine = agent_loop_ir_with_tools(
+            Model("mock".into()),
+            vec![ChatMessage::user("what's the weather in sf?")],
+            4,
+            false,
+            &["get_weather".into()],
+        );
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let (replayed, _machine) = crate::ir_interpreter::run_ir_sequential_with_store_and_replay(
+            &config,
+            machine,
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+
+        assert_eq!(replayed, recorded_value);
+        assert_eq!(
+            replay_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "replay must not invoke the native tool handler"
+        );
+        let _ = std::fs::remove_file(&trace_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_native_tool_failure_is_a_recoverable_tool_result() -> Result<()> {
+        let tool = crate::tool::NativeTool::from_fn(
+            "get_weather",
+            "always fails",
+            serde_json::json!({ "type": "object" }),
+            |_| async { Err(anyhow!("weather service is down")) },
+        );
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "get_weather",
+                    serde_json::json!({}),
+                )],
+            ),
+            response("recovered from tool failure", vec![]),
+        ]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = native_tool_config(provider.clone(), trace, tool);
+        let machine = agent_loop_ir_with_tools(
+            Model("mock".into()),
+            vec![ChatMessage::user("try the tool")],
+            4,
+            false,
+            &["get_weather".into()],
+        );
+
+        let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+
+        assert_eq!(
+            value["content"],
+            Value::String("recovered from tool failure".into())
+        );
+        // Errors-as-values: the failure reached the model as a tool result...
+        let prompts = provider.prompts();
+        let tool_message = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("failure tool result fed back");
+        let content = tool_message.content.as_deref().unwrap();
+        assert!(content.contains("\"ok\":false"), "{content}");
+        assert!(content.contains("weather service is down"), "{content}");
+        // ...and the trace closed the call with a ToolError event.
+        let events = TraceLogger::read_events(&trace_path).await?;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolError { name, error, .. }
+                if name == "get_weather" && error.contains("weather service is down")
+        )));
+        let _ = std::fs::remove_file(&trace_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_loop_ir_unregistered_native_tool_binds_error_result() -> Result<()> {
+        // The program advertises the arm but the registry has no handler
+        // (a caller wiring bug): the model sees the error, the turn lives.
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new("call-1", "ghost", serde_json::json!({}))],
+            ),
+            response("noted the missing tool", vec![]),
+        ]));
+        let machine = agent_loop_ir_with_tools(
+            Model("mock".into()),
+            vec![ChatMessage::user("call the ghost tool")],
+            4,
+            false,
+            &["ghost".into()],
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+
+        assert_eq!(
+            value["content"],
+            Value::String("noted the missing tool".into())
+        );
+        let prompts = provider.prompts();
+        let tool_message = prompts[1]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("missing-registration result fed back");
+        let content = tool_message.content.as_deref().unwrap();
+        assert!(content.contains("no native tool"), "{content}");
+        Ok(())
+    }
+
+    #[test]
+    fn native_tools_change_the_program_hash_and_unknown_message() {
+        let plain = agent_loop_ir(Model("m".into()), vec![], 4);
+        let with_native =
+            agent_loop_ir_with_tools(Model("m".into()), vec![], 4, false, &["get_weather".into()]);
+        assert_ne!(
+            crate::ir::program_hash(&plain.program).unwrap(),
+            crate::ir::program_hash(&with_native.program).unwrap(),
+            "the tool set is part of the program identity"
+        );
+        validate_program(&with_native.program).expect("native-tool variant validates");
+        // Native + memory arms coexist.
+        let both = agent_loop_ir_with_tools(
+            Model("m".into()),
+            vec![],
+            4,
+            true,
+            &["get_weather".into(), "lookup".into()],
+        );
+        validate_program(&both.program).expect("memory + native variant validates");
+        let rendered = serde_json::to_string(&both.program).unwrap();
+        assert!(
+            rendered.contains(
+                "unknown tool; available tools: shell, infer, remember, recall, get_weather, lookup"
+            ),
+            "unknown-tool message names the full tool set"
+        );
+    }
+
     #[test]
     fn memory_tools_only_change_the_program_when_enabled() {
         let plain = agent_loop_ir(Model("m".into()), vec![], 4);
@@ -2155,6 +2562,7 @@ mod tests {
         let mut gc_state = GcState::default();
         let options = AgentLoopOptions {
             memory_tools: false,
+            tool_names: Vec::new(),
             output_contract: contract,
         };
         let (value, machine) = run_agent_loop(
@@ -2350,6 +2758,7 @@ mod tests {
             let mut gc_state = GcState::default();
             let options = AgentLoopOptions {
                 memory_tools: false,
+                tool_names: Vec::new(),
                 output_contract: Some(contract_a.clone()),
             };
             let (value, _machine) = run_agent_loop(
@@ -2383,6 +2792,7 @@ mod tests {
                 let mut gc_state = GcState::default();
                 let options = AgentLoopOptions {
                     memory_tools: false,
+                    tool_names: Vec::new(),
                     output_contract: contract,
                 };
                 run_agent_loop(

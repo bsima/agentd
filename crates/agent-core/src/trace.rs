@@ -197,6 +197,48 @@ pub enum Event {
         duration_ms: u64,
         timestamp: DateTime<Utc>,
     },
+    /// Dispatch of a registered native tool (t-1308.7). `arguments` is the
+    /// model-supplied JSON payload, recorded verbatim — it is the replay
+    /// identity for the Tool effect, so no preview truncation.
+    ToolCall {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        name: String,
+        arguments: Value,
+        /// Stable IR effect identity; see [`Event::InferCall::effect`].
+        /// None for op-layer traces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<Box<EffectLocation>>,
+        timestamp: DateTime<Utc>,
+    },
+    ToolResult {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        name: String,
+        /// Full handler result, always recorded: replay returns it verbatim
+        /// without invoking the handler.
+        result: Value,
+        #[serde(default)]
+        result_preview: String,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// Terminal failure of a Tool effect (handler error, missing
+    /// registration, replay divergence). Closes the matching ToolCall.
+    ToolError {
+        run_id: String,
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_op_id: Option<u64>,
+        name: String,
+        error: String,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
     HydrationStart {
         run_id: String,
         op_id: u64,
@@ -291,6 +333,9 @@ impl Event {
             | Self::StoreCall { run_id, .. }
             | Self::StoreResult { run_id, .. }
             | Self::StoreError { run_id, .. }
+            | Self::ToolCall { run_id, .. }
+            | Self::ToolResult { run_id, .. }
+            | Self::ToolError { run_id, .. }
             | Self::HydrationStart { run_id, .. }
             | Self::HydrationSection { run_id, .. }
             | Self::HydrationEnd { run_id, .. }
@@ -317,6 +362,9 @@ impl Event {
             | Self::StoreCall { op_id, .. }
             | Self::StoreResult { op_id, .. }
             | Self::StoreError { op_id, .. }
+            | Self::ToolCall { op_id, .. }
+            | Self::ToolResult { op_id, .. }
+            | Self::ToolError { op_id, .. }
             | Self::HydrationStart { op_id, .. }
             | Self::HydrationSection { op_id, .. }
             | Self::HydrationEnd { op_id, .. }
@@ -343,6 +391,9 @@ impl Event {
             | Self::StoreCall { parent_op_id, .. }
             | Self::StoreResult { parent_op_id, .. }
             | Self::StoreError { parent_op_id, .. }
+            | Self::ToolCall { parent_op_id, .. }
+            | Self::ToolResult { parent_op_id, .. }
+            | Self::ToolError { parent_op_id, .. }
             | Self::HydrationStart { parent_op_id, .. }
             | Self::HydrationSection { parent_op_id, .. }
             | Self::HydrationEnd { parent_op_id, .. }
@@ -363,6 +414,7 @@ impl Event {
             | Self::RetrieveResult { .. }
             | Self::RetrieveError { .. } => "Retrieve",
             Self::StoreCall { .. } | Self::StoreResult { .. } | Self::StoreError { .. } => "Store",
+            Self::ToolCall { .. } | Self::ToolResult { .. } | Self::ToolError { .. } => "Tool",
             Self::HydrationStart { .. } | Self::HydrationEnd { .. } => "Hydration",
             Self::HydrationSection { .. } => "HydrationSection",
             Self::ParStart { .. } | Self::ParEnd { .. } => "Par",
@@ -389,6 +441,7 @@ impl Event {
                 | Self::EvalCall { .. }
                 | Self::RetrieveCall { .. }
                 | Self::StoreCall { .. }
+                | Self::ToolCall { .. }
                 | Self::HydrationStart { .. }
                 | Self::ParStart { .. }
         )
@@ -405,6 +458,8 @@ impl Event {
                 | Self::RetrieveError { .. }
                 | Self::StoreResult { .. }
                 | Self::StoreError { .. }
+                | Self::ToolResult { .. }
+                | Self::ToolError { .. }
                 | Self::HydrationEnd { .. }
                 | Self::ParEnd { .. }
         )
@@ -424,6 +479,9 @@ impl Event {
             | Self::StoreCall { timestamp, .. }
             | Self::StoreResult { timestamp, .. }
             | Self::StoreError { timestamp, .. }
+            | Self::ToolCall { timestamp, .. }
+            | Self::ToolResult { timestamp, .. }
+            | Self::ToolError { timestamp, .. }
             | Self::HydrationStart { timestamp, .. }
             | Self::HydrationSection { timestamp, .. }
             | Self::HydrationEnd { timestamp, .. }
@@ -574,6 +632,38 @@ impl Event {
                 ..
             } => {
                 attrs.push(KeyValue::new("agent.sink", sink.clone()));
+                attrs.push(KeyValue::new("error", error.clone()));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
+            Self::ToolCall {
+                name, arguments, ..
+            } => {
+                attrs.push(KeyValue::new("tool.name", name.clone()));
+                attrs.push(KeyValue::new(
+                    "agent.arguments_preview",
+                    preview(&arguments.to_string(), 512),
+                ));
+            }
+            Self::ToolResult {
+                name,
+                result_preview,
+                duration_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("tool.name", name.clone()));
+                attrs.push(KeyValue::new(
+                    "agent.result_preview",
+                    result_preview.clone(),
+                ));
+                attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
+            }
+            Self::ToolError {
+                name,
+                error,
+                duration_ms,
+                ..
+            } => {
+                attrs.push(KeyValue::new("tool.name", name.clone()));
                 attrs.push(KeyValue::new("error", error.clone()));
                 attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
             }

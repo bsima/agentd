@@ -2,9 +2,9 @@ use agent_core::{
     agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatHistory, ChatMessage,
     EnvPolicy, EvalConfig, Event, GcMode, GcTiming, HydrationSink, HydrationSource, InMemoryStore,
     IrReplayTrace, JsonlTraceSink, MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink,
-    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ResolvedModel, RingGc,
-    SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult,
-    StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
+    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayOnlyProvider,
+    ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
+    SourceResult, StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -234,22 +234,6 @@ struct Checkpoint {
     /// absent in checkpoints written before t-1162.
     #[serde(default)]
     discovered_budget: Option<usize>,
-}
-
-struct ReplayOnlyProvider;
-
-#[async_trait]
-impl agent_core::ChatProvider for ReplayOnlyProvider {
-    async fn chat(
-        &self,
-        _model: &agent_core::Model,
-        _tools: &[agent_core::provider::ToolSpec],
-        _messages: &[ChatMessage],
-    ) -> Result<agent_core::Response> {
-        Err(anyhow!(
-            "replay provider was called; trace is missing a recorded InferResult for this op"
-        ))
-    }
 }
 
 /// A parsed session turn frame (t-1308.2; docs/SUPERVISOR.md "Turn envelope").
@@ -522,6 +506,7 @@ async fn main() -> Result<()> {
         None => (initial_history(system_prompt), 0, None),
     };
     let config = SeqConfig {
+        tools: Default::default(),
         provider,
         hydration: hydration.clone(),
         passive_hydration: PassiveHydrationConfig::with_sources([
@@ -1315,6 +1300,7 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             .is_empty();
         let options = agent_core::AgentLoopOptions {
             memory_tools,
+            tool_names: runtime.config.tools.names(),
             output_contract: runtime.output_contract.clone(),
         };
         let (value, machine) = agent_core::run_agent_loop(

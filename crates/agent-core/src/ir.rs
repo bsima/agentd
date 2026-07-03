@@ -114,6 +114,8 @@ pub enum EffectKind {
     Emit,
     Retrieve,
     Store,
+    /// Native tool dispatch (t-1308.7): an in-process registered handler.
+    Tool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +191,20 @@ pub enum Instr {
         #[serde(default)]
         policy: StorePolicy,
     },
+    /// Invoke a registered native tool handler (t-1308.7,
+    /// [`crate::tool::ToolRegistry`]). `name` is static — dispatch arms are
+    /// generated per registered tool, so a changed tool set changes the
+    /// program (and its hash), exactly like the memory tools. `arguments`
+    /// is the dynamic JSON payload the model supplied. Never executed via a
+    /// shell: the interpreter calls the in-process handler directly, and
+    /// replay returns the recorded result without invoking it.
+    Tool {
+        out: Var,
+        name: String,
+        arguments: Expr,
+        #[serde(default)]
+        policy: ToolPolicy,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +255,15 @@ pub struct StorePolicy {
 /// Per-Retrieve policy slot; `on_error` chooses abort-vs-bind for this site.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievePolicy {
+    #[serde(default)]
+    pub on_error: EffectErrorMode,
+}
+
+/// Per-Tool policy slot; `on_error` chooses abort-vs-bind for this site.
+/// The agent loop's dispatch arms use Bind so a failed handler surfaces to
+/// the model as a tool result (errors-as-values, t-1222).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicy {
     #[serde(default)]
     pub on_error: EffectErrorMode,
 }
@@ -566,7 +591,8 @@ fn instr_out(instr: &Instr) -> Option<&Var> {
         | Instr::Infer { out, .. }
         | Instr::Eval { out, .. }
         | Instr::Retrieve { out, .. }
-        | Instr::Store { out, .. } => Some(out),
+        | Instr::Store { out, .. }
+        | Instr::Tool { out, .. } => Some(out),
         Instr::Emit { .. } => None,
     }
 }
@@ -591,6 +617,19 @@ fn validate_instr_vars(
                 validate_expr_vars(id, defined, block_id)?;
             }
             validate_expr_vars(item, defined, block_id)
+        }
+        Instr::Tool {
+            name, arguments, ..
+        } => {
+            // An empty name has no registry entry to dispatch to: a static
+            // program error, caught before any effect runs.
+            if name.trim().is_empty() {
+                return Err(anyhow!(
+                    "AgentIR Tool name must be non-empty in block {:?}",
+                    block_id
+                ));
+            }
+            validate_expr_vars(arguments, defined, block_id)
         }
     }
 }

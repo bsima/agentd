@@ -35,6 +35,9 @@ pub struct IrReplayTrace {
     store_calls: BTreeMap<String, IrStoreCall>,
     store_results: BTreeMap<String, String>,
     store_errors: BTreeMap<String, String>,
+    tool_calls: BTreeMap<String, IrToolCall>,
+    tool_results: BTreeMap<String, Value>,
+    tool_errors: BTreeMap<String, String>,
     /// Output-contract schema hash recorded by the run (the Custom
     /// `output_contract` event, t-1308.4). Run-identity metadata: replaying
     /// with a different contract must diverge, so the agent-loop driver
@@ -69,6 +72,17 @@ struct IrStoreCall {
 struct IrInferCall {
     location: EffectLocation,
     model: String,
+}
+
+/// The native-tool identity recorded for replay-divergence detection: the
+/// registered name plus the full model-supplied arguments (both dynamic at
+/// the call site — a same-site call with different arguments must diverge
+/// loudly instead of replaying a stale result).
+#[derive(Debug, Clone, PartialEq)]
+struct IrToolCall {
+    location: EffectLocation,
+    name: String,
+    arguments: Value,
 }
 
 /// The Eval identity recorded for replay-divergence detection: the display
@@ -234,6 +248,37 @@ impl IrReplayTrace {
                         replay.store_errors.insert(effect_id.clone(), error.clone());
                     }
                 }
+                Event::ToolCall {
+                    op_id,
+                    name,
+                    arguments,
+                    effect,
+                    ..
+                } => {
+                    let location = require_effect(effect.as_deref(), EffectKind::Tool, *op_id)?;
+                    let effect_id = location.effect_id.0.clone();
+                    replay.tool_calls.insert(
+                        effect_id.clone(),
+                        IrToolCall {
+                            location: location.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        },
+                    );
+                    effect_by_op.insert(*op_id, effect_id);
+                }
+                Event::ToolResult { op_id, result, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay
+                            .tool_results
+                            .insert(effect_id.clone(), result.clone());
+                    }
+                }
+                Event::ToolError { op_id, error, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay.tool_errors.insert(effect_id.clone(), error.clone());
+                    }
+                }
                 Event::Custom { name, data, .. }
                     if name == crate::output_contract::OUTPUT_CONTRACT_EVENT =>
                 {
@@ -369,6 +414,45 @@ impl IrReplayTrace {
             .get(effect_id)
             .cloned()
             .ok_or_else(|| anyhow!("AgentIR replay missing StoreResult for effect {effect_id}"))
+    }
+
+    /// Replay never invokes a native tool handler: the recorded result is
+    /// returned. Name and arguments are checked so a same-site call with a
+    /// different payload diverges instead of silently replaying stale data.
+    fn tool_result(
+        &self,
+        location: &EffectLocation,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<Value> {
+        let effect_id = &location.effect_id.0;
+        let recorded = self.tool_calls.get(effect_id).ok_or_else(|| {
+            anyhow!(
+                "AgentIR replay missing ToolCall for effect {} at {}; {MISSING_EFFECT_HINT}",
+                effect_id,
+                location_desc(location)
+            )
+        })?;
+        if recorded.name != name || recorded.arguments != *arguments {
+            return Err(anyhow!(
+                "AgentIR replay diverged at effect {}: expected tool {:?} with arguments {} at {}, observed {:?} with arguments {}",
+                effect_id,
+                recorded.name,
+                recorded.arguments,
+                location_desc(&recorded.location),
+                name,
+                arguments
+            ));
+        }
+        if let Some(error) = self.tool_errors.get(effect_id) {
+            return Err(anyhow!(
+                "AgentIR replaying recorded Tool failure at effect {effect_id}: {error}"
+            ));
+        }
+        self.tool_results
+            .get(effect_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("AgentIR replay missing ToolResult for effect {effect_id}"))
     }
 }
 
@@ -1099,6 +1183,89 @@ async fn execute_instr(
                 .await?;
             machine.env.insert(out, Value::String(sink_id));
         }
+        Instr::Tool {
+            out,
+            name,
+            arguments,
+            policy,
+        } => {
+            let location = effect_location(
+                program_hash.clone(),
+                EffectKind::Tool,
+                site,
+                dynamic_path.clone(),
+            )?;
+            let arguments = eval_expr(&machine.env, &arguments)?;
+            let op_id = config.trace.next_op_id();
+            config
+                .trace
+                .emit(&Event::ToolCall {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    parent_op_id: None,
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    effect: Some(Box::new(location.clone())),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            let started = Instant::now();
+            // Dispatch is registry-only: a Tool effect is executed by its
+            // in-process handler or replayed from the trace — never by a
+            // shell or any other fallback.
+            let result = match ir_replay {
+                Some(replay) => replay.tool_result(&location, &name, &arguments),
+                None if config.replay.is_some() => Err(anyhow!(
+                    "op-layer replay traces do not carry native tool results; \
+                     replay this run with an IR replay trace"
+                )),
+                None => match config.tools.get(&name) {
+                    Some(tool) => tool.handler.call(arguments.clone()).await,
+                    None => Err(anyhow!(
+                        "no native tool {name:?} is registered with the runtime"
+                    )),
+                },
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    config
+                        .trace
+                        .emit(&Event::ToolError {
+                            run_id: config.trace.run_id().into(),
+                            op_id,
+                            parent_op_id: None,
+                            name,
+                            error: format!("{err:#}"),
+                            duration_ms: millis_u64(started.elapsed()),
+                            timestamp: Utc::now(),
+                        })
+                        .await?;
+                    // Errors-as-values (t-1222): the loop's dispatch arms use
+                    // Bind so a failed handler becomes a tool result the
+                    // model can recover from.
+                    if policy.on_error == EffectErrorMode::Bind {
+                        machine.env.insert(out, effect_error_value(&err));
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            };
+            config
+                .trace
+                .emit(&Event::ToolResult {
+                    run_id: config.trace.run_id().into(),
+                    op_id,
+                    parent_op_id: None,
+                    name,
+                    result: result.clone(),
+                    result_preview: crate::trace::preview(&result.to_string(), 512),
+                    duration_ms: millis_u64(started.elapsed()),
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            machine.env.insert(out, result);
+        }
     }
     Ok(())
 }
@@ -1195,7 +1362,8 @@ async fn goto_block(
 /// Tool list shown to the provider: shell + infer always; remember/recall
 /// appear automatically whenever a memory backend is registered (settled
 /// question 6 — an unreachable sink is a trap, so registration IS the
-/// exposure switch).
+/// exposure switch); native tools ride with their registry entries
+/// (t-1308.7 — same principle).
 fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
     let mut specs = base_ir_tool_specs();
     if !config
@@ -1247,6 +1415,7 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
             },
         });
     }
+    specs.extend(config.tools.specs());
     specs
 }
 
@@ -1605,6 +1774,7 @@ mod tests {
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),

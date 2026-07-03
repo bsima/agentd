@@ -508,6 +508,82 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
             out.attrs.insert("sink".into(), Value::String(sink.clone()));
             Some(out)
         }
+        // Native tool dispatch (t-1308.7, schema 1.2): the reserved
+        // `tool.requested`/`tool.completed`/`tool.failed` names, emitted for
+        // registered native tools. Built-in tools still surface as the
+        // `eval.*`/`retrieve.*`/`store.*` effects they compile to.
+        Event::ToolCall {
+            run_id,
+            op_id,
+            parent_op_id,
+            name,
+            arguments,
+            effect,
+            timestamp,
+        } => {
+            let mut out = base(
+                "tool.requested",
+                *timestamp,
+                run_id,
+                Some(*op_id),
+                *parent_op_id,
+                PublicStatus::Started,
+            );
+            out.effect = effect.as_deref().map(PublicEffect::from);
+            // The runtime event carries the full arguments (replay
+            // identity); the public event carries only a preview, per the
+            // payload rules.
+            out.payload_preview = Some(preview(&arguments.to_string(), PAYLOAD_PREVIEW_MAX_CHARS));
+            out.attrs.insert("name".into(), Value::String(name.clone()));
+            Some(out)
+        }
+        Event::ToolResult {
+            run_id,
+            op_id,
+            parent_op_id,
+            name,
+            result: _,
+            result_preview,
+            duration_ms,
+            timestamp,
+        } => {
+            let mut out = base(
+                "tool.completed",
+                *timestamp,
+                run_id,
+                Some(*op_id),
+                *parent_op_id,
+                PublicStatus::Completed,
+            );
+            out.payload_preview = non_empty_preview(result_preview);
+            out.attrs
+                .insert("duration_ms".into(), (*duration_ms).into());
+            out.attrs.insert("name".into(), Value::String(name.clone()));
+            Some(out)
+        }
+        Event::ToolError {
+            run_id,
+            op_id,
+            parent_op_id,
+            name,
+            error,
+            duration_ms,
+            timestamp,
+        } => {
+            let mut out = base(
+                "tool.failed",
+                *timestamp,
+                run_id,
+                Some(*op_id),
+                *parent_op_id,
+                PublicStatus::Failed,
+            );
+            out.error = Some(error.clone());
+            out.attrs
+                .insert("duration_ms".into(), (*duration_ms).into());
+            out.attrs.insert("name".into(), Value::String(name.clone()));
+            Some(out)
+        }
         Event::AgentDone { run_id, timestamp } => Some(base(
             "run.completed",
             *timestamp,
@@ -753,6 +829,43 @@ mod tests {
                     timestamp: ts,
                 },
                 Some("store.failed"),
+            ),
+            (
+                Event::ToolCall {
+                    run_id: run.into(),
+                    op_id: 6,
+                    parent_op_id: None,
+                    name: "lookup".into(),
+                    arguments: serde_json::json!({ "city": "sf" }),
+                    effect: None,
+                    timestamp: ts,
+                },
+                Some("tool.requested"),
+            ),
+            (
+                Event::ToolResult {
+                    run_id: run.into(),
+                    op_id: 6,
+                    parent_op_id: None,
+                    name: "lookup".into(),
+                    result: serde_json::json!({ "temp": 61 }),
+                    result_preview: "{\"temp\":61}".into(),
+                    duration_ms: 1,
+                    timestamp: ts,
+                },
+                Some("tool.completed"),
+            ),
+            (
+                Event::ToolError {
+                    run_id: run.into(),
+                    op_id: 6,
+                    parent_op_id: None,
+                    name: "lookup".into(),
+                    error: "handler error".into(),
+                    duration_ms: 1,
+                    timestamp: ts,
+                },
+                Some("tool.failed"),
             ),
             (
                 Event::AgentDone {
@@ -1035,6 +1148,7 @@ mod tests {
         ));
         let trace = TraceLogger::new("golden-run", trace_path.clone());
         let config = SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: crate::hydration::SourceRegistry::new(),
             passive_hydration: Default::default(),

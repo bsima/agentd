@@ -15,6 +15,7 @@ pub mod prompt_ir;
 pub mod provider;
 pub mod public_trace;
 pub mod temporal;
+pub mod tool;
 pub mod trace;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
@@ -33,9 +34,12 @@ pub use ir::{
     effect_location, program_hash, validate_program, Block, BlockId, Budgets, ControlPath,
     DynamicPath, EffectErrorMode, EffectId, EffectKind, EffectLocation, EffectSite, EvalPolicy,
     EvalRequest, Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program, ProgramHash,
-    ProgramId, PromptRef, RetrievePolicy, StoreOp, StorePolicy, Terminator, Var,
+    ProgramId, PromptRef, RetrievePolicy, StoreOp, StorePolicy, Terminator, ToolPolicy, Var,
 };
-pub use ir_agent::{agent_loop_ir, agent_loop_ir_with_options, run_agent_loop, AgentLoopOptions};
+pub use ir_agent::{
+    agent_loop_ir, agent_loop_ir_with_options, agent_loop_ir_with_tools, run_agent_loop,
+    AgentLoopOptions,
+};
 pub use ir_interpreter::{
     run_ir_sequential, run_ir_sequential_with_gc, run_ir_sequential_with_store,
     run_ir_sequential_with_store_and_replay, run_ir_steps, run_ir_steps_with_gc,
@@ -63,13 +67,14 @@ pub use prompt_ir::{
 };
 pub use provider::{
     is_context_overflow_anyhow, is_context_overflow_message, ChatProvider, ContextOverflowError,
-    ProviderClient, ProviderConfig,
+    ProviderClient, ProviderConfig, ReplayOnlyProvider,
 };
 pub use public_trace::{
     public_event, PublicDynamicPath, PublicEffect, PublicEffectSite, PublicEvent, PublicStatus,
     PUBLIC_SCHEMA_VERSION,
 };
 pub use temporal::TemporalSource;
+pub use tool::{NativeTool, ToolHandler, ToolRegistry, RESERVED_TOOL_NAMES};
 pub use trace::{
     AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, TraceContextEnv, TraceLogger,
     TraceSink, TraceSummary,

@@ -236,6 +236,11 @@ impl ReplayTrace {
 pub struct SeqConfig {
     pub provider: Arc<dyn ChatProvider>,
     pub hydration: SourceRegistry,
+    /// Native tools registered with the runtime (t-1308.7): advertised to
+    /// the provider alongside the built-ins and dispatched in-process by
+    /// the IR interpreter's Tool effect. Registration is the exposure
+    /// switch, mirroring the memory tools.
+    pub tools: crate::tool::ToolRegistry,
     pub passive_hydration: PassiveHydrationConfig,
     pub trace: TraceLogger,
     pub eval: EvalConfig,
@@ -1033,6 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn gc_collects_to_threshold_budget() -> Result<()> {
         let config = SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1068,6 +1074,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1117,6 +1124,7 @@ mod tests {
         timing: GcTiming,
     ) -> SeqConfig {
         SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1343,6 +1351,7 @@ mod tests {
             response("done", vec![]),
         ]));
         let config = SeqConfig {
+            tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1397,6 +1406,7 @@ mod tests {
             response("finished", vec![]),
         ]));
         let config = SeqConfig {
+            tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1440,6 +1450,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1529,6 +1540,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![response("ok", vec![])]));
         let queries = Arc::new(Mutex::new(Vec::new()));
         let config = SeqConfig {
+            tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new().register(StaticSource {
                 name: "workspace",
@@ -1579,6 +1591,7 @@ mod tests {
             clean_vars.insert("PATH".into(), path);
         }
         let config = SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1850,6 +1863,7 @@ mod tests {
 
     fn seq_config_for_eval() -> SeqConfig {
         SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1875,6 +1889,7 @@ mod tests {
         // non-zero without blocking or stealing any input.
         let provider = Arc::new(MockProvider::new(vec![]));
         let config = SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1918,6 +1933,7 @@ mod tests {
         let trace = test_trace();
         let path = trace.path().clone();
         let config = SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1952,6 +1968,7 @@ mod tests {
         let record_trace = test_trace();
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
+            tools: Default::default(),
             provider: record_provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -1973,6 +1990,7 @@ mod tests {
 
         let replay = ReplayTrace::load(record_path).await?;
         let replay_config = SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -2000,6 +2018,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -2039,6 +2058,7 @@ mod tests {
         let record_trace = test_trace();
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -2074,6 +2094,7 @@ mod tests {
         let replay = ReplayTrace::load(record_path).await?;
         let live_provider = Arc::new(MockProvider::new(vec![response("unused", vec![])]));
         let replay_config = SeqConfig {
+            tools: Default::default(),
             provider: live_provider.clone(),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
@@ -2105,6 +2126,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
             passive_hydration: PassiveHydrationConfig::default(),
