@@ -209,9 +209,9 @@ One governance hook. Both operations.
 Every effect execution appends JSONL events with a run id, operation id, and — in IR mode — a stable effect identity carried directly on the call event (an `effect` field with the effect id, site, and dynamic path), so no consumer ever has to rely on event adjacency:
 
 ```json
-{"event":"InferCall",  "op_id":3, "model":"...", "prompt_preview":"...", "effect":{"effect_id":"sha256:...","kind":"Infer","site":{"block":0,"instruction_index":0},"dynamic_path":[...]}}
+{"event":"InferCall",  "op_id":3, "model":"...", "prompt_preview":"...", "effect":{"effect_id":"sha256:...","kind":"Infer","site":{"block":0,"instruction_index":0},"dynamic_path":{"path":"","transitions":0,"visit":0}}}
 {"event":"InferResult","op_id":3, "tokens":340, "response_preview":"..."}
-{"event":"EvalCall",   "op_id":4, "command":"rg TODO src/", "effect":{"effect_id":"sha256:...","kind":"Eval","site":{"block":0,"instruction_index":1},"dynamic_path":[...]}}
+{"event":"EvalCall",   "op_id":4, "command":"rg TODO src/", "effect":{"effect_id":"sha256:...","kind":"Eval","site":{"block":0,"instruction_index":1},"dynamic_path":{"path":"","transitions":0,"visit":0}}}
 {"event":"EvalError",  "op_id":4, "error":"..."}
 ```
 

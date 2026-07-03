@@ -143,18 +143,24 @@ A serialized `Machine` checkpoint contains enough local execution state to resum
 
 ## Effect IDs and replay
 
-Current replay is sequence-based. AgentIR should use stable effect IDs derived from program identity and dynamic execution path:
+AgentIR uses stable effect IDs derived from program identity and dynamic execution path:
 
 ```text
-effect_id = hash(program_hash, effect_site, dynamic_path)
+effect_id = sha256(program_hash, effect_kind, effect_site, dynamic_path)
 
-effect_site = block_id + instruction_index
-dynamic_path = interpreter-maintained branch/loop/parallel path
+effect_site  = block_id + instruction_index
+dynamic_path = { path, transitions, visit }
 ```
 
-The dynamic path must be explicit enough to distinguish repeated visits to the same effect site. It should not be an incidental global sequence number. A replay mismatch should say which effect was expected, which effect was observed, and where both are located in the program.
+The dynamic path is explicit enough to distinguish repeated visits to the same effect site *and* which control-flow route led there, while staying O(1) per trace line (ids ride on every effect call event):
 
-Replay then feeds recorded `Infer` and `Eval` results back at matching effect IDs. If the program diverges, replay should fail with a precise error that names the expected effect and the observed effect.
+- **`path`** is the machine's rolling control-flow digest at the moment the effect executed: a sha256 chain the interpreter folds at every terminator transition over `(from_block, arm, to_block)`. The arm records which way the terminator went — `0` for `Goto` and the `If` then-branch, `1` for the else-branch, the arm index for `Match` (its default arm is `arms.len()`). The entry block, before any transition, has the empty path. Because the digest chains, a then-visit and an else-visit to the same downstream site differ even after the paths rejoin, and every trip around a loop back-edge produces a fresh digest — full path sensitivity without storing the path.
+- **`transitions`** is how many transitions were folded into `path`: a human-readable depth for divergence errors, where the digest itself is opaque.
+- **`visit`** is the per-site execution ordinal (0-based). Within one machine run it is redundant with `path`; it exists because per-site visit counts are carried across session turns (each turn runs a fresh machine whose path restarts at the root), so turn N's entry effect is `(path = root, visit = N-1)` — distinguishable from turn 1's and computable without simulating the machine (`agent ir-effect --visit N-1`, `DynamicPath::at_entry`). It also names loop iterations legibly in errors.
+
+**Par (planned).** The scheme extends to parallel branches without new machinery: branch `b` of a `Par` at block `P` forks the parent path by folding `(P, arm = b, branch_entry)`, so sibling branches derive distinct, deterministic digests from the same parent, independent of scheduling order; the continuation after the join folds `(P, arm = branch_count, join)` onto the parent path. Nested forks compose the same way, since each branch's digest is a prefix-chained value — the parent-frame prefix comes for free. A scaffold test (`par_branches_fork_the_control_path`) documents this.
+
+Replay feeds recorded `Infer`/`Eval`/`Retrieve`/`Store` results back at matching effect IDs and never executes the underlying effect. A divergence fails with an error naming the effect id, its site, its visit, and its control path — and states the id scheme, since a "missing call" is usually an edited program or a different branch/loop path.
 
 ## Failure semantics
 
@@ -188,7 +194,7 @@ Open questions to settle before enabling it:
 - how branch writes are merged at the join
 - what happens when one branch fails or is canceled
 - how branch effects are ordered in the trace
-- how stable effect IDs include branch identity
+- ~~how stable effect IDs include branch identity~~ — settled: each branch forks the parent control path with its branch index (see "Effect IDs and replay" above), so branch effect ids are deterministic and independent of scheduling order
 - whether join result order follows branch declaration order
 
 The default should favor replayability over cleverness. Parallel branches should use isolated transactions unless a specific interpreter provides stronger shared-state semantics.

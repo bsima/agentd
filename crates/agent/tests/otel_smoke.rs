@@ -1,13 +1,79 @@
 use agent_core::{
-    agent_loop_ir, effect_location, program_hash, BlockId, DynamicPath, EffectKind, EffectSite,
-    Model,
+    agent_loop_ir, run_ir_sequential, ChatMessage, ChatProvider, EvalConfig, FinishReason, GcMode,
+    GcTiming, Model, PassiveHydrationConfig, Response, SeqConfig, SourceRegistry, ToolCall,
+    TraceLogger,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Serves the queued responses in order; the fixture recorder below drives
+/// the real IR agent loop with it so the recorded trace carries the true
+/// path-sensitive effect ids (the nudge retry after the non-stop "thinking"
+/// turn re-visits the entry Infer along a non-root control path, which
+/// cannot be hand-computed).
+struct ScriptedProvider(Mutex<Vec<Response>>);
+
+#[async_trait::async_trait]
+impl ChatProvider for ScriptedProvider {
+    async fn chat(
+        &self,
+        _model: &Model,
+        _tools: &[agent_core::provider::ToolSpec],
+        _messages: &[ChatMessage],
+    ) -> anyhow::Result<Response> {
+        self.0
+            .lock()
+            .unwrap()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted"))
+    }
+}
+
+fn response(content: &str, finish_reason: FinishReason) -> Response {
+    Response {
+        content: content.into(),
+        tool_calls: Vec::<ToolCall>::new(),
+        finish_reason: Some(finish_reason),
+        input_tokens: 0,
+        output_tokens: 1,
+        total_tokens: 1,
+        metadata: Default::default(),
+    }
+}
+
+/// Record a replay fixture by running the built-in agent loop in-process
+/// against a scripted provider. IR replay keys on stable effect ids that
+/// encode the dynamic control path, so recording is the way to produce a
+/// correct fixture — hardcoding ids (or hand-simulating the loop's block
+/// transitions) breaks whenever the program changes.
+fn record_replay_fixture(path: &std::path::Path, responses: Vec<Response>) {
+    let mut responses = responses;
+    responses.reverse();
+    let config = SeqConfig {
+        provider: Arc::new(ScriptedProvider(Mutex::new(responses))),
+        hydration: SourceRegistry::new(),
+        passive_hydration: PassiveHydrationConfig::default(),
+        trace: TraceLogger::new("replay", path.to_path_buf()),
+        eval: EvalConfig::default(),
+        replay: None,
+        trace_full_prompt_ir: false,
+        trace_full_payloads: false,
+        gc: GcMode::None,
+        gc_threshold: 0.85,
+        gc_log: false,
+        gc_timing: GcTiming::Threshold,
+        context_budget: 200_000,
+    };
+    let machine = agent_loop_ir(Model("mock".into()), vec![ChatMessage::user("hello")], 16);
+    tokio::runtime::Runtime::new()
+        .expect("create tokio runtime")
+        .block_on(run_ir_sequential(&config, machine))
+        .expect("record replay fixture");
+}
 
 #[test]
 fn otel_endpoint_smoke_preserves_replay_and_jsonl_trace() {
@@ -43,39 +109,15 @@ fn otel_endpoint_smoke_preserves_replay_and_jsonl_trace() {
     let dir = std::env::temp_dir().join(format!("agent-otel-smoke-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let replay_path = dir.join("replay.jsonl");
-    // IR replay keys on stable effect ids: compute the entry-Infer location
-    // for each visit (the second Infer is the nudge retry after the non-stop
-    // "thinking" turn) instead of hardcoding hashes.
-    let machine = agent_loop_ir(Model("mock".into()), vec![], 16);
-    let hash = program_hash(&machine.program).unwrap();
-    let site = EffectSite {
-        block: BlockId(0),
-        instruction_index: 0,
-    };
-    let effect = |visit: u64| {
-        serde_json::to_string(
-            &effect_location(
-                hash.clone(),
-                EffectKind::Infer,
-                site,
-                DynamicPath::with_visit(site, visit),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-    };
-    let (effect_0, effect_1) = (effect(0), effect(1));
-    std::fs::write(
+    // The first response is non-stop ("thinking", finish_reason length), so
+    // the loop nudges and re-Infers; the second ends the turn.
+    record_replay_fixture(
         &replay_path,
-        format!(
-            r#"{{"event":"InferCall","run_id":"replay","op_id":1,"model":"mock","prompt_preview":"","effect":{effect_0},"timestamp":"2026-06-02T00:00:00Z"}}
-{{"event":"InferResult","run_id":"replay","op_id":1,"response":{{"content":"thinking","tool_calls":[],"finish_reason":"length","input_tokens":0,"output_tokens":1,"total_tokens":1}},"response_preview":"thinking","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}}
-{{"event":"InferCall","run_id":"replay","op_id":2,"model":"mock","prompt_preview":"","effect":{effect_1},"timestamp":"2026-06-02T00:00:00Z"}}
-{{"event":"InferResult","run_id":"replay","op_id":2,"response":{{"content":"ok","tool_calls":[],"finish_reason":"stop","input_tokens":0,"output_tokens":1,"total_tokens":1}},"response_preview":"ok","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":1,"timestamp":"2026-06-02T00:00:00Z"}}
-"#
-        ),
-    )
-    .expect("write replay trace");
+        vec![
+            response("thinking", FinishReason::Length),
+            response("ok", FinishReason::Stop),
+        ],
+    );
     let run_id = format!("otel-smoke-{}", uuid::Uuid::new_v4());
 
     let output = Command::new(env!("CARGO_BIN_EXE_agent"))

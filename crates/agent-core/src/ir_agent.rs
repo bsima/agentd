@@ -1069,6 +1069,7 @@ pub fn agent_loop_ir_with_options(
             ),
         ]),
         effect_visits: BTreeMap::new(),
+        control_path: Default::default(),
         continuation_stack: vec![],
         budgets: Default::default(),
     }

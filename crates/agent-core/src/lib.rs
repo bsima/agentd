@@ -28,10 +28,10 @@ pub use hydration::{
 };
 pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, ReplayTrace, SeqConfig};
 pub use ir::{
-    effect_location, program_hash, validate_program, Block, BlockId, Budgets, DynamicPath,
-    DynamicPathSegment, EffectErrorMode, EffectId, EffectKind, EffectLocation, EffectSite,
-    EvalPolicy, EvalRequest, Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program,
-    ProgramHash, ProgramId, PromptRef, RetrievePolicy, StoreOp, StorePolicy, Terminator, Var,
+    effect_location, program_hash, validate_program, Block, BlockId, Budgets, ControlPath,
+    DynamicPath, EffectErrorMode, EffectId, EffectKind, EffectLocation, EffectSite, EvalPolicy,
+    EvalRequest, Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program, ProgramHash,
+    ProgramId, PromptRef, RetrievePolicy, StoreOp, StorePolicy, Terminator, Var,
 };
 pub use ir_agent::{agent_loop_ir, agent_loop_ir_with_options};
 pub use ir_interpreter::{

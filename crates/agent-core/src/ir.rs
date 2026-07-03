@@ -24,23 +24,84 @@ pub struct EffectSite {
     pub instruction_index: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct DynamicPath(pub Vec<DynamicPathSegment>);
+/// The dynamic execution context of one effect, hashed into its effect id
+/// and carried on every effect trace line — so it must stay O(1) in size
+/// no matter how long the run is. See docs/AGENT_IR.md "Effect identity".
+///
+/// * `path` is the machine's rolling control-flow digest at the moment the
+///   effect executed: a sha256 chain folded over every block transition
+///   (from block, arm index, to block) taken since the machine started
+///   (empty string = entry block, no transitions yet). Two visits to the
+///   same effect site along different control paths — the then arm vs the
+///   else arm of an upstream If, or different loop iterations — fold
+///   different transition sequences and so get different digests, even
+///   after the paths rejoin.
+/// * `transitions` is how many transitions were folded into `path`: a
+///   human-readable "how deep along the path", useful in divergence errors
+///   where the digest alone is opaque.
+/// * `visit` is the per-site execution ordinal (0-based). It is redundant
+///   with `path` within one machine run, but it is carried across session
+///   turns (each turn runs a fresh machine whose path restarts at the
+///   root), so the Nth turn's entry effect stays distinguishable from the
+///   first's, and it names loop iterations legibly in errors.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DynamicPath {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub transitions: u64,
+    pub visit: u64,
+}
 
 impl DynamicPath {
-    pub fn root() -> Self {
-        Self(Vec::new())
-    }
-
-    pub fn with_visit(site: EffectSite, visit: u64) -> Self {
-        Self(vec![DynamicPathSegment::Visit { site, visit }])
+    /// The path of an effect in the entry block before any transition, on
+    /// its `visit`th execution. This is the only dynamic path computable
+    /// without simulating the machine: turn N of a session re-enters a
+    /// fresh machine at the root, so its entry effect is `at_entry(N - 1)`.
+    pub fn at_entry(visit: u64) -> Self {
+        ControlPath::default().at_visit(visit)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum DynamicPathSegment {
-    Visit { site: EffectSite, visit: u64 },
-    Branch { index: usize },
+/// A machine's rolling control-flow digest: where execution has been, in
+/// O(1) space. Folded at every terminator transition; forked per branch for
+/// the future Par (see docs/AGENT_IR.md). Serialized with the machine so
+/// instruction-limit checkpoints resume with their path intact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlPath {
+    /// Hex sha256 chain over transitions; empty at the root (entry block).
+    #[serde(default)]
+    pub digest: String,
+    /// Number of transitions folded into `digest`.
+    #[serde(default)]
+    pub transitions: u64,
+}
+
+impl ControlPath {
+    /// Fold one control-flow transition into the path. `arm` says which way
+    /// the terminator went: 0 for Goto and the If then-branch, 1 for the If
+    /// else-branch, the arm index for Match (`arms.len()` for its default),
+    /// and — reserved for Par — the branch index at a fork.
+    pub fn transition(&mut self, from: BlockId, arm: u32, to: BlockId) {
+        let mut hasher = Sha256::new();
+        hasher.update(self.digest.as_bytes());
+        hasher.update([0xff]); // domain separator: digest is hex, never 0xff
+        hasher.update(from.0.to_be_bytes());
+        hasher.update(arm.to_be_bytes());
+        hasher.update(to.0.to_be_bytes());
+        self.digest = format!("{:x}", hasher.finalize());
+        self.transitions += 1;
+    }
+
+    /// The dynamic path of an effect executing now, on its `visit`th visit
+    /// to its site.
+    pub fn at_visit(&self, visit: u64) -> DynamicPath {
+        DynamicPath {
+            path: self.digest.clone(),
+            transitions: self.transitions,
+            visit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -351,6 +412,9 @@ pub struct Machine {
     pub env: BTreeMap<Var, Value>,
     #[serde(default)]
     pub effect_visits: BTreeMap<String, u64>,
+    /// Rolling control-flow digest feeding effect ids; see [`ControlPath`].
+    #[serde(default)]
+    pub control_path: ControlPath,
     #[serde(default)]
     pub continuation_stack: Vec<Frame>,
     #[serde(default)]
@@ -882,26 +946,63 @@ mod tests {
             hash.clone(),
             EffectKind::Retrieve,
             site,
-            DynamicPath::with_visit(site, 0),
+            DynamicPath::at_entry(0),
         )
         .unwrap();
         let first_again = effect_location(
             hash.clone(),
             EffectKind::Retrieve,
             site,
-            DynamicPath::with_visit(site, 0),
+            DynamicPath::at_entry(0),
         )
         .unwrap();
         let second_visit = effect_location(
-            hash,
+            hash.clone(),
             EffectKind::Retrieve,
             site,
-            DynamicPath::with_visit(site, 1),
+            DynamicPath::at_entry(1),
         )
         .unwrap();
+        // Same site and visit, but reached along a different control path
+        // (one transition folded): the id must differ (branch provenance).
+        let mut branched = ControlPath::default();
+        branched.transition(BlockId(0), 1, BlockId(2));
+        let branched_visit =
+            effect_location(hash, EffectKind::Retrieve, site, branched.at_visit(0)).unwrap();
 
         assert_eq!(first.effect_id, first_again.effect_id);
         assert_ne!(first.effect_id, second_visit.effect_id);
+        assert_ne!(first.effect_id, branched_visit.effect_id);
+    }
+
+    #[test]
+    fn control_path_distinguishes_arms_and_iterations_and_is_deterministic() {
+        let mut then_path = ControlPath::default();
+        then_path.transition(BlockId(0), 0, BlockId(3));
+        let mut else_path = ControlPath::default();
+        else_path.transition(BlockId(0), 1, BlockId(3));
+        assert_ne!(
+            then_path.digest, else_path.digest,
+            "same blocks, different arm: paths must differ"
+        );
+
+        // Loop iterations: folding the same back-edge again changes the
+        // digest every time (the chain never cycles).
+        let mut looped = then_path.clone();
+        looped.transition(BlockId(3), 0, BlockId(3));
+        assert_ne!(then_path.digest, looped.digest);
+        let once = looped.digest.clone();
+        looped.transition(BlockId(3), 0, BlockId(3));
+        assert_ne!(once, looped.digest);
+        assert_eq!(looped.transitions, 3);
+
+        // Determinism: replaying the identical transition sequence
+        // reproduces the digest exactly.
+        let mut replayed = ControlPath::default();
+        replayed.transition(BlockId(0), 0, BlockId(3));
+        replayed.transition(BlockId(3), 0, BlockId(3));
+        replayed.transition(BlockId(3), 0, BlockId(3));
+        assert_eq!(replayed, looped);
     }
 
     #[test]
@@ -927,6 +1028,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::from([(Var("x".into()), Value::String("y".into()))]),
             effect_visits: BTreeMap::new(),
+            control_path: ControlPath::default(),
             continuation_stack: vec![],
             budgets: Budgets::default(),
         };

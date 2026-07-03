@@ -6,7 +6,7 @@ use crate::interpreter::{
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectErrorMode,
-    EffectKind, EffectLocation, EffectSite, EvalRequest, Expr, Instr, Machine, MatchArm, Pattern,
+    EffectKind, EffectLocation, EffectSite, EvalRequest, Expr, Instr, Machine, Pattern,
     ProgramHash, PromptRef, Terminator, Var,
 };
 use crate::op::{ChatMessage, Model, Prompt};
@@ -231,19 +231,17 @@ impl IrReplayTrace {
         let effect_id = &location.effect_id.0;
         let call = self.infer_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
-                "AgentIR replay missing InferCall for effect {} at block {:?} instruction {}",
+                "AgentIR replay missing InferCall for effect {} at {}; {MISSING_EFFECT_HINT}",
                 effect_id,
-                location.site.block,
-                location.site.instruction_index
+                location_desc(location)
             )
         })?;
         if call.model != model {
             return Err(anyhow!(
-                "AgentIR replay diverged at effect {}: expected Infer model {:?} at block {:?} instruction {}, observed {:?}",
+                "AgentIR replay diverged at effect {}: expected Infer model {:?} at {}, observed {:?}",
                 effect_id,
                 call.model,
-                call.location.site.block,
-                call.location.site.instruction_index,
+                location_desc(&call.location),
                 model
             ));
         }
@@ -262,19 +260,17 @@ impl IrReplayTrace {
         let effect_id = &location.effect_id.0;
         let call = self.eval_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
-                "AgentIR replay missing EvalCall for effect {} at block {:?} instruction {}",
+                "AgentIR replay missing EvalCall for effect {} at {}; {MISSING_EFFECT_HINT}",
                 effect_id,
-                location.site.block,
-                location.site.instruction_index
+                location_desc(location)
             )
         })?;
         if call.command != command {
             return Err(anyhow!(
-                "AgentIR replay diverged at effect {}: expected Eval command {:?} at block {:?} instruction {}, observed {:?}",
+                "AgentIR replay diverged at effect {}: expected Eval command {:?} at {}, observed {:?}",
                 effect_id,
                 call.command,
-                call.location.site.block,
-                call.location.site.instruction_index,
+                location_desc(&call.location),
                 command
             ));
         }
@@ -293,10 +289,9 @@ impl IrReplayTrace {
         let effect_id = &location.effect_id.0;
         let recorded = self.retrieve_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
-                "AgentIR replay missing RetrieveCall for effect {} at block {:?} instruction {}",
+                "AgentIR replay missing RetrieveCall for effect {} at {}; {MISSING_EFFECT_HINT}",
                 effect_id,
-                location.site.block,
-                location.site.instruction_index
+                location_desc(location)
             )
         })?;
         if recorded != key {
@@ -323,10 +318,9 @@ impl IrReplayTrace {
         let effect_id = &location.effect_id.0;
         let recorded = self.store_calls.get(effect_id).ok_or_else(|| {
             anyhow!(
-                "AgentIR replay missing StoreCall for effect {} at block {:?} instruction {}",
+                "AgentIR replay missing StoreCall for effect {} at {}; {MISSING_EFFECT_HINT}",
                 effect_id,
-                location.site.block,
-                location.site.instruction_index
+                location_desc(location)
             )
         })?;
         if recorded != key {
@@ -344,6 +338,31 @@ impl IrReplayTrace {
             .cloned()
             .ok_or_else(|| anyhow!("AgentIR replay missing StoreResult for effect {effect_id}"))
     }
+}
+
+/// Appended to replay "missing call" errors so a divergence names the id
+/// scheme instead of leaving a bare lookup failure.
+const MISSING_EFFECT_HINT: &str = "effect ids hash (program hash, kind, site, control path, \
+     visit), so an edited program or a different branch/loop path diverges here";
+
+/// Render an effect's site and dynamic path for replay errors: the control
+/// path digest is opaque, so also say the visit ordinal and transition
+/// count, which humans can map back to loop iterations and turn numbers.
+fn location_desc(location: &EffectLocation) -> String {
+    let path = if location.dynamic_path.path.is_empty() {
+        "entry".to_string()
+    } else {
+        let digest = &location.dynamic_path.path;
+        format!(
+            "{}... after {} transitions",
+            &digest[..digest.len().min(12)],
+            location.dynamic_path.transitions
+        )
+    };
+    format!(
+        "block {:?} instruction {} (visit {}, control path {})",
+        location.site.block, location.site.instruction_index, location.dynamic_path.visit, path
+    )
 }
 
 fn require_effect(
@@ -525,7 +544,8 @@ pub async fn run_ir_steps_with_gc(
                 block: machine.block,
                 instruction_index: machine.pc,
             };
-            let dynamic_path = DynamicPath::with_visit(site, next_visit(&mut machine, site));
+            let visit = next_visit(&mut machine, site);
+            let dynamic_path = machine.control_path.at_visit(visit);
             let instr = block.instructions[machine.pc].clone();
             execute_instr(
                 config,
@@ -548,8 +568,11 @@ pub async fn run_ir_steps_with_gc(
                 let value = eval_expr(&machine.env, &value)?;
                 return Ok(IrStepOutcome::Complete { value, machine });
             }
+            // Every transition folds (from block, arm, to block) into the
+            // machine's control path so downstream effect ids encode which
+            // way control flow went (branch provenance, loop iterations).
             Terminator::Goto { block, args } => {
-                goto_block(&mut machine, block, args).await?;
+                goto_block(&mut machine, block, args, 0).await?;
             }
             Terminator::If {
                 cond,
@@ -559,12 +582,12 @@ pub async fn run_ir_steps_with_gc(
                 else_args,
             } => {
                 let cond = eval_expr(&machine.env, &cond)?;
-                let (target, args) = match cond {
-                    Value::Bool(true) => (then_block, then_args),
-                    Value::Bool(false) => (else_block, else_args),
+                let (arm, target, args) = match cond {
+                    Value::Bool(true) => (0, then_block, then_args),
+                    Value::Bool(false) => (1, else_block, else_args),
                     other => return Err(anyhow!("AgentIR If condition must be bool, got {other}")),
                 };
-                goto_block(&mut machine, target, args).await?;
+                goto_block(&mut machine, target, args, arm).await?;
             }
             Terminator::Match {
                 value,
@@ -573,13 +596,31 @@ pub async fn run_ir_steps_with_gc(
                 default_args,
             } => {
                 let value = eval_expr(&machine.env, &value)?;
-                let (target, args) = match_match_arm(&value, &arms)
-                    .map(|arm| (arm.block, arm.args.clone()))
-                    .or_else(|| default.map(|target| (target, default_args)))
-                    .ok_or_else(|| {
-                        anyhow!("AgentIR Match had no matching arm and no default for {value}")
-                    })?;
-                goto_block(&mut machine, target, args).await?;
+                let matched = arms
+                    .iter()
+                    .position(|arm| pattern_matches(&value, &arm.pattern));
+                let (arm, target, args) = match matched {
+                    Some(index) => (
+                        u32::try_from(index).expect("arm count fits in u32"),
+                        arms[index].block,
+                        arms[index].args.clone(),
+                    ),
+                    // The default arm's index is arms.len(): distinct from
+                    // every explicit arm in the control path.
+                    None => match default {
+                        Some(target) => (
+                            u32::try_from(arms.len()).expect("arm count fits in u32"),
+                            target,
+                            default_args,
+                        ),
+                        None => {
+                            return Err(anyhow!(
+                                "AgentIR Match had no matching arm and no default for {value}"
+                            ))
+                        }
+                    },
+                };
+                goto_block(&mut machine, target, args, arm).await?;
             }
             Terminator::Par { .. } => {
                 return Err(anyhow!(
@@ -1058,7 +1099,16 @@ async fn execute_store_live(
     }
 }
 
-async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -> Result<()> {
+/// Transfer control to `block_id`, binding its params and folding the
+/// transition (current block, `arm`, target block) into the machine's
+/// control path. `arm` records which way the terminator went — see
+/// [`crate::ir::ControlPath::transition`].
+async fn goto_block(
+    machine: &mut Machine,
+    block_id: BlockId,
+    args: Vec<Expr>,
+    arm: u32,
+) -> Result<()> {
     let target = machine
         .program
         .blocks
@@ -1076,6 +1126,9 @@ async fn goto_block(machine: &mut Machine, block_id: BlockId, args: Vec<Expr>) -
     for (param, arg) in target.params.iter().cloned().zip(args) {
         env.insert(param, eval_expr(&machine.env, &arg)?);
     }
+    machine
+        .control_path
+        .transition(machine.block, arm, block_id);
     machine.block = block_id;
     machine.pc = 0;
     machine.env = env;
@@ -1404,10 +1457,6 @@ fn resolve_prompt(
     }
 }
 
-fn match_match_arm<'a>(value: &Value, arms: &'a [MatchArm]) -> Option<&'a MatchArm> {
-    arms.iter().find(|arm| pattern_matches(value, &arm.pattern))
-}
-
 fn pattern_matches(value: &Value, pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Null => value.is_null(),
@@ -1572,6 +1621,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -1670,6 +1720,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -1716,6 +1767,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         }
@@ -1826,6 +1878,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         }
@@ -1996,6 +2049,7 @@ mod tests {
                 pc: 0,
                 env: BTreeMap::new(),
                 effect_visits: BTreeMap::new(),
+                control_path: Default::default(),
                 continuation_stack: vec![],
                 budgets: Default::default(),
             }
@@ -2099,6 +2153,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -2117,6 +2172,10 @@ mod tests {
         assert_eq!(locations[0].kind, EffectKind::Retrieve);
         assert_eq!(locations[0].site.block, BlockId(0));
         assert_eq!(locations[0].site.instruction_index, 0);
+        // An entry-block effect runs at the control-path root on visit 0 —
+        // the one dynamic path computable without simulating the machine
+        // (DynamicPath::at_entry, the `agent ir-effect` command).
+        assert_eq!(locations[0].dynamic_path, DynamicPath::at_entry(0));
         Ok(())
     }
 
@@ -2163,6 +2222,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -2197,6 +2257,271 @@ mod tests {
         assert_eq!(eval_effect.kind, EffectKind::Eval);
         assert_eq!(eval_effect.site.instruction_index, 1);
         assert_ne!(infer_effect.effect_id, eval_effect.effect_id);
+        Ok(())
+    }
+
+    fn machine_with_env(
+        name: &str,
+        blocks: BTreeMap<BlockId, crate::ir::Block>,
+        env: BTreeMap<Var, Value>,
+    ) -> Machine {
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId(name.into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env,
+            effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    fn retrieve_instr(out: &str) -> Instr {
+        Instr::Retrieve {
+            out: Var(out.into()),
+            query: Expr::Value(Value::String("q".into())),
+            kind: None,
+            max_bytes: None,
+            policy: Default::default(),
+        }
+    }
+
+    async fn recorded_effects(machine: Machine) -> Result<Vec<EffectLocation>> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let _ = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), trace),
+            machine,
+        )
+        .await?;
+        Ok(TraceLogger::read_events(trace_path)
+            .await?
+            .iter()
+            .filter_map(|event| match event {
+                Event::RetrieveCall { effect, .. } => effect.as_deref().cloned(),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Loop iterations: the same effect site executed twice around a
+    /// back-edge gets distinct ids, with the iteration visible both as the
+    /// visit ordinal and as a changed control-path digest (t-1058).
+    #[tokio::test]
+    async fn loop_iterations_get_distinct_path_sensitive_effect_ids() -> Result<()> {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![Var("i".into())],
+                instructions: vec![retrieve_instr("hits")],
+                terminator: Terminator::If {
+                    cond: Expr::Eq {
+                        left: Box::new(Expr::Var(Var("i".into()))),
+                        right: Box::new(Expr::Value(Value::Number(1.into()))),
+                    },
+                    then_block: BlockId(1),
+                    then_args: vec![],
+                    else_block: BlockId(0),
+                    else_args: vec![Expr::Add {
+                        left: Box::new(Expr::Var(Var("i".into()))),
+                        right: Box::new(Expr::Value(Value::Number(1.into()))),
+                    }],
+                },
+            },
+        );
+        blocks.insert(
+            BlockId(1),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Expr::Value(Value::String("done".into())),
+                },
+            },
+        );
+        let machine = machine_with_env(
+            "loop-ids",
+            blocks,
+            BTreeMap::from([(Var("i".into()), Value::Number(0.into()))]),
+        );
+
+        let effects = recorded_effects(machine).await?;
+        assert_eq!(effects.len(), 2, "two loop iterations, two Retrieves");
+        assert_eq!(effects[0].site, effects[1].site, "same static site");
+        assert_ne!(effects[0].effect_id, effects[1].effect_id);
+        assert_eq!(effects[0].dynamic_path.visit, 0);
+        assert_eq!(effects[1].dynamic_path.visit, 1);
+        // Iteration 0 runs at the root (no transitions yet); iteration 1
+        // folded the back-edge into the path.
+        assert_eq!(effects[0].dynamic_path.path, "");
+        assert_eq!(effects[0].dynamic_path.transitions, 0);
+        assert_ne!(effects[1].dynamic_path.path, "");
+        assert_eq!(effects[1].dynamic_path.transitions, 1);
+        Ok(())
+    }
+
+    /// Branch provenance: then vs else visits to the same downstream effect
+    /// site (after the paths rejoin!) produce ids that encode which arm was
+    /// taken, and replay refuses to feed a then-path recording to an
+    /// else-path run (t-1058).
+    fn diamond_machine(flag: bool) -> Machine {
+        // 0 --If(flag)--> 1 or 2, both Goto 3; 3 holds the effect.
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![Var("flag".into())],
+                instructions: vec![],
+                terminator: Terminator::If {
+                    cond: Expr::Var(Var("flag".into())),
+                    then_block: BlockId(1),
+                    then_args: vec![],
+                    else_block: BlockId(2),
+                    else_args: vec![],
+                },
+            },
+        );
+        for id in [1u32, 2] {
+            blocks.insert(
+                BlockId(id),
+                crate::ir::Block {
+                    params: vec![],
+                    instructions: vec![],
+                    terminator: Terminator::Goto {
+                        block: BlockId(3),
+                        args: vec![],
+                    },
+                },
+            );
+        }
+        blocks.insert(
+            BlockId(3),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![retrieve_instr("hits")],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("hits".into())),
+                },
+            },
+        );
+        machine_with_env(
+            "diamond-ids",
+            blocks,
+            BTreeMap::from([(Var("flag".into()), Value::Bool(flag))]),
+        )
+    }
+
+    #[tokio::test]
+    async fn branch_arms_reaching_the_same_site_get_distinct_effect_ids() -> Result<()> {
+        let then_effects = recorded_effects(diamond_machine(true)).await?;
+        let else_effects = recorded_effects(diamond_machine(false)).await?;
+        assert_eq!((then_effects.len(), else_effects.len()), (1, 1));
+        let (then_effect, else_effect) = (&then_effects[0], &else_effects[0]);
+        assert_eq!(then_effect.site, else_effect.site, "same join-block site");
+        assert_eq!(then_effect.dynamic_path.visit, 0);
+        assert_eq!(else_effect.dynamic_path.visit, 0);
+        assert_eq!(then_effect.dynamic_path.transitions, 2);
+        assert_ne!(
+            then_effect.dynamic_path.path, else_effect.dynamic_path.path,
+            "the arm taken at block 0 must be encoded in the path"
+        );
+        assert_ne!(then_effect.effect_id, else_effect.effect_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replaying_a_then_path_recording_against_an_else_path_run_diverges() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let _ = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), trace),
+            diamond_machine(true),
+        )
+        .await?;
+        let replay = IrReplayTrace::load(trace_path).await?;
+
+        let mut store = InMemoryStore::new();
+        let err = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            diamond_machine(false),
+            &mut store,
+            Some(&replay),
+        )
+        .await
+        .expect_err("an effect reached along a different branch must not replay");
+        let message = err.to_string();
+        assert!(
+            message.contains("AgentIR replay missing RetrieveCall"),
+            "{message}"
+        );
+        assert!(
+            message.contains("control path"),
+            "divergence must mention the id scheme: {message}"
+        );
+        Ok(())
+    }
+
+    /// Par scaffold (t-1058): the sequential interpreter rejects Par today,
+    /// but the control-path scheme already defines its id semantics — each
+    /// branch `b` of a Par at block `P` forks the parent path with the
+    /// transition `(P, arm = b, branch entry)`, so sibling branches derive
+    /// distinct, deterministic, order-independent digests from the same
+    /// parent; the continuation after the join folds `(P, arm =
+    /// branch_count, join)` onto the parent path. Un-ignore and extend once
+    /// Par executes.
+    #[tokio::test]
+    #[ignore = "Par is not implemented; documents the planned per-branch control-path fork"]
+    async fn par_branches_fork_the_control_path() -> Result<()> {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Par {
+                    branches: vec![BlockId(1), BlockId(2)],
+                    join: BlockId(3),
+                },
+            },
+        );
+        for id in [1u32, 2] {
+            blocks.insert(
+                BlockId(id),
+                crate::ir::Block {
+                    params: vec![],
+                    instructions: vec![retrieve_instr("hits")],
+                    terminator: Terminator::Goto {
+                        block: BlockId(3),
+                        args: vec![],
+                    },
+                },
+            );
+        }
+        blocks.insert(
+            BlockId(3),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Expr::Value(Value::Null),
+                },
+            },
+        );
+        let machine = machine_with_env("par-ids", blocks, BTreeMap::new());
+
+        let effects = recorded_effects(machine).await?;
+        assert_eq!(effects.len(), 2, "one effect per parallel branch");
+        assert_ne!(
+            effects[0].dynamic_path.path, effects[1].dynamic_path.path,
+            "sibling branches must fork distinct control paths"
+        );
+        assert_ne!(effects[0].effect_id, effects[1].effect_id);
         Ok(())
     }
 
@@ -2284,6 +2609,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         }
@@ -2368,6 +2694,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         }
@@ -2410,6 +2737,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };
@@ -2474,6 +2802,7 @@ mod tests {
             pc: 0,
             env: BTreeMap::new(),
             effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
             continuation_stack: vec![],
             budgets: Default::default(),
         };

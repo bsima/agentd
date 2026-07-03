@@ -1112,7 +1112,7 @@ mod tests {
             crate::ir::ProgramHash("sha256:test".into()),
             crate::ir::EffectKind::Infer,
             site,
-            crate::ir::DynamicPath::with_visit(site, 0),
+            crate::ir::DynamicPath::at_entry(0),
         )?;
         let event = Event::InferCall {
             run_id: "run".into(),

@@ -29,13 +29,8 @@ fn json_mode_stdout_is_parseable_jsonl() {
         block: BlockId(0),
         instruction_index: 0,
     };
-    let location = effect_location(
-        hash,
-        EffectKind::Infer,
-        site,
-        DynamicPath::with_visit(site, 0),
-    )
-    .unwrap();
+    let location =
+        effect_location(hash, EffectKind::Infer, site, DynamicPath::at_entry(0)).unwrap();
     let ir_effect = serde_json::to_string(&location).unwrap();
 
     let replay = format!(

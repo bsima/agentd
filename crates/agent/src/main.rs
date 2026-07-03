@@ -172,7 +172,10 @@ enum Command {
     IrEffect {
         #[arg(long)]
         model: String,
-        /// Visit count for the effect site (the Nth Infer of a session).
+        /// Visit ordinal for the entry Infer (the Nth turn of a session,
+        /// 0-based). Entry effects run before any block transition, so their
+        /// control path is the root; visits along non-root paths (e.g. the
+        /// within-turn nudge retry) cannot be computed here — record them.
         #[arg(long, default_value_t = 0)]
         visit: u64,
     },
@@ -973,7 +976,7 @@ async fn run_command(command: &Command) -> Result<()> {
                 hash,
                 agent_core::EffectKind::Infer,
                 site,
-                agent_core::DynamicPath::with_visit(site, *visit),
+                agent_core::DynamicPath::at_entry(*visit),
             )?;
             println!("{}", serde_json::to_string(&location)?);
             Ok(())
