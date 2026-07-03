@@ -104,6 +104,28 @@ agentd stop myagent
 This allows us to use all the regular Linux tooling for managing agents: systemd, kubernetes, docker/podman.
 Feel free to sandbox your agent with bwrap or nix or whatever you want.
 
+## Install
+
+The binary is named `agent`.
+
+Prebuilt static musl binaries (x86_64 and aarch64 Linux) are attached to [GitHub Releases](https://github.com/bsima/agentd/releases) as `agent-<tag>-<target>.tar.gz` with a `.sha256` alongside:
+
+```sh
+v=v0.1.0
+target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
+curl -LO "https://github.com/bsima/agentd/releases/download/$v/agent-$v-$target.tar.gz"
+curl -LO "https://github.com/bsima/agentd/releases/download/$v/agent-$v-$target.tar.gz.sha256"
+sha256sum -c "agent-$v-$target.tar.gz.sha256"
+tar xzf "agent-$v-$target.tar.gz"
+install -m 755 "agent-$v-$target/agent" ~/.local/bin/
+```
+
+Or build from source with cargo:
+
+```sh
+cargo install --git https://github.com/bsima/agentd agent
+```
+
 ## Quickstart
 
 Build and test:
