@@ -78,81 +78,90 @@ impl IrReplayTrace {
         Self::from_events(&events)
     }
 
+    /// Build a replay index from trace events. Effect identity is read from
+    /// the `effect` field carried directly on each `*Call` event; results and
+    /// errors are paired to their call via `op_id`. No event adjacency is
+    /// assumed, so a reordered, filtered, or interleaved trace still indexes
+    /// correctly as long as call/result pairs share their op ids.
     pub fn from_events(events: &[Event]) -> Result<Self> {
         let mut replay = Self::default();
-        let mut last_location: Option<EffectLocation> = None;
-        let mut last_infer_id: Option<String> = None;
-        let mut last_eval_id: Option<String> = None;
-        let mut last_retrieve_id: Option<String> = None;
-        let mut last_store_id: Option<String> = None;
+        // op_id -> effect_id for every effect call seen so far. Op ids are
+        // unique within a run, so one map covers all four effect kinds.
+        let mut effect_by_op: BTreeMap<u64, String> = BTreeMap::new();
 
         for event in events {
             match event {
-                Event::Custom { name, data, .. } if name == "ir_effect" => {
-                    let location: EffectLocation = serde_json::from_value(data.clone())?;
-                    last_location = matches!(
-                        location.kind,
-                        EffectKind::Infer
-                            | EffectKind::Eval
-                            | EffectKind::Retrieve
-                            | EffectKind::Store
-                    )
-                    .then_some(location);
-                }
-                Event::InferCall { model, .. } => {
-                    let location = take_location(&mut last_location, EffectKind::Infer)?;
+                Event::InferCall {
+                    op_id,
+                    model,
+                    effect,
+                    ..
+                } => {
+                    let location = require_effect(effect.as_deref(), EffectKind::Infer, *op_id)?;
                     let effect_id = location.effect_id.0.clone();
                     replay.infer_calls.insert(
                         effect_id.clone(),
                         IrInferCall {
-                            location,
+                            location: location.clone(),
                             model: model.clone(),
                         },
                     );
-                    last_infer_id = Some(effect_id);
+                    effect_by_op.insert(*op_id, effect_id);
                 }
                 Event::InferResult {
+                    op_id,
                     response: Some(response),
                     ..
                 } => {
-                    if let Some(effect_id) = last_infer_id.take() {
-                        replay.infer_results.insert(effect_id, response.clone());
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay
+                            .infer_results
+                            .insert(effect_id.clone(), response.clone());
                     }
                 }
-                Event::InferError { error, .. } => {
-                    if let Some(effect_id) = last_infer_id.take() {
-                        replay.infer_errors.insert(effect_id, error.clone());
+                Event::InferError { op_id, error, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay.infer_errors.insert(effect_id.clone(), error.clone());
                     }
                 }
-                Event::EvalCall { command, .. } => {
-                    let location = take_location(&mut last_location, EffectKind::Eval)?;
+                Event::EvalCall {
+                    op_id,
+                    command,
+                    effect,
+                    ..
+                } => {
+                    let location = require_effect(effect.as_deref(), EffectKind::Eval, *op_id)?;
                     let effect_id = location.effect_id.0.clone();
                     replay.eval_calls.insert(
                         effect_id.clone(),
                         IrEvalCall {
-                            location,
+                            location: location.clone(),
                             command: command.clone(),
                         },
                     );
-                    last_eval_id = Some(effect_id);
+                    effect_by_op.insert(*op_id, effect_id);
                 }
-                Event::EvalResult { result, .. } => {
-                    if let Some(effect_id) = last_eval_id.take() {
-                        replay.eval_results.insert(effect_id, result.clone());
+                Event::EvalResult { op_id, result, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay
+                            .eval_results
+                            .insert(effect_id.clone(), result.clone());
                     }
                 }
-                Event::EvalError { error, .. } => {
-                    if let Some(effect_id) = last_eval_id.take() {
-                        replay.eval_errors.insert(effect_id, error.clone());
+                Event::EvalError { op_id, error, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay.eval_errors.insert(effect_id.clone(), error.clone());
                     }
                 }
                 Event::RetrieveCall {
+                    op_id,
                     query,
                     kind,
                     max_bytes,
+                    effect,
                     ..
                 } => {
-                    let location = take_location(&mut last_location, EffectKind::Retrieve)?;
+                    let location = require_effect(effect.as_deref(), EffectKind::Retrieve, *op_id)?;
                     let effect_id = location.effect_id.0.clone();
                     replay.retrieve_calls.insert(
                         effect_id.clone(),
@@ -162,26 +171,32 @@ impl IrReplayTrace {
                             max_bytes: *max_bytes,
                         },
                     );
-                    last_retrieve_id = Some(effect_id);
+                    effect_by_op.insert(*op_id, effect_id);
                 }
-                Event::RetrieveResult { results, .. } => {
-                    if let Some(effect_id) = last_retrieve_id.take() {
-                        replay.retrieve_results.insert(effect_id, results.clone());
+                Event::RetrieveResult { op_id, results, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay
+                            .retrieve_results
+                            .insert(effect_id.clone(), results.clone());
                     }
                 }
-                Event::RetrieveError { error, .. } => {
-                    if let Some(effect_id) = last_retrieve_id.take() {
-                        replay.retrieve_errors.insert(effect_id, error.clone());
+                Event::RetrieveError { op_id, error, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay
+                            .retrieve_errors
+                            .insert(effect_id.clone(), error.clone());
                     }
                 }
                 Event::StoreCall {
+                    op_id,
                     sink,
                     store_op,
                     store_id,
                     content_hash,
+                    effect,
                     ..
                 } => {
-                    let location = take_location(&mut last_location, EffectKind::Store)?;
+                    let location = require_effect(effect.as_deref(), EffectKind::Store, *op_id)?;
                     let effect_id = location.effect_id.0.clone();
                     replay.store_calls.insert(
                         effect_id.clone(),
@@ -192,16 +207,18 @@ impl IrReplayTrace {
                             content_hash: content_hash.clone(),
                         },
                     );
-                    last_store_id = Some(effect_id);
+                    effect_by_op.insert(*op_id, effect_id);
                 }
-                Event::StoreResult { sink_id, .. } => {
-                    if let Some(effect_id) = last_store_id.take() {
-                        replay.store_results.insert(effect_id, sink_id.clone());
+                Event::StoreResult { op_id, sink_id, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay
+                            .store_results
+                            .insert(effect_id.clone(), sink_id.clone());
                     }
                 }
-                Event::StoreError { error, .. } => {
-                    if let Some(effect_id) = last_store_id.take() {
-                        replay.store_errors.insert(effect_id, error.clone());
+                Event::StoreError { op_id, error, .. } => {
+                    if let Some(effect_id) = effect_by_op.get(op_id) {
+                        replay.store_errors.insert(effect_id.clone(), error.clone());
                     }
                 }
                 _ => {}
@@ -329,16 +346,20 @@ impl IrReplayTrace {
     }
 }
 
-fn take_location(
-    location: &mut Option<EffectLocation>,
+fn require_effect(
+    effect: Option<&EffectLocation>,
     expected: EffectKind,
-) -> Result<EffectLocation> {
-    let location = location.take().ok_or_else(|| {
-        anyhow!("AgentIR replay trace missing ir_effect metadata before {expected:?}")
+    op_id: u64,
+) -> Result<&EffectLocation> {
+    let location = effect.ok_or_else(|| {
+        anyhow!(
+            "AgentIR replay trace {expected:?} call op {op_id} carries no effect identity; \
+             only IR-mode traces (whose call events have an `effect` field) are replayable"
+        )
     })?;
     if location.kind != expected {
         return Err(anyhow!(
-            "AgentIR replay expected {expected:?} metadata, got {:?} at block {:?} instruction {}",
+            "AgentIR replay expected {expected:?} effect metadata on op {op_id}, got {:?} at block {:?} instruction {}",
             location.kind,
             location.site.block,
             location.site.instruction_index
@@ -601,7 +622,6 @@ async fn execute_instr(
                 site,
                 dynamic_path.clone(),
             )?;
-            emit_ir_effect(config, &location).await?;
             let model = string_expr(&machine.env, &model, "Infer.model")?;
             let prompt = resolve_prompt(config, &machine.env, prompt)?;
             let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
@@ -616,6 +636,7 @@ async fn execute_instr(
                     model: model.clone(),
                     prompt: config.trace_full_payloads.then(|| prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
+                    effect: Some(Box::new(location.clone())),
                     timestamp: Utc::now(),
                 })
                 .await?;
@@ -709,7 +730,6 @@ async fn execute_instr(
                 site,
                 dynamic_path.clone(),
             )?;
-            emit_ir_effect(config, &location).await?;
             let command = match request {
                 EvalRequest::Shell { command } => {
                     string_expr(&machine.env, &command, "Eval.command")?
@@ -730,6 +750,7 @@ async fn execute_instr(
                         .map(|path| path.display().to_string()),
                     env_policy: config.eval.env.label(),
                     timeout_ms: millis_u64(config.eval.timeout),
+                    effect: Some(Box::new(location.clone())),
                     timestamp: Utc::now(),
                 })
                 .await?;
@@ -791,9 +812,6 @@ async fn execute_instr(
             machine.env.insert(out, result);
         }
         Instr::Emit { event } => {
-            let location =
-                effect_location(program_hash.clone(), EffectKind::Emit, site, dynamic_path)?;
-            emit_ir_effect(config, &location).await?;
             let value = eval_expr(&machine.env, &event)?;
             let event: Event =
                 serde_json::from_value(value).context("decoding AgentIR Emit event")?;
@@ -812,7 +830,6 @@ async fn execute_instr(
                 site,
                 dynamic_path.clone(),
             )?;
-            emit_ir_effect(config, &location).await?;
             let query = string_expr(&machine.env, &query, "Retrieve.query")?;
             let retrieve_key = IrRetrieveCall {
                 query: query.clone(),
@@ -829,6 +846,7 @@ async fn execute_instr(
                     query: query.clone(),
                     kind: retrieve_key.kind.clone(),
                     max_bytes,
+                    effect: Some(Box::new(location.clone())),
                     timestamp: Utc::now(),
                 })
                 .await?;
@@ -899,7 +917,6 @@ async fn execute_instr(
                 site,
                 dynamic_path.clone(),
             )?;
-            emit_ir_effect(config, &location).await?;
             let sink_name = string_expr(&machine.env, &sink, "Store.sink")?;
             let item_value = eval_expr(&machine.env, &item)?;
             let id_value = id
@@ -928,6 +945,7 @@ async fn execute_instr(
                     store_id: id_value.clone(),
                     item_preview: crate::trace::preview(&item_value.to_string(), 256),
                     content_hash: content_hash.clone(),
+                    effect: Some(Box::new(location.clone())),
                     timestamp: Utc::now(),
                 })
                 .await?;
@@ -1160,18 +1178,6 @@ fn next_visit(machine: &mut Machine, site: EffectSite) -> u64 {
     let current = *visit;
     *visit += 1;
     current
-}
-
-async fn emit_ir_effect(config: &SeqConfig, location: &EffectLocation) -> Result<()> {
-    config
-        .trace
-        .emit(&Event::Custom {
-            run_id: config.trace.run_id().into(),
-            name: "ir_effect".into(),
-            data: serde_json::to_value(location)?,
-            timestamp: Utc::now(),
-        })
-        .await
 }
 
 fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
@@ -2099,20 +2105,98 @@ mod tests {
 
         let _ = run_ir_sequential(&config_with_trace(provider, trace), machine).await?;
         let events = TraceLogger::read_events(trace_path).await?;
-        let locations = events
+        let locations: Vec<&EffectLocation> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Custom { name, data, .. } if name == "ir_effect" => {
-                    Some(serde_json::from_value::<EffectLocation>(data.clone()))
-                }
+                Event::RetrieveCall { effect, .. } => effect.as_deref(),
                 _ => None,
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
 
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].kind, EffectKind::Retrieve);
         assert_eq!(locations[0].site.block, BlockId(0));
         assert_eq!(locations[0].site.instruction_index, 0);
+        Ok(())
+    }
+
+    /// Effect identity rides directly on the call events (t-1057): no
+    /// side-channel `ir_effect` Custom event exists, and the `effect` field
+    /// carries the id and location that replay keys on.
+    #[tokio::test]
+    async fn call_events_carry_effect_identity_directly() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("hi")]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![
+                    Instr::Infer {
+                        out: Var("a".into()),
+                        model: Expr::Value(Value::String("mock".into())),
+                        prompt: PromptRef::Inline(vec![ChatMessage::user("hello")]),
+                        policy: Default::default(),
+                    },
+                    Instr::Eval {
+                        out: Var("b".into()),
+                        request: EvalRequest::Shell {
+                            command: Expr::Value(Value::String("true".into())),
+                        },
+                        policy: Default::default(),
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("b".into())),
+                },
+            },
+        );
+        let machine = Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("direct-effect".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        };
+
+        let _ = run_ir_sequential(&config_with_trace(provider, trace), machine).await?;
+        let events = TraceLogger::read_events(trace_path).await?;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Custom { name, .. } if name == "ir_effect")),
+            "the side-channel ir_effect event was removed in favor of direct fields"
+        );
+        let infer_effect = events
+            .iter()
+            .find_map(|event| match event {
+                Event::InferCall { effect, .. } => effect.as_deref(),
+                _ => None,
+            })
+            .expect("InferCall carries its effect location directly");
+        assert_eq!(infer_effect.kind, EffectKind::Infer);
+        assert_eq!(infer_effect.site.block, BlockId(0));
+        assert_eq!(infer_effect.site.instruction_index, 0);
+        assert!(infer_effect.effect_id.0.starts_with("sha256:"));
+        let eval_effect = events
+            .iter()
+            .find_map(|event| match event {
+                Event::EvalCall { effect, .. } => effect.as_deref(),
+                _ => None,
+            })
+            .expect("EvalCall carries its effect location directly");
+        assert_eq!(eval_effect.kind, EffectKind::Eval);
+        assert_eq!(eval_effect.site.instruction_index, 1);
+        assert_ne!(infer_effect.effect_id, eval_effect.effect_id);
         Ok(())
     }
 

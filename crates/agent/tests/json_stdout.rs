@@ -21,7 +21,8 @@ fn json_mode_stdout_is_parseable_jsonl() {
 
     // Compute the stable effect id for the entry-block Infer of the IR agent
     // loop, instead of hardcoding hashes that break whenever the program
-    // changes. This mirrors what the IR interpreter emits as `ir_effect`.
+    // changes. This mirrors the `effect` field the IR interpreter attaches
+    // to each InferCall event.
     let machine = agent_loop_ir(Model("test-model".into()), vec![], 16);
     let hash = program_hash(&machine.program).unwrap();
     let site = EffectSite {
@@ -38,8 +39,7 @@ fn json_mode_stdout_is_parseable_jsonl() {
     let ir_effect = serde_json::to_string(&location).unwrap();
 
     let replay = format!(
-        r#"{{"event":"Custom","run_id":"replay","op_id":0,"name":"ir_effect","data":{ir_effect},"timestamp":"{timestamp}"}}
-{{"event":"InferCall","run_id":"replay","op_id":2,"model":"test-model","prompt_preview":"","timestamp":"{timestamp}"}}
+        r#"{{"event":"InferCall","run_id":"replay","op_id":2,"model":"test-model","prompt_preview":"","effect":{ir_effect},"timestamp":"{timestamp}"}}
 {{"event":"InferResult","run_id":"replay","op_id":2,"response":{{"content":"hello human","tool_calls":[],"finish_reason":"stop","input_tokens":3,"output_tokens":4,"total_tokens":7}},"response_preview":"hello human","input_tokens":3,"output_tokens":4,"total_tokens":7,"duration_ms":1,"timestamp":"{timestamp}"}}
 "#
     );

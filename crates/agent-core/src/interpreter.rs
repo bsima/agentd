@@ -283,6 +283,9 @@ where
                     model: model.0.clone(),
                     prompt: config.trace_full_payloads.then(|| prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
+                    // Op-layer effects have no IR location; the field stays
+                    // absent so op traces serialize unchanged.
+                    effect: None,
                     timestamp: Utc::now(),
                 })
                 .await?;
@@ -369,6 +372,7 @@ where
                         .map(|path| path.display().to_string()),
                     env_policy: config.eval.env.label(),
                     timeout_ms: millis_u64(config.eval.timeout),
+                    effect: None,
                     timestamp: Utc::now(),
                 })
                 .await?;

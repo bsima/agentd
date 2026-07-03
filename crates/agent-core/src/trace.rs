@@ -1,3 +1,4 @@
+use crate::ir::EffectLocation;
 use crate::op::{Prompt, Response};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -30,6 +31,12 @@ pub enum Event {
         prompt: Option<Prompt>,
         #[serde(default)]
         prompt_preview: String,
+        /// Stable IR effect identity (program hash, effect id, site, dynamic
+        /// path), attached directly by the IR interpreter so replay never
+        /// depends on event adjacency. None for op-layer (non-IR) traces,
+        /// which serialize unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<Box<EffectLocation>>,
         timestamp: DateTime<Utc>,
     },
     InferResult {
@@ -68,6 +75,10 @@ pub enum Event {
         cwd: Option<String>,
         env_policy: String,
         timeout_ms: u64,
+        /// Stable IR effect identity; see [`Event::InferCall::effect`].
+        /// None for op-layer traces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<Box<EffectLocation>>,
         timestamp: DateTime<Utc>,
     },
     EvalResult {
@@ -103,6 +114,10 @@ pub enum Event {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<usize>,
+        /// Stable IR effect identity; see [`Event::InferCall::effect`].
+        /// None for op-layer traces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<Box<EffectLocation>>,
         timestamp: DateTime<Utc>,
     },
     RetrieveResult {
@@ -146,6 +161,10 @@ pub enum Event {
         /// Hash of the payload so replay can detect same-site divergence
         /// without recording the full item.
         content_hash: String,
+        /// Stable IR effect identity; see [`Event::InferCall::effect`].
+        /// None for op-layer traces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<Box<EffectLocation>>,
         timestamp: DateTime<Utc>,
     },
     StoreResult {
@@ -1043,6 +1062,74 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    /// Op-layer (non-IR) interpreter traces have no IR location: the
+    /// optional `effect` field must stay absent from their JSON so existing
+    /// op-trace consumers and fixtures are unaffected (t-1057).
+    #[test]
+    fn op_layer_call_events_serialize_without_effect_field() -> Result<()> {
+        let infer = Event::InferCall {
+            run_id: "run".into(),
+            op_id: 1,
+            parent_op_id: None,
+            model: "mock".into(),
+            prompt: None,
+            prompt_preview: "hi".into(),
+            effect: None,
+            timestamp: Utc::now(),
+        };
+        let eval = Event::EvalCall {
+            run_id: "run".into(),
+            op_id: 2,
+            parent_op_id: None,
+            command: "true".into(),
+            cwd: None,
+            env_policy: "inherit".into(),
+            timeout_ms: 1000,
+            effect: None,
+            timestamp: Utc::now(),
+        };
+        for event in [infer, eval] {
+            let json = serde_json::to_string(&event)?;
+            assert!(
+                !json.contains("\"effect\""),
+                "op-layer trace line grew an effect field: {json}"
+            );
+            // And a line without the field round-trips (old traces parse).
+            assert_eq!(serde_json::from_str::<Event>(&json)?, event);
+        }
+        Ok(())
+    }
+
+    /// IR traces carry the effect identity inline on call events and it
+    /// round-trips through JSONL.
+    #[test]
+    fn ir_call_events_round_trip_effect_identity() -> Result<()> {
+        let site = crate::ir::EffectSite {
+            block: crate::ir::BlockId(0),
+            instruction_index: 0,
+        };
+        let location = crate::ir::effect_location(
+            crate::ir::ProgramHash("sha256:test".into()),
+            crate::ir::EffectKind::Infer,
+            site,
+            crate::ir::DynamicPath::with_visit(site, 0),
+        )?;
+        let event = Event::InferCall {
+            run_id: "run".into(),
+            op_id: 1,
+            parent_op_id: None,
+            model: "mock".into(),
+            prompt: None,
+            prompt_preview: "hi".into(),
+            effect: Some(Box::new(location.clone())),
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains(&location.effect_id.0), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json)?, event);
+        Ok(())
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<Event>>,
@@ -1143,6 +1230,7 @@ mod tests {
             model: "mock-model".into(),
             prompt: None,
             prompt_preview: "hello".into(),
+            effect: None,
             timestamp: Utc::now(),
         })
         .await?;
@@ -1175,6 +1263,7 @@ mod tests {
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
+            effect: None,
             timestamp: Utc::now(),
         })
         .await?;
@@ -1257,6 +1346,7 @@ mod tests {
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
+            effect: None,
             timestamp: Utc::now(),
         })
         .await?;
@@ -1288,6 +1378,7 @@ mod tests {
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
+            effect: None,
             timestamp: Utc::now(),
         })
         .await?;
@@ -1311,6 +1402,7 @@ mod tests {
             cwd: None,
             env_policy: "inherit".into(),
             timeout_ms: 1000,
+            effect: None,
             timestamp: Utc::now(),
         })
         .await?;

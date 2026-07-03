@@ -2048,6 +2048,7 @@ mod gc_stats_tests {
             model: model.into(),
             prompt: Some(prompt.clone()),
             prompt_preview: String::new(),
+            effect: None,
             timestamp: Utc::now(),
         };
         let infer_result = |op_id: u64, input_tokens: u32| Event::InferResult {
@@ -2076,6 +2077,7 @@ mod gc_stats_tests {
                 model: "gpt-5.5".into(),
                 prompt: None,
                 prompt_preview: String::new(),
+                effect: None,
                 timestamp: Utc::now(),
             },
             infer_result(3, 100),

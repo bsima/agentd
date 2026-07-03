@@ -206,15 +206,16 @@ One governance hook. Both operations.
 
 ## Trace log
 
-Every effect execution appends JSONL events with a run id, operation id, and — in IR mode — a stable effect id:
+Every effect execution appends JSONL events with a run id, operation id, and — in IR mode — a stable effect identity carried directly on the call event (an `effect` field with the effect id, site, and dynamic path), so no consumer ever has to rely on event adjacency:
 
 ```json
-{"event":"Custom","name":"ir_effect","data":{"effect_id":"sha256:...","kind":"Infer","site":{"block":0,"instruction_index":0}}}
-{"event":"InferCall",  "op_id":3, "model":"...", "prompt_preview":"..."}
+{"event":"InferCall",  "op_id":3, "model":"...", "prompt_preview":"...", "effect":{"effect_id":"sha256:...","kind":"Infer","site":{"block":0,"instruction_index":0},"dynamic_path":[...]}}
 {"event":"InferResult","op_id":3, "tokens":340, "response_preview":"..."}
-{"event":"EvalCall",   "op_id":4, "command":"rg TODO src/"}
+{"event":"EvalCall",   "op_id":4, "command":"rg TODO src/", "effect":{"effect_id":"sha256:...","kind":"Eval","site":{"block":0,"instruction_index":1},"dynamic_path":[...]}}
 {"event":"EvalError",  "op_id":4, "error":"..."}
 ```
+
+Op-layer (non-IR) traces have no IR location; their call events simply omit the `effect` field and serialize unchanged.
 
 Failures close their call with `InferError`/`EvalError` (or `RetrieveError`/`StoreError` for the hydration effects), so failed runs are as inspectable and replayable as successful ones. Replay mode re-runs the same program and feeds recorded results (or failures) back at matching effect ids instead of calling providers, executing shell commands, or touching sources and sinks.
 
