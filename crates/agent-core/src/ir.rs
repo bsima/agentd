@@ -319,9 +319,14 @@ pub enum PromptRef {
     PromptIrVar(Var),
 }
 
+/// Per-Infer policy slot. `Instr::Infer` is a single provider call — it has
+/// no multi-turn semantics, so there is deliberately no turn limit here.
+/// Turn budgets belong to the loop *program* that contains the Infer: see
+/// the counter threaded through `agent_loop_ir` (ir_agent.rs) and
+/// `op::agent_loop` (t-1056). Old serialized programs that still carry a
+/// `max_turns` field deserialize fine; serde ignores unknown fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferPolicy {
-    pub max_turns: Option<usize>,
     /// Abort (default) vs bind-error-as-value for this Infer site.
     #[serde(default)]
     pub on_error: EffectErrorMode,
@@ -830,6 +835,20 @@ mod tests {
         let decoded: Program = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(decoded, program);
+    }
+
+    /// InferPolicy used to carry an unused `max_turns` field (removed in
+    /// t-1056). Programs serialized before the removal must still load:
+    /// serde ignores unknown fields, so the stale key is dropped silently.
+    #[test]
+    fn infer_policy_tolerates_legacy_max_turns_field() {
+        let legacy = r#"{"max_turns":3,"on_error":"bind"}"#;
+        let policy: InferPolicy = serde_json::from_str(legacy).unwrap();
+        assert_eq!(policy.on_error, EffectErrorMode::Bind);
+
+        let legacy_null = r#"{"max_turns":null}"#;
+        let policy: InferPolicy = serde_json::from_str(legacy_null).unwrap();
+        assert_eq!(policy, InferPolicy::default());
     }
 
     #[test]

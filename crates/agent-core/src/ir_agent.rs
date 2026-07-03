@@ -670,7 +670,6 @@ pub fn agent_loop_ir_with_options(
                     // recover from, not a turn-aborting error.
                     policy: InferPolicy {
                         on_error: EffectErrorMode::Bind,
-                        ..Default::default()
                     },
                 },
                 // Feed back the sub-response *text*, not the serialized
