@@ -36,6 +36,7 @@ mod frontmatter;
 const DEFAULT_MAX_TURNS: usize = 100;
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     #[arg(long)]
     provider: Option<String>,

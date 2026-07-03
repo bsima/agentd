@@ -108,14 +108,14 @@ Feel free to sandbox your agent with bwrap or nix or whatever you want.
 
 The binary is named `agent`.
 
-Prebuilt static musl binaries (x86_64 and aarch64 Linux) are attached to [GitHub Releases](https://github.com/bsima/agentd/releases) as `agent-<tag>-<target>.tar.gz` with a `.sha256` alongside:
+Prebuilt static musl binaries (x86_64 and aarch64 Linux) are attached to [GitHub Releases](https://github.com/bsima/agentd/releases) as `agent-<tag>-<target>.tar.gz` with a combined `SHA256SUMS`:
 
 ```sh
 v=v0.1.0
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 curl -LO "https://github.com/bsima/agentd/releases/download/$v/agent-$v-$target.tar.gz"
-curl -LO "https://github.com/bsima/agentd/releases/download/$v/agent-$v-$target.tar.gz.sha256"
-sha256sum -c "agent-$v-$target.tar.gz.sha256"
+curl -LO "https://github.com/bsima/agentd/releases/download/$v/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
 tar xzf "agent-$v-$target.tar.gz"
 install -m 755 "agent-$v-$target/agent" ~/.local/bin/
 ```
