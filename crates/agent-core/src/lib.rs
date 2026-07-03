@@ -12,6 +12,7 @@ pub mod models;
 pub mod op;
 pub mod prompt_ir;
 pub mod provider;
+pub mod public_trace;
 pub mod temporal;
 pub mod trace;
 
@@ -57,6 +58,10 @@ pub use prompt_ir::{
 pub use provider::{
     is_context_overflow_anyhow, is_context_overflow_message, ChatProvider, ContextOverflowError,
     ProviderClient, ProviderConfig,
+};
+pub use public_trace::{
+    public_event, PublicDynamicPath, PublicEffect, PublicEffectSite, PublicEvent, PublicStatus,
+    PUBLIC_SCHEMA_VERSION,
 };
 pub use temporal::TemporalSource;
 pub use trace::{
