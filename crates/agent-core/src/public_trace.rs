@@ -516,11 +516,51 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
             None,
             PublicStatus::Completed,
         )),
+        // Structured-output validation failure (t-1308.4): the one Custom
+        // name with a public projection (schema 1.1). Each failed attempt
+        // emits one event; the run may still complete after a repair turn,
+        // so `failed` here is per-attempt, not necessarily terminal.
+        Event::Custom {
+            run_id,
+            name,
+            data,
+            timestamp,
+        } if name == crate::output_contract::OUTPUT_VALIDATION_FAILED_EVENT => {
+            let mut out = base(
+                "output.validation_failed",
+                *timestamp,
+                run_id,
+                None,
+                None,
+                PublicStatus::Failed,
+            );
+            out.error = Some(
+                data.get("errors")
+                    .and_then(Value::as_array)
+                    .and_then(|errors| errors.first())
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "output failed schema validation".into()),
+            );
+            out.payload_preview = data
+                .get("preview")
+                .and_then(Value::as_str)
+                .filter(|preview| !preview.is_empty())
+                .map(str::to_owned);
+            if let Some(attempt) = data.get("attempt") {
+                out.attrs.insert("attempt".into(), attempt.clone());
+            }
+            if let Some(errors) = data.get("errors") {
+                out.attrs.insert("errors".into(), errors.clone());
+            }
+            Some(out)
+        }
         // Private: runtime-internal orchestration and extension events.
         // Context assembly (hydration/prompt IR) and Par structure may gain
         // public projections later (additive, minor bump); Custom is the
-        // domain-tag / gc / diagnostics extension channel and is never
-        // public — consumers who need it read the runtime trace.
+        // domain-tag / gc / diagnostics extension channel and — except for
+        // output_validation_failed above — is never public; consumers who
+        // need it read the runtime trace.
         Event::HydrationStart { .. }
         | Event::HydrationSection { .. }
         | Event::HydrationEnd { .. }
@@ -806,6 +846,30 @@ mod tests {
                 },
                 None,
             ),
+            // The one public Custom name (schema 1.1, t-1308.4)...
+            (
+                Event::Custom {
+                    run_id: run.into(),
+                    name: "output_validation_failed".into(),
+                    data: serde_json::json!({
+                        "attempt": 1,
+                        "errors": ["$: missing required property \"a\""],
+                        "preview": "{}",
+                    }),
+                    timestamp: ts,
+                },
+                Some("output.validation_failed"),
+            ),
+            // ...while its run-metadata sibling stays private.
+            (
+                Event::Custom {
+                    run_id: run.into(),
+                    name: "output_contract".into(),
+                    data: serde_json::json!({ "schema_hash": "sha256:x", "max_repairs": 2 }),
+                    timestamp: ts,
+                },
+                None,
+            ),
         ];
         for (event, expected) in &events {
             let projected = public_event(event);
@@ -827,6 +891,44 @@ mod tests {
                 assert_eq!(public.payload_ref, None);
             }
         }
+    }
+
+    /// Focused mapping test for the output_validation_failed projection
+    /// (docs/TRACE_SCHEMA.md, schema 1.1): error carries the first
+    /// validation error, the preview becomes payload_preview, and
+    /// attempt/errors ride in attrs.
+    #[test]
+    fn output_validation_failed_projects_fields() {
+        let event = Event::Custom {
+            run_id: "run".into(),
+            name: "output_validation_failed".into(),
+            data: serde_json::json!({
+                "attempt": 2,
+                "errors": ["$.answer: expected type integer, got string", "$: second"],
+                "preview": "{\"answer\":\"x\"}",
+            }),
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let public = public_event(&event).expect("projects");
+        assert_eq!(public.event, "output.validation_failed");
+        assert_eq!(public.status, PublicStatus::Failed);
+        assert_eq!(
+            public.error.as_deref(),
+            Some("$.answer: expected type integer, got string")
+        );
+        assert_eq!(
+            public.payload_preview.as_deref(),
+            Some("{\"answer\":\"x\"}")
+        );
+        assert_eq!(public.attrs.get("attempt"), Some(&Value::from(2)));
+        assert_eq!(
+            public.attrs.get("errors"),
+            Some(&serde_json::json!([
+                "$.answer: expected type integer, got string",
+                "$: second"
+            ]))
+        );
+        assert_eq!(public.op_id, None);
     }
 
     struct MockProvider {

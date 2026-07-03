@@ -35,6 +35,11 @@ pub struct IrReplayTrace {
     store_calls: BTreeMap<String, IrStoreCall>,
     store_results: BTreeMap<String, String>,
     store_errors: BTreeMap<String, String>,
+    /// Output-contract schema hash recorded by the run (the Custom
+    /// `output_contract` event, t-1308.4). Run-identity metadata: replaying
+    /// with a different contract must diverge, so the agent-loop driver
+    /// compares this against the current contract before executing.
+    output_schema_hash: Option<String>,
 }
 
 /// The Retrieve identity recorded for replay-divergence detection. `kind`
@@ -229,10 +234,22 @@ impl IrReplayTrace {
                         replay.store_errors.insert(effect_id.clone(), error.clone());
                     }
                 }
+                Event::Custom { name, data, .. }
+                    if name == crate::output_contract::OUTPUT_CONTRACT_EVENT =>
+                {
+                    if let Some(hash) = data.get("schema_hash").and_then(Value::as_str) {
+                        replay.output_schema_hash = Some(hash.to_owned());
+                    }
+                }
                 _ => {}
             }
         }
         Ok(replay)
+    }
+
+    /// The recorded output-contract schema hash, if the run had a contract.
+    pub fn output_schema_hash(&self) -> Option<&str> {
+        self.output_schema_hash.as_deref()
     }
 
     fn infer_result(&self, location: &EffectLocation, model: &str) -> Result<crate::op::Response> {

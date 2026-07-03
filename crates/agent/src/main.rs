@@ -66,6 +66,13 @@ struct Args {
     /// Replay recorded Infer/Eval results from a trace JSONL instead of calling providers or shell.
     #[arg(long, env = "AGENT_REPLAY_TRACE")]
     replay_trace: Option<PathBuf>,
+    /// Path to a JSON Schema file constraining the final response: each
+    /// turn's final answer must be a single JSON value conforming to it.
+    /// Non-conforming answers get up to 2 repair turns, then the turn
+    /// errors. Supported schema subset: type/required/properties/items/enum
+    /// (see agent_core::output_contract).
+    #[arg(long, env = "AGENT_OUTPUT_SCHEMA")]
+    output_schema: Option<PathBuf>,
     /// Store full PromptIR section content in traces instead of previews/hashes only.
     #[arg(long, env = "AGENT_TRACE_FULL_PROMPT_IR")]
     trace_full_prompt_ir: bool,
@@ -326,6 +333,9 @@ struct Runtime {
     ir_store: InMemoryStore,
     ir_replay: Option<IrReplayTrace>,
     ir_effect_visits: BTreeMap<String, u64>,
+    /// Structured final-output contract (t-1308.4): validation with bounded
+    /// repair applies to each turn's final response, one-shot and session.
+    output_contract: Option<agent_core::OutputContract>,
     /// Session-lived GC state (t-1162): the discovered provider ceiling
     /// (catch-overflow), frame lifecycles, and the every-N cadence survive
     /// across turns instead of being relearned per turn.
@@ -405,6 +415,10 @@ async fn main() -> Result<()> {
     let replay_enabled = args.replay_trace.is_some();
     let ir_replay = match args.replay_trace.as_ref() {
         Some(path) => Some(IrReplayTrace::load(path).await?),
+        None => None,
+    };
+    let output_contract = match args.output_schema.as_ref() {
+        Some(path) => Some(load_output_contract(path).await?),
         None => None,
     };
     let context_budget = resolved_model.context;
@@ -555,6 +569,7 @@ async fn main() -> Result<()> {
         ir_store: InMemoryStore::new(),
         ir_replay,
         ir_effect_visits: BTreeMap::new(),
+        output_contract,
         gc_state: agent_core::GcState {
             // The discovered ceiling is knowledge about the provider, not
             // the process: a resumed session keeps it.
@@ -1298,22 +1313,34 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             .hydration
             .sinks_of_kind(agent_core::SourceKind::Semantic)
             .is_empty();
-        let mut machine = agent_core::agent_loop_ir_with_options(
-            runtime.model.clone(),
-            prompt.clone(),
-            runtime.max_turns,
+        let options = agent_core::AgentLoopOptions {
             memory_tools,
-        );
-        machine.effect_visits = runtime.ir_effect_visits.clone();
-        let (value, machine) = agent_core::run_ir_sequential_with_gc(
+            output_contract: runtime.output_contract.clone(),
+        };
+        let (value, machine) = agent_core::run_agent_loop(
             &runtime.config,
-            machine,
             &mut runtime.ir_store,
             runtime.ir_replay.as_ref(),
             &mut runtime.gc_state,
+            runtime.model.clone(),
+            prompt.clone(),
+            runtime.max_turns,
+            &options,
+            runtime.ir_effect_visits.clone(),
         )
         .await?;
         runtime.ir_effect_visits = machine.effect_visits.clone();
+        // Exhausted output-schema repairs come back as a typed value (the
+        // loop's errors-as-values convention); surface them as a failed
+        // turn — agent_error in session mode, nonzero exit one-shot —
+        // rather than emitting non-conforming output as a completion.
+        if let Some(failure) = agent_core::output_contract_failure(&value) {
+            return Err(anyhow!(
+                "final output failed the output schema after {} attempt(s): {}",
+                failure.attempts,
+                failure.errors.join("; ")
+            ));
+        }
         let response: agent_core::Response =
             serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
         let history = machine
@@ -1604,6 +1631,37 @@ fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoin
         timestamp: Utc::now(),
         discovered_budget: runtime.gc_state.discovered_budget,
     })
+}
+
+async fn load_output_contract(path: &Path) -> Result<agent_core::OutputContract> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("reading output schema {}", path.display()))?;
+    parse_output_contract(&text)
+        .with_context(|| format!("parsing output schema {}", path.display()))
+}
+
+/// Pure parsing seam (like `parse_turn_frame`): output-schema file text to
+/// contract. The document must be a JSON object — a bare `true`/`false`
+/// schema is technically valid JSON Schema but useless as an output
+/// contract, and anything else is a caller error worth failing loudly.
+fn parse_output_contract(text: &str) -> Result<agent_core::OutputContract> {
+    let schema: serde_json::Value =
+        serde_json::from_str(text).context("output schema is not valid JSON")?;
+    if !schema.is_object() {
+        return Err(anyhow!(
+            "output schema must be a JSON object (a JSON Schema document), got {}",
+            match schema {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Null => "null",
+                serde_json::Value::Object(_) => unreachable!(),
+            }
+        ));
+    }
+    Ok(agent_core::OutputContract::new(schema))
 }
 
 async fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
@@ -2317,5 +2375,32 @@ mod gc_stats_tests {
             "{rendered}"
         );
         assert!(!rendered.contains("overflow recoveries"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_output_contract_accepts_a_schema_object_with_default_repairs() {
+        let contract =
+            parse_output_contract(r#"{ "type": "object", "required": ["answer"] }"#).unwrap();
+        assert_eq!(contract.max_repairs, agent_core::DEFAULT_MAX_REPAIRS);
+        assert_eq!(contract.schema["type"], "object");
+    }
+
+    #[test]
+    fn parse_output_contract_rejects_invalid_json() {
+        let err = parse_output_contract("{ nope").unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_output_contract_rejects_non_object_documents() {
+        for (text, kind) in [
+            ("true", "a boolean"),
+            ("[1, 2]", "an array"),
+            ("\"x\"", "a string"),
+            ("null", "null"),
+        ] {
+            let err = parse_output_contract(text).unwrap_err();
+            assert!(err.to_string().contains(kind), "{text}: {err:#}");
+        }
     }
 }

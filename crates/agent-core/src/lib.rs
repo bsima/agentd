@@ -10,6 +10,7 @@ pub mod ir_normalize;
 pub mod memory;
 pub mod models;
 pub mod op;
+pub mod output_contract;
 pub mod prompt_ir;
 pub mod provider;
 pub mod public_trace;
@@ -34,7 +35,7 @@ pub use ir::{
     EvalRequest, Expr, Frame, InferPolicy, Instr, Machine, MatchArm, Pattern, Program, ProgramHash,
     ProgramId, PromptRef, RetrievePolicy, StoreOp, StorePolicy, Terminator, Var,
 };
-pub use ir_agent::{agent_loop_ir, agent_loop_ir_with_options};
+pub use ir_agent::{agent_loop_ir, agent_loop_ir_with_options, run_agent_loop, AgentLoopOptions};
 pub use ir_interpreter::{
     run_ir_sequential, run_ir_sequential_with_gc, run_ir_sequential_with_store,
     run_ir_sequential_with_store_and_replay, run_ir_steps, run_ir_steps_with_gc,
@@ -48,6 +49,11 @@ pub use op::{
     agent_loop, close_pending_tool_calls, emit, eval, eval_argv, has_pending_tool_calls, infer,
     par, repair_trailing_pending_tool_calls, ChatMessage, EvalSpec, FinishReason, Model, Op, OpF,
     Prompt, Response, ToolCall,
+};
+pub use output_contract::{
+    output_contract_failure, validate as validate_output, OutputContract, OutputContractFailure,
+    DEFAULT_MAX_REPAIRS, OUTPUT_CONTRACT_ERROR, OUTPUT_CONTRACT_EVENT,
+    OUTPUT_VALIDATION_FAILED_EVENT,
 };
 pub use prompt_ir::{
     collect_prompt_ir_sections, compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash,

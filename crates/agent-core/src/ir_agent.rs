@@ -1,8 +1,18 @@
+use crate::gc::GcState;
+use crate::interpreter::SeqConfig;
 use crate::ir::{
     Block, BlockId, EffectErrorMode, Expr, InferPolicy, Instr, Machine, Program, ProgramId,
     PromptRef, RetrievePolicy, StorePolicy, Terminator, Var,
 };
+use crate::ir_interpreter::{IrReplayTrace, IrStore};
 use crate::op::{Model, Prompt};
+use crate::output_contract::{
+    OutputContract, OutputContractFailure, MAX_TRACE_ERRORS, OUTPUT_CONTRACT_EVENT,
+    OUTPUT_VALIDATION_FAILED_EVENT,
+};
+use crate::trace::Event;
+use anyhow::{anyhow, Result};
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -1075,6 +1085,205 @@ pub fn agent_loop_ir_with_options(
     }
 }
 
+/// Loop-level options for [`run_agent_loop`]. The output contract lives
+/// here — not in `InferPolicy` — per the SDK PRD decision (DR-2): final
+/// output validation is post-processing over the whole loop run, migrated
+/// into the IR only when AgentIR can host it cleanly.
+#[derive(Debug, Clone, Default)]
+pub struct AgentLoopOptions {
+    /// Include the model-initiated remember/recall tools (docs/MEMORY.md);
+    /// see [`agent_loop_ir_with_options`].
+    pub memory_tools: bool,
+    /// Validate the loop's final response against a JSON Schema, with
+    /// bounded repair (t-1308.4, DR-2).
+    pub output_contract: Option<OutputContract>,
+}
+
+/// Run the agent loop with loop-level post-processing (t-1308.4): build the
+/// loop program, execute it, and — when an [`OutputContract`] is present —
+/// validate the natural final response as JSON against the schema. Each
+/// failure appends a repair turn (a user message quoting the validation
+/// errors) and re-enters the loop, up to `max_repairs` times; exhaustion
+/// returns an [`OutputContractFailure`] rendered as a value (errors-as-
+/// values, t-1222), never a process abort. Detect it with
+/// [`crate::output_contract::output_contract_failure`].
+///
+/// Scope of validation: natural completions only. A turn-budget-exhausted
+/// response (`metadata.stop_reason = "turn_budget_exhausted"`) is returned
+/// as-is — the turn never produced a final answer to validate.
+///
+/// `effect_visits` seeds the machine's per-site visit counters (thread the
+/// returned machine's counters back in on the next session turn, exactly as
+/// with the raw builder); repair runs inside this call carry them forward
+/// automatically, so effect ids stay unique across repairs.
+///
+/// Replay: when a contract is present its `schema_hash` is recorded in the
+/// trace (a Custom `output_contract` event). Replaying against a trace whose
+/// recorded hash differs from the current contract's (including one side
+/// having no contract at all) fails fast with a divergence error.
+#[allow(clippy::too_many_arguments)] // mirrors run_ir_steps_with_gc's seams: config, state, and loop identity are distinct axes
+pub async fn run_agent_loop(
+    config: &SeqConfig,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&IrReplayTrace>,
+    gc_state: &mut GcState,
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    options: &AgentLoopOptions,
+    effect_visits: BTreeMap<String, u64>,
+) -> Result<(Value, Machine)> {
+    if let Some(replay) = ir_replay {
+        check_output_schema_hash(replay, options.output_contract.as_ref())?;
+    }
+    if let Some(contract) = &options.output_contract {
+        // Run-identity metadata: the schema hash rides in the trace the way
+        // program_hash rides in every effect id, so replay can detect a
+        // changed contract (checked above on the replay side).
+        config
+            .trace
+            .emit(&Event::Custom {
+                run_id: config.trace.run_id().into(),
+                name: OUTPUT_CONTRACT_EVENT.into(),
+                data: serde_json::json!({
+                    "schema_hash": contract.schema_hash(),
+                    "max_repairs": contract.max_repairs,
+                }),
+                timestamp: Utc::now(),
+            })
+            .await?;
+    }
+
+    let mut machine =
+        agent_loop_ir_with_options(model.clone(), prompt, max_turns, options.memory_tools);
+    machine.effect_visits = effect_visits;
+    let mut attempt = 0usize;
+    loop {
+        let (value, done) = crate::ir_interpreter::run_ir_sequential_with_gc(
+            config, machine, store, ir_replay, gc_state,
+        )
+        .await?;
+        let Some(contract) = &options.output_contract else {
+            return Ok((value, done));
+        };
+        if turn_budget_exhausted(&value) {
+            return Ok((value, done));
+        }
+        let content = value
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let errors = contract.validate_text(&content);
+        if errors.is_empty() {
+            return Ok((value, done));
+        }
+        attempt += 1;
+        config
+            .trace
+            .emit(&Event::Custom {
+                run_id: config.trace.run_id().into(),
+                name: OUTPUT_VALIDATION_FAILED_EVENT.into(),
+                data: serde_json::json!({
+                    "attempt": attempt,
+                    "errors": errors.iter().take(MAX_TRACE_ERRORS).collect::<Vec<_>>(),
+                    "preview": crate::trace::preview(&content, 256),
+                }),
+                timestamp: Utc::now(),
+            })
+            .await?;
+        if attempt > contract.max_repairs {
+            let failure = OutputContractFailure {
+                attempts: attempt,
+                errors,
+                content,
+            };
+            return Ok((failure.into_value(), done));
+        }
+        machine = repair_machine(
+            &done,
+            &content,
+            &errors,
+            model.clone(),
+            max_turns,
+            options.memory_tools,
+        );
+    }
+}
+
+fn turn_budget_exhausted(value: &Value) -> bool {
+    value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("stop_reason"))
+        .and_then(Value::as_str)
+        == Some("turn_budget_exhausted")
+}
+
+/// A fresh loop machine for one repair turn: the completed machine's
+/// history plus the invalid assistant answer and a user repair message,
+/// with a full turn budget and the effect-visit counters carried forward
+/// (same shape as a new session turn in the runtime).
+fn repair_machine(
+    done: &Machine,
+    content: &str,
+    errors: &[String],
+    model: Model,
+    max_turns: usize,
+    memory_tools: bool,
+) -> Machine {
+    let mut history = done
+        .env
+        .get(&Var("history".into()))
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    if let Value::Array(messages) = &mut history {
+        if !content.is_empty() {
+            messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": repair_prompt(errors) }));
+    }
+    let mut machine = agent_loop_ir_with_options(model, vec![], max_turns, memory_tools);
+    machine.env.insert(Var("history".into()), history);
+    machine.effect_visits = done.effect_visits.clone();
+    machine
+}
+
+fn repair_prompt(errors: &[String]) -> String {
+    let listed = errors
+        .iter()
+        .take(MAX_TRACE_ERRORS)
+        .map(|error| format!("- {error}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your final response failed validation against the required output schema:\n{listed}\n\n\
+         Respond again with ONLY a single JSON value that conforms to the output schema. \
+         No prose, no code fences, no explanation."
+    )
+}
+
+/// Replay-divergence check for the output contract: the recorded
+/// `schema_hash` (from the trace's `output_contract` Custom event) must
+/// match the current contract's, including presence — a run recorded with a
+/// contract cannot be replayed without one, and vice versa.
+fn check_output_schema_hash(
+    replay: &IrReplayTrace,
+    contract: Option<&OutputContract>,
+) -> Result<()> {
+    let recorded = replay.output_schema_hash();
+    let current = contract.map(OutputContract::schema_hash);
+    if recorded != current.as_deref() {
+        return Err(anyhow!(
+            "AgentIR replay diverged: output contract schema_hash mismatch \
+             (recorded {}, current {}); replay requires the same output schema \
+             the run was recorded with",
+            recorded.unwrap_or("none"),
+            current.as_deref().unwrap_or("none")
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1912,6 +2121,300 @@ mod tests {
             Event::Custom { name, .. } if name == "agent_complete"
         )));
         assert_eq!(value["content"], Value::String("done".into()));
+        Ok(())
+    }
+
+    // ---- run_agent_loop / OutputContract (t-1308.4) ----
+
+    fn answer_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": { "answer": { "type": "integer" } }
+        })
+    }
+
+    fn contract_with_repairs(schema: Value, max_repairs: usize) -> OutputContract {
+        OutputContract {
+            schema,
+            max_repairs,
+        }
+    }
+
+    /// Drive run_agent_loop with a scripted provider and return the loop
+    /// value, the final machine, and the runtime trace events.
+    async fn run_contract_loop(
+        provider: Arc<MockProvider>,
+        contract: Option<OutputContract>,
+        max_turns: usize,
+    ) -> Result<(Value, Machine, Vec<Event>)> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = config_with_trace(provider, trace);
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let mut gc_state = GcState::default();
+        let options = AgentLoopOptions {
+            memory_tools: false,
+            output_contract: contract,
+        };
+        let (value, machine) = run_agent_loop(
+            &config,
+            &mut store,
+            None,
+            &mut gc_state,
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("go")],
+            max_turns,
+            &options,
+            BTreeMap::new(),
+        )
+        .await?;
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let _ = std::fs::remove_file(&trace_path);
+        Ok((value, machine, events))
+    }
+
+    fn validation_failures(events: &[Event]) -> Vec<&Value> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. }
+                    if name == crate::output_contract::OUTPUT_VALIDATION_FAILED_EVENT =>
+                {
+                    Some(data)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn output_contract_valid_response_passes_through() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response(
+            r#"{"answer": 42}"#,
+            vec![],
+        )]));
+        let contract = contract_with_repairs(answer_schema(), 2);
+        let schema_hash = contract.schema_hash();
+        let (value, _machine, events) = run_contract_loop(provider, Some(contract), 4).await?;
+
+        assert_eq!(value["content"], Value::String(r#"{"answer": 42}"#.into()));
+        assert!(validation_failures(&events).is_empty());
+        // The schema hash rides in the trace as run-identity metadata.
+        let recorded = events.iter().find_map(|event| match event {
+            Event::Custom { name, data, .. }
+                if name == crate::output_contract::OUTPUT_CONTRACT_EVENT =>
+            {
+                data.get("schema_hash")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }
+            _ => None,
+        });
+        assert_eq!(recorded.as_deref(), Some(schema_hash.as_str()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_invalid_then_repaired() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response("not json at all", vec![]),
+            response(r#"{"answer": 7}"#, vec![]),
+        ]));
+        let (value, machine, events) = run_contract_loop(
+            provider.clone(),
+            Some(contract_with_repairs(answer_schema(), 2)),
+            4,
+        )
+        .await?;
+
+        assert_eq!(value["content"], Value::String(r#"{"answer": 7}"#.into()));
+        // Exactly one failed attempt was traced, with the parse error.
+        let failures = validation_failures(&events);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["attempt"], Value::from(1));
+        assert!(
+            failures[0]["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("not valid JSON"),
+            "{failures:?}"
+        );
+        assert_eq!(
+            failures[0]["preview"],
+            Value::String("not json at all".into())
+        );
+        // The repair turn carried the invalid answer plus a user message
+        // quoting the errors and demanding JSON only.
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2);
+        let repair = &prompts[1];
+        let assistant = repair
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("invalid assistant answer in repair prompt");
+        assert_eq!(assistant.content.as_deref(), Some("not json at all"));
+        let last = repair.last().unwrap();
+        assert_eq!(last.role, "user");
+        let repair_text = last.content.as_deref().unwrap();
+        assert!(repair_text.contains("not valid JSON"), "{repair_text}");
+        assert!(
+            repair_text.contains("ONLY a single JSON value"),
+            "{repair_text}"
+        );
+        // The final machine's history contains the repair exchange, so a
+        // session persists it like any other turn.
+        let history = machine.env.get(&Var("history".into())).unwrap();
+        assert!(
+            serde_json::to_string(history)?.contains("failed validation"),
+            "repair exchange survives in history"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_exhausted_repairs_return_typed_error_value() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(r#"{"answer": "nope"}"#, vec![]),
+            response(r#"{"wrong": true}"#, vec![]),
+        ]));
+        let (value, _machine, events) =
+            run_contract_loop(provider, Some(contract_with_repairs(answer_schema(), 1)), 4).await?;
+
+        // The loop returned (no abort) with the typed failure value.
+        let failure = crate::output_contract::output_contract_failure(&value)
+            .expect("exhausted repairs yield a contract failure value");
+        assert_eq!(failure.attempts, 2);
+        assert_eq!(failure.content, r#"{"wrong": true}"#);
+        assert!(
+            failure.errors.iter().any(|error| error.contains("answer")),
+            "last validation errors preserved: {failure:?}"
+        );
+        let failures = validation_failures(&events);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["attempt"], Value::from(1));
+        assert_eq!(failures[1]["attempt"], Value::from(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_skips_budget_exhausted_turns() -> Result<()> {
+        // A turn-budget stop never produced a final answer; it is returned
+        // annotated, not validated (and not "repaired").
+        let tool_turn = || {
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-budget",
+                    "shell",
+                    serde_json::json!({ "command": "printf spin" }),
+                )],
+            )
+        };
+        let provider = Arc::new(MockProvider::new(vec![tool_turn(), tool_turn()]));
+        let (value, _machine, events) =
+            run_contract_loop(provider, Some(contract_with_repairs(answer_schema(), 2)), 1).await?;
+
+        assert_eq!(
+            value["metadata"]["stop_reason"],
+            Value::String("turn_budget_exhausted".into())
+        );
+        assert!(validation_failures(&events).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_absent_leaves_loop_untouched() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("plain text", vec![])]));
+        let (value, _machine, events) = run_contract_loop(provider, None, 4).await?;
+        assert_eq!(value["content"], Value::String("plain text".into()));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Custom { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_schema_hash_gates_replay() -> Result<()> {
+        // Record a run with contract A...
+        let contract_a = contract_with_repairs(answer_schema(), 2);
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        {
+            let provider = Arc::new(MockProvider::new(vec![response(
+                r#"{"answer": 1}"#,
+                vec![],
+            )]));
+            let config = config_with_trace(provider, trace);
+            let mut store = crate::ir_interpreter::InMemoryStore::new();
+            let mut gc_state = GcState::default();
+            let options = AgentLoopOptions {
+                memory_tools: false,
+                output_contract: Some(contract_a.clone()),
+            };
+            let (value, _machine) = run_agent_loop(
+                &config,
+                &mut store,
+                None,
+                &mut gc_state,
+                Model("mock".into()),
+                vec![ChatMessage::user("go")],
+                4,
+                &options,
+                BTreeMap::new(),
+            )
+            .await?;
+            assert_eq!(value["content"], Value::String(r#"{"answer": 1}"#.into()));
+        }
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let replay = IrReplayTrace::from_events(&events)?;
+        assert_eq!(
+            replay.output_schema_hash(),
+            Some(contract_a.schema_hash().as_str())
+        );
+
+        let run_replay = |contract: Option<OutputContract>| {
+            let events = events.clone();
+            async move {
+                let replay = IrReplayTrace::from_events(&events)?;
+                let provider = Arc::new(MockProvider::new(vec![]));
+                let config = config(provider);
+                let mut store = crate::ir_interpreter::InMemoryStore::new();
+                let mut gc_state = GcState::default();
+                let options = AgentLoopOptions {
+                    memory_tools: false,
+                    output_contract: contract,
+                };
+                run_agent_loop(
+                    &config,
+                    &mut store,
+                    Some(&replay),
+                    &mut gc_state,
+                    Model("mock".into()),
+                    vec![ChatMessage::user("go")],
+                    4,
+                    &options,
+                    BTreeMap::new(),
+                )
+                .await
+                .map(|(value, _machine)| value)
+            }
+        };
+
+        // Same contract: replays cleanly from the recorded results.
+        let value = run_replay(Some(contract_a.clone())).await?;
+        assert_eq!(value["content"], Value::String(r#"{"answer": 1}"#.into()));
+
+        // A changed schema diverges with a clear error before any effect.
+        let contract_b = contract_with_repairs(serde_json::json!({ "type": "array" }), 2);
+        let err = run_replay(Some(contract_b)).await.unwrap_err();
+        assert!(err.to_string().contains("schema_hash"), "{err:#}");
+
+        // Dropping the contract entirely also diverges.
+        let err = run_replay(None).await.unwrap_err();
+        assert!(err.to_string().contains("schema_hash"), "{err:#}");
+
+        let _ = std::fs::remove_file(&trace_path);
         Ok(())
     }
 }

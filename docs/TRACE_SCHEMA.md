@@ -1,6 +1,6 @@
 # Public Trace Event Schema
 
-`schema_version: 1`
+`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.1**, see the version history at the end)
 
 This document is the contract for consumers of agentd trace data: the SDK
 trace adapter, dashboard ingest, and any external tooling. It defines a
@@ -169,8 +169,19 @@ same `run_id`/`op_id`.
 | `store.completed` | `StoreResult` | `completed` | — | `duration_ms`, `sink`, `sink_id` |
 | `store.failed` | `StoreError` | `failed` | — | `duration_ms`, `sink` |
 | `run.completed` | `AgentDone` | `completed` | — | — |
+| `output.validation_failed` | `Custom { name: "output_validation_failed" }` | `failed` | invalid final-output excerpt | `attempt` (1-based), `errors` (string[], capped at 8) |
 
 (`?` = present only when the runtime recorded a value.)
+
+`output.validation_failed` (since 1.1, t-1308.4): the run has an output
+contract (`--output-schema`) and a natural final response failed JSON
+Schema validation. One event per failed attempt; `error` carries the first
+validation error. Unlike the effect `*.failed` events this is not
+necessarily terminal — the loop appends a bounded repair turn after each
+failure, so a run may emit these and still complete successfully. It has no
+`op_id` (it is loop-level, not an effect). Repairs exhausted means the turn
+ends in a typed contract-violation error, visible on the supervisor
+channel, not in the trace.
 
 ### Reserved event names (documented, not yet emitted)
 
@@ -186,7 +197,6 @@ Consumers must accept these without a schema bump when they start flowing:
   `eval.*` / `retrieve.*` / `store.*` effects they compile to).
 - `approval.requested`, `approval.resolved` — human-in-the-loop approval
   gates.
-- `output.validation_failed` — structured-output validation failures.
 
 ### Private runtime events (no public projection)
 
@@ -199,7 +209,7 @@ the runtime trace, and may change without notice:
 | `ParStart` / `ParEnd` | execution-structure internals (lineage already public via `parent_op_id`) |
 | `Checkpoint` | persistence internals |
 | `TurnBudgetExhausted` | budget taxonomy internals (t-1133); candidate for a future additive projection |
-| `Custom` (all names: `gc_collect`, `gc_truncate`, `context_overflow`, `prompt_ir`, domain tags, ...) | extension/diagnostics channel, unbounded vocabulary — never public |
+| `Custom` (all names except `output_validation_failed`: `gc_collect`, `gc_truncate`, `context_overflow`, `prompt_ir`, `output_contract`, domain tags, ...) | extension/diagnostics channel, unbounded vocabulary — private by default. `output_validation_failed` is the one projected name (see the emitted table); `output_contract` (the run's output-schema hash, replay identity for `--output-schema`) stays private |
 
 ## Correlation semantics
 
@@ -241,3 +251,12 @@ its own naming (span-per-effect, `gen_ai.*` semconv attributes). It predates
 this schema and is unaffected by it; the public event schema is the JSON
 contract, OTel is the tracing-backend mapping. They may converge later, but
 neither constrains the other today.
+
+## Version history
+
+- **1.1** (t-1308.4) — additive: the reserved `output.validation_failed`
+  is now emitted (projected from the runtime `Custom` event
+  `output_validation_failed`), with `attempt`/`errors` attrs. Wire
+  `schema_version` stays `1` per the compatibility policy.
+- **1.0** (t-1308.3) — initial schema: the `infer.*`/`eval.*`/`retrieve.*`/
+  `store.*` lifecycle events and `run.completed`.

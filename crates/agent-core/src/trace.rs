@@ -375,6 +375,8 @@ impl Event {
                 "gc_collect" => "gc_collect",
                 "gc_truncate" => "gc_truncate",
                 "context_overflow" => "context_overflow",
+                "output_contract" => "output_contract",
+                "output_validation_failed" => "output_validation_failed",
                 _ => "Custom",
             },
         }
