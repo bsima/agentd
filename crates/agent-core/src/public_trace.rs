@@ -208,6 +208,9 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
             input_tokens,
             output_tokens,
             total_tokens,
+            cached_input_tokens,
+            cost_micro_usd,
+            pricing,
             duration_ms,
             timestamp,
         } => {
@@ -228,6 +231,25 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
                 .insert("output_tokens".into(), (*output_tokens).into());
             out.attrs
                 .insert("total_tokens".into(), (*total_tokens).into());
+            // Cost accounting (schema 1.3, t-1334): present exactly when
+            // the runtime recorded them — absent cost means unknown
+            // pricing, never zero.
+            if let Some(cached) = cached_input_tokens {
+                out.attrs
+                    .insert("cached_input_tokens".into(), (*cached).into());
+            }
+            if let Some(cost) = cost_micro_usd {
+                out.attrs.insert("cost_micro_usd".into(), (*cost).into());
+            }
+            if let Some(pricing) = pricing {
+                out.attrs.insert(
+                    "pricing".into(),
+                    serde_json::json!({
+                        "input_micro_usd_per_mtok": pricing.input_micro_usd_per_mtok,
+                        "output_micro_usd_per_mtok": pricing.output_micro_usd_per_mtok,
+                    }),
+                );
+            }
             Some(out)
         }
         Event::InferError {
@@ -584,14 +606,45 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
             out.attrs.insert("name".into(), Value::String(name.clone()));
             Some(out)
         }
-        Event::AgentDone { run_id, timestamp } => Some(base(
-            "run.completed",
-            *timestamp,
+        Event::AgentDone {
             run_id,
-            None,
-            None,
-            PublicStatus::Completed,
-        )),
+            usage,
+            timestamp,
+        } => {
+            let mut out = base(
+                "run.completed",
+                *timestamp,
+                run_id,
+                None,
+                None,
+                PublicStatus::Completed,
+            );
+            // Run rollup (schema 1.3, t-1334): exact integer sums of the
+            // run's recorded InferResult usage/cost. Absent entirely for
+            // infer-less runs and pre-1.3 traces.
+            if let Some(usage) = usage {
+                out.attrs
+                    .insert("infer_calls".into(), usage.infer_calls.into());
+                out.attrs
+                    .insert("input_tokens".into(), usage.input_tokens.into());
+                out.attrs
+                    .insert("output_tokens".into(), usage.output_tokens.into());
+                out.attrs
+                    .insert("total_tokens".into(), usage.total_tokens.into());
+                if let Some(cached) = usage.cached_input_tokens {
+                    out.attrs
+                        .insert("cached_input_tokens".into(), cached.into());
+                }
+                if let Some(cost) = usage.cost_micro_usd {
+                    out.attrs.insert("cost_micro_usd".into(), cost.into());
+                }
+                out.attrs.insert(
+                    "uncosted_infer_calls".into(),
+                    usage.uncosted_infer_calls.into(),
+                );
+            }
+            Some(out)
+        }
         // Structured-output validation failure (t-1308.4): the one Custom
         // name with a public projection (schema 1.1). Each failed attempt
         // emits one event; the run may still complete after a repair turn,
@@ -696,6 +749,9 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 2,
                     total_tokens: 3,
+                    cached_input_tokens: None,
+                    cost_micro_usd: None,
+                    pricing: None,
                     duration_ms: 4,
                     timestamp: ts,
                 },
@@ -870,6 +926,7 @@ mod tests {
             (
                 Event::AgentDone {
                     run_id: run.into(),
+                    usage: None,
                     timestamp: ts,
                 },
                 Some("run.completed"),
@@ -1006,6 +1063,81 @@ mod tests {
         }
     }
 
+    /// Cost accounting projection (schema 1.3, t-1334): infer.completed
+    /// carries cached/cost/pricing attrs exactly when recorded, and
+    /// run.completed carries the AgentDone usage rollup. Absent recorded
+    /// values project to absent attrs — never zero.
+    #[test]
+    fn cost_fields_project_into_infer_completed_and_run_completed_attrs() {
+        let ts = DateTime::<Utc>::UNIX_EPOCH;
+        let costed = Event::InferResult {
+            run_id: "run".into(),
+            op_id: 1,
+            parent_op_id: None,
+            response: None,
+            response_preview: "ok".into(),
+            input_tokens: 7,
+            output_tokens: 3,
+            total_tokens: 10,
+            cached_input_tokens: Some(2),
+            cost_micro_usd: Some(66),
+            pricing: Some(crate::cost::Pricing {
+                input_micro_usd_per_mtok: 3_000_000,
+                output_micro_usd_per_mtok: 15_000_000,
+            }),
+            duration_ms: 4,
+            timestamp: ts,
+        };
+        let public = public_event(&costed).expect("projects");
+        assert_eq!(
+            public.attrs.get("cached_input_tokens"),
+            Some(&Value::from(2))
+        );
+        assert_eq!(public.attrs.get("cost_micro_usd"), Some(&Value::from(66)));
+        assert_eq!(
+            public.attrs.get("pricing"),
+            Some(&serde_json::json!({
+                "input_micro_usd_per_mtok": 3_000_000,
+                "output_micro_usd_per_mtok": 15_000_000,
+            }))
+        );
+
+        let done = Event::AgentDone {
+            run_id: "run".into(),
+            usage: Some(crate::cost::RunUsage {
+                infer_calls: 2,
+                input_tokens: 14,
+                output_tokens: 6,
+                total_tokens: 20,
+                cached_input_tokens: None,
+                cost_micro_usd: Some(132),
+                uncosted_infer_calls: 1,
+            }),
+            timestamp: ts,
+        };
+        let public = public_event(&done).expect("projects");
+        assert_eq!(public.event, "run.completed");
+        assert_eq!(public.attrs.get("infer_calls"), Some(&Value::from(2)));
+        assert_eq!(public.attrs.get("input_tokens"), Some(&Value::from(14)));
+        assert_eq!(public.attrs.get("output_tokens"), Some(&Value::from(6)));
+        assert_eq!(public.attrs.get("total_tokens"), Some(&Value::from(20)));
+        assert_eq!(public.attrs.get("cost_micro_usd"), Some(&Value::from(132)));
+        assert_eq!(
+            public.attrs.get("uncosted_infer_calls"),
+            Some(&Value::from(1))
+        );
+        // Never-reported cached tokens stay absent, not zero.
+        assert_eq!(public.attrs.get("cached_input_tokens"), None);
+
+        // A pre-t-1334 / infer-less AgentDone projects with no attrs.
+        let bare = Event::AgentDone {
+            run_id: "run".into(),
+            usage: None,
+            timestamp: ts,
+        };
+        assert!(public_event(&bare).expect("projects").attrs.is_empty());
+    }
+
     /// Focused mapping test for the output_validation_failed projection
     /// (docs/TRACE_SCHEMA.md, schema 1.1): error carries the first
     /// validation error, the preview becomes payload_preview, and
@@ -1072,6 +1204,9 @@ mod tests {
             input_tokens: 7,
             output_tokens: 3,
             total_tokens: 10,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         }
     }
@@ -1162,6 +1297,14 @@ mod tests {
             gc_log: false,
             gc_timing: crate::gc::GcTiming::Threshold,
             context_budget: 200_000,
+            // Pricing for the mock model so the golden pins the cost
+            // attrs (t-1334): 7 in + 3 out tokens at $3/$15 per Mtok =
+            // 66 micro-USD.
+            pricing: {
+                let mut table = crate::cost::PricingTable::default();
+                table.insert("mock", crate::cost::Pricing::from_usd_per_mtok(3.0, 15.0)?);
+                table
+            },
         };
 
         let (value, _machine) = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
@@ -1169,6 +1312,7 @@ mod tests {
         trace
             .emit(&Event::AgentDone {
                 run_id: "golden-run".into(),
+                usage: None,
                 timestamp: Utc::now(),
             })
             .await?;

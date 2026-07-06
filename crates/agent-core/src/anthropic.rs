@@ -244,6 +244,10 @@ fn parse_messages_response(text: &str) -> Result<Response> {
             .usage
             .input_tokens
             .saturating_add(response.usage.output_tokens),
+        cached_input_tokens: response.usage.cache_read_input_tokens,
+        // Cost is stamped at trace-emission time (crate::cost), not here.
+        cost_micro_usd: None,
+        pricing: None,
         metadata: Default::default(),
     })
 }
@@ -274,6 +278,10 @@ enum AnthropicContentBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    /// Prompt-cache read tokens; recorded when the API reports them,
+    /// never fabricated (t-1334).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 #[cfg(test)]

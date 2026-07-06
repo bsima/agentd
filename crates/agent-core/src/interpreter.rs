@@ -256,6 +256,12 @@ pub struct SeqConfig {
     pub gc_log: bool,
     pub gc_timing: GcTiming,
     pub context_budget: usize,
+    /// Model pricing used to stamp `cost_micro_usd`/`pricing` onto live
+    /// InferResults at emission time (t-1334). Keyed by model id string
+    /// (registry alias and provider api id). Empty table = usage recorded,
+    /// cost omitted. Replayed InferResults never consult this: recorded
+    /// costs pass through verbatim.
+    pub pricing: crate::cost::PricingTable,
 }
 
 impl SeqConfig {
@@ -354,7 +360,7 @@ where
                     other => break other,
                 }
             };
-            let response = match result {
+            let mut response = match result {
                 Ok(response) => response,
                 Err(err) => {
                     let err = annotate_overflow_failure(err, overflow_cycles);
@@ -372,6 +378,13 @@ where
                     return Err(err);
                 }
             };
+            // Live responses get cost stamped from the registry pricing;
+            // replayed responses carry their recorded cost untouched so a
+            // replay reproduces the original totals even if today's
+            // models.yaml prices differ (t-1334).
+            if config.replay.is_none() {
+                crate::cost::price_response(&mut response, &config.pricing, &model.0);
+            }
             config
                 .trace
                 .emit(&Event::InferResult {
@@ -383,6 +396,9 @@ where
                     input_tokens: response.input_tokens,
                     output_tokens: response.output_tokens,
                     total_tokens: response.total_tokens,
+                    cached_input_tokens: response.cached_input_tokens,
+                    cost_micro_usd: response.cost_micro_usd,
+                    pricing: response.pricing,
                     duration_ms: millis_u64(started.elapsed()),
                     timestamp: Utc::now(),
                 })
@@ -1022,6 +1038,9 @@ mod tests {
             input_tokens: 3,
             output_tokens: 4,
             total_tokens: 7,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         }
     }
@@ -1052,6 +1071,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 100,
+            pricing: Default::default(),
         };
         let prompt = vec![
             ChatMessage::system("system"),
@@ -1088,6 +1108,7 @@ mod tests {
             gc_log: true,
             gc_timing: GcTiming::Threshold,
             context_budget: 100,
+            pricing: Default::default(),
         };
         // One message alone larger than the whole budget: only the truncate
         // pre-pass can shrink it, and that must be visible as its own event.
@@ -1138,6 +1159,7 @@ mod tests {
             gc_log: true,
             gc_timing: timing,
             context_budget: 200_000,
+            pricing: Default::default(),
         }
     }
 
@@ -1365,6 +1387,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let prompt = vec![ChatMessage::user("use echo")];
 
@@ -1420,6 +1443,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let prompt = vec![ChatMessage::user("do two steps")];
 
@@ -1464,6 +1488,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
 
         let program = infer(Model("mock".into()), vec![ChatMessage::user("first")]).and_then(
@@ -1562,6 +1587,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let prompt = vec![ChatMessage::user("answer")];
 
@@ -1612,6 +1638,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
 
         let (timeout_result, _) = run_sequential(&config, (), crate::op::eval("sleep 1")).await?;
@@ -1877,6 +1904,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         }
     }
 
@@ -1914,6 +1942,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
 
         let (result, _) = run_sequential(
@@ -1947,6 +1976,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
 
         let _ = run_sequential(
@@ -1982,6 +2012,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
             .and_then(|_| crate::op::eval("printf replayed"));
@@ -2004,11 +2035,141 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")])
             .and_then(|_| crate::op::eval("printf replayed"));
         let (replayed, _) = run_sequential(&replay_config, (), program).await?;
         assert_eq!(replayed, recorded);
+        Ok(())
+    }
+
+    /// t-1334 acceptance: a replayed run reproduces the ORIGINAL usage and
+    /// cost exactly — the recorded values pass through the replayed
+    /// Response, and neither the per-event cost nor the AgentDone rollup is
+    /// recomputed from whatever pricing the replaying machine has today.
+    #[tokio::test]
+    async fn replay_reproduces_recorded_usage_and_cost_totals() -> Result<()> {
+        let cost_fields = |event: &Event| match event {
+            Event::InferResult {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cached_input_tokens,
+                cost_micro_usd,
+                pricing,
+                ..
+            } => Some((
+                *input_tokens,
+                *output_tokens,
+                *total_tokens,
+                *cached_input_tokens,
+                *cost_micro_usd,
+                *pricing,
+            )),
+            _ => None,
+        };
+        let mut provider_response = response("recorded", vec![]);
+        provider_response.cached_input_tokens = Some(2);
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let mut record_pricing = crate::cost::PricingTable::default();
+        record_pricing.insert("mock", crate::cost::Pricing::from_usd_per_mtok(3.0, 15.0)?);
+        let record_config = SeqConfig {
+            tools: Default::default(),
+            provider: Arc::new(MockProvider::new(vec![provider_response])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            trace: record_trace.clone(),
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            gc_timing: GcTiming::Threshold,
+            context_budget: 200_000,
+            pricing: record_pricing,
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
+        let _ = run_sequential(&record_config, (), program).await?;
+        record_trace
+            .emit(&Event::AgentDone {
+                run_id: record_trace.run_id().into(),
+                usage: None,
+                timestamp: Utc::now(),
+            })
+            .await?;
+
+        let recorded_events = TraceLogger::read_events(&record_path).await?;
+        let recorded = recorded_events
+            .iter()
+            .find_map(cost_fields)
+            .expect("recorded InferResult");
+        // 3 input + 4 output tokens at $3/$15 per Mtok = 69 micro-USD.
+        let pricing = crate::cost::Pricing {
+            input_micro_usd_per_mtok: 3_000_000,
+            output_micro_usd_per_mtok: 15_000_000,
+        };
+        assert_eq!(recorded, (3, 4, 7, Some(2), Some(69), Some(pricing)));
+
+        // Replay under a WILDLY different pricing table: if anything
+        // recomputed, cost would come out at $100/Mtok rates, not 69.
+        let mut replay_pricing = crate::cost::PricingTable::default();
+        replay_pricing.insert(
+            "mock",
+            crate::cost::Pricing::from_usd_per_mtok(100.0, 100.0)?,
+        );
+        let replay_trace = test_trace();
+        let replay_path = replay_trace.path().clone();
+        let replay_config = SeqConfig {
+            tools: Default::default(),
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            trace: replay_trace.clone(),
+            eval: EvalConfig::default(),
+            replay: Some(ReplayTrace::from_events(&recorded_events)),
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: GcMode::None,
+            gc_threshold: 0.85,
+            gc_log: false,
+            gc_timing: GcTiming::Threshold,
+            context_budget: 200_000,
+            pricing: replay_pricing,
+        };
+        let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
+        let (replayed_response, _) = run_sequential(&replay_config, (), program).await?;
+        assert_eq!(replayed_response.cost_micro_usd, Some(69));
+        replay_trace
+            .emit(&Event::AgentDone {
+                run_id: replay_trace.run_id().into(),
+                usage: None,
+                timestamp: Utc::now(),
+            })
+            .await?;
+
+        let replayed_events = TraceLogger::read_events(&replay_path).await?;
+        let replayed = replayed_events
+            .iter()
+            .find_map(cost_fields)
+            .expect("replayed InferResult");
+        assert_eq!(replayed, recorded, "per-event usage/cost must match");
+        let rollup = |events: &[Event]| {
+            events.iter().find_map(|event| match event {
+                Event::AgentDone { usage, .. } => usage.clone(),
+                _ => None,
+            })
+        };
+        let recorded_rollup = rollup(&recorded_events).expect("recorded rollup");
+        assert_eq!(recorded_rollup.cost_micro_usd, Some(69));
+        assert_eq!(
+            rollup(&replayed_events),
+            Some(recorded_rollup),
+            "replayed run rollup must equal the original"
+        );
         Ok(())
     }
 
@@ -2032,6 +2193,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
 
@@ -2072,6 +2234,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
         let err = run_sequential(&record_config, (), program)
@@ -2108,6 +2271,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
         let err = run_sequential(&replay_config, (), program)
@@ -2143,6 +2307,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         };
 
         let result = run_sequential(&config, (), crate::op::eval("printf hi")).await;

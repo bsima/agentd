@@ -834,7 +834,7 @@ async fn execute_instr(
                     other => break other,
                 }
             };
-            let response = match result {
+            let mut response = match result {
                 Ok(response) => response,
                 Err(err) => {
                     let err = annotate_overflow_failure(err, overflow_cycles);
@@ -859,6 +859,13 @@ async fn execute_instr(
                     return Err(err);
                 }
             };
+            // Live responses get cost stamped from the registry pricing;
+            // replayed responses carry their recorded cost untouched so a
+            // replay reproduces the original totals even if today's
+            // models.yaml prices differ (t-1334).
+            if live {
+                crate::cost::price_response(&mut response, &config.pricing, &model);
+            }
             config
                 .trace
                 .emit(&Event::InferResult {
@@ -870,6 +877,9 @@ async fn execute_instr(
                     input_tokens: response.input_tokens,
                     output_tokens: response.output_tokens,
                     total_tokens: response.total_tokens,
+                    cached_input_tokens: response.cached_input_tokens,
+                    cost_micro_usd: response.cost_micro_usd,
+                    pricing: response.pricing,
                     duration_ms: millis_u64(started.elapsed()),
                     timestamp: Utc::now(),
                 })
@@ -1759,6 +1769,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 1,
             total_tokens: 1,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         }
     }
@@ -1788,6 +1801,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         }
     }
 

@@ -41,6 +41,9 @@ fn response(content: &str, finish_reason: FinishReason) -> Response {
         input_tokens: 0,
         output_tokens: 1,
         total_tokens: 1,
+        cached_input_tokens: None,
+        cost_micro_usd: None,
+        pricing: None,
         metadata: Default::default(),
     }
 }
@@ -68,6 +71,7 @@ fn record_replay_fixture(path: &std::path::Path, responses: Vec<Response>) {
         gc_log: false,
         gc_timing: GcTiming::Threshold,
         context_budget: 200_000,
+        pricing: Default::default(),
     };
     let machine = agent_loop_ir(Model("mock".into()), vec![ChatMessage::user("hello")], 16);
     tokio::runtime::Runtime::new()

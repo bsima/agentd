@@ -9,6 +9,19 @@
 # services such as Ava.
 #
 # API keys can be literal strings, but env var references are safer.
+#
+# Cost accounting (t-1334): give a model an optional `pricing` block (USD per
+# million tokens) and every InferResult trace event records the call's token
+# cost in integer micro-USD plus the rates used:
+#
+#     pricing:
+#       input_per_mtok_usd: 3.0
+#       output_per_mtok_usd: 15.0
+#
+# No pricing block = usage is still recorded, cost is omitted (absent means
+# unknown — it is never guessed and never zero). The legacy flat
+# `input`/`output` fields below are NOT read for cost accounting.
+# Roll up a trace with: agent cost --trace <file.jsonl> [--json]
 
 # Used when --model is omitted.
 default_model: openrouter/auto
@@ -33,6 +46,9 @@ models:
     api_id: gpt-4o-mini
     input: 0.15
     output: 0.60
+    pricing:
+      input_per_mtok_usd: 0.15
+      output_per_mtok_usd: 0.60
     context: 128000
     thinking: false
     vision: true
@@ -45,6 +61,9 @@ models:
     api_id: claude-sonnet-4-6
     input: 3.0
     output: 15.0
+    pricing:
+      input_per_mtok_usd: 3.0
+      output_per_mtok_usd: 15.0
     context: 1000000
     thinking: true
     vision: true

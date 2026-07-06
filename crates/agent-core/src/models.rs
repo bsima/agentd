@@ -1,6 +1,23 @@
+use crate::cost::{Pricing, PricingTable};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+/// Optional cost-accounting rates for a model entry, in USD per million
+/// tokens (t-1334). Absent pricing means Infer usage is recorded but cost
+/// is omitted — never guessed, never zero.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricingEntry {
+    pub input_per_mtok_usd: f64,
+    pub output_per_mtok_usd: f64,
+}
+
+impl PricingEntry {
+    fn to_pricing(&self, model: &str) -> Result<Pricing> {
+        Pricing::from_usd_per_mtok(self.input_per_mtok_usd, self.output_per_mtok_usd)
+            .with_context(|| format!("invalid pricing for model {model:?}"))
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
@@ -23,6 +40,12 @@ pub struct ModelEntry {
     #[serde(default)]
     pub vision: bool,
     pub display: Option<String>,
+    /// Cost-accounting rates (USD per Mtok); serde-optional so existing
+    /// models.yaml files load unchanged. The legacy flat `input`/`output`
+    /// fields above are NOT read for cost accounting (their zero default
+    /// cannot distinguish "free" from "unknown").
+    #[serde(default)]
+    pub pricing: Option<PricingEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +63,9 @@ pub struct ResolvedModel {
     pub api_key: Option<String>,
     pub context: usize,
     pub max_tokens: Option<u32>,
+    /// Registry pricing for this model, already validated/converted to the
+    /// exact integer representation. None = no pricing configured.
+    pub pricing: Option<Pricing>,
 }
 
 impl ModelRegistry {
@@ -83,7 +109,33 @@ impl ModelRegistry {
             api_key: expand_api_key(entry.api_key.as_deref())?,
             context: entry.context,
             max_tokens: entry.max_tokens,
+            pricing: entry
+                .pricing
+                .as_ref()
+                .map(|pricing| pricing.to_pricing(&entry.name))
+                .transpose()?,
         })
+    }
+
+    /// Pricing lookup table over the whole registry, keyed by both the
+    /// registry alias (`name`) and the provider `api_id` — trace events
+    /// record the model id the Infer actually ran with, which is the api id
+    /// for registry-resolved models and may be either for dynamic
+    /// (tool-supplied) models. First entry wins on key collisions, matching
+    /// the resolve order of the file.
+    pub fn pricing_table(&self) -> Result<PricingTable> {
+        let mut table = PricingTable::default();
+        for entry in &self.models {
+            let Some(pricing) = entry.pricing.as_ref() else {
+                continue;
+            };
+            let pricing = pricing.to_pricing(&entry.name)?;
+            table.insert(entry.name.clone(), pricing);
+            if let Some(api_id) = entry.api_id.as_deref() {
+                table.insert(api_id.to_owned(), pricing);
+            }
+        }
+        Ok(table)
     }
 }
 
@@ -136,6 +188,9 @@ models:
   thinking: false
   vision: false
   display: Qwen3 235B (parasail)
+  pricing:
+    input_per_mtok_usd: 0.5
+    output_per_mtok_usd: 2.0
 - name: direct-name
   provider: openai-compatible
   input: 1.0
@@ -176,5 +231,60 @@ models:
         assert!(err.contains("parasail/qwen3-235b"), "got: {err}");
         assert_eq!(registry.resolve(Some("direct-name"))?.api_id, "direct-name");
         Ok(())
+    }
+
+    /// Pricing is optional per entry: present entries resolve to the exact
+    /// integer rates, absent entries resolve to None (usage recorded, cost
+    /// omitted — the legacy flat input/output fields are deliberately NOT
+    /// read as pricing).
+    #[test]
+    fn pricing_is_optional_and_resolves_to_integer_rates() -> Result<()> {
+        let registry = ModelRegistry::from_yaml_str(MODELS)?;
+        let priced = registry.resolve(Some("parasail/qwen3-235b"))?;
+        assert_eq!(
+            priced.pricing,
+            Some(Pricing {
+                input_micro_usd_per_mtok: 500_000,
+                output_micro_usd_per_mtok: 2_000_000,
+            })
+        );
+        // `input: 1.0 / output: 1.0` (legacy fields) must not leak into
+        // pricing: absent means absent.
+        assert_eq!(registry.resolve(Some("direct-name"))?.pricing, None);
+        Ok(())
+    }
+
+    #[test]
+    fn pricing_table_is_keyed_by_alias_and_api_id() -> Result<()> {
+        let registry = ModelRegistry::from_yaml_str(MODELS)?;
+        let table = registry.pricing_table()?;
+        let expected = Pricing {
+            input_micro_usd_per_mtok: 500_000,
+            output_micro_usd_per_mtok: 2_000_000,
+        };
+        assert_eq!(table.get("parasail/qwen3-235b"), Some(&expected));
+        assert_eq!(
+            table.get("parasail-qwen3-235b-a22b-instruct-2507"),
+            Some(&expected)
+        );
+        assert_eq!(table.get("direct-name"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn negative_pricing_fails_closed() {
+        let yaml = r#"
+default_model: m
+models:
+- name: m
+  provider: openai-compatible
+  pricing:
+    input_per_mtok_usd: -1.0
+    output_per_mtok_usd: 2.0
+"#;
+        let registry = ModelRegistry::from_yaml_str(yaml).expect("parses");
+        let err = registry.resolve(Some("m")).unwrap_err().to_string();
+        assert!(err.contains("invalid pricing"), "got: {err}");
+        assert!(registry.pricing_table().is_err());
     }
 }

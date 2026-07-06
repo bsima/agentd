@@ -861,6 +861,7 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
     let mut input_tokens = 0_u32;
     let mut output_tokens = 0_u32;
     let mut total_tokens = 0_u32;
+    let mut cached_input_tokens = None;
 
     for event_text in parse_sse_events(text) {
         let Some(event) = parse_sse_event_json(event_text) else {
@@ -909,7 +910,7 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
                 }
             }
             Some("response.completed" | "response.done") => {
-                if let Some((input, output, total)) = event
+                if let Some((input, output, total, cached)) = event
                     .get("response")
                     .and_then(|response| response.get("usage"))
                     .and_then(codex_token_usage)
@@ -917,6 +918,7 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
                     input_tokens = input;
                     output_tokens = output;
                     total_tokens = total;
+                    cached_input_tokens = cached;
                 }
             }
             Some("error" | "response.failed") => {
@@ -961,6 +963,10 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
         input_tokens,
         output_tokens,
         total_tokens,
+        cached_input_tokens,
+        // Cost is stamped at trace-emission time (agent_core::cost).
+        cost_micro_usd: None,
+        pricing: None,
         metadata: Default::default(),
     })
 }
@@ -1030,7 +1036,7 @@ fn extract_codex_output_text(item: &Value) -> String {
         .join("")
 }
 
-fn codex_token_usage(usage: &Value) -> Option<(u32, u32, u32)> {
+fn codex_token_usage(usage: &Value) -> Option<(u32, u32, u32, Option<u32>)> {
     let input = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -1046,7 +1052,14 @@ fn codex_token_usage(usage: &Value) -> Option<(u32, u32, u32)> {
         .and_then(Value::as_u64)
         .and_then(|tokens| u32::try_from(tokens).ok())
         .unwrap_or_else(|| input.saturating_add(output));
-    Some((input, output, total))
+    // Responses-API cached-prompt breakdown; recorded when present, never
+    // fabricated (t-1334).
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok());
+    Some((input, output, total, cached))
 }
 
 fn extract_codex_account_id(token: &str) -> Option<String> {

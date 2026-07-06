@@ -299,6 +299,9 @@ async fn send_chat_request(
         let total_tokens = usage
             .total_tokens
             .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        let cached_input_tokens = usage
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens);
         let finish_reason = choice
             .finish_reason
             .as_deref()
@@ -339,6 +342,11 @@ async fn send_chat_request(
             input_tokens,
             output_tokens,
             total_tokens,
+            cached_input_tokens,
+            // Cost is stamped at trace-emission time from the registry
+            // pricing (crate::cost); the provider layer never prices.
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         })
     }
@@ -557,6 +565,14 @@ struct Usage {
     total_tokens: Option<u32>,
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
+    /// OpenAI-compatible cached-prompt breakdown; recorded when present,
+    /// never fabricated (t-1334).
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    cached_tokens: Option<u32>,
 }
 
 #[cfg(test)]
@@ -572,6 +588,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         }
     }

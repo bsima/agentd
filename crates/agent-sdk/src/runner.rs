@@ -358,6 +358,7 @@ async fn execute(
         gc_log: false,
         gc_timing: GcTiming::Threshold,
         context_budget,
+        pricing: Default::default(),
     };
     let options = AgentLoopOptions {
         memory_tools,
@@ -410,6 +411,7 @@ async fn execute(
     trace
         .emit(&Event::AgentDone {
             run_id: run_id.clone(),
+            usage: None,
             timestamp: Utc::now(),
         })
         .await

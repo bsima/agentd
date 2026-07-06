@@ -1,6 +1,6 @@
 # Public Trace Event Schema
 
-`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.2**, see the version history at the end)
+`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.3**, see the version history at the end)
 
 This document is the contract for consumers of agentd trace data: the SDK
 trace adapter, dashboard ingest, and any external tooling. It defines a
@@ -163,7 +163,7 @@ same `run_id`/`op_id`.
 | public event | mapped from runtime variant | status | `payload_preview` | `attrs` keys |
 |---|---|---|---|---|
 | `infer.started` | `InferCall` | `started` | prompt preview | `model` |
-| `infer.completed` | `InferResult` | `completed` | response preview | `duration_ms`, `input_tokens`, `output_tokens`, `total_tokens` |
+| `infer.completed` | `InferResult` | `completed` | response preview | `duration_ms`, `input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens`?, `cost_micro_usd`?, `pricing`? |
 | `infer.failed` | `InferError` | `failed` | — | `duration_ms` |
 | `eval.started` | `EvalCall` | `started` | display command | `argv`? (string[], direct-exec only), `cwd`?, `env_policy`, `timeout_ms` |
 | `eval.completed` | `EvalResult` | `completed` | stdout preview | `command`, `duration_ms`, `ok`?, `exit_code`?, `timed_out`?, `truncated_stdout`, `truncated_stderr` |
@@ -177,7 +177,7 @@ same `run_id`/`op_id`.
 | `tool.requested` | `ToolCall` | `started` | arguments preview | `name` |
 | `tool.completed` | `ToolResult` | `completed` | result preview | `duration_ms`, `name` |
 | `tool.failed` | `ToolError` | `failed` | — | `duration_ms`, `name` |
-| `run.completed` | `AgentDone` | `completed` | — | — |
+| `run.completed` | `AgentDone` | `completed` | — | `infer_calls`?, `input_tokens`?, `output_tokens`?, `total_tokens`?, `cached_input_tokens`?, `cost_micro_usd`?, `uncosted_infer_calls`? |
 | `output.validation_failed` | `Custom { name: "output_validation_failed" }` | `failed` | invalid final-output excerpt | `attempt` (1-based), `errors` (string[], capped at 8) |
 
 (`?` = present only when the runtime recorded a value.)
@@ -193,6 +193,31 @@ tools are unchanged: shell/infer/remember/recall still surface as the
 `Tool`); `attrs.name` on all three is the registered tool name. Handler
 failures ride the loop's errors-as-values convention, so a `tool.failed` is
 usually followed by the model reacting to the error, not by run failure.
+
+Cost accounting attrs (since 1.3, t-1334): all cost arithmetic is exact
+integer math — see `agent_core::cost`.
+
+- `infer.completed`: `cached_input_tokens` is the provider-reported cached
+  prompt-token count (OpenAI-compatible `prompt_tokens_details.cached_tokens`,
+  Anthropic `cache_read_input_tokens`, codex Responses
+  `input_tokens_details.cached_tokens`), present only when the provider
+  reported it. `cost_micro_usd` is this call's cost in **integer micro-USD**
+  (`input_tokens` and `output_tokens` at the model's registry rates, rounded
+  half-up once per call); `pricing` is the rate snapshot used, an object
+  `{ "input_micro_usd_per_mtok": u64, "output_micro_usd_per_mtok": u64 }`
+  (micro-USD per million tokens, so `$3.00/Mtok` is `3000000`). Both are
+  present exactly when the model had pricing configured in models.yaml at
+  record time — **absent means unknown pricing, never zero** — and are part
+  of the recorded payload: replayed runs re-emit the recorded values
+  verbatim rather than repricing.
+- `run.completed`: rollup of every InferResult recorded in the run —
+  integer sums of the per-event values (floats are never accumulated).
+  `uncosted_infer_calls` counts infers recorded without cost, so a partial
+  `cost_micro_usd` total is visibly partial. `cached_input_tokens` /
+  `cost_micro_usd` are absent when no event in the run carried them; the
+  whole attr group is absent for infer-less runs and traces recorded before
+  1.3. `agent cost --trace <file.jsonl> [--json]` prints the same rollup
+  (plus per-model breakdowns) from a trace file.
 
 `output.validation_failed` (since 1.1, t-1308.4): the run has an output
 contract (`--output-schema`) and a natural final response failed JSON
@@ -272,6 +297,12 @@ neither constrains the other today.
 
 ## Version history
 
+- **1.3** (t-1334) — additive: cost accounting. `infer.completed` gains
+  `cached_input_tokens`, `cost_micro_usd`, and `pricing` attrs (present when
+  recorded); `run.completed` gains the usage/cost rollup attrs
+  (`infer_calls`, `input_tokens`, `output_tokens`, `total_tokens`,
+  `cached_input_tokens`?, `cost_micro_usd`?, `uncosted_infer_calls`). Wire
+  `schema_version` stays `1` per the compatibility policy.
 - **1.2** (t-1308.7) — additive: the reserved `tool.requested` /
   `tool.completed` / `tool.failed` are now emitted (projected from the new
   runtime `ToolCall`/`ToolResult`/`ToolError` events) for registered native

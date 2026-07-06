@@ -51,6 +51,19 @@ pub enum Event {
         input_tokens: u32,
         output_tokens: u32,
         total_tokens: u32,
+        /// Provider-reported cached prompt tokens; absent when the provider
+        /// did not report any (t-1334). Old traces deserialize to None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_input_tokens: Option<u32>,
+        /// Cost of this call in integer micro-USD (see [`crate::cost`]).
+        /// Absent when no pricing was configured for the model — absent
+        /// means unknown, never zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micro_usd: Option<u64>,
+        /// The pricing rates (micro-USD per Mtok) used for `cost_micro_usd`,
+        /// snapshotted so the trace is self-contained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pricing: Option<crate::cost::Pricing>,
         duration_ms: u64,
         timestamp: DateTime<Utc>,
     },
@@ -308,6 +321,12 @@ pub enum Event {
     },
     AgentDone {
         run_id: String,
+        /// Per-run usage/cost rollup (t-1334): exact integer sums of the
+        /// run's recorded InferResult usage and micro-USD costs, stamped by
+        /// [`TraceLogger`] when the run recorded at least one InferResult.
+        /// Absent on infer-less runs and on traces recorded before t-1334.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::cost::RunUsage>,
         timestamp: DateTime<Utc>,
     },
     Custom {
@@ -518,6 +537,8 @@ impl Event {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                cached_input_tokens,
+                cost_micro_usd,
                 duration_ms,
                 response_preview,
                 ..
@@ -534,6 +555,15 @@ impl Event {
                     "gen_ai.usage.total_tokens",
                     i64::from(*total_tokens),
                 ));
+                if let Some(cached) = cached_input_tokens {
+                    attrs.push(KeyValue::new(
+                        "gen_ai.usage.cached_input_tokens",
+                        i64::from(*cached),
+                    ));
+                }
+                if let Some(cost) = cost_micro_usd {
+                    attrs.push(KeyValue::new("agent.cost_micro_usd", *cost as i64));
+                }
                 attrs.push(KeyValue::new("duration_ms", *duration_ms as i64));
                 attrs.push(KeyValue::new(
                     "agent.response_preview",
@@ -1044,6 +1074,13 @@ pub struct TraceLogger {
     next_op_id: Arc<AtomicU64>,
     sinks: Arc<Vec<Arc<dyn TraceSink>>>,
     context_env: TraceContextEnv,
+    /// Running usage/cost rollup (t-1334): every InferResult emitted through
+    /// this logger (or a clone) is folded in, and an `AgentDone` emitted
+    /// without a usage payload is stamped with the totals. Sums are exact
+    /// integer arithmetic over the recorded per-event values, so replayed
+    /// runs (which re-emit the recorded usage/cost) reproduce the original
+    /// rollup exactly.
+    usage: Arc<Mutex<crate::cost::RunUsage>>,
 }
 
 impl TraceLogger {
@@ -1072,6 +1109,7 @@ impl TraceLogger {
             next_op_id: Arc::new(AtomicU64::new(1)),
             sinks: Arc::new(sinks),
             context_env,
+            usage: Arc::new(Mutex::new(crate::cost::RunUsage::default())),
         }
     }
 
@@ -1098,10 +1136,52 @@ impl TraceLogger {
     }
 
     pub async fn emit(&self, event: &Event) -> Result<()> {
+        let enriched = self.fold_usage(event);
+        let event = enriched.as_ref().unwrap_or(event);
         for sink in self.sinks.iter() {
             sink.emit(event).await?;
         }
         Ok(())
+    }
+
+    /// Fold InferResult usage/cost into the run rollup; stamp the rollup
+    /// onto an `AgentDone` that does not already carry one. Returns the
+    /// replacement event when the input event was enriched. AgentDone stays
+    /// untouched when the run recorded no InferResults (absent means
+    /// absent) or when the caller supplied its own rollup.
+    fn fold_usage(&self, event: &Event) -> Option<Event> {
+        match event {
+            Event::InferResult {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cached_input_tokens,
+                cost_micro_usd,
+                ..
+            } => {
+                self.usage.lock().unwrap().observe_infer(
+                    *input_tokens,
+                    *output_tokens,
+                    *total_tokens,
+                    *cached_input_tokens,
+                    *cost_micro_usd,
+                );
+                None
+            }
+            Event::AgentDone {
+                run_id,
+                usage: None,
+                timestamp,
+            } => {
+                let usage = self.usage.lock().unwrap().clone();
+                (!usage.is_empty()).then(|| Event::AgentDone {
+                    run_id: run_id.clone(),
+                    usage: Some(usage),
+                    timestamp: *timestamp,
+                })
+            }
+            _ => None,
+        }
     }
 
     pub async fn read_events(path: impl AsRef<Path>) -> Result<Vec<Event>> {
@@ -1274,6 +1354,71 @@ mod tests {
         Ok(())
     }
 
+    /// Serde back-compat for the t-1334 cost fields: an InferResult line
+    /// written before cost accounting (no cached/cost/pricing keys, and a
+    /// Response payload without them) still deserializes; a costless new
+    /// event serializes without the keys; a costed event round-trips.
+    #[test]
+    fn infer_result_cost_fields_are_optional_and_round_trip() -> Result<()> {
+        // Verbatim pre-t-1334 trace line shape.
+        let old_line = r#"{"event":"InferResult","run_id":"run","op_id":2,"response":{"content":"hi","tool_calls":[],"finish_reason":"stop","input_tokens":3,"output_tokens":4,"total_tokens":7},"response_preview":"hi","input_tokens":3,"output_tokens":4,"total_tokens":7,"duration_ms":1,"timestamp":"2026-05-29T00:00:00Z"}"#;
+        let event: Event = serde_json::from_str(old_line)?;
+        let Event::InferResult {
+            cached_input_tokens,
+            cost_micro_usd,
+            pricing,
+            response: Some(response),
+            ..
+        } = &event
+        else {
+            panic!("expected InferResult, got {event:?}");
+        };
+        assert_eq!(*cached_input_tokens, None);
+        assert_eq!(*cost_micro_usd, None);
+        assert_eq!(*pricing, None);
+        assert_eq!(response.cost_micro_usd, None);
+        // A costless event stays byte-compatible: no new keys appear.
+        let json = serde_json::to_string(&event)?;
+        for key in ["cached_input_tokens", "cost_micro_usd", "pricing"] {
+            assert!(!json.contains(key), "costless line grew {key}: {json}");
+        }
+        assert_eq!(serde_json::from_str::<Event>(&json)?, event);
+
+        // A costed event round-trips with the recorded snapshot intact.
+        let pricing = crate::cost::Pricing {
+            input_micro_usd_per_mtok: 3_000_000,
+            output_micro_usd_per_mtok: 15_000_000,
+        };
+        let costed = Event::InferResult {
+            run_id: "run".into(),
+            op_id: 3,
+            parent_op_id: None,
+            response: None,
+            response_preview: "ok".into(),
+            input_tokens: 7,
+            output_tokens: 3,
+            total_tokens: 10,
+            cached_input_tokens: Some(2),
+            cost_micro_usd: Some(66),
+            pricing: Some(pricing),
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&costed)?;
+        assert!(json.contains("\"cost_micro_usd\":66"), "{json}");
+        assert!(
+            json.contains("\"input_micro_usd_per_mtok\":3000000"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json)?, costed);
+
+        // Pre-t-1334 AgentDone lines (no usage) still parse.
+        let old_done = r#"{"event":"AgentDone","run_id":"run","timestamp":"2026-05-29T00:00:00Z"}"#;
+        let done: Event = serde_json::from_str(old_done)?;
+        assert!(matches!(done, Event::AgentDone { usage: None, .. }));
+        Ok(())
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<Event>>,
@@ -1290,6 +1435,7 @@ mod tests {
     fn done_event(run_id: &str) -> Event {
         Event::AgentDone {
             run_id: run_id.into(),
+            usage: None,
             timestamp: Utc::now(),
         }
     }
@@ -1360,6 +1506,62 @@ mod tests {
         Ok(())
     }
 
+    /// t-1334: the logger folds every emitted InferResult into a run rollup
+    /// and stamps it onto AgentDone. Sums are the recorded integers, cost
+    /// stays partial-and-flagged when some infers had no pricing, and an
+    /// infer-less run's AgentDone stays untouched (covered by
+    /// `trace_logger_emits_to_all_sinks_and_preserves_jsonl_readback`,
+    /// which asserts byte-equality for a bare AgentDone).
+    #[tokio::test]
+    async fn trace_logger_stamps_run_usage_onto_agent_done() -> Result<()> {
+        let recording = Arc::new(RecordingSink::default());
+        let logger = TraceLogger::with_sinks(
+            "run",
+            std::env::temp_dir().join("unused.jsonl"),
+            vec![recording.clone()],
+        );
+        let infer_result = |op_id, cached, cost| Event::InferResult {
+            run_id: "run".into(),
+            op_id,
+            parent_op_id: None,
+            response: None,
+            response_preview: String::new(),
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_input_tokens: cached,
+            cost_micro_usd: cost,
+            pricing: None,
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        };
+        logger.emit(&infer_result(1, Some(4), Some(100))).await?;
+        // A clone shares the rollup, like par branches share the logger.
+        logger.clone().emit(&infer_result(2, None, None)).await?;
+        logger.emit(&done_event("run")).await?;
+
+        let events = recording.events.lock().unwrap();
+        let Event::AgentDone {
+            usage: Some(usage), ..
+        } = &events[2]
+        else {
+            panic!("AgentDone missing usage rollup: {:?}", events[2]);
+        };
+        assert_eq!(
+            *usage,
+            crate::cost::RunUsage {
+                infer_calls: 2,
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+                cached_input_tokens: Some(4),
+                cost_micro_usd: Some(100),
+                uncosted_infer_calls: 1,
+            }
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn otel_sink_maps_spans_parents_and_traceparent() -> Result<()> {
         let (exporter, provider) = install_in_memory_tracer();
@@ -1387,6 +1589,9 @@ mod tests {
             input_tokens: 10,
             output_tokens: 32,
             total_tokens: 42,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             duration_ms: 9,
             timestamp: Utc::now(),
         })

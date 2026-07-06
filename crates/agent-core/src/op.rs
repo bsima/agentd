@@ -108,6 +108,24 @@ pub struct Response {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// Provider-reported cached prompt tokens (OpenAI-compatible
+    /// `usage.prompt_tokens_details.cached_tokens`, Anthropic
+    /// `usage.cache_read_input_tokens`). Recorded only when the provider
+    /// sent it — never fabricated (t-1334).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u32>,
+    /// USD cost of this call in integer micro-dollars, stamped at trace
+    /// emission time from the model registry pricing (see [`crate::cost`]
+    /// for units and rounding). Absent when the registry has no pricing for
+    /// the model. Part of the recorded result payload: replay returns the
+    /// recorded value verbatim and never recomputes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
+    /// The pricing rates used to compute `cost_micro_usd`, snapshotted so
+    /// traces are self-contained (nothing about cost depends on the
+    /// models.yaml of the machine reading the trace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::cost::Pricing>,
     /// Runtime annotations that travel with the response (e.g.
     /// stop_reason = "turn_budget_exhausted" when the agent loop returned
     /// because max_turns ran out rather than a natural stop — t-1133).
@@ -249,7 +267,9 @@ pub enum OpF<S, A> {
         next: Box<dyn FnOnce(Value) -> Op<S, A> + Send>,
     },
     Emit {
-        event: crate::trace::Event,
+        /// Boxed: `Event` is a wide enum (cost accounting grew InferResult
+        /// and AgentDone, t-1334) and would dominate OpF's size inline.
+        event: Box<crate::trace::Event>,
         next: Op<S, A>,
     },
     Par {
@@ -335,7 +355,7 @@ pub fn eval_argv<S: Send + 'static>(
 
 pub fn emit<S: Send + 'static>(event: crate::trace::Event) -> Op<S, ()> {
     Op(Box::new(OpF::Emit {
-        event,
+        event: Box::new(event),
         next: Op::pure(()),
     }))
 }
@@ -559,6 +579,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         }
     }
@@ -646,6 +669,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         }
     }
 
@@ -903,6 +927,7 @@ mod tests {
     async fn emit_and_pure_round_trip_through_sequential_interpreter() -> Result<()> {
         let event = crate::trace::Event::AgentDone {
             run_id: "op-test".into(),
+            usage: None,
             timestamp: chrono::Utc::now(),
         };
         let program = emit::<i32>(event).and_then(move |_| Op::pure(42));

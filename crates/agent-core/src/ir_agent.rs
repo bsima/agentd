@@ -1468,6 +1468,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 1,
             total_tokens: 1,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         }
     }
@@ -1499,6 +1502,7 @@ mod tests {
             gc_log: false,
             gc_timing: GcTiming::Threshold,
             context_budget: 200_000,
+            pricing: Default::default(),
         }
     }
 

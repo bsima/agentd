@@ -63,6 +63,9 @@ fn response(content: String, tool_calls: Vec<ToolCall>) -> Response {
         input_tokens: 0,
         output_tokens: 1,
         total_tokens: 1,
+        cached_input_tokens: None,
+        cost_micro_usd: None,
+        pricing: None,
         metadata: Default::default(),
     }
 }
@@ -167,6 +170,9 @@ impl SessionReplayFixture {
                 input_tokens: 0,
                 output_tokens: 1,
                 total_tokens: 1,
+                cached_input_tokens: None,
+                cost_micro_usd: None,
+                pricing: None,
                 duration_ms: 0,
                 timestamp: Utc::now(),
             });

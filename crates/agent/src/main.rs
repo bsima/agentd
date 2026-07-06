@@ -1,10 +1,11 @@
 use agent_core::{
-    agent_loop_ir, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatHistory, ChatMessage,
-    EnvPolicy, EvalConfig, Event, GcMode, GcTiming, HydrationSink, HydrationSource, InMemoryStore,
-    IrReplayTrace, JsonlTraceSink, MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink,
-    PassiveHydrationConfig, PassiveSource, ProviderClient, ProviderConfig, ReplayOnlyProvider,
-    ResolvedModel, RingGc, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry,
-    SourceResult, StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
+    agent_loop_ir, format_micro_usd, AgentIdGenerator, AnthropicConfig, AnthropicProvider,
+    ChatHistory, ChatMessage, EnvPolicy, EvalConfig, Event, GcMode, GcTiming, HydrationSink,
+    HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink, MarkSweepGc, MemorySource,
+    ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource, PricingTable,
+    ProviderClient, ProviderConfig, ReplayOnlyProvider, ResolvedModel, RingGc, RunUsage, SeqConfig,
+    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, StackFrameGc,
+    TemporalSource, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -184,6 +185,17 @@ enum EvalEnvMode {
 enum Command {
     /// Print GC statistics from a trace JSONL file.
     GcStats { trace: PathBuf },
+    /// Print per-model/per-run token usage and USD cost rollups from a
+    /// trace JSONL file (t-1334). Costs sum the integer micro-USD recorded
+    /// on each InferResult; infers recorded without pricing are counted as
+    /// "uncosted" rather than priced retroactively.
+    Cost {
+        #[arg(long)]
+        trace: PathBuf,
+        /// Emit machine-readable JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the AgentIR effect-location JSON for the entry Infer of the
     /// built-in agent loop. Eval scripts use it to build replay fixtures
     /// without hardcoding program hashes.
@@ -381,7 +393,8 @@ async fn main() -> Result<()> {
     };
     let system_prompt = build_system_prompt(system_prompt_override).await?;
 
-    let resolved_model = resolve_model(requested_model, provider_file.model.clone()).await?;
+    let (resolved_model, pricing_table) =
+        resolve_model(requested_model, provider_file.model.clone()).await?;
     let eval_config = EvalConfig {
         cwd: args.eval_cwd.clone(),
         timeout: Duration::from_secs(args.eval_timeout_seconds),
@@ -547,6 +560,7 @@ async fn main() -> Result<()> {
         gc_log: args.gc_log,
         gc_timing: args.gc_timing,
         context_budget,
+        pricing: pricing_table,
     };
     if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
         return Err(anyhow!(
@@ -700,7 +714,7 @@ fn reported_provider_url(oauth_provider: Option<&str>, resolved_url: &str) -> St
 async fn resolve_model(
     args_model: Option<String>,
     file_model: Option<String>,
-) -> Result<ResolvedModel> {
+) -> Result<(ResolvedModel, PricingTable)> {
     let requested = args_model
         .or(file_model)
         .or_else(|| std::env::var("AGENT_MODEL").ok());
@@ -708,24 +722,34 @@ async fn resolve_model(
 }
 
 /// Pure registry-or-fallback resolution, split from the env/filesystem reads
-/// so it is testable without mutating process-global state.
+/// so it is testable without mutating process-global state. Also returns the
+/// registry's pricing table (t-1334) so cost accounting covers dynamic
+/// (tool-supplied) model ids, not just the resolved one; the no-registry
+/// fallback has no pricing (usage recorded, cost omitted).
 fn resolve_model_from(
     registry: Result<ModelRegistry>,
     requested: Option<String>,
-) -> Result<ResolvedModel> {
+) -> Result<(ResolvedModel, PricingTable)> {
     match registry {
-        Ok(registry) => registry.resolve(requested.as_deref()),
+        Ok(registry) => Ok((
+            registry.resolve(requested.as_deref())?,
+            registry.pricing_table()?,
+        )),
         Err(_err) if requested.is_some() => {
             let model = requested.expect("requested model checked above");
-            Ok(ResolvedModel {
-                alias: model.clone(),
-                provider: None,
-                api_id: model,
-                base_url: None,
-                api_key: None,
-                context: 200_000,
-                max_tokens: None,
-            })
+            Ok((
+                ResolvedModel {
+                    alias: model.clone(),
+                    provider: None,
+                    api_id: model,
+                    base_url: None,
+                    api_key: None,
+                    context: 200_000,
+                    max_tokens: None,
+                    pricing: None,
+                },
+                PricingTable::default(),
+            ))
         }
         Err(err) => Err(err.context(
             "loading default model registry; create ~/.config/agent/models.yaml or pass --model with a raw model id",
@@ -963,6 +987,200 @@ async fn run_gc_stats_command(trace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Cost rollup over a trace (t-1334): per-run and per-model token/cost
+/// sums built purely from the recorded `InferResult` fields — the exact
+/// integer micro-USD values stamped at emission time. Nothing here consults
+/// models.yaml, so the same trace always rolls up to the same totals,
+/// including replayed traces.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CostReport {
+    runs: Vec<RunCostReport>,
+    total: RunUsage,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RunCostReport {
+    run_id: String,
+    /// Keyed by the model recorded on the paired InferCall (joined via
+    /// op_id); InferResults whose call is missing from the trace bucket
+    /// under "(unknown)".
+    per_model: BTreeMap<String, RunUsage>,
+    total: RunUsage,
+}
+
+impl CostReport {
+    fn from_events(events: &[Event]) -> Self {
+        // (run_id, op_id) -> model, from the InferCall side of each pair.
+        let mut model_by_op: BTreeMap<(String, u64), String> = BTreeMap::new();
+        for event in events {
+            if let Event::InferCall {
+                run_id,
+                op_id,
+                model,
+                ..
+            } = event
+            {
+                model_by_op.insert((run_id.clone(), *op_id), model.clone());
+            }
+        }
+        let mut report = Self::default();
+        let mut run_index: BTreeMap<String, usize> = BTreeMap::new();
+        for event in events {
+            let Event::InferResult {
+                run_id,
+                op_id,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cached_input_tokens,
+                cost_micro_usd,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let index = *run_index.entry(run_id.clone()).or_insert_with(|| {
+                report.runs.push(RunCostReport {
+                    run_id: run_id.clone(),
+                    per_model: BTreeMap::new(),
+                    total: RunUsage::default(),
+                });
+                report.runs.len() - 1
+            });
+            let run = &mut report.runs[index];
+            let model = model_by_op
+                .get(&(run_id.clone(), *op_id))
+                .cloned()
+                .unwrap_or_else(|| "(unknown)".into());
+            for usage in [
+                run.per_model.entry(model).or_default(),
+                &mut run.total,
+                &mut report.total,
+            ] {
+                usage.observe_infer(
+                    *input_tokens,
+                    *output_tokens,
+                    *total_tokens,
+                    *cached_input_tokens,
+                    *cost_micro_usd,
+                );
+            }
+        }
+        report
+    }
+
+    fn render(&self) -> String {
+        if self.runs.is_empty() {
+            return "no InferResult events in this trace\n".to_owned();
+        }
+        let mut out = String::new();
+        for run in &self.runs {
+            out.push_str(&format!("Run {}\n", run.run_id));
+            out.push_str(&format!(
+                "  {:<40} {:>7} {:>12} {:>12} {:>10} {:>14}\n",
+                "model", "infers", "input tok", "output tok", "cached", "cost (USD)"
+            ));
+            for (model, usage) in &run.per_model {
+                out.push_str(&render_usage_row(model, usage));
+            }
+            out.push_str(&render_usage_row("run total", &run.total));
+            if run.total.uncosted_infer_calls > 0 {
+                out.push_str(&format!(
+                    "  uncosted infer calls: {} (no pricing recorded; cost total is partial)\n",
+                    run.total.uncosted_infer_calls
+                ));
+            }
+            out.push('\n');
+        }
+        if self.runs.len() > 1 {
+            out.push_str(&format!(
+                "Total: {} infer(s), {} input + {} output = {} tokens, cost {}{}\n",
+                self.total.infer_calls,
+                self.total.input_tokens,
+                self.total.output_tokens,
+                self.total.total_tokens,
+                self.total
+                    .cost_micro_usd
+                    .map(format_micro_usd)
+                    .unwrap_or_else(|| "n/a".into()),
+                if self.total.uncosted_infer_calls > 0 {
+                    format!(" ({} uncosted)", self.total.uncosted_infer_calls)
+                } else {
+                    String::new()
+                },
+            ));
+        }
+        out
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "runs": self
+                .runs
+                .iter()
+                .map(|run| {
+                    serde_json::json!({
+                        "run_id": run.run_id,
+                        "models": run
+                            .per_model
+                            .iter()
+                            .map(|(model, usage)| (model.clone(), usage_json(usage)))
+                            .collect::<serde_json::Map<String, serde_json::Value>>(),
+                        "total": usage_json(&run.total),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "total": usage_json(&self.total),
+        })
+    }
+}
+
+fn render_usage_row(label: &str, usage: &RunUsage) -> String {
+    format!(
+        "  {:<40} {:>7} {:>12} {:>12} {:>10} {:>14}\n",
+        label,
+        usage.infer_calls,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage
+            .cached_input_tokens
+            .map(|cached| cached.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        usage
+            .cost_micro_usd
+            .map(format_micro_usd)
+            .unwrap_or_else(|| "n/a".into()),
+    )
+}
+
+/// JSON rendering of a rollup: the canonical integer `cost_micro_usd` plus
+/// a derived exact-decimal `cost_usd` string for humans/spreadsheets.
+fn usage_json(usage: &RunUsage) -> serde_json::Value {
+    let mut value = serde_json::to_value(usage).expect("RunUsage serializes");
+    if let (Some(cost), Some(object)) = (usage.cost_micro_usd, value.as_object_mut()) {
+        object.insert(
+            "cost_usd".into(),
+            serde_json::Value::String(format_micro_usd(cost).trim_start_matches('$').to_owned()),
+        );
+    }
+    value
+}
+
+async fn run_cost_command(trace: &Path, json: bool) -> Result<()> {
+    // read_events fails on any malformed JSONL line, which exits nonzero:
+    // a broken trace must never roll up to a silently-wrong total.
+    let events = TraceLogger::read_events(trace)
+        .await
+        .with_context(|| format!("reading trace {}", trace.display()))?;
+    let report = CostReport::from_events(&events);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+    } else {
+        print!("{}", report.render());
+    }
+    Ok(())
+}
+
 /// estimate_tokens drift against provider-reported usage (t-1163). Every
 /// InferResult carries the provider's real input_tokens; when the trace
 /// also recorded full prompts (--trace-full-payloads) we can re-estimate
@@ -1049,6 +1267,7 @@ impl CalibrationReport {
 async fn run_command(command: &Command) -> Result<()> {
     match command {
         Command::GcStats { trace } => run_gc_stats_command(trace).await,
+        Command::Cost { trace, json } => run_cost_command(trace, *json).await,
         Command::IrEffect { model, visit } => {
             let machine = agent_loop_ir(agent_core::Model(model.clone()), vec![], 16);
             let hash = agent_core::program_hash(&machine.program)?;
@@ -1137,6 +1356,7 @@ async fn run_one_shot(runtime: &mut Runtime, prompt: String) -> Result<()> {
         .trace
         .emit(&Event::AgentDone {
             run_id: runtime.run_id.clone(),
+            usage: None,
             timestamp: Utc::now(),
         })
         .await?;
@@ -1465,6 +1685,7 @@ async fn emit_done(runtime: &mut Runtime) -> Result<()> {
         .trace
         .emit(&Event::AgentDone {
             run_id: runtime.run_id.clone(),
+            usage: None,
             timestamp: Utc::now(),
         })
         .await
@@ -1856,6 +2077,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata,
         }
     }
@@ -2008,6 +2232,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             metadata: Default::default(),
         };
         assert!(!response_turn_budget_exhausted(&response));
@@ -2084,11 +2311,14 @@ mod tests {
         // which races under parallel test execution.
         let missing_registry = Err(anyhow!("no registry on this machine"));
 
-        let resolved = resolve_model_from(missing_registry, Some("openrouter/auto".into()))?;
+        let (resolved, pricing) =
+            resolve_model_from(missing_registry, Some("openrouter/auto".into()))?;
 
         assert_eq!(resolved.alias, "openrouter/auto");
         assert_eq!(resolved.api_id, "openrouter/auto");
         assert_eq!(resolved.provider, None);
+        assert_eq!(resolved.pricing, None);
+        assert!(pricing.is_empty(), "fallback has no pricing to guess from");
         Ok(())
     }
 
@@ -2218,6 +2448,7 @@ mod gc_stats_tests {
         let events = vec![
             Event::AgentDone {
                 run_id: "run".into(),
+                usage: None,
                 timestamp: Utc::now(),
             },
             custom_gc(100, 60, false),
@@ -2239,6 +2470,7 @@ mod gc_stats_tests {
     fn gc_stats_reports_zero_fire_case_clearly() {
         let events = vec![Event::AgentDone {
             run_id: "run".into(),
+            usage: None,
             timestamp: Utc::now(),
         }];
 
@@ -2325,6 +2557,9 @@ mod gc_stats_tests {
             input_tokens,
             output_tokens: 1,
             total_tokens: input_tokens + 1,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
             duration_ms: 1,
             timestamp: Utc::now(),
         };
@@ -2404,5 +2639,148 @@ mod gc_stats_tests {
             let err = parse_output_contract(text).unwrap_err();
             assert!(err.to_string().contains(kind), "{text}: {err:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn infer_call(run_id: &str, op_id: u64, model: &str) -> Event {
+        Event::InferCall {
+            run_id: run_id.into(),
+            op_id,
+            parent_op_id: None,
+            model: model.into(),
+            prompt: None,
+            prompt_preview: String::new(),
+            effect: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_result(
+        run_id: &str,
+        op_id: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: Option<u32>,
+        cost_micro_usd: Option<u64>,
+    ) -> Event {
+        Event::InferResult {
+            run_id: run_id.into(),
+            op_id,
+            parent_op_id: None,
+            response: None,
+            response_preview: String::new(),
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_input_tokens,
+            cost_micro_usd,
+            pricing: None,
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn two_run_events() -> Vec<Event> {
+        vec![
+            infer_call("run-a", 1, "claude-sonnet-4-6"),
+            infer_result("run-a", 1, 1000, 200, Some(100), Some(9_000)),
+            infer_call("run-a", 2, "claude-sonnet-4-6"),
+            infer_result("run-a", 2, 2000, 300, None, Some(10_500)),
+            // Recorded without pricing: counted, tokens summed, no cost.
+            infer_call("run-a", 3, "gpt-5.5"),
+            infer_result("run-a", 3, 50, 5, None, None),
+            // Result whose call is missing from the trace (filtered file).
+            infer_result("run-b", 7, 10, 1, None, Some(33)),
+        ]
+    }
+
+    #[test]
+    fn cost_report_aggregates_per_model_and_per_run_from_recorded_integers() {
+        let report = CostReport::from_events(&two_run_events());
+
+        assert_eq!(report.runs.len(), 2);
+        let run_a = &report.runs[0];
+        assert_eq!(run_a.run_id, "run-a");
+        let sonnet = &run_a.per_model["claude-sonnet-4-6"];
+        assert_eq!(sonnet.infer_calls, 2);
+        assert_eq!(sonnet.input_tokens, 3000);
+        assert_eq!(sonnet.output_tokens, 500);
+        assert_eq!(sonnet.cached_input_tokens, Some(100));
+        assert_eq!(sonnet.cost_micro_usd, Some(19_500));
+        assert_eq!(sonnet.uncosted_infer_calls, 0);
+        let gpt = &run_a.per_model["gpt-5.5"];
+        assert_eq!(gpt.cost_micro_usd, None, "absent means absent, not zero");
+        assert_eq!(gpt.uncosted_infer_calls, 1);
+        assert_eq!(run_a.total.infer_calls, 3);
+        assert_eq!(run_a.total.cost_micro_usd, Some(19_500));
+        assert_eq!(run_a.total.uncosted_infer_calls, 1);
+
+        let run_b = &report.runs[1];
+        assert!(run_b.per_model.contains_key("(unknown)"));
+        assert_eq!(run_b.total.cost_micro_usd, Some(33));
+
+        assert_eq!(report.total.infer_calls, 4);
+        assert_eq!(report.total.total_tokens, 3566);
+        assert_eq!(report.total.cost_micro_usd, Some(19_533));
+        assert_eq!(report.total.uncosted_infer_calls, 1);
+    }
+
+    /// Golden rendering: pins the human-readable table so accidental format
+    /// churn is visible in review.
+    #[test]
+    fn cost_report_renders_golden_table() {
+        let rendered = CostReport::from_events(&two_run_events()).render();
+        let expected = "\
+Run run-a
+  model                                     infers    input tok   output tok     cached     cost (USD)
+  claude-sonnet-4-6                              2         3000          500        100      $0.019500
+  gpt-5.5                                        1           50            5        n/a            n/a
+  run total                                      3         3050          505        100      $0.019500
+  uncosted infer calls: 1 (no pricing recorded; cost total is partial)
+
+Run run-b
+  model                                     infers    input tok   output tok     cached     cost (USD)
+  (unknown)                                      1           10            1        n/a      $0.000033
+  run total                                      1           10            1        n/a      $0.000033
+
+Total: 4 infer(s), 3060 input + 506 output = 3566 tokens, cost $0.019533 (1 uncosted)
+";
+        assert_eq!(rendered, expected, "actual:\n{rendered}");
+    }
+
+    #[test]
+    fn cost_report_json_carries_canonical_micro_usd_and_derived_decimal() {
+        let json = CostReport::from_events(&two_run_events()).to_json();
+        assert_eq!(json["total"]["cost_micro_usd"], 19_533);
+        assert_eq!(json["total"]["cost_usd"], "0.019533");
+        assert_eq!(json["total"]["uncosted_infer_calls"], 1);
+        let run_a = &json["runs"][0];
+        assert_eq!(run_a["run_id"], "run-a");
+        assert_eq!(
+            run_a["models"]["claude-sonnet-4-6"]["cost_micro_usd"],
+            19_500
+        );
+        assert_eq!(
+            run_a["models"]["claude-sonnet-4-6"]["cached_input_tokens"],
+            100
+        );
+        // Unpriced models carry no cost keys at all.
+        assert!(run_a["models"]["gpt-5.5"]
+            .as_object()
+            .unwrap()
+            .get("cost_micro_usd")
+            .is_none());
+    }
+
+    #[test]
+    fn cost_report_on_infer_less_trace_says_so() {
+        let rendered = CostReport::from_events(&[]).render();
+        assert!(rendered.contains("no InferResult events"), "{rendered}");
     }
 }
