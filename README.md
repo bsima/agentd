@@ -142,6 +142,14 @@ mkdir -p ~/.config/agent
 cp -n examples/models.yaml ~/.config/agent/models.yaml
 ```
 
+Installed from a release tarball instead of a source checkout? The same
+file ships alongside the binary as `models.yaml.example`:
+
+```sh
+mkdir -p ~/.config/agent
+cp -n models.yaml.example ~/.config/agent/models.yaml
+```
+
 Do not overwrite an existing `~/.config/agent/models.yaml`; it is runtime configuration and may contain local aliases used by deployed services.
 
 Set the provider key:

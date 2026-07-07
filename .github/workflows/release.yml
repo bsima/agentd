@@ -51,6 +51,7 @@ jobs:
           name="agent-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp "$bin" LICENSE README.md "$name/"
+          cp examples/models.yaml "$name/models.yaml.example"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
