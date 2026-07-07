@@ -43,6 +43,30 @@ pub struct IrReplayTrace {
     /// with a different contract must diverge, so the agent-loop driver
     /// compares this against the current contract before executing.
     output_schema_hash: Option<String>,
+    /// Approval-gate history (t-1308.10), keyed by effect id: recorded
+    /// `ApprovalRequested` payloads and `ApprovalResolved` decisions.
+    /// Replay reproduces the pause/decision as data — never pausing a
+    /// resolved recording and never prompting.
+    approval_requests: BTreeMap<String, IrApprovalRequested>,
+    approval_resolutions: BTreeMap<String, IrApprovalResolved>,
+}
+
+/// A recorded `ApprovalRequested`: the request payload doubles as the
+/// dynamic identity check for effects that never emitted a `*Call` (denied
+/// or still-pending), where the usual call-identity comparison cannot run.
+#[derive(Debug, Clone, PartialEq)]
+struct IrApprovalRequested {
+    pending_id: String,
+    kind: String,
+    request: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IrApprovalResolved {
+    pending_id: String,
+    decision: String,
+    resolved_by: Option<String>,
+    reason: Option<String>,
 }
 
 /// The Retrieve identity recorded for replay-divergence detection. `kind`
@@ -286,6 +310,40 @@ impl IrReplayTrace {
                         replay.output_schema_hash = Some(hash.to_owned());
                     }
                 }
+                Event::ApprovalRequested {
+                    pending_id,
+                    kind,
+                    request,
+                    effect,
+                    ..
+                } => {
+                    replay.approval_requests.insert(
+                        effect.effect_id.0.clone(),
+                        IrApprovalRequested {
+                            pending_id: pending_id.clone(),
+                            kind: kind.clone(),
+                            request: request.clone(),
+                        },
+                    );
+                }
+                Event::ApprovalResolved {
+                    pending_id,
+                    effect_id,
+                    decision,
+                    resolved_by,
+                    reason,
+                    ..
+                } => {
+                    replay.approval_resolutions.insert(
+                        effect_id.clone(),
+                        IrApprovalResolved {
+                            pending_id: pending_id.clone(),
+                            decision: decision.clone(),
+                            resolved_by: resolved_by.clone(),
+                            reason: reason.clone(),
+                        },
+                    );
+                }
                 _ => {}
             }
         }
@@ -511,8 +569,26 @@ pub struct IrCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrStepOutcome {
-    Complete { value: Value, machine: Machine },
-    Suspended { checkpoint: IrCheckpoint },
+    Complete {
+        value: Value,
+        machine: Machine,
+    },
+    Suspended {
+        checkpoint: IrCheckpoint,
+    },
+    /// A gated effect was reached with no decision available (t-1308.10,
+    /// DR-7): the machine checkpointed mid-turn with the program counter
+    /// still at the gated instruction (its visit counter rewound), so
+    /// re-entering the checkpoint recomputes the same effect id and — with
+    /// a resolution loaded into
+    /// [`crate::approval::ApprovalConfig::resolutions`] — executes the
+    /// effect (approved) or binds the typed denial value (denied). The
+    /// effect did NOT execute; failing closed is the only unattended
+    /// behavior.
+    AwaitingApproval {
+        checkpoint: IrCheckpoint,
+        pending: crate::approval::ApprovalRequest,
+    },
 }
 
 /// Backing store for the IR interpreter's instruction-limit checkpoints
@@ -565,6 +641,7 @@ pub async fn run_ir_sequential_with_store(
     match run_ir_steps_with_store_and_replay(config, machine, store, None, None).await? {
         IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
         IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
+        IrStepOutcome::AwaitingApproval { pending, .. } => Err(awaiting_approval_error(&pending)),
     }
 }
 
@@ -595,7 +672,22 @@ pub async fn run_ir_sequential_with_gc(
     match run_ir_steps_with_gc(config, machine, store, ir_replay, None, gc_state).await? {
         IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
         IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
+        IrStepOutcome::AwaitingApproval { pending, .. } => Err(awaiting_approval_error(&pending)),
     }
+}
+
+/// The fail-closed rendering of a pause for entry points that cannot
+/// suspend: the gated effect did not execute and no one can approve it
+/// here. Drivers that CAN pause (`run_agent_loop_outcome`, the `agent`
+/// CLI) handle [`IrStepOutcome::AwaitingApproval`] instead.
+pub(crate) fn awaiting_approval_error(pending: &crate::approval::ApprovalRequest) -> anyhow::Error {
+    anyhow!(
+        "gated {} effect {} requires approval and no resolver is configured; \
+         failing closed without executing it (request: {})",
+        pending.kind.as_str(),
+        pending.effect.effect_id.0,
+        pending.request
+    )
 }
 
 pub async fn run_ir_steps(
@@ -663,7 +755,7 @@ pub async fn run_ir_steps_with_gc(
             let visit = next_visit(&mut machine, site);
             let dynamic_path = machine.control_path.at_visit(visit);
             let instr = block.instructions[machine.pc].clone();
-            execute_instr(
+            if let Some(pending) = execute_instr(
                 config,
                 &mut machine,
                 &program_hash,
@@ -673,7 +765,24 @@ pub async fn run_ir_steps_with_gc(
                 instr,
                 gc_state,
             )
-            .await?;
+            .await?
+            {
+                // Pause mid-turn without executing the gated effect: rewind
+                // this site's visit counter (taken above by next_visit) so
+                // re-entering the checkpoint recomputes the identical
+                // effect id, and leave pc pointing at the instruction.
+                let key = format!("{}:{}", site.block.0, site.instruction_index);
+                if let Some(visits) = machine.effect_visits.get_mut(&key) {
+                    *visits = visits.saturating_sub(1);
+                }
+                let store = store.in_memory_snapshot().ok_or_else(|| {
+                    anyhow!("AgentIR approval pauses require an in-memory store snapshot")
+                })?;
+                return Ok(IrStepOutcome::AwaitingApproval {
+                    checkpoint: IrCheckpoint { machine, store },
+                    pending,
+                });
+            }
             machine.pc += 1;
             instructions_executed += 1;
             continue;
@@ -751,6 +860,10 @@ pub async fn run_ir_steps_with_gc(
     }
 }
 
+/// Execute one instruction. `Ok(None)` means the instruction ran (or bound
+/// an error/denial value); `Ok(Some(pending))` means an approval-gated
+/// effect was reached with no decision available — the machine is
+/// unmodified and the caller must suspend (t-1308.10).
 #[allow(clippy::too_many_arguments)]
 async fn execute_instr(
     config: &SeqConfig,
@@ -761,7 +874,7 @@ async fn execute_instr(
     ir_replay: Option<&IrReplayTrace>,
     instr: Instr,
     gc_state: &mut GcState,
-) -> Result<()> {
+) -> Result<Option<crate::approval::ApprovalRequest>> {
     match instr {
         Instr::Let { out, expr } => {
             let value = eval_expr(&machine.env, &expr)?;
@@ -854,7 +967,7 @@ async fn execute_instr(
                     // the turn. Abort (default) propagates.
                     if policy.on_error == EffectErrorMode::Bind {
                         machine.env.insert(out, effect_error_value(&err));
-                        return Ok(());
+                        return Ok(None);
                     }
                     return Err(err);
                 }
@@ -889,7 +1002,7 @@ async fn execute_instr(
         Instr::Eval {
             out,
             request,
-            policy: _,
+            policy,
         } => {
             let location = effect_location(
                 program_hash.clone(),
@@ -912,6 +1025,28 @@ async fn execute_instr(
                     (crate::op::render_argv(&argv), Some(argv))
                 }
             };
+            // The approval gate runs before the EvalCall event: a paused or
+            // denied effect never dispatches, so it leaves no dangling call
+            // in the trace (t-1308.10).
+            match approval_gate(
+                config,
+                ir_replay,
+                &location,
+                crate::approval::ApprovalKind::Eval,
+                serde_json::json!({ "command": command, "argv": argv }),
+                policy.require_approval,
+            )
+            .await?
+            {
+                GateOutcome::Proceed => {}
+                GateOutcome::Deny(denial) => {
+                    // Denial is not an abort: bind the typed denial value
+                    // (errors-as-values, t-1222) and continue the program.
+                    machine.env.insert(out, denial);
+                    return Ok(None);
+                }
+                GateOutcome::Pause(pending) => return Ok(Some(pending)),
+            }
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -1073,7 +1208,7 @@ async fn execute_instr(
                         .await?;
                     if policy.on_error == EffectErrorMode::Bind {
                         machine.env.insert(out, effect_error_value(&err));
-                        return Ok(());
+                        return Ok(None);
                     }
                     return Err(err);
                 }
@@ -1125,6 +1260,37 @@ async fn execute_instr(
                 id: id_value.clone(),
                 content_hash: content_hash.clone(),
             };
+            // The per-sink write policy is the Store gate (docs/MEMORY.md):
+            // a RequireApproval sink pauses exactly like a gated Eval.
+            // Replay never consults the live registry — the recorded
+            // approval story decides.
+            let store_gated = ir_replay.is_none()
+                && config.hydration.sink(&sink_name).is_some_and(|sink| {
+                    sink.write_policy() == crate::hydration::SinkWritePolicy::RequireApproval
+                });
+            match approval_gate(
+                config,
+                ir_replay,
+                &location,
+                crate::approval::ApprovalKind::Store,
+                serde_json::json!({
+                    "sink": sink_name,
+                    "op": store_op.name(),
+                    "id": id_value,
+                    "item_preview": crate::trace::preview(&item_value.to_string(), 256),
+                    "content_hash": content_hash,
+                }),
+                store_gated,
+            )
+            .await?
+            {
+                GateOutcome::Proceed => {}
+                GateOutcome::Deny(denial) => {
+                    machine.env.insert(out, denial);
+                    return Ok(None);
+                }
+                GateOutcome::Pause(pending) => return Ok(Some(pending)),
+            }
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -1174,7 +1340,7 @@ async fn execute_instr(
                         .await?;
                     if policy.on_error == EffectErrorMode::Bind {
                         machine.env.insert(out, effect_error_value(&err));
-                        return Ok(());
+                        return Ok(None);
                     }
                     return Err(err);
                 }
@@ -1256,7 +1422,7 @@ async fn execute_instr(
                     // model can recover from.
                     if policy.on_error == EffectErrorMode::Bind {
                         machine.env.insert(out, effect_error_value(&err));
-                        return Ok(());
+                        return Ok(None);
                     }
                     return Err(err);
                 }
@@ -1277,7 +1443,7 @@ async fn execute_instr(
             machine.env.insert(out, result);
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The value an effect binds to its `out` when `on_error: Bind` and the
@@ -1286,6 +1452,193 @@ async fn execute_instr(
 /// result the model can read and recover from.
 fn effect_error_value(err: &anyhow::Error) -> Value {
     serde_json::json!({ "ok": false, "error": format!("{err:#}") })
+}
+
+/// What the approval gate decided for one gated effect.
+enum GateOutcome {
+    /// Not gated, or approved: dispatch the effect normally.
+    Proceed,
+    /// Denied: bind this typed denial value to the effect's `out` and
+    /// continue — denial is a value, not an abort.
+    Deny(Value),
+    /// No decision available: suspend the machine without executing
+    /// (fail closed).
+    Pause(crate::approval::ApprovalRequest),
+}
+
+/// The approval gate (t-1308.10, DR-7) — one decision point shared by every
+/// gatable effect kind (Eval today, Store via sink policy; an Infer gate
+/// would call this same function). Precedence, live:
+///
+/// 1. not gated → proceed;
+/// 2. a pre-loaded resolution for this effect id (resume driver) → emit
+///    `ApprovalResolved`, then proceed or bind the denial;
+/// 3. the in-process hook → emit `ApprovalRequested`, ask it, emit
+///    `ApprovalResolved`, act on the decision;
+/// 4. otherwise → emit `ApprovalRequested` and pause. Never auto-approve.
+///
+/// Under replay the recording is the sole authority: recorded pauses and
+/// decisions are reproduced as data (their events re-emitted), a gated
+/// effect with no recorded approval story is a divergence, and the recorded
+/// request payload is checked against the observed one — that is the only
+/// dynamic identity check available for effects that never dispatched
+/// (denied or still pending).
+async fn approval_gate(
+    config: &SeqConfig,
+    ir_replay: Option<&IrReplayTrace>,
+    location: &EffectLocation,
+    kind: crate::approval::ApprovalKind,
+    request: Value,
+    gated: bool,
+) -> Result<GateOutcome> {
+    use crate::approval::{denial_value, pending_id_for, ApprovalDecision, ApprovalRequest};
+
+    let effect_id = &location.effect_id.0;
+    let run_id: String = config.trace.run_id().into();
+
+    if let Some(replay) = ir_replay {
+        let requested = replay.approval_requests.get(effect_id);
+        let resolution = replay.approval_resolutions.get(effect_id);
+        if requested.is_none() && resolution.is_none() {
+            if gated {
+                return Err(anyhow!(
+                    "AgentIR replay diverged at effect {effect_id}: the effect is \
+                     approval-gated but the recording has no approval outcome for it"
+                ));
+            }
+            return Ok(GateOutcome::Proceed);
+        }
+        if let Some(requested) = requested {
+            if requested.request != request {
+                return Err(anyhow!(
+                    "AgentIR replay diverged at effect {effect_id}: recorded approval \
+                     request {} does not match observed request {request}",
+                    requested.request
+                ));
+            }
+        }
+        let pending_id = requested
+            .map(|requested| requested.pending_id.clone())
+            .or_else(|| resolution.map(|resolution| resolution.pending_id.clone()))
+            .expect("requested or resolution present");
+        config
+            .trace
+            .emit(&Event::ApprovalRequested {
+                run_id: run_id.clone(),
+                pending_id: pending_id.clone(),
+                kind: kind.as_str().into(),
+                request: request.clone(),
+                effect: Box::new(location.clone()),
+                timestamp: Utc::now(),
+            })
+            .await?;
+        let Some(resolution) = resolution else {
+            // The recorded run parked here unresolved; the replay reports
+            // the same pause as data (the driver never persists or prompts
+            // under replay).
+            return Ok(GateOutcome::Pause(ApprovalRequest {
+                pending_id,
+                effect: location.clone(),
+                kind,
+                request,
+            }));
+        };
+        config
+            .trace
+            .emit(&Event::ApprovalResolved {
+                run_id,
+                pending_id: pending_id.clone(),
+                effect_id: effect_id.clone(),
+                kind: kind.as_str().into(),
+                decision: resolution.decision.clone(),
+                resolved_by: resolution.resolved_by.clone(),
+                reason: resolution.reason.clone(),
+                timestamp: Utc::now(),
+            })
+            .await?;
+        return Ok(if resolution.decision == "denied" {
+            GateOutcome::Deny(denial_value(
+                &pending_id,
+                resolution.resolved_by.as_deref(),
+                resolution.reason.as_deref(),
+            ))
+        } else {
+            GateOutcome::Proceed
+        });
+    }
+
+    if !gated {
+        return Ok(GateOutcome::Proceed);
+    }
+    let pending_id = pending_id_for(&run_id, effect_id);
+    if let Some(resolution) = config.approvals.resolutions.get(effect_id) {
+        // Resume path: the pausing process already emitted the
+        // ApprovalRequested into this run's trace; only the resolution is
+        // emitted here, at the effect site where it takes effect.
+        config
+            .trace
+            .emit(&Event::ApprovalResolved {
+                run_id,
+                pending_id: pending_id.clone(),
+                effect_id: effect_id.clone(),
+                kind: kind.as_str().into(),
+                decision: resolution.decision.as_status_str().into(),
+                resolved_by: resolution.resolved_by.clone(),
+                reason: resolution.reason.clone(),
+                timestamp: Utc::now(),
+            })
+            .await?;
+        return Ok(match resolution.decision {
+            ApprovalDecision::Approve => GateOutcome::Proceed,
+            ApprovalDecision::Deny => GateOutcome::Deny(denial_value(
+                &pending_id,
+                resolution.resolved_by.as_deref(),
+                resolution.reason.as_deref(),
+            )),
+        });
+    }
+    config
+        .trace
+        .emit(&Event::ApprovalRequested {
+            run_id: run_id.clone(),
+            pending_id: pending_id.clone(),
+            kind: kind.as_str().into(),
+            request: request.clone(),
+            effect: Box::new(location.clone()),
+            timestamp: Utc::now(),
+        })
+        .await?;
+    let pending = ApprovalRequest {
+        pending_id: pending_id.clone(),
+        effect: location.clone(),
+        kind,
+        request,
+    };
+    if let Some(hook) = &config.approvals.hook {
+        let decision = hook(&pending);
+        config
+            .trace
+            .emit(&Event::ApprovalResolved {
+                run_id,
+                pending_id: pending_id.clone(),
+                effect_id: effect_id.clone(),
+                kind: kind.as_str().into(),
+                decision: decision.as_status_str().into(),
+                resolved_by: Some("hook".into()),
+                reason: None,
+                timestamp: Utc::now(),
+            })
+            .await?;
+        return Ok(match decision {
+            ApprovalDecision::Approve => GateOutcome::Proceed,
+            ApprovalDecision::Deny => {
+                GateOutcome::Deny(denial_value(&pending_id, Some("hook"), None))
+            }
+        });
+    }
+    // Fail closed: no resolution and no hook means the effect does not
+    // execute — the machine suspends for a durable, out-of-process decision.
+    Ok(GateOutcome::Pause(pending))
 }
 
 /// Execute a live Store against the registry: resolve the sink, enforce its
@@ -1299,17 +1652,15 @@ async fn execute_store_live(
     id: Option<&str>,
     payload: Value,
 ) -> Result<String> {
-    use crate::hydration::{Provenance, SinkId, SinkItem, SinkWritePolicy};
+    use crate::hydration::{Provenance, SinkId, SinkItem};
 
+    // A RequireApproval write policy is enforced by the approval gate ahead
+    // of dispatch (t-1308.10): reaching this function means the write is
+    // free, approved, or pre-resolved.
     let sink = config
         .hydration
         .sink(sink_name)
         .ok_or_else(|| anyhow!("no sink {sink_name:?} registered"))?;
-    if sink.write_policy() == SinkWritePolicy::RequireApproval {
-        return Err(anyhow!(
-            "sink {sink_name:?} requires approval; the approval flow is not implemented yet (docs/MEMORY.md)"
-        ));
-    }
     let item = SinkItem {
         payload,
         provenance: Provenance {
@@ -1787,6 +2138,7 @@ mod tests {
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -3016,7 +3368,9 @@ mod tests {
         let outcome = run_ir_steps(&config(first_provider.clone()), machine, 1).await?;
         let checkpoint = match outcome {
             IrStepOutcome::Suspended { checkpoint } => checkpoint,
-            IrStepOutcome::Complete { .. } => panic!("expected suspension after one instruction"),
+            IrStepOutcome::Complete { .. } | IrStepOutcome::AwaitingApproval { .. } => {
+                panic!("expected suspension after one instruction")
+            }
         };
         assert_eq!(first_provider.prompt_count(), 1);
 
@@ -3208,6 +3562,572 @@ mod tests {
 
         assert!(err.contains("used before definition"));
         assert_eq!(provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    // ---- approval/pause protocol (t-1308.10, DR-7) ----
+
+    use crate::approval::{
+        is_denial_value, pending_id_for, ApprovalConfig, ApprovalDecision, ApprovalStore,
+        PendingEffectRecord, PendingStatus,
+    };
+
+    /// A single-block program: one gated Eval, then a Let that proves the
+    /// program continued past the gate, returning both. The command comes
+    /// in through the entry block's `cmd` param (seeded via machine env),
+    /// so tests can vary the request without changing the program hash.
+    fn gated_eval_machine(name: &str) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![Var("cmd".into())],
+                instructions: vec![
+                    Instr::Eval {
+                        out: Var("eval_out".into()),
+                        request: crate::ir::EvalRequest::Shell {
+                            command: Expr::Var(Var("cmd".into())),
+                        },
+                        policy: crate::ir::EvalPolicy {
+                            require_approval: true,
+                            ..Default::default()
+                        },
+                    },
+                    Instr::Let {
+                        out: Var("after".into()),
+                        expr: Expr::Value(Value::Bool(true)),
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Expr::Object(BTreeMap::from([
+                        ("eval".into(), Expr::Var(Var("eval_out".into()))),
+                        ("after".into(), Expr::Var(Var("after".into()))),
+                    ])),
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId(name.into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    fn append_command(marker: &std::path::Path) -> String {
+        format!("printf ran >> {}", marker.display())
+    }
+
+    fn temp_marker(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("agent-approval-{tag}-{}", Uuid::new_v4()))
+    }
+
+    fn pending_record_for(
+        run_id: &str,
+        pending: &crate::approval::ApprovalRequest,
+    ) -> PendingEffectRecord {
+        PendingEffectRecord {
+            pending_id: pending.pending_id.clone(),
+            run_id: run_id.into(),
+            turn_id: Some(format!("{run_id}-t0")),
+            effect_id: pending.effect.effect_id.0.clone(),
+            program_hash: pending.effect.program_hash.0.clone(),
+            kind: pending.kind,
+            request: pending.request.clone(),
+            created_ts: Utc::now(),
+            status: PendingStatus::AwaitingApproval,
+            resolved_ts: None,
+            resolved_by: None,
+            reason: None,
+            runtime: Some(serde_json::json!({ "model": "mock" })),
+        }
+    }
+
+    /// The full one-shot pause/approve lifecycle across a simulated process
+    /// restart: a gated Eval pauses without executing, the pause persists
+    /// as a pending record (file shape pinned here — Ben reviews this
+    /// before dashboard consumption) plus a machine checkpoint, and a fresh
+    /// "process" (all-new store/config objects, state loaded from disk
+    /// only) approves, claims, resumes, executes the command exactly once,
+    /// and completes the run. Double-resolution and double-claim both fail.
+    #[tokio::test]
+    async fn gated_eval_pauses_persists_and_approve_after_restart_executes_once() -> Result<()> {
+        let marker = temp_marker("approve");
+        let dir = std::env::temp_dir().join(format!("agent-approvals-{}", Uuid::new_v4()));
+        let run_id = "run-approve";
+        let trace_path =
+            std::env::temp_dir().join(format!("agent-approval-trace-{}.jsonl", Uuid::new_v4()));
+
+        // --- process 1: run until the gate pauses ---
+        let pending = {
+            let provider = Arc::new(MockProvider::new(vec![]));
+            let config = config_with_trace(
+                provider,
+                TraceLogger::new(run_id.to_string(), trace_path.clone()),
+            );
+            let mut machine = gated_eval_machine("gated-approve");
+            machine
+                .env
+                .insert(Var("cmd".into()), Value::String(append_command(&marker)));
+            let mut store = InMemoryStore::new();
+            let outcome =
+                run_ir_steps_with_store_and_replay(&config, machine, &mut store, None, None)
+                    .await?;
+            let IrStepOutcome::AwaitingApproval {
+                checkpoint,
+                pending,
+            } = outcome
+            else {
+                panic!("expected AwaitingApproval, got {outcome:?}");
+            };
+            assert!(!marker.exists(), "gated effect must not have executed");
+            assert_eq!(pending.kind, crate::approval::ApprovalKind::Eval);
+            assert_eq!(
+                pending.pending_id,
+                pending_id_for(run_id, &pending.effect.effect_id.0)
+            );
+            let approvals = ApprovalStore::new(&dir);
+            approvals
+                .write_pending(&pending_record_for(run_id, &pending), &checkpoint)
+                .await?;
+            pending
+        };
+
+        // The on-disk record shape (the dashboard/API contract).
+        let raw: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(dir.join(format!("{}.json", pending.pending_id))).await?,
+        )?;
+        assert_eq!(raw["pending_id"], pending.pending_id.as_str());
+        assert_eq!(raw["run_id"], run_id);
+        assert_eq!(raw["turn_id"], "run-approve-t0");
+        assert_eq!(raw["effect_id"], pending.effect.effect_id.0.as_str());
+        assert_eq!(raw["program_hash"], pending.effect.program_hash.0.as_str());
+        assert_eq!(raw["kind"], "eval");
+        assert_eq!(
+            raw["request"]["command"],
+            Value::String(append_command(&marker))
+        );
+        assert_eq!(raw["status"], "awaiting_approval");
+        assert!(raw["created_ts"].is_string());
+        assert!(raw.get("resolved_ts").is_none(), "unresolved: field absent");
+        assert!(
+            dir.join(format!("{}.machine.json", pending.pending_id))
+                .exists(),
+            "mid-turn machine checkpoint persisted alongside"
+        );
+
+        // --- "restart": fresh objects, state comes from disk only ---
+        let approvals = ApprovalStore::new(&dir);
+        let record = approvals
+            .resolve(
+                &pending.pending_id,
+                ApprovalDecision::Approve,
+                Some("ben".into()),
+                None,
+            )
+            .await?;
+        let checkpoint = approvals.claim_checkpoint(&pending.pending_id).await?;
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = config_with_trace(
+            provider,
+            TraceLogger::new(run_id.to_string(), trace_path.clone()),
+        );
+        config.approvals = ApprovalConfig::default();
+        config.approvals.resolutions.insert(
+            record.effect_id.clone(),
+            ApprovalStore::resolution_of(&record)?,
+        );
+        let mut store = checkpoint.store.clone();
+        let outcome =
+            run_ir_steps_with_store_and_replay(&config, checkpoint.machine, &mut store, None, None)
+                .await?;
+        let IrStepOutcome::Complete { value, .. } = outcome else {
+            panic!("expected completion after approval, got {outcome:?}");
+        };
+        assert_eq!(value["after"], Value::Bool(true), "program continued");
+        assert_eq!(value["eval"]["ok"], Value::Bool(true));
+        assert_eq!(
+            tokio::fs::read_to_string(&marker).await?,
+            "ran",
+            "the approved effect executed exactly once"
+        );
+
+        // Exactly-once guards: no re-resolution, no re-claim.
+        assert!(approvals
+            .resolve(&pending.pending_id, ApprovalDecision::Deny, None, None)
+            .await
+            .is_err());
+        assert!(approvals
+            .claim_checkpoint(&pending.pending_id)
+            .await
+            .is_err());
+
+        // Trace: the pause emitted ApprovalRequested; the resume appended
+        // ApprovalResolved at the effect site, under the same run id.
+        let events = TraceLogger::read_events(&trace_path).await?;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ApprovalRequested { pending_id, .. } if *pending_id == pending.pending_id
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ApprovalResolved { decision, resolved_by, .. }
+                if decision == "approved" && resolved_by.as_deref() == Some("ben")
+        )));
+        Ok(())
+    }
+
+    /// Denial is a value, not an abort: the denied Eval binds the typed
+    /// denial (errors-as-values) and the instructions after the gate still
+    /// run. The command never executes.
+    #[tokio::test]
+    async fn denied_gated_eval_binds_typed_value_and_program_continues() -> Result<()> {
+        let marker = temp_marker("deny");
+        let run_id = "run-deny";
+        let trace_path =
+            std::env::temp_dir().join(format!("agent-approval-trace-{}.jsonl", Uuid::new_v4()));
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let config = config_with_trace(
+            provider,
+            TraceLogger::new(run_id.to_string(), trace_path.clone()),
+        );
+        let mut machine = gated_eval_machine("gated-deny");
+        machine
+            .env
+            .insert(Var("cmd".into()), Value::String(append_command(&marker)));
+        let mut store = InMemoryStore::new();
+        let outcome =
+            run_ir_steps_with_store_and_replay(&config, machine, &mut store, None, None).await?;
+        let IrStepOutcome::AwaitingApproval {
+            checkpoint,
+            pending,
+        } = outcome
+        else {
+            panic!("expected AwaitingApproval, got {outcome:?}");
+        };
+
+        // Resolve as denied (via the durable store, like the CLI) and resume.
+        let dir = std::env::temp_dir().join(format!("agent-approvals-{}", Uuid::new_v4()));
+        let approvals = ApprovalStore::new(&dir);
+        approvals
+            .write_pending(&pending_record_for(run_id, &pending), &checkpoint)
+            .await?;
+        let record = approvals
+            .resolve(
+                &pending.pending_id,
+                ApprovalDecision::Deny,
+                Some("ben".into()),
+                Some("not on prod".into()),
+            )
+            .await?;
+        let checkpoint = approvals.claim_checkpoint(&pending.pending_id).await?;
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = config_with_trace(
+            provider,
+            TraceLogger::new(run_id.to_string(), trace_path.clone()),
+        );
+        config.approvals.resolutions.insert(
+            record.effect_id.clone(),
+            ApprovalStore::resolution_of(&record)?,
+        );
+        let mut store = checkpoint.store.clone();
+        let outcome =
+            run_ir_steps_with_store_and_replay(&config, checkpoint.machine, &mut store, None, None)
+                .await?;
+        let IrStepOutcome::Complete { value, .. } = outcome else {
+            panic!("expected completion after denial, got {outcome:?}");
+        };
+        assert_eq!(value["after"], Value::Bool(true), "program continued");
+        assert!(is_denial_value(&value["eval"]), "typed denial: {value}");
+        assert_eq!(value["eval"]["ok"], Value::Bool(false));
+        assert_eq!(value["eval"]["approval"]["status"], "denied");
+        assert_eq!(value["eval"]["approval"]["reason"], "not on prod");
+        assert!(!marker.exists(), "denied effect must never execute");
+        Ok(())
+    }
+
+    /// Unattended fail-closed: no hook, no resolution — the entry points
+    /// that cannot pause return an error and the effect does not execute.
+    /// Never auto-approve.
+    #[tokio::test]
+    async fn unattended_gated_eval_fails_closed() -> Result<()> {
+        let marker = temp_marker("closed");
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut machine = gated_eval_machine("gated-closed");
+        machine
+            .env
+            .insert(Var("cmd".into()), Value::String(append_command(&marker)));
+        let err = run_ir_sequential(&config(provider), machine)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires approval"), "{err}");
+        assert!(err.contains("failing closed"), "{err}");
+        assert!(!marker.exists(), "fail closed means the effect never ran");
+        Ok(())
+    }
+
+    /// The in-process hook decides at the effect site: approve executes
+    /// inline (no pause), and both events land in the trace.
+    #[tokio::test]
+    async fn approval_hook_decides_at_the_effect_site() -> Result<()> {
+        let marker = temp_marker("hook");
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = config_with_trace(provider, trace);
+        config.approvals.hook = Some(Arc::new(|_request: &crate::approval::ApprovalRequest| {
+            ApprovalDecision::Approve
+        }));
+        let mut machine = gated_eval_machine("gated-hook");
+        machine
+            .env
+            .insert(Var("cmd".into()), Value::String(append_command(&marker)));
+        let (value, _machine) = run_ir_sequential(&config, machine).await?;
+        assert_eq!(value["eval"]["ok"], Value::Bool(true));
+        assert_eq!(tokio::fs::read_to_string(&marker).await?, "ran");
+
+        let events = TraceLogger::read_events(&trace_path).await?;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::ApprovalRequested { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ApprovalResolved { decision, resolved_by, .. }
+                if decision == "approved" && resolved_by.as_deref() == Some("hook")
+        )));
+        Ok(())
+    }
+
+    /// Record an approved and a denied gated run, then replay both traces:
+    /// the pause/decision are reproduced as data (both events re-emitted),
+    /// nothing pauses, nothing prompts, and the approved command is NOT
+    /// re-executed (the recorded EvalResult is served by effect id).
+    #[tokio::test]
+    async fn replay_reproduces_approved_and_denied_outcomes_as_data() -> Result<()> {
+        for decision in [ApprovalDecision::Approve, ApprovalDecision::Deny] {
+            let marker = temp_marker("replay");
+            let record_trace = test_trace();
+            let record_path = record_trace.path().clone();
+            let provider = Arc::new(MockProvider::new(vec![]));
+            let mut config = config_with_trace(provider, record_trace);
+            config.approvals.hook = Some(Arc::new(move |_: &crate::approval::ApprovalRequest| {
+                decision
+            }));
+            let mut machine = gated_eval_machine("gated-replay");
+            machine
+                .env
+                .insert(Var("cmd".into()), Value::String(append_command(&marker)));
+            let (recorded_value, _machine) = run_ir_sequential(&config, machine.clone()).await?;
+            let executions_after_recording = marker.exists() as usize;
+
+            let replay = IrReplayTrace::load(&record_path).await?;
+            let replay_trace = test_trace();
+            let replay_path = replay_trace.path().clone();
+            // No hook and no resolutions: the recording is the sole
+            // authority under replay.
+            let replay_config =
+                config_with_trace(Arc::new(MockProvider::new(vec![])), replay_trace);
+            let mut store = InMemoryStore::new();
+            let outcome = run_ir_steps_with_store_and_replay(
+                &replay_config,
+                machine,
+                &mut store,
+                Some(&replay),
+                None,
+            )
+            .await?;
+            let IrStepOutcome::Complete { value, .. } = outcome else {
+                panic!("replay must not pause: {outcome:?}");
+            };
+            assert_eq!(value, recorded_value, "replay reproduces the outcome");
+            assert_eq!(
+                marker.exists() as usize,
+                executions_after_recording,
+                "replay never re-executes the effect"
+            );
+            let events = TraceLogger::read_events(&replay_path).await?;
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, Event::ApprovalRequested { .. })));
+            let expected = decision.as_status_str();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                Event::ApprovalResolved { decision, .. } if decision == expected
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replay divergence on mismatched effect identity: same program, same
+    /// effect id, but the observed gated request differs from the recorded
+    /// one (the request payload is the identity check for gated effects).
+    #[tokio::test]
+    async fn replay_diverges_on_mismatched_gated_request() -> Result<()> {
+        let marker = temp_marker("diverge");
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = config_with_trace(provider, record_trace);
+        config.approvals.hook = Some(Arc::new(|_: &crate::approval::ApprovalRequest| {
+            ApprovalDecision::Deny
+        }));
+        let mut machine = gated_eval_machine("gated-diverge");
+        machine
+            .env
+            .insert(Var("cmd".into()), Value::String(append_command(&marker)));
+        run_ir_sequential(&config, machine.clone()).await?;
+
+        // Same program (hash unchanged: the command is env data), different
+        // observed request.
+        let replay = IrReplayTrace::load(&record_path).await?;
+        machine
+            .env
+            .insert(Var("cmd".into()), Value::String("printf other".to_string()));
+        let replay_config = config_with_trace(Arc::new(MockProvider::new(vec![])), test_trace());
+        let mut store = InMemoryStore::new();
+        let err = run_ir_steps_with_store_and_replay(
+            &replay_config,
+            machine,
+            &mut store,
+            Some(&replay),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("diverged"), "{err}");
+        assert!(err.contains("does not match observed request"), "{err}");
+        Ok(())
+    }
+
+    /// A sink registered with `SinkWritePolicy::RequireApproval` gates the
+    /// Store effect exactly like a gated Eval: pause without a resolver,
+    /// execute on hook-approve, typed denial on hook-deny.
+    struct GatedSink {
+        items: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl crate::hydration::HydrationSink for GatedSink {
+        fn name(&self) -> &str {
+            "gated"
+        }
+
+        fn kind(&self) -> crate::hydration::SourceKind {
+            crate::hydration::SourceKind::Semantic
+        }
+
+        fn write_policy(&self) -> crate::hydration::SinkWritePolicy {
+            crate::hydration::SinkWritePolicy::RequireApproval
+        }
+
+        async fn store(
+            &self,
+            item: crate::hydration::SinkItem,
+        ) -> Result<crate::hydration::SinkId> {
+            self.items.lock().unwrap().push(item.payload);
+            Ok(crate::hydration::SinkId("gated-1".into()))
+        }
+
+        async fn update(
+            &self,
+            _id: &crate::hydration::SinkId,
+            _item: crate::hydration::SinkItem,
+        ) -> Result<()> {
+            unimplemented!("not exercised")
+        }
+
+        async fn delete(&self, _id: &crate::hydration::SinkId) -> Result<()> {
+            unimplemented!("not exercised")
+        }
+    }
+
+    fn gated_store_machine(name: &str) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![Instr::Store {
+                    out: Var("stored".into()),
+                    sink: Expr::Value(Value::String("gated".into())),
+                    op: crate::ir::StoreOp::Create,
+                    id: None,
+                    item: Expr::Value(serde_json::json!({ "note": "hello" })),
+                    policy: Default::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("stored".into())),
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId(name.into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_approval_sink_gates_store_effects() -> Result<()> {
+        // No resolver: pause, nothing written.
+        let items = Arc::new(Mutex::new(Vec::new()));
+        let mut config = config(Arc::new(MockProvider::new(vec![])));
+        config.hydration = SourceRegistry::new().register_sink(GatedSink {
+            items: items.clone(),
+        });
+        let mut store = InMemoryStore::new();
+        let outcome = run_ir_steps_with_store_and_replay(
+            &config,
+            gated_store_machine("gated-store"),
+            &mut store,
+            None,
+            None,
+        )
+        .await?;
+        let IrStepOutcome::AwaitingApproval { pending, .. } = outcome else {
+            panic!("expected AwaitingApproval, got {outcome:?}");
+        };
+        assert_eq!(pending.kind, crate::approval::ApprovalKind::Store);
+        assert_eq!(pending.request["sink"], "gated");
+        assert_eq!(pending.request["op"], "create");
+        assert!(items.lock().unwrap().is_empty(), "no write before approval");
+
+        // Hook approve: the write happens.
+        config.approvals.hook = Some(Arc::new(|_: &crate::approval::ApprovalRequest| {
+            ApprovalDecision::Approve
+        }));
+        let (value, _machine) =
+            run_ir_sequential(&config, gated_store_machine("gated-store-ok")).await?;
+        assert_eq!(value, Value::String("gated-1".into()));
+        assert_eq!(items.lock().unwrap().len(), 1);
+
+        // Hook deny: typed denial value, no additional write.
+        config.approvals.hook = Some(Arc::new(|_: &crate::approval::ApprovalRequest| {
+            ApprovalDecision::Deny
+        }));
+        let (value, _machine) =
+            run_ir_sequential(&config, gated_store_machine("gated-store-no")).await?;
+        assert!(is_denial_value(&value), "{value}");
+        assert_eq!(items.lock().unwrap().len(), 1);
         Ok(())
     }
 }

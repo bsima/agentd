@@ -335,6 +335,44 @@ pub enum Event {
         data: Value,
         timestamp: DateTime<Utc>,
     },
+    /// A gated effect reached the approval gate with no decision available
+    /// (t-1308.10, DR-7): the run pauses (or an in-process hook is about to
+    /// decide). Typed runtime variants — not `Custom` — because approval
+    /// outcomes are replay identity like the `ToolCall` triple: replay
+    /// consumes them via `IrReplayTrace` to reproduce the pause/decision as
+    /// data, so their shape must be compile-checked, unlike the
+    /// diagnostics-only `output_validation_failed` Custom event.
+    ApprovalRequested {
+        run_id: String,
+        /// Durable pause id; matches the on-disk pending record.
+        pending_id: String,
+        /// `"eval"` or `"store"` (see [`crate::approval::ApprovalKind`]).
+        kind: String,
+        /// The gated request preview: for Eval `{command, argv}`; for Store
+        /// `{sink, op, id, item_preview, content_hash}`. Replay checks this
+        /// against the current request for denied effects (approved effects
+        /// are checked by their own `*Call` identity).
+        request: Value,
+        effect: Box<EffectLocation>,
+        timestamp: DateTime<Utc>,
+    },
+    /// The decision on a gated effect, emitted at the effect site by the
+    /// process that consumes it (hook decisions inline; resume decisions
+    /// when the checkpointed machine re-reaches the effect). Carries the
+    /// decision and resolver metadata; replay reproduces it as data.
+    ApprovalResolved {
+        run_id: String,
+        pending_id: String,
+        effect_id: String,
+        kind: String,
+        /// `"approved"` or `"denied"`.
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl Event {
@@ -363,7 +401,9 @@ impl Event {
             | Self::Checkpoint { run_id, .. }
             | Self::TurnBudgetExhausted { run_id, .. }
             | Self::AgentDone { run_id, .. }
-            | Self::Custom { run_id, .. } => run_id,
+            | Self::Custom { run_id, .. }
+            | Self::ApprovalRequested { run_id, .. }
+            | Self::ApprovalResolved { run_id, .. } => run_id,
         }
     }
 
@@ -392,7 +432,9 @@ impl Event {
             Self::Checkpoint { .. }
             | Self::TurnBudgetExhausted { .. }
             | Self::AgentDone { .. }
-            | Self::Custom { .. } => None,
+            | Self::Custom { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ApprovalResolved { .. } => None,
         }
     }
 
@@ -421,7 +463,9 @@ impl Event {
             Self::Checkpoint { .. }
             | Self::TurnBudgetExhausted { .. }
             | Self::AgentDone { .. }
-            | Self::Custom { .. } => None,
+            | Self::Custom { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ApprovalResolved { .. } => None,
         }
     }
 
@@ -440,6 +484,8 @@ impl Event {
             Self::Checkpoint { .. } => "Checkpoint",
             Self::TurnBudgetExhausted { .. } => "turn_budget_exhausted",
             Self::AgentDone { .. } => "AgentDone",
+            Self::ApprovalRequested { .. } => "ApprovalRequested",
+            Self::ApprovalResolved { .. } => "ApprovalResolved",
             Self::Custom { name, .. } => match name.as_str() {
                 "agent_error" => "agent_error",
                 "agent_response" => "agent_response",
@@ -509,7 +555,9 @@ impl Event {
             | Self::Checkpoint { timestamp, .. }
             | Self::TurnBudgetExhausted { timestamp, .. }
             | Self::AgentDone { timestamp, .. }
-            | Self::Custom { timestamp, .. } => *timestamp,
+            | Self::Custom { timestamp, .. }
+            | Self::ApprovalRequested { timestamp, .. }
+            | Self::ApprovalResolved { timestamp, .. } => *timestamp,
         }
     }
 
@@ -755,6 +803,37 @@ impl Event {
             Self::Custom { name, data, .. } => {
                 attrs.push(KeyValue::new("agent.custom_name", name.clone()));
                 attrs.push(KeyValue::new("agent.data", data.to_string()));
+            }
+            Self::ApprovalRequested {
+                pending_id,
+                kind,
+                request,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.pending_id", pending_id.clone()));
+                attrs.push(KeyValue::new("agent.approval_kind", kind.clone()));
+                attrs.push(KeyValue::new(
+                    "agent.request_preview",
+                    preview(&request.to_string(), 512),
+                ));
+            }
+            Self::ApprovalResolved {
+                pending_id,
+                kind,
+                decision,
+                resolved_by,
+                reason,
+                ..
+            } => {
+                attrs.push(KeyValue::new("agent.pending_id", pending_id.clone()));
+                attrs.push(KeyValue::new("agent.approval_kind", kind.clone()));
+                attrs.push(KeyValue::new("agent.decision", decision.clone()));
+                if let Some(resolved_by) = resolved_by {
+                    attrs.push(KeyValue::new("agent.resolved_by", resolved_by.clone()));
+                }
+                if let Some(reason) = reason {
+                    attrs.push(KeyValue::new("agent.reason", reason.clone()));
+                }
             }
             Self::AgentDone { .. } => {}
         }

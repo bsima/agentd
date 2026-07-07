@@ -51,6 +51,24 @@ pub fn agent_loop_ir_with_tools(
     memory_tools: bool,
     native_tools: &[String],
 ) -> Machine {
+    agent_loop_ir_with_policies(model, prompt, max_turns, memory_tools, native_tools, false)
+}
+
+/// The agent loop with per-effect policy knobs (t-1308.10). Today the one
+/// knob is `shell_requires_approval`: gate the shell tool's Eval behind the
+/// approval protocol (DR-7) by setting `require_approval` on its
+/// [`crate::ir::EvalPolicy`]. Gating is part of the program — enabling it
+/// changes the program hash, so replay against a differently-gated loop
+/// diverges; the ungated loop hashes identically to before the field
+/// existed (the policy field serializes only when true).
+pub fn agent_loop_ir_with_policies(
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    memory_tools: bool,
+    native_tools: &[String],
+    shell_requires_approval: bool,
+) -> Machine {
     let entry = BlockId(0);
     let done = BlockId(1);
     let prepare_tools = BlockId(2);
@@ -619,7 +637,10 @@ pub fn agent_loop_ir_with_tools(
                     request: crate::ir::EvalRequest::Shell {
                         command: Expr::Var(command),
                     },
-                    policy: Default::default(),
+                    policy: crate::ir::EvalPolicy {
+                        require_approval: shell_requires_approval,
+                        ..Default::default()
+                    },
                 },
                 Instr::Let {
                     out: tool_content.clone(),
@@ -1205,6 +1226,11 @@ pub struct AgentLoopOptions {
     /// Validate the loop's final response against a JSON Schema, with
     /// bounded repair (t-1308.4, DR-2).
     pub output_contract: Option<OutputContract>,
+    /// Gate the shell tool's Eval behind the approval protocol (t-1308.10,
+    /// DR-7): see [`agent_loop_ir_with_policies`]. Off by default; without
+    /// a resolver (hook or pre-loaded resolution) a gated shell command
+    /// pauses the run instead of executing.
+    pub shell_requires_approval: bool,
 }
 
 /// Run the agent loop with loop-level post-processing (t-1308.4): build the
@@ -1241,6 +1267,59 @@ pub async fn run_agent_loop(
     options: &AgentLoopOptions,
     effect_visits: BTreeMap<String, u64>,
 ) -> Result<(Value, Machine)> {
+    match run_agent_loop_outcome(
+        config,
+        store,
+        ir_replay,
+        gc_state,
+        model,
+        prompt,
+        max_turns,
+        options,
+        effect_visits,
+    )
+    .await?
+    {
+        AgentLoopOutcome::Complete { value, machine } => Ok((value, machine)),
+        // This entry point cannot suspend, so a pause with no resolver is
+        // the fail-closed error: the gated effect did not execute (DR-7).
+        AgentLoopOutcome::AwaitingApproval { pending, .. } => {
+            Err(crate::ir_interpreter::awaiting_approval_error(&pending))
+        }
+    }
+}
+
+/// The outcome of one agent-loop run for drivers that can pause (t-1308.10).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentLoopOutcome {
+    /// The loop ran to completion (including any output-contract repairs).
+    Complete { value: Value, machine: Machine },
+    /// An approval-gated effect was reached with no decision available: the
+    /// machine checkpointed mid-turn without executing it. Persist the
+    /// checkpoint alongside a [`crate::approval::PendingEffectRecord`]
+    /// (see [`crate::approval::ApprovalStore`]) and, once resolved, re-enter
+    /// it with [`resume_agent_loop_outcome`].
+    AwaitingApproval {
+        checkpoint: crate::ir_interpreter::IrCheckpoint,
+        pending: crate::approval::ApprovalRequest,
+    },
+}
+
+/// [`run_agent_loop`] for drivers that can pause on approval gates: instead
+/// of failing closed with an error, a gated effect with no resolver returns
+/// [`AgentLoopOutcome::AwaitingApproval`] carrying the mid-turn checkpoint.
+#[allow(clippy::too_many_arguments)] // mirrors run_agent_loop's axes
+pub async fn run_agent_loop_outcome(
+    config: &SeqConfig,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&IrReplayTrace>,
+    gc_state: &mut GcState,
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    options: &AgentLoopOptions,
+    effect_visits: BTreeMap<String, u64>,
+) -> Result<AgentLoopOutcome> {
     if let Some(replay) = ir_replay {
         check_output_schema_hash(replay, options.output_contract.as_ref())?;
     }
@@ -1262,25 +1341,96 @@ pub async fn run_agent_loop(
             .await?;
     }
 
-    let mut machine = agent_loop_ir_with_tools(
+    let mut machine = agent_loop_ir_with_policies(
         model.clone(),
         prompt,
         max_turns,
         options.memory_tools,
         &options.tool_names,
+        options.shell_requires_approval,
     );
     machine.effect_visits = effect_visits;
+    drive_agent_loop(
+        config, store, ir_replay, gc_state, model, max_turns, options, machine,
+    )
+    .await
+}
+
+/// Re-enter an approval pause (t-1308.10): run the checkpointed machine —
+/// program counter still at the gated instruction — to completion or to the
+/// next pause. The caller seeds `store` from the checkpoint's store
+/// snapshot and loads the durable decision into
+/// [`crate::approval::ApprovalConfig::resolutions`] on `config` (see
+/// [`crate::approval::ApprovalStore::resolution_of`]); the gate consumes it
+/// at the effect site, executing the effect (approved) or binding the typed
+/// denial value (denied). `model`/`max_turns`/`options` must match the
+/// original run: they rebuild the loop for output-contract repair turns.
+#[allow(clippy::too_many_arguments)] // mirrors run_agent_loop's axes
+pub async fn resume_agent_loop_outcome(
+    config: &SeqConfig,
+    store: &mut dyn IrStore,
+    gc_state: &mut GcState,
+    model: Model,
+    max_turns: usize,
+    options: &AgentLoopOptions,
+    machine: Machine,
+) -> Result<AgentLoopOutcome> {
+    // No replay: a resume is a live continuation of a live run. The
+    // output-contract identity event was already emitted by the run that
+    // paused, so the drive loop is entered directly.
+    drive_agent_loop(
+        config, store, None, gc_state, model, max_turns, options, machine,
+    )
+    .await
+}
+
+/// The agent loop's execute/validate/repair cycle, shared by fresh runs and
+/// approval resumes. Repair attempts count from zero per entry — a resumed
+/// run's earlier repair attempts are not carried across the pause (wave-1
+/// simplification; the contract budget still bounds each entry).
+#[allow(clippy::too_many_arguments)] // mirrors run_agent_loop's axes
+async fn drive_agent_loop(
+    config: &SeqConfig,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&IrReplayTrace>,
+    gc_state: &mut GcState,
+    model: Model,
+    max_turns: usize,
+    options: &AgentLoopOptions,
+    mut machine: Machine,
+) -> Result<AgentLoopOutcome> {
     let mut attempt = 0usize;
     loop {
-        let (value, done) = crate::ir_interpreter::run_ir_sequential_with_gc(
-            config, machine, store, ir_replay, gc_state,
+        let (value, done) = match crate::ir_interpreter::run_ir_steps_with_gc(
+            config, machine, store, ir_replay, None, gc_state,
         )
-        .await?;
+        .await?
+        {
+            crate::ir_interpreter::IrStepOutcome::Complete { value, machine } => (value, machine),
+            crate::ir_interpreter::IrStepOutcome::AwaitingApproval {
+                checkpoint,
+                pending,
+            } => {
+                return Ok(AgentLoopOutcome::AwaitingApproval {
+                    checkpoint,
+                    pending,
+                })
+            }
+            crate::ir_interpreter::IrStepOutcome::Suspended { .. } => {
+                unreachable!("no instruction limit was set")
+            }
+        };
         let Some(contract) = &options.output_contract else {
-            return Ok((value, done));
+            return Ok(AgentLoopOutcome::Complete {
+                value,
+                machine: done,
+            });
         };
         if turn_budget_exhausted(&value) {
-            return Ok((value, done));
+            return Ok(AgentLoopOutcome::Complete {
+                value,
+                machine: done,
+            });
         }
         let content = value
             .get("content")
@@ -1289,7 +1439,10 @@ pub async fn run_agent_loop(
             .to_owned();
         let errors = contract.validate_text(&content);
         if errors.is_empty() {
-            return Ok((value, done));
+            return Ok(AgentLoopOutcome::Complete {
+                value,
+                machine: done,
+            });
         }
         attempt += 1;
         config
@@ -1311,17 +1464,12 @@ pub async fn run_agent_loop(
                 errors,
                 content,
             };
-            return Ok((failure.into_value(), done));
+            return Ok(AgentLoopOutcome::Complete {
+                value: failure.into_value(),
+                machine: done,
+            });
         }
-        machine = repair_machine(
-            &done,
-            &content,
-            &errors,
-            model.clone(),
-            max_turns,
-            options.memory_tools,
-            &options.tool_names,
-        );
+        machine = repair_machine(&done, &content, &errors, model.clone(), max_turns, options);
     }
 }
 
@@ -1337,15 +1485,13 @@ fn turn_budget_exhausted(value: &Value) -> bool {
 /// history plus the invalid assistant answer and a user repair message,
 /// with a full turn budget and the effect-visit counters carried forward
 /// (same shape as a new session turn in the runtime).
-#[allow(clippy::too_many_arguments)] // mirrors run_agent_loop's axes: loop identity vs repair state
 fn repair_machine(
     done: &Machine,
     content: &str,
     errors: &[String],
     model: Model,
     max_turns: usize,
-    memory_tools: bool,
-    tool_names: &[String],
+    options: &AgentLoopOptions,
 ) -> Machine {
     let mut history = done
         .env
@@ -1358,7 +1504,14 @@ fn repair_machine(
         }
         messages.push(serde_json::json!({ "role": "user", "content": repair_prompt(errors) }));
     }
-    let mut machine = agent_loop_ir_with_tools(model, vec![], max_turns, memory_tools, tool_names);
+    let mut machine = agent_loop_ir_with_policies(
+        model,
+        vec![],
+        max_turns,
+        options.memory_tools,
+        &options.tool_names,
+        options.shell_requires_approval,
+    );
     machine.env.insert(Var("history".into()), history);
     machine.effect_visits = done.effect_visits.clone();
     machine
@@ -1488,6 +1641,7 @@ mod tests {
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -2568,6 +2722,7 @@ mod tests {
             memory_tools: false,
             tool_names: Vec::new(),
             output_contract: contract,
+            shell_requires_approval: false,
         };
         let (value, machine) = run_agent_loop(
             &config,
@@ -2764,6 +2919,7 @@ mod tests {
                 memory_tools: false,
                 tool_names: Vec::new(),
                 output_contract: Some(contract_a.clone()),
+                shell_requires_approval: false,
             };
             let (value, _machine) = run_agent_loop(
                 &config,
@@ -2798,6 +2954,7 @@ mod tests {
                     memory_tools: false,
                     tool_names: Vec::new(),
                     output_contract: contract,
+                    shell_requires_approval: false,
                 };
                 run_agent_loop(
                     &config,

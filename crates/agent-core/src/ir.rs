@@ -445,6 +445,16 @@ pub enum EvalRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalPolicy {
     pub timeout_ms: Option<u64>,
+    /// Gate this Eval site behind human approval (t-1308.10, DR-7): the
+    /// effect does not execute until a decision arrives (in-process hook,
+    /// pre-loaded resolution, or a durable pause resolved by `agent
+    /// approvals`). Serde-default `false` and skipped when false, so
+    /// programs (and their canonical hashes) recorded before this field
+    /// exist unchanged — back-compat is pinned by test. The gate mechanism
+    /// is kind-agnostic (see [`crate::approval`]); an `InferPolicy` gate
+    /// would reuse it without redesign.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_approval: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1013,6 +1023,76 @@ mod tests {
         let encoded = serde_json::to_string(&argv).unwrap();
         let decoded: EvalRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, argv);
+    }
+
+    /// Serde back-compat for `EvalPolicy.require_approval` (t-1308.10): the
+    /// field is default-off and skipped when false, so programs (and their
+    /// canonical hashes) recorded before it existed parse and hash
+    /// unchanged. Pinned here on the wire shape: a default policy
+    /// serializes without the key, pre-gate JSON deserializes to the
+    /// default, and only a true value reaches the wire (where it is part of
+    /// program identity on purpose — a gated program IS a different
+    /// program).
+    #[test]
+    fn eval_policy_require_approval_is_backward_compatible() {
+        let default_wire = serde_json::to_value(EvalPolicy::default()).unwrap();
+        assert_eq!(default_wire, serde_json::json!({ "timeout_ms": null }));
+
+        let pre_gate: EvalPolicy = serde_json::from_str(r#"{ "timeout_ms": null }"#).unwrap();
+        assert_eq!(pre_gate, EvalPolicy::default());
+        assert!(!pre_gate.require_approval);
+
+        let gated = EvalPolicy {
+            require_approval: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&gated).unwrap(),
+            serde_json::json!({ "timeout_ms": null, "require_approval": true })
+        );
+        let round_trip: EvalPolicy =
+            serde_json::from_value(serde_json::to_value(&gated).unwrap()).unwrap();
+        assert_eq!(round_trip, gated);
+
+        // Program identity: an explicit false hashes identically to the
+        // pre-gate default; true changes the hash (gating is program).
+        let program_with = |policy: EvalPolicy| Program {
+            id: ProgramId("gate".into()),
+            entry: BlockId(0),
+            blocks: BTreeMap::from([(
+                BlockId(0),
+                Block {
+                    params: vec![],
+                    instructions: vec![Instr::Eval {
+                        out: Var("result".into()),
+                        request: EvalRequest::Shell {
+                            command: Expr::Value(Value::String("true".into())),
+                        },
+                        policy,
+                    }],
+                    terminator: Terminator::Return {
+                        value: Expr::Var(Var("result".into())),
+                    },
+                },
+            )]),
+        };
+        let ungated_hash = program_hash(&program_with(EvalPolicy::default())).unwrap();
+        assert_eq!(
+            ungated_hash,
+            program_hash(&program_with(EvalPolicy {
+                require_approval: false,
+                ..Default::default()
+            }))
+            .unwrap()
+        );
+        assert_ne!(
+            ungated_hash,
+            program_hash(&program_with(EvalPolicy {
+                require_approval: true,
+                ..Default::default()
+            }))
+            .unwrap()
+        );
     }
 
     #[test]

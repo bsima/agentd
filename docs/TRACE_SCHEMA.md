@@ -1,6 +1,6 @@
 # Public Trace Event Schema
 
-`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.3**, see the version history at the end)
+`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.4**, see the version history at the end)
 
 This document is the contract for consumers of agentd trace data: the SDK
 trace adapter, dashboard ingest, and any external tooling. It defines a
@@ -177,6 +177,8 @@ same `run_id`/`op_id`.
 | `tool.requested` | `ToolCall` | `started` | arguments preview | `name` |
 | `tool.completed` | `ToolResult` | `completed` | result preview | `duration_ms`, `name` |
 | `tool.failed` | `ToolError` | `failed` | — | `duration_ms`, `name` |
+| `approval.requested` | `ApprovalRequested` | `started` | gated request payload | `kind`, `pending_id` |
+| `approval.resolved` | `ApprovalResolved` | `completed` | — | `decision`, `effect_id`, `kind`, `pending_id`, `reason`?, `resolved_by`? |
 | `run.completed` | `AgentDone` | `completed` | — | `infer_calls`?, `input_tokens`?, `output_tokens`?, `total_tokens`?, `cached_input_tokens`?, `cost_micro_usd`?, `uncosted_infer_calls`? |
 | `output.validation_failed` | `Custom { name: "output_validation_failed" }` | `failed` | invalid final-output excerpt | `attempt` (1-based), `errors` (string[], capped at 8) |
 
@@ -193,6 +195,25 @@ tools are unchanged: shell/infer/remember/recall still surface as the
 `Tool`); `attrs.name` on all three is the registered tool name. Handler
 failures ride the loop's errors-as-values convention, so a `tool.failed` is
 usually followed by the model reacting to the error, not by run failure.
+
+`approval.requested` / `approval.resolved` (since 1.4, t-1308.10):
+human-in-the-loop approval gates over effects (DR-7 — Store to a
+`RequireApproval` sink, or an Eval whose `EvalPolicy.require_approval` is
+set). `approval.requested` fires when a gated effect reaches the gate with
+no decision yet: the run either pauses durably (a pending record + mid-turn
+machine checkpoint under `~/.local/share/agent/approvals`, resolved by
+`agent approvals --approve/--deny`) or asks an in-process hook (the SDK's
+`on_approval`). `approval.resolved` fires when the decision is consumed at
+the effect site — possibly in a later process, appended to the same trace.
+Neither carries an `op_id`: the gate sits ahead of effect dispatch (a
+paused or denied effect never becomes an operation). Correlate the pair via
+`attrs.pending_id`, and the resolution to its effect via `attrs.effect_id`
+(the `requested` side carries the full `effect` identity). A denial is
+`completed`, not `failed`: it resolves to a typed denial value the program
+and model react to (errors-as-values); the run continues. Approval outcomes
+are recorded results — replay reproduces the pause or the decision as data
+(re-emitting both events) without pausing or prompting, and diverges when
+the recorded request payload does not match the observed effect.
 
 Cost accounting attrs (since 1.3, t-1334): all cost arithmetic is exact
 integer math — see `agent_core::cost`.
@@ -238,8 +259,6 @@ Consumers must accept these without a schema bump when they start flowing:
 - `turn.started`, `turn.completed` — turns exist in the session protocol
   (machine events carry `turn_id`), but the runtime trace does not yet
   record turn boundaries.
-- `approval.requested`, `approval.resolved` — human-in-the-loop approval
-  gates.
 
 ### Private runtime events (no public projection)
 
@@ -297,6 +316,13 @@ neither constrains the other today.
 
 ## Version history
 
+- **1.4** (t-1308.10) — additive: the reserved `approval.requested` /
+  `approval.resolved` are now emitted (projected from the new runtime
+  `ApprovalRequested`/`ApprovalResolved` events) for approval-gated effects
+  (DR-7), with `pending_id`/`kind` attrs (plus
+  `decision`/`effect_id`/`resolved_by`?/`reason`? on the resolution) and
+  full effect identity on `approval.requested`. Wire `schema_version` stays
+  `1` per the compatibility policy.
 - **1.3** (t-1334) — additive: cost accounting. `infer.completed` gains
   `cached_input_tokens`, `cost_micro_usd`, and `pricing` attrs (present when
   recorded); `run.completed` gains the usage/cost rollup attrs

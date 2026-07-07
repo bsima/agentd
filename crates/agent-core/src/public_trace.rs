@@ -684,6 +684,73 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
             }
             Some(out)
         }
+        // Approval gates (t-1308.10, schema 1.4): the reserved
+        // `approval.requested` / `approval.resolved` names, now emitted.
+        // Neither carries an op_id — the gate sits ahead of effect dispatch
+        // (a paused or denied effect never becomes an operation); correlate
+        // the pair via `attrs.pending_id`, and the resolved event to its
+        // effect via `attrs.effect_id`.
+        Event::ApprovalRequested {
+            run_id,
+            pending_id,
+            kind,
+            request,
+            effect,
+            timestamp,
+        } => {
+            let mut out = base(
+                "approval.requested",
+                *timestamp,
+                run_id,
+                None,
+                None,
+                PublicStatus::Started,
+            );
+            out.effect = Some(PublicEffect::from(effect.as_ref()));
+            out.payload_preview = Some(preview(&request.to_string(), PAYLOAD_PREVIEW_MAX_CHARS));
+            out.attrs.insert("kind".into(), Value::String(kind.clone()));
+            out.attrs
+                .insert("pending_id".into(), Value::String(pending_id.clone()));
+            Some(out)
+        }
+        // A denial is `completed`, not `failed`: the gate resolved and the
+        // denial continues the program as a typed value (errors-as-values);
+        // `failed` stays reserved for terminal effect failure.
+        Event::ApprovalResolved {
+            run_id,
+            pending_id,
+            effect_id,
+            kind,
+            decision,
+            resolved_by,
+            reason,
+            timestamp,
+        } => {
+            let mut out = base(
+                "approval.resolved",
+                *timestamp,
+                run_id,
+                None,
+                None,
+                PublicStatus::Completed,
+            );
+            out.attrs
+                .insert("decision".into(), Value::String(decision.clone()));
+            out.attrs
+                .insert("effect_id".into(), Value::String(effect_id.clone()));
+            out.attrs.insert("kind".into(), Value::String(kind.clone()));
+            out.attrs
+                .insert("pending_id".into(), Value::String(pending_id.clone()));
+            if let Some(reason) = reason {
+                out.attrs
+                    .insert("reason".into(), Value::String(reason.clone()));
+            }
+            if let Some(resolved_by) = resolved_by {
+                out.attrs
+                    .insert("resolved_by".into(), Value::String(resolved_by.clone()));
+            }
+            Some(out)
+        }
         // Private: runtime-internal orchestration and extension events.
         // Context assembly (hydration/prompt IR) and Par structure may gain
         // public projections later (additive, minor bump); Custom is the
@@ -1007,6 +1074,31 @@ mod tests {
                 },
                 None,
             ),
+            // Approval gates (schema 1.4, t-1308.10): both events public.
+            (
+                Event::ApprovalRequested {
+                    run_id: run.into(),
+                    pending_id: "pa-abc".into(),
+                    kind: "eval".into(),
+                    request: serde_json::json!({ "command": "echo hi", "argv": null }),
+                    effect: Box::new(test_effect_location()),
+                    timestamp: ts,
+                },
+                Some("approval.requested"),
+            ),
+            (
+                Event::ApprovalResolved {
+                    run_id: run.into(),
+                    pending_id: "pa-abc".into(),
+                    effect_id: "sha256:e".into(),
+                    kind: "eval".into(),
+                    decision: "denied".into(),
+                    resolved_by: Some("ben".into()),
+                    reason: Some("not on prod".into()),
+                    timestamp: ts,
+                },
+                Some("approval.resolved"),
+            ),
             (
                 Event::Custom {
                     run_id: run.into(),
@@ -1061,6 +1153,87 @@ mod tests {
                 assert_eq!(public.payload_ref, None);
             }
         }
+    }
+
+    fn test_effect_location() -> EffectLocation {
+        crate::ir::effect_location(
+            crate::ir::ProgramHash("sha256:p".into()),
+            crate::ir::EffectKind::Eval,
+            crate::ir::EffectSite {
+                block: crate::ir::BlockId(0),
+                instruction_index: 1,
+            },
+            crate::ir::DynamicPath::at_entry(0),
+        )
+        .expect("effect location")
+    }
+
+    /// Approval projection shape (schema 1.4, t-1308.10): the pair
+    /// correlates by pending_id (no op_id — the gate precedes dispatch),
+    /// `requested` carries the effect identity and a request preview, and a
+    /// denial is `completed` (it resolves to a value; nothing failed).
+    #[test]
+    fn approval_events_project_with_pending_id_correlation() {
+        let ts = DateTime::<Utc>::UNIX_EPOCH;
+        let requested = public_event(&Event::ApprovalRequested {
+            run_id: "run".into(),
+            pending_id: "pa-abc".into(),
+            kind: "eval".into(),
+            request: serde_json::json!({ "command": "rm -rf /tmp/x", "argv": null }),
+            effect: Box::new(test_effect_location()),
+            timestamp: ts,
+        })
+        .expect("public");
+        assert_eq!(requested.event, "approval.requested");
+        assert_eq!(requested.status, PublicStatus::Started);
+        assert_eq!(requested.op_id, None);
+        assert_eq!(
+            requested.effect.as_ref().map(|effect| &effect.effect_id),
+            Some(&test_effect_location().effect_id.0)
+        );
+        assert_eq!(requested.attrs.get("kind"), Some(&Value::from("eval")));
+        assert_eq!(
+            requested.attrs.get("pending_id"),
+            Some(&Value::from("pa-abc"))
+        );
+        assert_eq!(
+            requested.payload_preview.as_deref(),
+            Some(r#"{"argv":null,"command":"rm -rf /tmp/x"}"#)
+        );
+
+        let resolved = public_event(&Event::ApprovalResolved {
+            run_id: "run".into(),
+            pending_id: "pa-abc".into(),
+            effect_id: test_effect_location().effect_id.0,
+            kind: "eval".into(),
+            decision: "denied".into(),
+            resolved_by: Some("ben".into()),
+            reason: Some("not on prod".into()),
+            timestamp: ts,
+        })
+        .expect("public");
+        assert_eq!(resolved.event, "approval.resolved");
+        assert_eq!(resolved.status, PublicStatus::Completed);
+        assert_eq!(resolved.error, None, "a denial is a value, not a failure");
+        assert_eq!(resolved.op_id, None);
+        assert_eq!(resolved.attrs.get("decision"), Some(&Value::from("denied")));
+        assert_eq!(
+            resolved.attrs.get("pending_id"),
+            Some(&Value::from("pa-abc"))
+        );
+        assert_eq!(
+            resolved.attrs.get("effect_id"),
+            requested
+                .effect
+                .as_ref()
+                .map(|effect| Value::from(effect.effect_id.clone()))
+                .as_ref()
+        );
+        assert_eq!(resolved.attrs.get("resolved_by"), Some(&Value::from("ben")));
+        assert_eq!(
+            resolved.attrs.get("reason"),
+            Some(&Value::from("not on prod"))
+        );
     }
 
     /// Cost accounting projection (schema 1.3, t-1334): infer.completed
@@ -1283,6 +1456,7 @@ mod tests {
         ));
         let trace = TraceLogger::new("golden-run", trace_path.clone());
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: crate::hydration::SourceRegistry::new(),

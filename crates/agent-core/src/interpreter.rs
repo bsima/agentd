@@ -262,6 +262,11 @@ pub struct SeqConfig {
     /// cost omitted. Replayed InferResults never consult this: recorded
     /// costs pass through verbatim.
     pub pricing: crate::cost::PricingTable,
+    /// Approval policy for gated effects (t-1308.10, DR-7): pre-loaded
+    /// resolutions (resume drivers) and the in-process decision hook (SDK
+    /// Runner). Default = neither, which fails closed: a gated effect
+    /// pauses the run instead of executing.
+    pub approvals: crate::approval::ApprovalConfig,
 }
 
 impl SeqConfig {
@@ -1057,6 +1062,7 @@ mod tests {
     #[tokio::test]
     async fn gc_collects_to_threshold_budget() -> Result<()> {
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
@@ -1094,6 +1100,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
@@ -1145,6 +1152,7 @@ mod tests {
         timing: GcTiming,
     ) -> SeqConfig {
         SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -1373,6 +1381,7 @@ mod tests {
             response("done", vec![]),
         ]));
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
@@ -1429,6 +1438,7 @@ mod tests {
             response("finished", vec![]),
         ]));
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
@@ -1474,6 +1484,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new(),
@@ -1565,6 +1576,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![response("ok", vec![])]));
         let queries = Arc::new(Mutex::new(Vec::new()));
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: provider.clone(),
             hydration: SourceRegistry::new().register(StaticSource {
@@ -1617,6 +1629,7 @@ mod tests {
             clean_vars.insert("PATH".into(), path);
         }
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -1890,6 +1903,7 @@ mod tests {
 
     fn seq_config_for_eval() -> SeqConfig {
         SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
@@ -1917,6 +1931,7 @@ mod tests {
         // non-zero without blocking or stealing any input.
         let provider = Arc::new(MockProvider::new(vec![]));
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -1962,6 +1977,7 @@ mod tests {
         let trace = test_trace();
         let path = trace.path().clone();
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -1998,6 +2014,7 @@ mod tests {
         let record_trace = test_trace();
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: record_provider,
             hydration: SourceRegistry::new(),
@@ -2021,6 +2038,7 @@ mod tests {
 
         let replay = ReplayTrace::load(record_path).await?;
         let replay_config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
@@ -2076,6 +2094,7 @@ mod tests {
         let mut record_pricing = crate::cost::PricingTable::default();
         record_pricing.insert("mock", crate::cost::Pricing::from_usd_per_mtok(3.0, 15.0)?);
         let record_config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![provider_response])),
             hydration: SourceRegistry::new(),
@@ -2124,6 +2143,7 @@ mod tests {
         let replay_trace = test_trace();
         let replay_path = replay_trace.path().clone();
         let replay_config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
@@ -2179,6 +2199,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -2220,6 +2241,7 @@ mod tests {
         let record_trace = test_trace();
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
@@ -2257,6 +2279,7 @@ mod tests {
         let replay = ReplayTrace::load(record_path).await?;
         let live_provider = Arc::new(MockProvider::new(vec![response("unused", vec![])]));
         let replay_config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: live_provider.clone(),
             hydration: SourceRegistry::new(),
@@ -2290,6 +2313,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            approvals: Default::default(),
             tools: Default::default(),
             provider: Arc::new(MockProvider::new(vec![])),
             hydration: SourceRegistry::new(),
