@@ -1,0 +1,28 @@
+[package]
+name = "agentd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Supervisor CLI for named, long-running agent sessions: naming, turn delivery, and lifecycle over a conventional directory layout"
+keywords = ["agent", "llm", "supervisor", "cli", "unix"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Tests only (docs/SUPERVISOR.md quality bar): replay fixtures for driving
+# the real `agent` child without credentials. The supervisor itself talks
+# to the agent purely through the filesystem/process contract.
+agent-sdk = { path = "../agent-sdk", version = "0.2.0" }
+serde_json.workspace = true
+uuid.workspace = true

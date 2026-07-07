@@ -84,6 +84,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentd"
+version = "0.2.0"
+dependencies = [
+ "agent-sdk",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "libc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "uuid",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

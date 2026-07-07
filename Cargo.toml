@@ -4,6 +4,7 @@ members = [
     "crates/agent-oauth",
     "crates/agent",
     "crates/agent-sdk",
+    "crates/agentd",
 ]
 resolver = "2"
 
