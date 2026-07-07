@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-core",
  "agent-oauth",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "agent-oauth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-core",
  "anyhow",

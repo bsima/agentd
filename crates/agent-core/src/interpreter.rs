@@ -1628,7 +1628,7 @@ mod tests {
         if let Ok(path) = std::env::var("PATH") {
             clean_vars.insert("PATH".into(), path);
         }
-        let config = SeqConfig {
+        let mut config = SeqConfig {
             approvals: Default::default(),
             tools: Default::default(),
             provider,
@@ -1638,6 +1638,10 @@ mod tests {
             eval: EvalConfig {
                 shell: "/bin/sh".into(),
                 cwd: Some(cwd.clone()),
+                // Short timeout only for the timed_out assertion below; the
+                // remaining evals get a generous timeout, because under
+                // parallel-test load even spawning `sh -c printf` can take
+                // longer than 50ms and the child dies with empty output.
                 timeout: std::time::Duration::from_millis(50),
                 max_stdout_bytes: 4,
                 max_stderr_bytes: 4,
@@ -1657,6 +1661,7 @@ mod tests {
         let (timeout_result, _) = run_sequential(&config, (), crate::op::eval("sleep 1")).await?;
         assert_eq!(timeout_result["timed_out"], json!(true));
 
+        config.eval.timeout = std::time::Duration::from_secs(10);
         let (cap_result, _) = run_sequential(&config, (), crate::op::eval("printf 123456")).await?;
         assert_eq!(cap_result["stdout"], json!("1234"));
         assert_eq!(cap_result["stdout_truncated"], json!(true));

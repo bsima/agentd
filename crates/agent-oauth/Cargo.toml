@@ -9,7 +9,7 @@ keywords = ["agent", "llm", "oauth", "pkce", "authentication"]
 categories = ["authentication", "api-bindings"]
 
 [dependencies]
-agent-core = { path = "../agent-core", version = "0.1.0" }
+agent-core = { path = "../agent-core", version = "0.2.0" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

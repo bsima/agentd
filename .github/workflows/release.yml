@@ -13,6 +13,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Fail fast if the tag doesn't match the workspace crate version —
+      # otherwise the released binary reports the wrong --version.
+      - name: Tag matches crate version
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          have="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$want" != "$have" ]; then
+            echo "tag $GITHUB_REF_NAME does not match [workspace.package] version $have" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -54,6 +65,30 @@ jobs:
           cp examples/models.yaml "$name/models.yaml.example"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      # Verify the artifact exactly as a user would consume it: checksum,
+      # extract, exact file set, and the binary runs and reports the tag
+      # version. Native runners on both arches, so execution is real.
+      - name: Verify tarball
+        run: |
+          set -euo pipefail
+          name="agent-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          verify="$(mktemp -d)"
+          cp "$name.tar.gz" "$name.tar.gz.sha256" "$verify/"
+          cd "$verify"
+          sha256sum -c "$name.tar.gz.sha256"
+          tar xzf "$name.tar.gz"
+          want="agent LICENSE README.md models.yaml.example"
+          have="$(ls "$name" | sort | tr '\n' ' ' | sed 's/ $//')"
+          if [ "$have" != "$(echo $want | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//')" ]; then
+            echo "tarball contents mismatch: have [$have]" >&2
+            exit 1
+          fi
+          got="$("./$name/agent" --version)"
+          if [ "$got" != "agent ${GITHUB_REF_NAME#v}" ]; then
+            echo "binary reports '$got', expected 'agent ${GITHUB_REF_NAME#v}'" >&2
+            exit 1
+          fi
+          "./$name/agent" --help > /dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: tarball-${{ matrix.target }}
