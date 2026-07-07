@@ -433,6 +433,11 @@ runs against a collection of real long-running task traces:
 - Run with: `cargo test --test gc_evals -- --nocapture`
 - Recording new fixtures requires `--trace-full-payloads`: the harness reads
   full `InferCall` prompts, which are preview-only in traces by default
+- The semantic-coherence score is an LLM-judge column (t-1168):
+  online-gated behind `RUN_AGENT_ONLINE_EVAL=1`, with judge responses
+  recorded to `evals/gc/judge/recorded.jsonl` and replayed by default so
+  offline reruns stay deterministic and comparable (see
+  `evals/gc/README.md`)
 
 Gate any strategy change on showing improvement over `ring` on the existing
 eval set. This also lets us tune `--gc-threshold` empirically.

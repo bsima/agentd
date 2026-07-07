@@ -24,14 +24,20 @@
 //! Incremental timings thread one `GcState` across all collections, so
 //! cross-turn metadata (frame status, lifecycle tags, infer counts) behaves
 //! as it does in the runtime loop.
+//!
+//! The optional `judge` column (t-1168) is an LLM semantic-coherence score,
+//! ONLINE-GATED behind `RUN_AGENT_ONLINE_EVAL=1` with recorded-judge replay
+//! by default — see the judge section at the bottom of this file.
 
 use agent_core::{
-    estimate_tokens, truncate_oversized_message, ChatMessage, ContextGc, GcState, MarkSweepGc,
-    RingGc, StackFrameGc, ToolCall,
+    estimate_tokens, truncate_oversized_message, ChatMessage, ChatProvider, ContextGc, GcState,
+    MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc, StackFrameGc, ToolCall,
 };
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +85,10 @@ struct EvalMetrics {
     converged: bool,
     last_user_retained: bool,
     last_message_retained: bool,
+    /// Semantic-coherence judge score (t-1168), e.g. "3/3". None when no
+    /// recording exists and the run is offline, or when the judge response
+    /// did not parse.
+    judge: Option<String>,
 }
 
 enum Strategy {
@@ -142,13 +152,15 @@ fn gc_strategy_matrix() -> Result<()> {
     let cases = all_cases()?;
     assert!(!cases.is_empty(), "expected at least one eval case");
 
+    let mut judge = JudgeBook::load_default()?;
     print_header();
     for case in &cases {
         for pressure in PRESSURES {
             for timing in TIMINGS {
                 for strategy in &STRATEGIES {
                     for preserve in [true, false] {
-                        let metrics = evaluate(case, pressure, timing, strategy, preserve)?;
+                        let metrics =
+                            evaluate(case, pressure, timing, strategy, preserve, Some(&mut judge))?;
                         print_metrics(&metrics);
                     }
                 }
@@ -170,9 +182,23 @@ fn gc_challengers_improve_over_ring_on_tool_chains() -> Result<()> {
     );
 
     for case in tool_chains {
-        let ring = evaluate(case, GATE_PRESSURE, Timing::Final, &Strategy::Ring, false)?;
+        let ring = evaluate(
+            case,
+            GATE_PRESSURE,
+            Timing::Final,
+            &Strategy::Ring,
+            false,
+            None,
+        )?;
         for challenger_kind in [Strategy::MarkSweep, Strategy::Stack] {
-            let challenger = evaluate(case, GATE_PRESSURE, Timing::Final, &challenger_kind, false)?;
+            let challenger = evaluate(
+                case,
+                GATE_PRESSURE,
+                Timing::Final,
+                &challenger_kind,
+                false,
+                None,
+            )?;
             assert!(
                 challenger.messages_after > ring.messages_after
                     || challenger.tool_results_after > ring.tool_results_after,
@@ -196,6 +222,7 @@ fn evaluate(
     timing: Timing,
     strategy: &Strategy,
     preserve_prefix: bool,
+    judge: Option<&mut JudgeBook>,
 ) -> Result<EvalMetrics> {
     let gc = strategy.build(preserve_prefix);
     let tokens_before = estimate_tokens(&case.prompt);
@@ -234,14 +261,31 @@ fn evaluate(
         );
     }
 
+    let cache = if preserve_prefix {
+        "preserve"
+    } else {
+        "ignore"
+    };
+    let judge_score = match judge {
+        Some(book) => {
+            let cell = format!(
+                "{}|{:.2}|{}|{}|{}",
+                case.name,
+                pressure,
+                timing.label(),
+                gc.name(),
+                cache
+            );
+            book.verdict(&cell, &case.prompt, &collected)?
+                .map(|verdict| verdict.display())
+        }
+        None => None,
+    };
+
     Ok(EvalMetrics {
         strategy: gc.name(),
         timing,
-        cache: if preserve_prefix {
-            "preserve"
-        } else {
-            "ignore"
-        },
+        cache,
         trace: case.name.clone(),
         pressure,
         budget,
@@ -266,6 +310,7 @@ fn evaluate(
             .last()
             .zip(collected.last())
             .is_none_or(|(before, after)| before.id == after.id),
+        judge: judge_score,
     })
 }
 
@@ -674,7 +719,7 @@ fn stable_prefix_len(original: &[ChatMessage], collected: &[ChatMessage]) -> usi
 
 fn print_header() {
     println!(
-        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>6} {:>4} {:>5} {:>4}",
+        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>6} {:>4} {:>5} {:>4} {:>5}",
         "case",
         "press",
         "timing",
@@ -690,13 +735,14 @@ fn print_header() {
         "prefix",
         "coll",
         "inval",
-        "conv"
+        "conv",
+        "judge"
     );
 }
 
 fn print_metrics(metrics: &EvalMetrics) {
     println!(
-        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>6} {:>4} {:>5} {:>4}{}",
+        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>6} {:>4} {:>5} {:>4} {:>5}{}",
         metrics.trace,
         metrics.pressure,
         metrics.timing.label(),
@@ -715,6 +761,7 @@ fn print_metrics(metrics: &EvalMetrics) {
         metrics.collections,
         metrics.invalidations,
         metrics.converged,
+        metrics.judge.as_deref().unwrap_or("-"),
         match (metrics.last_user_retained, metrics.last_message_retained) {
             (true, true) => "",
             (false, true) => "  !last-user-dropped",
@@ -790,6 +837,430 @@ fn gc_cache_preserve_keeps_prefix_stable() -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+// --- semantic-coherence judge (t-1168) ---------------------------------------
+//
+// An LLM scores whether a GC-collected window preserves what is needed to
+// continue the session coherently. ONLINE-GATED: the offline matrix never
+// talks to a provider. Judge responses are recorded to
+// `evals/gc/judge/recorded.jsonl` keyed by a content hash of the judge
+// prompt and replayed from there by default, so reruns are comparable
+// offline. Set RUN_AGENT_ONLINE_EVAL=1 (the evals/ convention) to score
+// unrecorded cells against a real model, appending the recordings.
+
+/// Rubric the judge scores against. Fixed string: the judge prompt must be
+/// deterministic so its hash is a stable recording key.
+const JUDGE_RUBRIC: &str = "You are auditing a context-window garbage collection. \
+You are shown a FULL conversation window and the COLLECTED window an agent will \
+actually continue from. Decide whether the collected window preserves what is \
+needed to continue the session coherently.\n\
+Score three booleans:\n\
+- task_goal_retained: the task/goal the assistant is currently working on is \
+still stated or reconstructible from the collected window.\n\
+- open_threads_retained: work that was still in flight (unanswered questions, \
+pending tool activity, unfinished steps) is still visible.\n\
+- no_orphaned_references: the collected window does not depend on dropped \
+content (e.g. 'as shown above' with the referent gone, discussion of results \
+that no longer appear).\n\
+Reply with ONLY a JSON object, no prose: \
+{\"task_goal_retained\": bool, \"open_threads_retained\": bool, \"no_orphaned_references\": bool}";
+
+/// Cap for each rendered message body in the judge prompt: keeps prompts
+/// bounded and deterministic.
+const JUDGE_RENDER_CHARS: usize = 280;
+
+/// Deterministic, comparable score shape: three rubric booleans, displayed
+/// as "<sum>/3".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct JudgeVerdict {
+    task_goal_retained: bool,
+    open_threads_retained: bool,
+    no_orphaned_references: bool,
+}
+
+impl JudgeVerdict {
+    fn score(&self) -> u8 {
+        u8::from(self.task_goal_retained)
+            + u8::from(self.open_threads_retained)
+            + u8::from(self.no_orphaned_references)
+    }
+
+    fn display(&self) -> String {
+        format!("{}/3", self.score())
+    }
+}
+
+/// One recorded judge exchange. `cell` and `model` are provenance for human
+/// readers; lookup is purely by `key`. `note` marks hand-written entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JudgeRecord {
+    key: String,
+    cell: String,
+    model: String,
+    response: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Recorded-judge replay book. Offline (the default) it only serves
+/// recordings; online it scores misses against a real provider and appends
+/// them to the recording file.
+struct JudgeBook {
+    path: PathBuf,
+    recordings: HashMap<String, String>,
+    online: Option<JudgeClient>,
+}
+
+struct JudgeClient {
+    client: ProviderClient,
+    model: Model,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl JudgeBook {
+    /// Load the shipped recording file; go online only under
+    /// RUN_AGENT_ONLINE_EVAL=1 (the evals/ convention).
+    fn load_default() -> Result<Self> {
+        let path = judge_recording_path()?;
+        let online = std::env::var("RUN_AGENT_ONLINE_EVAL").is_ok_and(|v| v == "1");
+        Self::load(path, online)
+    }
+
+    fn load(path: PathBuf, online: bool) -> Result<Self> {
+        let mut recordings = HashMap::new();
+        if path.exists() {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("reading judge recordings {}", path.display()))?;
+            for (line_idx, line) in content.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: JudgeRecord = serde_json::from_str(line).with_context(|| {
+                    format!("decoding {} line {}", path.display(), line_idx + 1)
+                })?;
+                recordings.insert(record.key, record.response);
+            }
+        }
+        let online = if online {
+            Some(JudgeClient::from_env()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            path,
+            recordings,
+            online,
+        })
+    }
+
+    /// Score one matrix cell. Replays a recording when one exists; otherwise
+    /// judges online (recording the response for future replays) or returns
+    /// None offline.
+    fn verdict(
+        &mut self,
+        cell: &str,
+        original: &[ChatMessage],
+        collected: &[ChatMessage],
+    ) -> Result<Option<JudgeVerdict>> {
+        let prompt = judge_prompt(original, collected);
+        let key = judge_key(&prompt);
+        if let Some(response) = self.recordings.get(&key) {
+            return Ok(parse_judge_response(response));
+        }
+        let Some(client) = &self.online else {
+            return Ok(None);
+        };
+        let response = client.judge(&prompt)?;
+        self.append_record(&JudgeRecord {
+            key: key.clone(),
+            cell: cell.to_string(),
+            model: client.model.0.clone(),
+            response: response.clone(),
+            note: None,
+        })?;
+        self.recordings.insert(key, response.clone());
+        Ok(parse_judge_response(&response))
+    }
+
+    fn append_record(&self, record: &JudgeRecord) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut line = serde_json::to_string(record)?;
+        line.push('\n');
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("appending judge recording {}", self.path.display()))?;
+        file.write_all(line.as_bytes())?;
+        Ok(())
+    }
+}
+
+impl JudgeClient {
+    /// Provider config from the environment, following crates/agent
+    /// conventions: AGENT_JUDGE_MODEL (or AGENT_ONLINE_MODEL) against an
+    /// OpenAI-compatible endpoint, key from
+    /// AGENT_API_KEY/ANTHROPIC_API_KEY/OPENROUTER_API_KEY.
+    fn from_env() -> Result<Self> {
+        let url = std::env::var("AGENT_JUDGE_URL")
+            .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into());
+        let api_key = std::env::var("AGENT_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+            .map_err(|_| {
+                anyhow!(
+                    "RUN_AGENT_ONLINE_EVAL=1 needs AGENT_API_KEY/ANTHROPIC_API_KEY/OPENROUTER_API_KEY"
+                )
+            })?;
+        let model = Model(
+            std::env::var("AGENT_JUDGE_MODEL")
+                .or_else(|_| std::env::var("AGENT_ONLINE_MODEL"))
+                .unwrap_or_else(|_| "openrouter/auto".into()),
+        );
+        let client = ProviderClient::new(ProviderConfig {
+            url,
+            api_key,
+            model: model.clone(),
+        });
+        let runtime = tokio::runtime::Runtime::new()?;
+        Ok(Self {
+            client,
+            model,
+            runtime,
+        })
+    }
+
+    fn judge(&self, prompt: &[ChatMessage]) -> Result<String> {
+        let response = self
+            .runtime
+            .block_on(self.client.chat(&self.model, &[], prompt))?;
+        Ok(response.content)
+    }
+}
+
+fn judge_recording_path() -> Result<PathBuf> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("could not resolve repo root"))?;
+    Ok(repo_root.join("evals/gc/judge/recorded.jsonl"))
+}
+
+/// Deterministic judge prompt: rubric + rendered before/after windows. No
+/// message UUIDs, timestamps, or map iteration order leak in, so the prompt
+/// (and therefore the recording key) is stable across runs.
+fn judge_prompt(original: &[ChatMessage], collected: &[ChatMessage]) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(JUDGE_RUBRIC),
+        ChatMessage::user(format!(
+            "== FULL WINDOW (before GC) ==\n{}== COLLECTED WINDOW (after GC) ==\n{}",
+            render_window(original),
+            render_window(collected),
+        )),
+    ]
+}
+
+fn render_window(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (index, message) in messages.iter().enumerate() {
+        let _ = write!(out, "#{index} {}", message.role);
+        if let Some(id) = &message.tool_call_id {
+            let _ = write!(out, " (result for {id})");
+        }
+        for call in message.tool_calls.as_deref().unwrap_or_default() {
+            let _ = write!(
+                out,
+                " [calls {} {} as {}]",
+                call.name,
+                judge_preview(&call.arguments.to_string()),
+                call.id
+            );
+        }
+        out.push_str(": ");
+        out.push_str(&judge_preview(message.content.as_deref().unwrap_or("")));
+        out.push('\n');
+    }
+    out
+}
+
+fn judge_preview(input: &str) -> String {
+    let mut out: String = input.chars().take(JUDGE_RENDER_CHARS).collect();
+    if input.chars().count() > JUDGE_RENDER_CHARS {
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
+/// Recording key: content hash of the judge prompt text (roles + rendered
+/// content only — never message UUIDs, which are freshly assigned every
+/// run).
+fn judge_key(prompt: &[ChatMessage]) -> String {
+    let mut hasher = Sha256::new();
+    for message in prompt {
+        hasher.update(message.role.as_bytes());
+        hasher.update([0]);
+        hasher.update(message.content.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Lenient JSON extraction: the strict-JSON instruction notwithstanding,
+/// models wrap answers in prose/fences often enough that we take the
+/// outermost brace span that parses.
+fn parse_judge_response(response: &str) -> Option<JudgeVerdict> {
+    let start = response.find('{')?;
+    let end = response.rfind('}')?;
+    serde_json::from_str(&response[start..=end]).ok()
+}
+
+// --- judge plumbing tests (offline; recorded/hand-written fixtures only) ----
+
+/// The judge key must be stable across runs and independent of message
+/// UUIDs (which are freshly assigned on every construction).
+#[test]
+fn gc_judge_key_is_deterministic_and_id_independent() {
+    let build = || {
+        (
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("do the thing"),
+            ],
+            vec![ChatMessage::system("sys")],
+        )
+    };
+    let (original_a, collected_a) = build();
+    let (original_b, collected_b) = build();
+    // Same structural content, different UUIDs.
+    assert_ne!(original_a[0].id, original_b[0].id);
+    let key_a = judge_key(&judge_prompt(&original_a, &collected_a));
+    let key_b = judge_key(&judge_prompt(&original_b, &collected_b));
+    assert_eq!(key_a, key_b);
+
+    let key_c = judge_key(&judge_prompt(&original_a, &original_a.clone()));
+    assert_ne!(key_a, key_c, "different collected window, different key");
+}
+
+#[test]
+fn gc_judge_parses_strict_and_wrapped_json_rejects_garbage() {
+    let verdict = parse_judge_response(
+        r#"{"task_goal_retained": true, "open_threads_retained": false, "no_orphaned_references": true}"#,
+    )
+    .expect("strict JSON parses");
+    assert_eq!(verdict.score(), 2);
+    assert_eq!(verdict.display(), "2/3");
+
+    let wrapped = parse_judge_response(
+        "Here is my assessment:\n```json\n{\"task_goal_retained\": true, \
+         \"open_threads_retained\": true, \"no_orphaned_references\": true}\n```",
+    )
+    .expect("fenced JSON parses");
+    assert_eq!(wrapped.display(), "3/3");
+
+    assert_eq!(parse_judge_response("I think it looks fine."), None);
+    assert_eq!(parse_judge_response("{\"task_goal_retained\": 3}"), None);
+}
+
+/// Round-trip through the recording format: a record written the way the
+/// online path writes it is served back by a fresh offline book.
+#[test]
+fn gc_judge_offline_replays_recorded_response_and_misses_return_none() -> Result<()> {
+    let original = vec![
+        ChatMessage::system("You are a test agent."),
+        ChatMessage::user("finish the report"),
+        ChatMessage::assistant(Some("working on it".into()), vec![]),
+    ];
+    let collected = original[..2].to_vec();
+    let key = judge_key(&judge_prompt(&original, &collected));
+
+    let dir = std::env::temp_dir().join(format!("gc-judge-test-{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("recorded.jsonl");
+    let record = JudgeRecord {
+        key,
+        cell: "test|0.50|final|ring|ignore".into(),
+        model: "test-judge".into(),
+        response: r#"{"task_goal_retained": true, "open_threads_retained": true, "no_orphaned_references": false}"#.into(),
+        note: Some("written by gc_judge_offline_replays_recorded_response".into()),
+    };
+    fs::write(&path, format!("{}\n", serde_json::to_string(&record)?))?;
+
+    // Offline book (online=false regardless of environment).
+    let mut book = JudgeBook::load(path.clone(), false)?;
+    let verdict = book
+        .verdict("test|0.50|final|ring|ignore", &original, &collected)?
+        .expect("recorded response replays offline");
+    assert_eq!(verdict.display(), "2/3");
+    assert!(!verdict.no_orphaned_references);
+
+    // A different collected window has no recording: offline miss is None,
+    // never a provider call.
+    let missing = book.verdict("test|other", &original, &original.clone())?;
+    assert_eq!(missing, None);
+
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// The shipped hand-written fixture (evals/gc/judge/recorded.jsonl) must
+/// stay in sync with the judge prompt format: it pins the matrix cells it
+/// covers, so this fails loudly (printing the expected keys) if the prompt
+/// rendering or the synthetic cases change. Recorded entries are replayed
+/// into the matrix judge column; every shipped entry must parse.
+#[test]
+fn gc_judge_shipped_fixture_replays_into_matrix_cells() -> Result<()> {
+    let path = judge_recording_path()?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("reading shipped judge fixture {}", path.display()))?;
+    let mut shipped_keys = BTreeSet::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let record: JudgeRecord = serde_json::from_str(line)?;
+        assert!(
+            parse_judge_response(&record.response).is_some(),
+            "shipped judge recording {} must parse into a verdict",
+            record.cell
+        );
+        shipped_keys.insert(record.key);
+    }
+    assert!(
+        !shipped_keys.is_empty(),
+        "expected at least one shipped judge recording"
+    );
+
+    // The cells the hand-written fixture pins: ring vs mark-sweep vs stack
+    // on the long tool-heavy window at heavy pressure (cache=ignore,
+    // timing=final).
+    let mut book = JudgeBook::load(path, false)?;
+    let cases = all_cases()?;
+    let case = cases
+        .iter()
+        .find(|case| case.name == "synthetic:tool-heavy-long")
+        .expect("synthetic:tool-heavy-long case exists");
+    for strategy in &STRATEGIES {
+        let metrics = evaluate(case, 0.35, Timing::Final, strategy, false, Some(&mut book))?;
+        let prompt_key = {
+            let gc = strategy.build(false);
+            let run = run_timed(&case.prompt, metrics.budget, gc.as_ref(), Timing::Final);
+            judge_key(&judge_prompt(&case.prompt, &run.collected))
+        };
+        assert!(
+            metrics.judge.is_some(),
+            "expected a shipped judge recording for cell {}|0.35|final|{}|ignore \
+             (prompt key {prompt_key}); re-generate the hand-written fixture",
+            case.name,
+            metrics.strategy,
+        );
     }
     Ok(())
 }

@@ -62,3 +62,36 @@ full recorded window (what the first catch-overflow cycle sees); the
 incremental timings (`threshold`, `eager`, `every:4`) replay the session
 growing message-by-message and fire at infer points, threading one
 `GcState` across collections like the runtime loop does.
+
+## Semantic-coherence judge (optional column, online-gated)
+
+The `judge` column scores whether the collected window preserves what is
+needed to continue the session coherently (rubric: task goal retained, open
+threads retained, no orphaned references; displayed as `N/3`). The offline
+matrix never calls a provider:
+
+- **Replay (default):** judge responses are looked up in
+  `judge/recorded.jsonl` by a content hash of the deterministic judge
+  prompt. Cells without a recording print `-`.
+- **Record (online):** `RUN_AGENT_ONLINE_EVAL=1` (the evals/ convention)
+  scores unrecorded cells against a real model and appends recordings, so
+  subsequent offline reruns are comparable. Configure with
+  `AGENT_JUDGE_MODEL` (or `AGENT_ONLINE_MODEL`, default `openrouter/auto`),
+  `AGENT_JUDGE_URL` (default OpenRouter), and
+  `AGENT_API_KEY`/`ANTHROPIC_API_KEY`/`OPENROUTER_API_KEY`:
+
+  ```sh
+  RUN_AGENT_ONLINE_EVAL=1 cargo test -p agent-core --test gc_evals \
+    gc_strategy_matrix -- --nocapture
+  ```
+
+Recording keys hash the judge prompt text only (roles + rendered content,
+never message UUIDs), so keys are stable across runs and change exactly when
+a strategy's output or the prompt format changes — a changed cell simply
+misses the recording rather than replaying a stale verdict.
+
+`judge/recorded.jsonl` entries marked `"model": "hand-written"` are NOT real
+model judgments: they were written by hand in a credential-free environment
+to exercise the replay path (and are pinned by
+`gc_judge_shipped_fixture_replays_into_matrix_cells`). Re-record online
+before trusting their scores.
