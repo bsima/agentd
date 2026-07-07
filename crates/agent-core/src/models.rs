@@ -48,10 +48,23 @@ pub struct ModelEntry {
     pub pricing: Option<PricingEntry>,
 }
 
+/// Optional `embeddings` section (t-1340): selects, by registry alias, the
+/// model the memory backend embeds with. The alias must name an entry in
+/// `models`, which supplies the base_url/api_key/api_id exactly like a chat
+/// model — one resolution path, one fail-closed behavior.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingsEntry {
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelRegistry {
     pub default_model: String,
     pub models: Vec<ModelEntry>,
+    /// Serde-optional so existing models.yaml files load unchanged; absent
+    /// means keyword-only memory retrieval.
+    #[serde(default)]
+    pub embeddings: Option<EmbeddingsEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +128,21 @@ impl ModelRegistry {
                 .map(|pricing| pricing.to_pricing(&entry.name))
                 .transpose()?,
         })
+    }
+
+    /// Resolve the optional `embeddings` section through the same alias
+    /// resolution as chat models: `Ok(None)` when absent (keyword-only
+    /// retrieval), and a fail-closed error when the section names an
+    /// unknown alias (26c02ea) — a typo'd embeddings model must surface at
+    /// config load, not silently degrade semantic retrieval.
+    pub fn resolve_embeddings(&self) -> Result<Option<ResolvedModel>> {
+        self.embeddings
+            .as_ref()
+            .map(|entry| {
+                self.resolve(Some(&entry.model))
+                    .context("resolving embeddings model")
+            })
+            .transpose()
     }
 
     /// Pricing lookup table over the whole registry, keyed by both the
@@ -268,6 +296,45 @@ models:
             Some(&expected)
         );
         assert_eq!(table.get("direct-name"), None);
+        Ok(())
+    }
+
+    /// The `embeddings` section (t-1340) is serde-optional (existing
+    /// configs load unchanged), resolves through the same alias path as
+    /// chat models, and fails closed on an unknown alias or a malformed
+    /// section.
+    #[test]
+    fn embeddings_section_absent_present_and_invalid() -> Result<()> {
+        // Absent: keyword-only retrieval, not an error.
+        let registry = ModelRegistry::from_yaml_str(MODELS)?;
+        assert!(registry.resolve_embeddings()?.is_none());
+
+        // Present, valid alias: resolves like any chat model.
+        let yaml = format!("{MODELS}\nembeddings:\n  model: parasail/qwen3-235b\n");
+        let resolved = ModelRegistry::from_yaml_str(&yaml)?
+            .resolve_embeddings()?
+            .expect("embeddings configured");
+        assert_eq!(resolved.api_id, "parasail-qwen3-235b-a22b-instruct-2507");
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://api.parasail.io/v1")
+        );
+
+        // Unknown alias: fails closed with the alias in the error.
+        let yaml = format!("{MODELS}\nembeddings:\n  model: nope/missing\n");
+        let err = ModelRegistry::from_yaml_str(&yaml)?
+            .resolve_embeddings()
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("resolving embeddings model"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("nope/missing"), "{rendered}");
+
+        // Malformed section (no `model` field): fails at parse.
+        let yaml = format!("{MODELS}\nembeddings: {{}}\n");
+        assert!(ModelRegistry::from_yaml_str(&yaml).is_err());
         Ok(())
     }
 

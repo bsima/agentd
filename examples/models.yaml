@@ -23,6 +23,31 @@
 # `input`/`output` fields below are NOT read for cost accounting.
 # Roll up a trace with: agent cost --trace <file.jsonl> [--json]
 
+# Semantic memory retrieval (t-1340): an optional top-level `embeddings`
+# section selects, by alias, the model used to embed memories for the
+# memory backend (--memory-dir). The alias must name an entry in `models`
+# below, which supplies the base_url / api_key / api_id exactly like a chat
+# model. The endpoint must speak the OpenAI-compatible `POST /embeddings`
+# shape (OpenAI, OpenRouter, and local servers all do), so the entry needs
+# a base_url.
+#
+#     embeddings:
+#       model: openai/text-embedding-3-small
+#
+#     models:
+#       - name: openai/text-embedding-3-small
+#         provider: openai-compatible
+#         base_url: https://api.openai.com/v1
+#         api_key: $OPENAI_API_KEY
+#         api_id: text-embedding-3-small
+#
+# Omitting the section entirely means keyword-only memory retrieval (the
+# default; costs nothing). A section that names an unknown alias, or an
+# entry without a base_url, fails closed at startup — as does a referenced
+# api_key env var that is unset, which is why this example ships with the
+# section commented out. Embedding-endpoint failures at runtime, by
+# contrast, silently degrade retrieval back to keyword ranking.
+
 # Used when --model is omitted.
 default_model: openrouter/auto
 

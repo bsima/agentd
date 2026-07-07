@@ -196,6 +196,46 @@ retired once the conformance test moves to effect-level assertions. There
 are no external agent programs to break; the cut can be clean rather than
 staged.
 
+## Semantic retrieval (v2, t-1340)
+
+The memory backend's retrieval, keyword-only in v1, optionally blends in
+embedding similarity. All of it is **backend-internal** to `MemorySource`;
+nothing about the traits, the `Retrieve` effect, or `SourceResult` changed.
+
+- **Config:** an optional top-level `embeddings: { model: <alias> }`
+  section in `models.yaml` (see `examples/models.yaml`). The alias resolves
+  through the ordinary model registry, so base_url / api_key / api_id come
+  from a normal `models` entry; the endpoint must be OpenAI-compatible
+  (`POST /embeddings`). No section = keyword-only retrieval at zero cost.
+  An invalid section (unknown alias, entry without a base_url) fails closed
+  at config load.
+- **Index:** a JSON sidecar at `<memory-dir>/.index/embeddings.json`,
+  vectors keyed by (memory id, content hash) plus the embedding model id.
+  It is a rebuildable cache: corrupt, missing, or model-mismatched indexes
+  load as empty and re-embed lazily. Stores embed incrementally; the first
+  query backfills anything un-embedded; edits re-embed (the content hash
+  misses); deletes drop the vector (with query-time pruning as the
+  self-heal for out-of-band file deletions).
+- **Ranking:** `score = keyword + 4.0 * cosine` (cosine clamped to
+  [0, 1]) — keyword-dominant by design, so embeddings break ties among
+  keyword matches and rescue paraphrased queries rather than outvoting
+  exact term hits. A memory with zero keyword overlap needs cosine >= 0.30
+  to appear at all; below that, misses stay omitted.
+- **Degradation:** every failure — no config, endpoint down, malformed
+  response, empty or corrupt index — reverts that query to pure keyword
+  ranking. An embedding outage must never fail a `Retrieve`, and a Store /
+  Update / Delete never fails on an embedding error either (the index
+  catches up on a later query). `SourceResult.metadata.semantic` records
+  whether similarity actually contributed.
+
+**Replay, effects, and cost:** embedding HTTP calls are backend-internal,
+like a vector DB's internals. They are *not* IR effects, consume no effect
+ids, and are never replayed — the `Retrieve` effect records its *results*,
+which is what keeps replay sound (a replayed session serves recorded hits
+and never touches the backend, per the IR-effects section above). They are
+also not cost-attributed: embedding spend does not appear in t-1334 cost
+accounting. Cost attribution for embedding calls is future work.
+
 ## Experiment: the system prompt as a backend (Ben, 2026-06-12)
 
 If memory backends are just `HydrationSource + HydrationSink` pairs, the

@@ -1,11 +1,11 @@
 use agent_core::{
     agent_loop_ir, format_micro_usd, AgentIdGenerator, AnthropicConfig, AnthropicProvider,
-    ChatHistory, ChatMessage, EnvPolicy, EvalConfig, Event, GcMode, GcTiming, HydrationSink,
-    HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink, MarkSweepGc, MemorySource,
-    ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource, PricingTable,
-    ProviderClient, ProviderConfig, ReplayOnlyProvider, ResolvedModel, RingGc, RunUsage, SeqConfig,
-    SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult, StackFrameGc,
-    TemporalSource, TraceContextEnv, TraceLogger,
+    ChatHistory, ChatMessage, Embedder, EmbeddingClient, EnvPolicy, EvalConfig, Event, GcMode,
+    GcTiming, HydrationSink, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink,
+    MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
+    PricingTable, ProviderClient, ProviderConfig, ReplayOnlyProvider, ResolvedModel, RingGc,
+    RunUsage, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult,
+    StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -466,7 +466,7 @@ async fn main() -> Result<()> {
     };
     let system_prompt = build_system_prompt(system_prompt_override).await?;
 
-    let (resolved_model, pricing_table) =
+    let (resolved_model, pricing_table, embedder) =
         resolve_model(requested_model, provider_file.model.clone()).await?;
     let eval_config = EvalConfig {
         cwd: args.eval_cwd.clone(),
@@ -533,7 +533,10 @@ async fn main() -> Result<()> {
         }
         if let Some(path) = args.memory_dir.as_ref() {
             // Both halves: source for retrieval, sink for the Store effect.
-            registry = registry.register_backend(MemorySource::new(path.clone()));
+            // The embedder is the registry's optional `embeddings` config;
+            // None = keyword-only retrieval (t-1340).
+            registry = registry
+                .register_backend(MemorySource::new(path.clone()).with_embedder(embedder.clone()));
         }
         if let Some(path) = args.temporal_dir.as_ref() {
             registry = registry.register(TemporalSource::new(path.clone()));
@@ -826,10 +829,15 @@ fn build_provider(
     Ok((provider, reported))
 }
 
+/// What model resolution yields: the chat model, the registry's pricing
+/// table (t-1334), and the optional memory embedder (t-1340; `None` =
+/// keyword-only retrieval).
+type ModelResolution = (ResolvedModel, PricingTable, Option<Arc<dyn Embedder>>);
+
 async fn resolve_model(
     args_model: Option<String>,
     file_model: Option<String>,
-) -> Result<(ResolvedModel, PricingTable)> {
+) -> Result<ModelResolution> {
     let requested = args_model
         .or(file_model)
         .or_else(|| std::env::var("AGENT_MODEL").ok());
@@ -844,12 +852,20 @@ async fn resolve_model(
 fn resolve_model_from(
     registry: Result<ModelRegistry>,
     requested: Option<String>,
-) -> Result<(ResolvedModel, PricingTable)> {
+) -> Result<ModelResolution> {
     match registry {
-        Ok(registry) => Ok((
-            registry.resolve(requested.as_deref())?,
-            registry.pricing_table()?,
-        )),
+        Ok(registry) => {
+            // The optional `embeddings` section (t-1340): absent = None
+            // (keyword-only memory retrieval); an invalid section — unknown
+            // alias, no base_url — fails the run here, at config load.
+            let embedder = EmbeddingClient::from_registry(&registry)?
+                .map(|client| Arc::new(client) as Arc<dyn Embedder>);
+            Ok((
+                registry.resolve(requested.as_deref())?,
+                registry.pricing_table()?,
+                embedder,
+            ))
+        }
         Err(_err) if requested.is_some() => {
             let model = requested.expect("requested model checked above");
             Ok((
@@ -864,6 +880,7 @@ fn resolve_model_from(
                     pricing: None,
                 },
                 PricingTable::default(),
+                None,
             ))
         }
         Err(err) => Err(err.context(
@@ -1428,7 +1445,7 @@ async fn resume_run(
     checkpoint: agent_core::IrCheckpoint,
     facts: ResumeFacts,
 ) -> Result<()> {
-    let (resolved_model, pricing_table) = resolve_model_from(
+    let (resolved_model, pricing_table, embedder) = resolve_model_from(
         ModelRegistry::load_default().await,
         Some(facts.model.clone()),
     )?;
@@ -1440,7 +1457,8 @@ async fn resume_run(
             registry = registry.register(LocalFileSource::new(path.clone()));
         }
         if let Some(path) = facts.memory_dir.as_ref() {
-            registry = registry.register_backend(MemorySource::new(path.clone()));
+            registry = registry
+                .register_backend(MemorySource::new(path.clone()).with_embedder(embedder.clone()));
         }
         if let Some(path) = facts.temporal_dir.as_ref() {
             registry = registry.register(TemporalSource::new(path.clone()));
@@ -2800,8 +2818,9 @@ mod tests {
         // which races under parallel test execution.
         let missing_registry = Err(anyhow!("no registry on this machine"));
 
-        let (resolved, pricing) =
+        let (resolved, pricing, embedder) =
             resolve_model_from(missing_registry, Some("openrouter/auto".into()))?;
+        assert!(embedder.is_none(), "no registry, no embedder");
 
         assert_eq!(resolved.alias, "openrouter/auto");
         assert_eq!(resolved.api_id, "openrouter/auto");
@@ -2813,10 +2832,12 @@ mod tests {
 
     #[test]
     fn missing_registry_without_requested_model_is_an_error() {
-        let err = resolve_model_from(Err(anyhow!("no registry")), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("models.yaml"), "got: {err}");
+        // No unwrap_err: the Ok tuple holds an Arc<dyn Embedder>, which has
+        // no Debug impl.
+        let Err(err) = resolve_model_from(Err(anyhow!("no registry")), None) else {
+            panic!("missing registry without a requested model must error");
+        };
+        assert!(err.to_string().contains("models.yaml"), "got: {err}");
     }
 
     #[test]

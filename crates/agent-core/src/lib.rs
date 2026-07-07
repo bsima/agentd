@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod approval;
 pub mod chat_history;
 pub mod cost;
+pub mod embedding;
 pub mod gc;
 pub mod hydration;
 pub mod interpreter;
@@ -28,6 +29,7 @@ pub use approval::{
 };
 pub use chat_history::ChatHistory;
 pub use cost::{format_micro_usd, Pricing, PricingTable, RunUsage};
+pub use embedding::{content_hash, cosine, Embedder, EmbeddingClient, EmbeddingIndex};
 pub use gc::{
     estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
     GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,
@@ -57,7 +59,7 @@ pub use ir_interpreter::{
 };
 pub use ir_normalize::{normalize_program, validate_strict_ssa_program};
 pub use memory::MemorySource;
-pub use models::{ModelEntry, ModelRegistry, PricingEntry, ResolvedModel};
+pub use models::{EmbeddingsEntry, ModelEntry, ModelRegistry, PricingEntry, ResolvedModel};
 pub use op::{
     agent_loop, close_pending_tool_calls, emit, eval, eval_argv, has_pending_tool_calls, infer,
     par, repair_trailing_pending_tool_calls, ChatMessage, EvalSpec, FinishReason, Model, Op, OpF,

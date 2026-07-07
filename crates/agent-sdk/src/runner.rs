@@ -10,10 +10,10 @@ use agent_core::public_trace::{public_event, PublicEvent};
 use agent_core::trace::TraceSink;
 use agent_core::{
     output_contract_failure, run_agent_loop_outcome, AgentLoopOptions, AgentLoopOutcome,
-    AnthropicConfig, AnthropicProvider, ApprovalConfig, ChatMessage, ChatProvider, EvalConfig,
-    Event, GcMode, GcState, GcTiming, IrReplayTrace, JsonlTraceSink, MemorySource, Model,
-    ModelRegistry, PassiveHydrationConfig, ProviderClient, ProviderConfig, ReplayOnlyProvider,
-    Response, SeqConfig, SourceRegistry, TraceLogger,
+    AnthropicConfig, AnthropicProvider, ApprovalConfig, ChatMessage, ChatProvider, Embedder,
+    EmbeddingClient, EvalConfig, Event, GcMode, GcState, GcTiming, IrReplayTrace, JsonlTraceSink,
+    MemorySource, Model, ModelRegistry, PassiveHydrationConfig, ProviderClient, ProviderConfig,
+    ReplayOnlyProvider, Response, SeqConfig, SourceRegistry, TraceLogger,
 };
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
@@ -308,6 +308,21 @@ async fn replay_model(agent: &Agent) -> String {
     }
 }
 
+/// The optional memory embedder from the default model registry (t-1340).
+/// No registry file at all (tests, embedded use with injected providers)
+/// means keyword-only retrieval — the SDK must stay runnable offline with
+/// zero config. A registry that IS present but carries an invalid
+/// `embeddings` section fails closed: a typo'd config must surface, not
+/// silently degrade semantic retrieval.
+async fn registry_embedder() -> Result<Option<Arc<dyn Embedder>>, SdkError> {
+    let Ok(registry) = ModelRegistry::load_default().await else {
+        return Ok(None);
+    };
+    let client = EmbeddingClient::from_registry(&registry)
+        .map_err(|err| SdkError::Config(format!("{err:#}")))?;
+    Ok(client.map(|client| Arc::new(client) as Arc<dyn Embedder>))
+}
+
 async fn execute(
     agent: Agent,
     prompt: String,
@@ -335,7 +350,16 @@ async fn execute(
 
     let mut hydration = SourceRegistry::new();
     if let Some(dir) = &agent.memory_dir {
-        hydration = hydration.register_backend(MemorySource::new(dir.clone()));
+        // Semantic memory retrieval (t-1340): consult the default registry's
+        // optional `embeddings` section. Replay never retrieves (recorded
+        // results are served by effect id), so it skips the lookup entirely.
+        let embedder = if replay.is_some() {
+            None
+        } else {
+            registry_embedder().await?
+        };
+        hydration =
+            hydration.register_backend(MemorySource::new(dir.clone()).with_embedder(embedder));
     }
     let memory_tools = agent.memory_dir.is_some();
 

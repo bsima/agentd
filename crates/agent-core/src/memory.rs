@@ -5,8 +5,10 @@
 //! (`name`, `description`, optional `metadata.type`) — the same shape Claude
 //! Code memories use, so a memory directory is human-curated and
 //! agent-readable with no migration. Retrieval is deterministic keyword
-//! scoring over name/description/body: no embeddings, no network, evaluable
-//! offline.
+//! scoring over name/description/body, optionally blended with embedding
+//! cosine similarity when an [`Embedder`] is configured (t-1340, see
+//! [`crate::embedding`]): the keyword path needs no network and stays
+//! evaluable offline, and every embedding failure degrades back to it.
 //!
 //! The write half (t-1178, per the approved docs/MEMORY.md design)
 //! implements [`HydrationSink`]: the payload schema is
@@ -18,6 +20,7 @@
 //! dirs live in git; history is the tombstone); write policy is Free
 //! (trace-visible) by decision.
 
+use crate::embedding::{content_hash, cosine, Embedder, EmbeddingIndex};
 use crate::hydration::{
     HydrationSink, HydrationSource, Provenance, SinkId, SinkItem, SinkWritePolicy,
     SourceCapability, SourceKind, SourceParams, SourceResult,
@@ -25,7 +28,9 @@ use crate::hydration::{
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Default cap on rendered memory bytes per retrieval; callers override via
 /// `SourceParams.max_bytes`.
@@ -37,9 +42,32 @@ const NAME_WEIGHT: f64 = 3.0;
 const DESCRIPTION_WEIGHT: f64 = 2.0;
 const BODY_WEIGHT: f64 = 1.0;
 
+/// Ranking blend (t-1340): `score = keyword + SEMANTIC_WEIGHT * cosine`
+/// (cosine clamped to `[0, 1]`). The blend is keyword-dominant by design —
+/// a perfect semantic match is worth about one name+body keyword hit — so
+/// embeddings act as a tie-breaker among keyword matches and as a recall
+/// net for paraphrased queries, without letting a fuzzy cosine outvote an
+/// exact term match. Chosen over a hard gate so the two signals compose in
+/// one deterministic ordering.
+const SEMANTIC_WEIGHT: f64 = 4.0;
+
+/// A memory with zero keyword overlap is only included when its cosine
+/// clears this floor. Real embedding spaces score *unrelated* text well
+/// above zero, so "any positive cosine" would make every memory relevant
+/// to every query — the floor is what preserves the "misses are omitted"
+/// contract on the semantic path.
+const SEMANTIC_FLOOR: f64 = 0.30;
+
 pub struct MemorySource {
     root: PathBuf,
     max_bytes: usize,
+    /// Absent = keyword-only retrieval, the zero-cost default; nothing on
+    /// that path touches the index or the network.
+    embedder: Option<Arc<dyn Embedder>>,
+    /// Serializes read-modify-write cycles on the index file within this
+    /// process. The index is a rebuildable cache, so a cross-process race
+    /// at worst wastes a re-embed.
+    index_lock: tokio::sync::Mutex<()>,
 }
 
 impl MemorySource {
@@ -47,7 +75,24 @@ impl MemorySource {
         Self {
             root,
             max_bytes: DEFAULT_MAX_BYTES,
+            embedder: None,
+            index_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach the optional embedder (t-1340). `None` is the keyword-only
+    /// configuration and is exactly `new()` — call sites can pass their
+    /// `Option` straight through.
+    pub fn with_embedder(mut self, embedder: Option<Arc<dyn Embedder>>) -> Self {
+        self.embedder = embedder;
+        self
+    }
+
+    /// The vector index sidecar: `<root>/.index/embeddings.json`. Lives
+    /// inside the memory dir so it travels with it, but under a dot-dir the
+    /// memory loader already ignores.
+    fn index_path(&self) -> PathBuf {
+        self.root.join(".index").join("embeddings.json")
     }
 
     async fn load_memories(&self) -> Result<Vec<Memory>> {
@@ -147,6 +192,14 @@ impl Memory {
             .sum()
     }
 
+    /// The text a memory is embedded from. Must stay in lockstep with
+    /// [`embed_text_parts`] (the write half embeds from the payload before
+    /// the file is re-read) or content hashes will never match and every
+    /// query re-embeds everything.
+    fn embed_text(&self) -> String {
+        embed_text_parts(&self.name, &self.description, &self.body)
+    }
+
     fn render(&self) -> String {
         let mut header = format!("### {}", self.name);
         if let Some(memory_type) = &self.memory_type {
@@ -156,6 +209,158 @@ impl Memory {
             header.push_str(&format!(" — {}", self.description));
         }
         format!("{header}\n{}", self.body)
+    }
+}
+
+/// Canonical embeddable text for a memory: name, description, and body,
+/// newline-joined. One definition shared by the read half (parsed files)
+/// and the write half (sink payloads) so the (id, content hash) index key
+/// agrees across both.
+fn embed_text_parts(name: &str, description: &str, body: &str) -> String {
+    format!("{name}\n{description}\n{body}")
+}
+
+impl MemorySource {
+    /// Semantic scores by memory name for one query: prune vectors of
+    /// deleted memories, lazily backfill un-embedded ones, embed the query,
+    /// and cosine against the index — all in one batch `embed` call.
+    ///
+    /// Best-effort throughout: no embedder, no memories, an endpoint
+    /// failure, or a malformed response all return an empty map, which the
+    /// caller treats as "keyword ranking only". An embedding outage must
+    /// never fail a Retrieve (docs/MEMORY.md).
+    async fn semantic_scores(&self, query: &str, memories: &[Memory]) -> HashMap<String, f64> {
+        let Some(embedder) = &self.embedder else {
+            return HashMap::new();
+        };
+        if memories.is_empty() {
+            return HashMap::new();
+        }
+        let _guard = self.index_lock.lock().await;
+        let path = self.index_path();
+        let mut index = EmbeddingIndex::load(&path, embedder.model_id()).await;
+
+        // Drop vectors of memories that no longer exist (covers files
+        // deleted out-of-band, where the delete() hook never ran).
+        let live: HashSet<&str> = memories.iter().map(|memory| memory.name.as_str()).collect();
+        let mut dirty = index.retain_ids(&live);
+
+        // One batch call embeds the query plus every stale/missing memory.
+        let hashed: Vec<(&Memory, String, String)> = memories
+            .iter()
+            .map(|memory| {
+                let text = memory.embed_text();
+                let hash = content_hash(&text);
+                (memory, hash, text)
+            })
+            .collect();
+        let missing: Vec<&(&Memory, String, String)> = hashed
+            .iter()
+            .filter(|(memory, hash, _)| index.vector(&memory.name, hash).is_none())
+            .collect();
+        let mut inputs = Vec::with_capacity(1 + missing.len());
+        inputs.push(query.to_string());
+        inputs.extend(missing.iter().map(|(_, _, text)| text.clone()));
+
+        let query_vector = match embedder.embed(&inputs).await {
+            Ok(mut vectors) if vectors.len() == inputs.len() => {
+                let backfill = vectors.split_off(1);
+                for ((memory, hash, _), vector) in missing.into_iter().zip(backfill) {
+                    index.insert(memory.name.clone(), hash.clone(), vector);
+                    dirty = true;
+                }
+                vectors.pop().expect("vectors[0] is the query embedding")
+            }
+            Ok(vectors) => {
+                tracing::warn!(
+                    got = vectors.len(),
+                    expected = inputs.len(),
+                    "embedder returned wrong vector count; keyword ranking only"
+                );
+                if dirty {
+                    save_index_best_effort(&index, &path).await;
+                }
+                return HashMap::new();
+            }
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "embedding failed; keyword ranking only");
+                if dirty {
+                    save_index_best_effort(&index, &path).await;
+                }
+                return HashMap::new();
+            }
+        };
+        if dirty {
+            save_index_best_effort(&index, &path).await;
+        }
+
+        hashed
+            .into_iter()
+            .filter_map(|(memory, hash, _)| {
+                index.vector(&memory.name, &hash).map(|vector| {
+                    (
+                        memory.name.clone(),
+                        f64::from(cosine(&query_vector, vector)),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Write-side hook: embed one memory and upsert its vector, keyed by
+    /// (name, content hash) so unchanged content is a no-op and changed
+    /// content re-embeds. Best-effort — a Store/Update must succeed even
+    /// with the embedding endpoint down (the query path backfills later).
+    async fn embed_memory_best_effort(&self, name: &str, description: &str, body: &str) {
+        let Some(embedder) = &self.embedder else {
+            return;
+        };
+        let text = embed_text_parts(name, description, body);
+        let hash = content_hash(&text);
+        let _guard = self.index_lock.lock().await;
+        let path = self.index_path();
+        let mut index = EmbeddingIndex::load(&path, embedder.model_id()).await;
+        if index.vector(name, &hash).is_some() {
+            return;
+        }
+        match embedder.embed(std::slice::from_ref(&text)).await {
+            Ok(mut vectors) if vectors.len() == 1 => {
+                index.insert(name.to_string(), hash, vectors.remove(0));
+                save_index_best_effort(&index, &path).await;
+            }
+            Ok(vectors) => tracing::warn!(
+                memory = name,
+                got = vectors.len(),
+                "embedder returned wrong vector count; memory left un-embedded"
+            ),
+            Err(err) => tracing::warn!(
+                memory = name,
+                error = %format!("{err:#}"),
+                "embedding memory failed; will backfill on a later query"
+            ),
+        }
+    }
+
+    /// Write-side hook for delete: drop the memory's vector. Best-effort;
+    /// the query path also prunes dead ids, so a miss here self-heals.
+    async fn drop_vector_best_effort(&self, name: &str) {
+        let Some(embedder) = &self.embedder else {
+            return;
+        };
+        let _guard = self.index_lock.lock().await;
+        let path = self.index_path();
+        let mut index = EmbeddingIndex::load(&path, embedder.model_id()).await;
+        if index.remove(name) {
+            save_index_best_effort(&index, &path).await;
+        }
+    }
+}
+
+/// The index is a rebuildable cache: failing to persist it costs a future
+/// re-embed, never the operation that produced it.
+async fn save_index_best_effort(index: &EmbeddingIndex, path: &std::path::Path) {
+    if let Err(err) = index.save(path).await {
+        tracing::warn!(error = %format!("{err:#}"), "saving embedding index failed");
     }
 }
 
@@ -190,15 +395,18 @@ impl HydrationSource for MemorySource {
         SourceCapability::QUERY
     }
 
-    /// With a query: keyword-scored memories, best first, zero-score
-    /// memories omitted. Without one: the index (name + description per
-    /// memory), so a passive caller can see what is rememberable. Both
-    /// respect the byte cap and are deterministic (score desc, then name).
+    /// With a query: scored memories, best first, misses omitted — keyword
+    /// scoring blended with embedding cosine when an embedder is configured
+    /// (see [`SEMANTIC_WEIGHT`]/[`SEMANTIC_FLOOR`]; every embedding failure
+    /// silently reverts to pure keyword ranking). Without a query: the
+    /// index (name + description per memory), so a passive caller can see
+    /// what is rememberable. Both respect the byte cap and are
+    /// deterministic given the same index state (score desc, then name).
     async fn retrieve(&self, params: SourceParams) -> Result<SourceResult> {
         let memories = self.load_memories().await?;
         let max_bytes = params.max_bytes.unwrap_or(self.max_bytes);
 
-        let (selected, index_only) = match params.query.as_deref() {
+        let (selected, index_only, semantic) = match params.query.as_deref() {
             Some(query) if !query.trim().is_empty() => {
                 // Words under 3 chars ("i", "a", "of") match everything and
                 // make every memory relevant to every query; drop them.
@@ -208,10 +416,21 @@ impl HydrationSource for MemorySource {
                     .filter(|word| word.len() >= 3)
                     .map(str::to_string)
                     .collect();
+                // Empty on any failure => the blend below degrades to
+                // exactly the old keyword-only ranking.
+                let semantic = self.semantic_scores(query, &memories).await;
                 let mut scored: Vec<(f64, &Memory)> = memories
                     .iter()
-                    .map(|memory| (memory.score(&words), memory))
-                    .filter(|(score, _)| *score > 0.0)
+                    .filter_map(|memory| {
+                        let keyword = memory.score(&words);
+                        let similarity = semantic
+                            .get(&memory.name)
+                            .copied()
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 1.0);
+                        (keyword > 0.0 || similarity >= SEMANTIC_FLOOR)
+                            .then_some((keyword + SEMANTIC_WEIGHT * similarity, memory))
+                    })
                     .collect();
                 scored.sort_by(|(score_a, mem_a), (score_b, mem_b)| {
                     score_b
@@ -222,9 +441,10 @@ impl HydrationSource for MemorySource {
                 (
                     scored.into_iter().map(|(_, memory)| memory).collect(),
                     false,
+                    !semantic.is_empty(),
                 )
             }
-            _ => (memories.iter().collect::<Vec<_>>(), true),
+            _ => (memories.iter().collect::<Vec<_>>(), true, false),
         };
 
         let mut content = String::new();
@@ -254,6 +474,9 @@ impl HydrationSource for MemorySource {
                 "memories": included,
                 "total": selected.len(),
                 "index_only": index_only,
+                // Whether embedding similarity contributed to this ranking;
+                // false = keyword-only (no embedder, or it degraded).
+                "semantic": semantic,
             }),
         })
     }
@@ -413,6 +636,8 @@ impl HydrationSink for MemorySource {
         tokio::fs::write(&path, payload.render(&slug, &item.provenance)?)
             .await
             .with_context(|| format!("writing memory {}", path.display()))?;
+        self.embed_memory_best_effort(&slug, &payload.description, payload.body.trim())
+            .await;
         Ok(id)
     }
 
@@ -435,7 +660,12 @@ impl HydrationSink for MemorySource {
         }
         tokio::fs::write(&path, payload.render(&id.0, &item.provenance)?)
             .await
-            .with_context(|| format!("rewriting memory {}", path.display()))
+            .with_context(|| format!("rewriting memory {}", path.display()))?;
+        // Keyed by content hash, so unchanged content is a no-op and
+        // changed content re-embeds.
+        self.embed_memory_best_effort(&id.0, &payload.description, payload.body.trim())
+            .await;
+        Ok(())
     }
 
     async fn delete(&self, id: &SinkId) -> Result<()> {
@@ -446,7 +676,9 @@ impl HydrationSink for MemorySource {
         let path = self.memory_path(id);
         tokio::fs::remove_file(&path)
             .await
-            .with_context(|| format!("deleting memory {:?}", id.0))
+            .with_context(|| format!("deleting memory {:?}", id.0))?;
+        self.drop_vector_best_effort(&id.0).await;
+        Ok(())
     }
 }
 
@@ -749,5 +981,370 @@ mod tests {
         let result = source.retrieve(SourceParams::new("rust")).await.unwrap();
 
         assert_eq!(result.metadata["total"], 1);
+    }
+
+    // ---- semantic retrieval (t-1340): all offline via MockEmbedder ----
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Deterministic offline embedder: each dimension counts occurrences of
+    /// a synonym group, so tests control cosine exactly — and, crucially,
+    /// semantic similarity can exist without keyword overlap ("feline"
+    /// embeds onto the same axis as "cat").
+    struct MockEmbedder {
+        fail: AtomicBool,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    fn mock_vector(text: &str) -> Vec<f32> {
+        const AXES: [&[&str]; 3] = [
+            &["cat", "feline"],
+            &["deploy", "release"],
+            &["rust", "crab"],
+        ];
+        let lower = text.to_lowercase();
+        AXES.iter()
+            .map(|synonyms| {
+                synonyms
+                    .iter()
+                    .map(|synonym| lower.matches(synonym).count())
+                    .sum::<usize>() as f32
+            })
+            .collect()
+    }
+
+    impl MockEmbedder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                fail: AtomicBool::new(false),
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            let embedder = Self::new();
+            embedder.fail.store(true, Ordering::SeqCst);
+            embedder
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::embedding::Embedder for MockEmbedder {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.to_vec());
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(anyhow!("mock embedding endpoint down"));
+            }
+            Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-embedder"
+        }
+    }
+
+    fn semantic_backend(dir: PathBuf, embedder: &Arc<MockEmbedder>) -> MemorySource {
+        MemorySource::new(dir).with_embedder(Some(embedder.clone() as Arc<dyn Embedder>))
+    }
+
+    fn cat_note() -> serde_json::Value {
+        serde_json::json!({
+            "name": "cat-care",
+            "description": "feeding schedule",
+            "body": "the cat eats at dawn",
+        })
+    }
+
+    #[tokio::test]
+    async fn store_embeds_incrementally_and_query_reuses_the_vector() {
+        let dir = temp_memory_dir();
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir.clone(), &embedder);
+
+        backend.store(item(cat_note())).await.unwrap();
+
+        // Exactly one embed call, with exactly the memory's canonical text,
+        // and the vector lands in the sidecar under (id, content hash).
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![embed_text_parts(
+                "cat-care",
+                "feeding schedule",
+                "the cat eats at dawn"
+            )]
+        );
+        let index =
+            EmbeddingIndex::load(&dir.join(".index").join("embeddings.json"), "mock-embedder")
+                .await;
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.vector("cat-care", &content_hash(&calls[0][0])),
+            Some(mock_vector(&calls[0][0]).as_slice())
+        );
+
+        // A query embeds only itself — the stored memory is already
+        // indexed — and ranks the semantic match despite zero keyword
+        // overlap ("feline" never appears in the memory).
+        let result = backend.retrieve(SourceParams::new("feline")).await.unwrap();
+        assert_eq!(embedder.calls().len(), 2);
+        assert_eq!(embedder.calls()[1], vec!["feline".to_string()]);
+        assert_eq!(result.metadata["semantic"], true);
+        assert!(
+            result.content.contains("### cat-care"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn update_reembeds_changed_content_and_skips_unchanged() {
+        let dir = temp_memory_dir();
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir.clone(), &embedder);
+        let id = backend.store(item(cat_note())).await.unwrap();
+
+        let mut revised = cat_note();
+        revised["body"] = "the cat eats at dusk".into();
+        backend.update(&id, item(revised.clone())).await.unwrap();
+        assert_eq!(embedder.calls().len(), 2, "changed content re-embeds");
+
+        let index =
+            EmbeddingIndex::load(&dir.join(".index").join("embeddings.json"), "mock-embedder")
+                .await;
+        let new_text = embed_text_parts("cat-care", "feeding schedule", "the cat eats at dusk");
+        assert_eq!(
+            index.vector("cat-care", &content_hash(&new_text)),
+            Some(mock_vector(&new_text).as_slice()),
+            "index holds the new content's vector"
+        );
+
+        // Same content again: the (id, hash) key hits, so no embed call.
+        backend.update(&id, item(revised)).await.unwrap();
+        assert_eq!(embedder.calls().len(), 2, "unchanged content is a no-op");
+    }
+
+    #[tokio::test]
+    async fn delete_drops_the_vector() {
+        let dir = temp_memory_dir();
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir.clone(), &embedder);
+        let id = backend.store(item(cat_note())).await.unwrap();
+
+        backend.delete(&id).await.unwrap();
+
+        let index =
+            EmbeddingIndex::load(&dir.join(".index").join("embeddings.json"), "mock-embedder")
+                .await;
+        assert!(index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_query_lazily_backfills_hand_written_memories() {
+        let dir = temp_memory_dir();
+        write_memory(&dir, "rust.md", RUST_MEMORY).await;
+        write_memory(&dir, "deploy.md", DEPLOY_MEMORY).await;
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir.clone(), &embedder);
+
+        backend
+            .retrieve(SourceParams::new("release the deploy"))
+            .await
+            .unwrap();
+
+        // One batch call: the query plus both un-embedded memories.
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 3, "query + 2 backfills: {:?}", calls[0]);
+        let index =
+            EmbeddingIndex::load(&dir.join(".index").join("embeddings.json"), "mock-embedder")
+                .await;
+        assert_eq!(index.len(), 2);
+
+        // The second query finds everything cached.
+        backend
+            .retrieve(SourceParams::new("release the deploy"))
+            .await
+            .unwrap();
+        assert_eq!(embedder.calls()[1].len(), 1, "only the query re-embeds");
+    }
+
+    #[tokio::test]
+    async fn blended_score_breaks_keyword_ties_semantically() {
+        let dir = temp_memory_dir();
+        // Symmetric keyword profiles ("notes" in name and description of
+        // both), asymmetric semantics (only one is about cats).
+        write_memory(
+            &dir,
+            "a.md",
+            "---\nname: cat-notes\ndescription: notes about my cat\n---\n\nthe cat purrs",
+        )
+        .await;
+        write_memory(
+            &dir,
+            "b.md",
+            "---\nname: dog-notes\ndescription: notes about my dog\n---\n\nthe dog barks",
+        )
+        .await;
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir, &embedder);
+
+        // "feline" shares no keyword with either memory; "notes" ties them.
+        let result = backend
+            .retrieve(SourceParams::new("feline notes"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["semantic"], true);
+        assert_eq!(result.metadata["memories"][0], "cat-notes");
+        assert_eq!(result.metadata["memories"][1], "dog-notes");
+        assert!(
+            result.content.starts_with("### cat-notes"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_only_match_needs_the_floor_and_misses_stay_omitted() {
+        let dir = temp_memory_dir();
+        write_memory(
+            &dir,
+            "cat.md",
+            "---\nname: cat-care\ndescription: pet routine\n---\n\nthe cat eats at dawn",
+        )
+        .await;
+        write_memory(&dir, "deploy.md", DEPLOY_MEMORY).await;
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir, &embedder);
+
+        // Zero keyword overlap with both; cosine 1.0 with the cat memory,
+        // cosine 0.0 (below SEMANTIC_FLOOR) with the deploy memory.
+        let result = backend.retrieve(SourceParams::new("feline")).await.unwrap();
+
+        assert!(
+            result.content.contains("### cat-care"),
+            "{}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("deploy-runbook"),
+            "below-floor memories stay omitted: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn embedder_outage_degrades_every_path_without_erroring() {
+        let dir = temp_memory_dir();
+        write_memory(&dir, "rust.md", RUST_MEMORY).await;
+        write_memory(&dir, "deploy.md", DEPLOY_MEMORY).await;
+        let embedder = MockEmbedder::failing();
+        let backend = semantic_backend(dir.clone(), &embedder);
+
+        // Store succeeds with the endpoint down; the memory is just left
+        // un-embedded (a later query backfills).
+        backend.store(item(cat_note())).await.unwrap();
+        assert!(dir.join("cat-care.md").exists());
+
+        // Retrieve degrades to exactly the keyword ranking.
+        let result = backend
+            .retrieve(SourceParams::new("how should I deploy agentd"))
+            .await
+            .unwrap();
+        assert_eq!(result.metadata["semantic"], false);
+        assert!(result.content.starts_with("### deploy-runbook"));
+
+        // Update and delete likewise never surface the outage.
+        let mut revised = cat_note();
+        revised["body"] = "revised".into();
+        backend
+            .update(&SinkId("cat-care".into()), item(revised))
+            .await
+            .unwrap();
+        backend.delete(&SinkId("cat-care".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_empty_index_is_rebuilt_not_fatal() {
+        let dir = temp_memory_dir();
+        write_memory(
+            &dir,
+            "cat.md",
+            "---\nname: cat-care\ndescription: pet routine\n---\n\nthe cat eats at dawn",
+        )
+        .await;
+        let index_path = dir.join(".index").join("embeddings.json");
+        tokio::fs::create_dir_all(index_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&index_path, "{corrupt").await.unwrap();
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir, &embedder);
+
+        let result = backend.retrieve(SourceParams::new("feline")).await.unwrap();
+
+        assert_eq!(result.metadata["semantic"], true);
+        assert!(result.content.contains("### cat-care"));
+        let rebuilt = EmbeddingIndex::load(&index_path, "mock-embedder").await;
+        assert_eq!(rebuilt.len(), 1, "corrupt index was rebuilt in place");
+    }
+
+    #[tokio::test]
+    async fn query_prunes_vectors_of_memories_deleted_out_of_band() {
+        let dir = temp_memory_dir();
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir.clone(), &embedder);
+        backend.store(item(cat_note())).await.unwrap();
+        backend.store(item(note("keeper"))).await.unwrap();
+
+        // Delete the file directly — the delete() hook never runs.
+        tokio::fs::remove_file(dir.join("cat-care.md"))
+            .await
+            .unwrap();
+
+        backend.retrieve(SourceParams::new("keep")).await.unwrap();
+        let index =
+            EmbeddingIndex::load(&dir.join(".index").join("embeddings.json"), "mock-embedder")
+                .await;
+        assert_eq!(index.len(), 1, "dead id pruned on query");
+        assert!(index.vector("cat-care", "any").is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_memory_dir_with_embedder_never_calls_it() {
+        let dir = temp_memory_dir();
+        let embedder = MockEmbedder::new();
+        let backend = semantic_backend(dir, &embedder);
+
+        let result = backend
+            .retrieve(SourceParams::new("anything"))
+            .await
+            .unwrap();
+
+        assert!(result.content.is_empty());
+        assert_eq!(result.metadata["semantic"], false);
+        assert!(embedder.calls().is_empty(), "no memories, no embed call");
+    }
+
+    #[tokio::test]
+    async fn no_embedder_is_zero_cost_and_keyword_only() {
+        let dir = temp_memory_dir();
+        let backend = MemorySource::new(dir.clone());
+        backend.store(item(cat_note())).await.unwrap();
+
+        let result = backend.retrieve(SourceParams::new("cat")).await.unwrap();
+
+        assert_eq!(result.metadata["semantic"], false);
+        assert!(result.content.contains("### cat-care"));
+        assert!(
+            !dir.join(".index").exists(),
+            "no embedder => no index sidecar is ever created"
+        );
     }
 }
