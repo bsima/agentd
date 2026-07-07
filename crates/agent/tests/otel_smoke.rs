@@ -57,6 +57,7 @@ fn record_replay_fixture(path: &std::path::Path, responses: Vec<Response>) {
     let mut responses = responses;
     responses.reverse();
     let config = SeqConfig {
+        approvals: Default::default(),
         tools: Default::default(),
         provider: Arc::new(ScriptedProvider(Mutex::new(responses))),
         hydration: SourceRegistry::new(),

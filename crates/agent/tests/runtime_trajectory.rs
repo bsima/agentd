@@ -258,6 +258,8 @@ fn summarize_ops(events: &[Event]) -> String {
             Event::StoreCall { .. } => "StoreCall",
             Event::StoreResult { .. } => "StoreResult",
             Event::StoreError { .. } => "StoreError",
+            Event::ApprovalRequested { .. } => "ApprovalRequested",
+            Event::ApprovalResolved { .. } => "ApprovalResolved",
             Event::ToolCall { .. } => "ToolCall",
             Event::ToolResult { .. } => "ToolResult",
             Event::ToolError { .. } => "ToolError",

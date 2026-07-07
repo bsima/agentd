@@ -154,6 +154,13 @@ struct Args {
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
+    /// Gate the shell tool behind human approval (t-1308.10, DR-7): each
+    /// shell command pauses the run until approved. The pause persists as a
+    /// pending-approval record plus a mid-turn machine checkpoint under
+    /// ~/.local/share/agent/approvals; resolve and resume it — in this or
+    /// any later process — with `agent approvals --approve/--deny`.
+    #[arg(long, env = "AGENT_REQUIRE_SHELL_APPROVAL")]
+    require_shell_approval: bool,
     /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
     #[command(subcommand)]
@@ -195,6 +202,35 @@ enum Command {
         /// Emit machine-readable JSON instead of the table.
         #[arg(long)]
         json: bool,
+    },
+    /// Inspect and resolve pending approval gates (t-1308.10, DR-7). A
+    /// paused run persists one record + one machine checkpoint per gated
+    /// effect under ~/.local/share/agent/approvals; `--approve` records the
+    /// decision, re-enters the checkpoint, executes the effect exactly
+    /// once, and drives the run to completion (or its next pause); `--deny`
+    /// records the denial and re-enters the checkpoint so the program
+    /// continues with a typed denial value the model can react to. Both
+    /// work after a full process restart — the filesystem is the API.
+    Approvals {
+        /// List pending and resolved approvals, oldest first.
+        #[arg(long)]
+        list: bool,
+        /// With --list: emit the records as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Approve this pending effect and resume its run.
+        #[arg(long, value_name = "PENDING_ID", conflicts_with_all = ["list", "deny"])]
+        approve: Option<String>,
+        /// Deny this pending effect and resume its run (the effect fails as
+        /// a value; the program continues).
+        #[arg(long, value_name = "PENDING_ID", conflicts_with = "list")]
+        deny: Option<String>,
+        /// Who resolved it; recorded on the record and the trace event.
+        #[arg(long)]
+        by: Option<String>,
+        /// Optional reason, recorded and carried on the denial value.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Print the AgentIR effect-location JSON for the entry Infer of the
     /// built-in agent loop. Eval scripts use it to build replay fixtures
@@ -347,6 +383,43 @@ struct Runtime {
     /// (catch-overflow), frame lifecycles, and the every-N cadence survive
     /// across turns instead of being relearned per turn.
     gc_state: agent_core::GcState,
+    /// Gate the shell tool's Eval behind the approval protocol (t-1308.10).
+    shell_requires_approval: bool,
+    /// Driver-owned facts persisted onto every pending-approval record
+    /// (`PendingEffectRecord.runtime`) so `agent approvals` can rebuild
+    /// this runtime after a full process restart.
+    resume_facts: ResumeFacts,
+}
+
+/// What `agent approvals` needs to rebuild the runtime that paused: the
+/// model alias (registry re-resolution recovers provider/url/pricing; the
+/// API key is re-read from flags/env, never persisted), the run's trace
+/// path (the resume appends to the same trace), and the loop/eval policies
+/// that shape the program and its effects. Serialized as
+/// `PendingEffectRecord.runtime` — opaque to agent-core.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResumeFacts {
+    model: String,
+    trace_path: PathBuf,
+    max_turns: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hydration_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporal_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_schema: Option<PathBuf>,
+    #[serde(default)]
+    memory_tools: bool,
+    #[serde(default)]
+    shell_requires_approval: bool,
+    eval_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_cwd: Option<PathBuf>,
+    eval_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_max_output_bytes: Option<usize>,
 }
 
 #[tokio::main]
@@ -409,22 +482,6 @@ async fn main() -> Result<()> {
         },
         ..EvalConfig::default()
     };
-    let provider_tag = resolved_model.provider.as_deref();
-    let is_anthropic_provider = provider_tag == Some("anthropic");
-    let oauth_provider = provider_tag.filter(|provider| is_oauth_provider_tag(provider));
-    let url = requested_provider
-        .or(provider_file.url)
-        .or(resolved_model.base_url.clone())
-        .or_else(|| std::env::var("AGENT_PROVIDER").ok())
-        .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
-        .unwrap_or_else(|| {
-            if is_anthropic_provider {
-                "https://api.anthropic.com/v1".into()
-            } else {
-                "https://openrouter.ai/api/v1".into()
-            }
-        });
-    let reported_provider_url = reported_provider_url(oauth_provider, &url);
     let replay_enabled = args.replay_trace.is_some();
     let ir_replay = match args.replay_trace.as_ref() {
         Some(path) => Some(IrReplayTrace::load(path).await?),
@@ -436,30 +493,12 @@ async fn main() -> Result<()> {
     };
     let context_budget = resolved_model.context;
     let model = resolved_model.api_id.clone();
-    #[cfg(not(feature = "oauth"))]
-    if !replay_enabled {
-        if let Some(provider) = oauth_provider {
-            return Err(anyhow!(
-                "model '{}' requires OAuth provider '{provider}', but this agent was built without the 'oauth' feature",
-                resolved_model.alias
-            ));
-        }
-    }
-    let api_key = if oauth_provider.is_some() || replay_enabled {
-        None
-    } else {
-        Some(
-            args.key
-                .or(provider_file.api_key)
-                .or(resolved_model.api_key.clone())
-                .or_else(|| std::env::var("AGENT_API_KEY").ok())
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .ok_or_else(|| {
-                    anyhow!("missing API key: pass --key, set AGENT_API_KEY/ANTHROPIC_API_KEY/OPENROUTER_API_KEY, or configure api_key in models.yaml")
-                })?,
-        )
-    };
+    let (provider, reported_provider_url) = build_provider(
+        &resolved_model,
+        requested_provider.or(provider_file.url),
+        args.key.clone().or(provider_file.api_key),
+        replay_enabled,
+    )?;
 
     let checkpoint = match args.resume.as_ref() {
         Some(path) => Some(load_checkpoint(path).await?),
@@ -487,35 +526,6 @@ async fn main() -> Result<()> {
         }
         None => TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug),
     };
-    let provider: Arc<dyn agent_core::ChatProvider> = if replay_enabled {
-        Arc::new(ReplayOnlyProvider)
-    } else {
-        match oauth_provider {
-            Some(tag) => {
-                #[cfg(feature = "oauth")]
-                {
-                    agent_oauth::provider_for_tag(tag, agent_core::Model(model.clone()))?
-                        .map(Arc::from)
-                        .ok_or_else(|| anyhow!("unsupported OAuth provider tag: {tag}"))?
-                }
-                #[cfg(not(feature = "oauth"))]
-                {
-                    return Err(anyhow!("unsupported OAuth provider tag: {tag}"));
-                }
-            }
-            None if is_anthropic_provider => Arc::new(AnthropicProvider::new(AnthropicConfig {
-                base_url: url.clone(),
-                api_key: api_key.expect("api_key is set for non-OAuth providers"),
-                model: agent_core::Model(model.clone()),
-                max_tokens: resolved_model.max_tokens,
-            })),
-            None => Arc::new(ProviderClient::new(ProviderConfig {
-                url: url.clone(),
-                api_key: api_key.expect("api_key is set for non-OAuth providers"),
-                model: agent_core::Model(model.clone()),
-            })),
-        }
-    };
     let hydration = {
         let mut registry = SourceRegistry::new();
         if let Some(path) = args.hydration_dir.as_ref() {
@@ -535,6 +545,10 @@ async fn main() -> Result<()> {
         None => (initial_history(system_prompt), 0, None),
     };
     let config = SeqConfig {
+        // No in-process approval hook in the CLI: gated effects pause
+        // durably and resolve via `agent approvals` (t-1308.10). Resume
+        // drivers load resolutions into this config before re-entering.
+        approvals: Default::default(),
         tools: Default::default(),
         provider,
         hydration: hydration.clone(),
@@ -590,6 +604,26 @@ async fn main() -> Result<()> {
             // the process: a resumed session keeps it.
             discovered_budget: resumed_discovered_budget,
             ..Default::default()
+        },
+        shell_requires_approval: args.require_shell_approval,
+        resume_facts: ResumeFacts {
+            model: resolved_model.alias.clone(),
+            trace_path: trace_path.clone(),
+            max_turns,
+            memory_dir: args.memory_dir.clone(),
+            hydration_dir: args.hydration_dir.clone(),
+            temporal_dir: args.temporal_dir.clone(),
+            output_schema: args.output_schema.clone(),
+            memory_tools: args.memory_dir.is_some(),
+            shell_requires_approval: args.require_shell_approval,
+            eval_timeout_seconds: args.eval_timeout_seconds,
+            eval_cwd: args.eval_cwd.clone(),
+            eval_env: match args.eval_env {
+                EvalEnvMode::Inherit => "inherit".into(),
+                EvalEnvMode::InheritFull => "inherit-full".into(),
+                EvalEnvMode::Clean => "clean".into(),
+            },
+            eval_max_output_bytes: args.eval_max_output_bytes,
         },
     };
 
@@ -709,6 +743,87 @@ fn reported_provider_url(oauth_provider: Option<&str>, resolved_url: &str) -> St
         .and_then(oauth_provider_base_url)
         .map(str::to_string)
         .unwrap_or_else(|| resolved_url.to_string())
+}
+
+/// Construct the chat provider for a resolved model, mirroring the CLI's
+/// conventions (flag/config overrides, then env fallbacks, then defaults).
+/// Shared by the main run path and the `agent approvals` resume path
+/// (t-1308.10), which must rebuild the exact same provider after a full
+/// process restart. Returns the provider plus the reported provider URL.
+fn build_provider(
+    resolved: &ResolvedModel,
+    url_override: Option<String>,
+    key_override: Option<String>,
+    replay_enabled: bool,
+) -> Result<(Arc<dyn agent_core::ChatProvider>, String)> {
+    let provider_tag = resolved.provider.as_deref();
+    let is_anthropic_provider = provider_tag == Some("anthropic");
+    let oauth_provider = provider_tag.filter(|provider| is_oauth_provider_tag(provider));
+    let url = url_override
+        .or(resolved.base_url.clone())
+        .or_else(|| std::env::var("AGENT_PROVIDER").ok())
+        .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
+        .unwrap_or_else(|| {
+            if is_anthropic_provider {
+                "https://api.anthropic.com/v1".into()
+            } else {
+                "https://openrouter.ai/api/v1".into()
+            }
+        });
+    let reported = reported_provider_url(oauth_provider, &url);
+    #[cfg(not(feature = "oauth"))]
+    if !replay_enabled {
+        if let Some(provider) = oauth_provider {
+            return Err(anyhow!(
+                "model '{}' requires OAuth provider '{provider}', but this agent was built without the 'oauth' feature",
+                resolved.alias
+            ));
+        }
+    }
+    let api_key = if oauth_provider.is_some() || replay_enabled {
+        None
+    } else {
+        Some(
+            key_override
+                .or(resolved.api_key.clone())
+                .or_else(|| std::env::var("AGENT_API_KEY").ok())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .ok_or_else(|| {
+                    anyhow!("missing API key: pass --key, set AGENT_API_KEY/ANTHROPIC_API_KEY/OPENROUTER_API_KEY, or configure api_key in models.yaml")
+                })?,
+        )
+    };
+    let provider: Arc<dyn agent_core::ChatProvider> = if replay_enabled {
+        Arc::new(ReplayOnlyProvider)
+    } else {
+        match oauth_provider {
+            Some(tag) => {
+                #[cfg(feature = "oauth")]
+                {
+                    agent_oauth::provider_for_tag(tag, agent_core::Model(resolved.api_id.clone()))?
+                        .map(Arc::from)
+                        .ok_or_else(|| anyhow!("unsupported OAuth provider tag: {tag}"))?
+                }
+                #[cfg(not(feature = "oauth"))]
+                {
+                    return Err(anyhow!("unsupported OAuth provider tag: {tag}"));
+                }
+            }
+            None if is_anthropic_provider => Arc::new(AnthropicProvider::new(AnthropicConfig {
+                base_url: url.clone(),
+                api_key: api_key.expect("api_key is set for non-OAuth providers"),
+                model: agent_core::Model(resolved.api_id.clone()),
+                max_tokens: resolved.max_tokens,
+            })),
+            None => Arc::new(ProviderClient::new(ProviderConfig {
+                url: url.clone(),
+                api_key: api_key.expect("api_key is set for non-OAuth providers"),
+                model: agent_core::Model(resolved.api_id.clone()),
+            })),
+        }
+    };
+    Ok((provider, reported))
 }
 
 async fn resolve_model(
@@ -1181,6 +1296,290 @@ async fn run_cost_command(trace: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `agent approvals` (t-1308.10, DR-7): list pending/resolved approval
+/// records, or resolve one and resume its run from the persisted mid-turn
+/// checkpoint. Everything flows through the flat approvals directory
+/// (`~/.local/share/agent/approvals`) — the filesystem is the API, so
+/// resolution works from any process, including after a full restart of
+/// the machine that paused.
+async fn run_approvals_command(
+    list: bool,
+    json: bool,
+    approve: Option<&str>,
+    deny: Option<&str>,
+    by: Option<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    let store = agent_core::ApprovalStore::new(agent_core::ApprovalStore::default_dir()?);
+    match (list, approve, deny) {
+        (true, None, None) => {
+            let records = store.list().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+                return Ok(());
+            }
+            if records.is_empty() {
+                println!("no pending approvals under {}", store.dir().display());
+                return Ok(());
+            }
+            println!(
+                "PENDING_ID       STATUS             KIND   RUN_ID                                 REQUEST"
+            );
+            for record in records {
+                println!(
+                    "{:<16} {:<18} {:<6} {:<38} {}",
+                    record.pending_id,
+                    match record.status {
+                        agent_core::PendingStatus::AwaitingApproval => "awaiting_approval",
+                        agent_core::PendingStatus::Approved => "approved",
+                        agent_core::PendingStatus::Denied => "denied",
+                    },
+                    record.kind.as_str(),
+                    record.run_id,
+                    record.request
+                );
+            }
+            Ok(())
+        }
+        (false, Some(pending_id), None) => {
+            resolve_and_resume(
+                &store,
+                pending_id,
+                agent_core::ApprovalDecision::Approve,
+                by,
+                reason,
+            )
+            .await
+        }
+        (false, None, Some(pending_id)) => {
+            resolve_and_resume(
+                &store,
+                pending_id,
+                agent_core::ApprovalDecision::Deny,
+                by,
+                reason,
+            )
+            .await
+        }
+        _ => Err(anyhow!(
+            "pass exactly one of --list, --approve <pending_id>, or --deny <pending_id>"
+        )),
+    }
+}
+
+/// Record the decision (exactly once), claim the mid-turn checkpoint
+/// (atomically — a second resume attempt fails instead of re-executing the
+/// effect), rebuild the paused runtime from the record's persisted facts,
+/// and drive the run to completion or to its next pause. A record already
+/// resolved with the SAME decision (e.g. via the SDK's
+/// `PendingApproval::approve`) skips straight to the resume; a
+/// contradicting decision is refused.
+async fn resolve_and_resume(
+    store: &agent_core::ApprovalStore,
+    pending_id: &str,
+    decision: agent_core::ApprovalDecision,
+    by: Option<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    let record = store.load(pending_id).await?;
+    let record = if record.is_awaiting() {
+        store
+            .resolve(
+                pending_id,
+                decision,
+                Some(by.unwrap_or_else(|| "agent-approvals".into())),
+                reason,
+            )
+            .await?
+    } else {
+        let recorded = agent_core::ApprovalStore::resolution_of(&record)?;
+        if recorded.decision != decision {
+            return Err(anyhow!(
+                "pending approval {pending_id} is already resolved as {}; refusing to overturn a made decision",
+                recorded.decision.as_status_str()
+            ));
+        }
+        record
+    };
+    let resolution = agent_core::ApprovalStore::resolution_of(&record)?;
+    let checkpoint = store.claim_checkpoint(pending_id).await?;
+    let facts: ResumeFacts = serde_json::from_value(record.runtime.clone().ok_or_else(|| {
+        anyhow!(
+            "pending approval {pending_id} carries no runtime facts; it was not persisted by \
+             this CLI and cannot be resumed here"
+        )
+    })?)
+    .with_context(|| format!("parsing runtime facts of pending approval {pending_id}"))?;
+    resume_run(store, &record, resolution, checkpoint, facts).await
+}
+
+/// Re-enter a claimed checkpoint: same model resolution, provider
+/// construction, hydration registry, and eval policies as the run that
+/// paused (rebuilt from [`ResumeFacts`]; the API key comes from the
+/// environment, never from disk), with the decision pre-loaded so the gate
+/// consumes it at the effect site. Trace events append to the run's
+/// original trace file under its original run id. The resumed turn's
+/// final response prints to stdout; it is not folded back into a session
+/// checkpoint (wave-1 limitation, see docs/TRACE_SCHEMA.md 1.4 notes).
+async fn resume_run(
+    store: &agent_core::ApprovalStore,
+    record: &agent_core::PendingEffectRecord,
+    resolution: agent_core::ApprovalResolution,
+    checkpoint: agent_core::IrCheckpoint,
+    facts: ResumeFacts,
+) -> Result<()> {
+    let (resolved_model, pricing_table) = resolve_model_from(
+        ModelRegistry::load_default().await,
+        Some(facts.model.clone()),
+    )?;
+    let (provider, _provider_url) = build_provider(&resolved_model, None, None, false)?;
+    let trace = TraceLogger::new(record.run_id.clone(), facts.trace_path.clone());
+    let hydration = {
+        let mut registry = SourceRegistry::new();
+        if let Some(path) = facts.hydration_dir.as_ref() {
+            registry = registry.register(LocalFileSource::new(path.clone()));
+        }
+        if let Some(path) = facts.memory_dir.as_ref() {
+            registry = registry.register_backend(MemorySource::new(path.clone()));
+        }
+        if let Some(path) = facts.temporal_dir.as_ref() {
+            registry = registry.register(TemporalSource::new(path.clone()));
+        }
+        registry
+    };
+    let output_contract = match facts.output_schema.as_ref() {
+        Some(path) => Some(load_output_contract(path).await?),
+        None => None,
+    };
+    let mut approvals = agent_core::ApprovalConfig::default();
+    approvals
+        .resolutions
+        .insert(record.effect_id.clone(), resolution);
+    let config = SeqConfig {
+        approvals,
+        tools: Default::default(),
+        provider,
+        hydration,
+        passive_hydration: PassiveHydrationConfig::with_sources([
+            PassiveSource::TemporalHistory,
+            PassiveSource::SessionContext,
+        ]),
+        trace: trace.clone(),
+        eval: EvalConfig {
+            cwd: facts.eval_cwd.clone(),
+            timeout: Duration::from_secs(facts.eval_timeout_seconds),
+            max_stdout_bytes: facts.eval_max_output_bytes.unwrap_or(1024 * 1024),
+            max_stderr_bytes: facts.eval_max_output_bytes.unwrap_or(1024 * 1024),
+            env: match facts.eval_env.as_str() {
+                "inherit-full" => EnvPolicy::InheritFull,
+                "clean" => EnvPolicy::Clean {
+                    vars: Default::default(),
+                },
+                _ => EnvPolicy::Inherit,
+            },
+            ..EvalConfig::default()
+        },
+        replay: None,
+        trace_full_prompt_ir: false,
+        trace_full_payloads: false,
+        gc: GcMode::Ring(RingGc {
+            preserve_prefix: true,
+        }),
+        gc_threshold: 0.85,
+        gc_log: false,
+        gc_timing: GcTiming::Threshold,
+        context_budget: resolved_model.context,
+        pricing: pricing_table,
+    };
+    let options = agent_core::AgentLoopOptions {
+        memory_tools: facts.memory_tools,
+        tool_names: vec![],
+        output_contract,
+        shell_requires_approval: facts.shell_requires_approval,
+    };
+    let mut ir_store = checkpoint.store.clone();
+    let mut gc_state = agent_core::GcState::default();
+    eprintln!(
+        "resuming run {} at effect {} ({})",
+        record.run_id,
+        record.effect_id,
+        resolution_status(record)
+    );
+    match agent_core::resume_agent_loop_outcome(
+        &config,
+        &mut ir_store,
+        &mut gc_state,
+        agent_core::Model(resolved_model.api_id.clone()),
+        facts.max_turns,
+        &options,
+        checkpoint.machine,
+    )
+    .await?
+    {
+        agent_core::AgentLoopOutcome::Complete { value, .. } => {
+            if let Some(failure) = agent_core::output_contract_failure(&value) {
+                return Err(anyhow!(
+                    "final output failed the output schema after {} attempt(s): {}",
+                    failure.attempts,
+                    failure.errors.join("; ")
+                ));
+            }
+            let response: agent_core::Response =
+                serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
+            trace
+                .emit(&Event::AgentDone {
+                    run_id: record.run_id.clone(),
+                    usage: None,
+                    timestamp: Utc::now(),
+                })
+                .await?;
+            println!("{}", response.content);
+            Ok(())
+        }
+        agent_core::AgentLoopOutcome::AwaitingApproval {
+            checkpoint,
+            pending,
+        } => {
+            // The resumed run reached its NEXT gated effect: persist the
+            // new pause with the same runtime facts and report it.
+            let next = agent_core::PendingEffectRecord {
+                pending_id: pending.pending_id.clone(),
+                run_id: record.run_id.clone(),
+                turn_id: record.turn_id.clone(),
+                effect_id: pending.effect.effect_id.0.clone(),
+                program_hash: pending.effect.program_hash.0.clone(),
+                kind: pending.kind,
+                request: pending.request.clone(),
+                created_ts: Utc::now(),
+                status: agent_core::PendingStatus::AwaitingApproval,
+                resolved_ts: None,
+                resolved_by: None,
+                reason: None,
+                runtime: record.runtime.clone(),
+            };
+            store.write_pending(&next, &checkpoint).await?;
+            println!(
+                "run paused again awaiting approval {}: gated {} effect (request: {}); resolve \
+                 with `agent approvals --approve {}` or `agent approvals --deny {}`",
+                next.pending_id,
+                next.kind.as_str(),
+                next.request,
+                next.pending_id,
+                next.pending_id
+            );
+            Ok(())
+        }
+    }
+}
+
+fn resolution_status(record: &agent_core::PendingEffectRecord) -> &'static str {
+    match record.status {
+        agent_core::PendingStatus::AwaitingApproval => "awaiting_approval",
+        agent_core::PendingStatus::Approved => "approved",
+        agent_core::PendingStatus::Denied => "denied",
+    }
+}
+
 /// estimate_tokens drift against provider-reported usage (t-1163). Every
 /// InferResult carries the provider's real input_tokens; when the trace
 /// also recorded full prompts (--trace-full-payloads) we can re-estimate
@@ -1268,6 +1667,24 @@ async fn run_command(command: &Command) -> Result<()> {
     match command {
         Command::GcStats { trace } => run_gc_stats_command(trace).await,
         Command::Cost { trace, json } => run_cost_command(trace, *json).await,
+        Command::Approvals {
+            list,
+            json,
+            approve,
+            deny,
+            by,
+            reason,
+        } => {
+            run_approvals_command(
+                *list,
+                *json,
+                approve.as_deref(),
+                deny.as_deref(),
+                by.clone(),
+                reason.clone(),
+            )
+            .await
+        }
         Command::IrEffect { model, visit } => {
             let machine = agent_loop_ir(agent_core::Model(model.clone()), vec![], 16);
             let hash = agent_core::program_hash(&machine.program)?;
@@ -1498,7 +1915,7 @@ async fn run_turn_with_status(
     let turn_id = turn_id.unwrap_or_else(|| mint_turn_id(&runtime.run_id, runtime.turn_seq));
     runtime.turn_seq += 1;
     emit_agent_start(runtime, &turn_id).await?;
-    match run_turn(runtime, input).await {
+    match run_turn(runtime, input, &turn_id).await {
         Ok(response) => {
             // A turn-budget stop with empty content must not look like a
             // crash: surface a clear terminal notice instead (t-1133).
@@ -1523,7 +1940,11 @@ async fn run_turn_with_status(
     }
 }
 
-async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::Response> {
+async fn run_turn(
+    runtime: &mut Runtime,
+    message: String,
+    turn_id: &str,
+) -> Result<agent_core::Response> {
     runtime.history.push(ChatMessage::user(message));
     let prompt = runtime.history.clone();
     let (response, mut new_history) = {
@@ -1538,8 +1959,9 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             memory_tools,
             tool_names: runtime.config.tools.names(),
             output_contract: runtime.output_contract.clone(),
+            shell_requires_approval: runtime.shell_requires_approval,
         };
-        let (value, machine) = agent_core::run_agent_loop(
+        let outcome = agent_core::run_agent_loop_outcome(
             &runtime.config,
             &mut runtime.ir_store,
             runtime.ir_replay.as_ref(),
@@ -1551,6 +1973,15 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
             runtime.ir_effect_visits.clone(),
         )
         .await?;
+        let (value, machine) = match outcome {
+            agent_core::AgentLoopOutcome::Complete { value, machine } => (value, machine),
+            agent_core::AgentLoopOutcome::AwaitingApproval {
+                checkpoint,
+                pending,
+            } => {
+                return Err(pause_turn(runtime, turn_id, checkpoint, pending).await?);
+            }
+        };
         runtime.ir_effect_visits = machine.effect_visits.clone();
         // Exhausted output-schema repairs come back as a typed value (the
         // loop's errors-as-values convention); surface them as a failed
@@ -1596,6 +2027,64 @@ async fn run_turn(runtime: &mut Runtime, message: String) -> Result<agent_core::
     runtime.history = new_history;
     persist_session(runtime).await;
     Ok(response)
+}
+
+/// Persist an approval pause durably (the pending record plus the mid-turn
+/// machine checkpoint, under `~/.local/share/agent/approvals`) and return
+/// the error that reports it. The turn does NOT complete: in one-shot mode
+/// the process exits nonzero with this message; in session mode it rides
+/// the turn's `agent_error` machine event (naming the pending id) and the
+/// session stays alive for further turns. Resolution and resumption — in
+/// this or any later process — are `agent approvals --approve/--deny`.
+async fn pause_turn(
+    runtime: &Runtime,
+    turn_id: &str,
+    checkpoint: agent_core::IrCheckpoint,
+    pending: agent_core::ApprovalRequest,
+) -> Result<anyhow::Error> {
+    // Replay reproduces a recorded pause as data (the gate already
+    // re-emitted its events); persisting or waiting would make replay
+    // side-effecting.
+    if runtime.ir_replay.is_some() {
+        return Ok(anyhow!(
+            "replay reproduced an approval pause: effect {} (pending {}) was recorded awaiting \
+             approval and never resolved",
+            pending.effect.effect_id.0,
+            pending.pending_id
+        ));
+    }
+    let store = agent_core::ApprovalStore::new(agent_core::ApprovalStore::default_dir()?);
+    let record = agent_core::PendingEffectRecord {
+        pending_id: pending.pending_id.clone(),
+        run_id: runtime.run_id.clone(),
+        turn_id: Some(turn_id.to_owned()),
+        effect_id: pending.effect.effect_id.0.clone(),
+        program_hash: pending.effect.program_hash.0.clone(),
+        kind: pending.kind,
+        request: pending.request.clone(),
+        created_ts: Utc::now(),
+        status: agent_core::PendingStatus::AwaitingApproval,
+        resolved_ts: None,
+        resolved_by: None,
+        reason: None,
+        runtime: Some(serde_json::to_value(&runtime.resume_facts)?),
+    };
+    store.write_pending(&record, &checkpoint).await?;
+    tracing::info!(
+        run_id = %runtime.run_id,
+        %turn_id,
+        pending_id = %record.pending_id,
+        "turn paused awaiting approval"
+    );
+    Ok(anyhow!(
+        "turn paused awaiting approval {id}: gated {kind} effect did not execute \
+         (request: {request}); resolve with `agent approvals --approve {id}` or \
+         `agent approvals --deny {id}` (state under {dir})",
+        id = record.pending_id,
+        kind = record.kind.as_str(),
+        request = record.request,
+        dir = store.dir().display(),
+    ))
 }
 
 fn response_turn_budget_exhausted(response: &agent_core::Response) -> bool {
