@@ -92,6 +92,19 @@ struct StubProvider {
 
 /// Serve `responses` in order: (delay before answering, response text).
 async fn stub_provider(responses: Vec<(Duration, String)>) -> StubProvider {
+    stub_provider_messages(
+        responses
+            .into_iter()
+            .map(|(delay, text)| (delay, json!({ "content": text }), "stop".to_string()))
+            .collect(),
+    )
+    .await
+}
+
+/// Serve raw OpenAI-compatible `message` objects in order:
+/// (delay, message, finish_reason). Lets a test script tool calls, not
+/// just final text.
+async fn stub_provider_messages(responses: Vec<(Duration, Value, String)>) -> StubProvider {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -142,16 +155,16 @@ async fn stub_provider(responses: Vec<(Duration, String)>) -> StubProvider {
             if let Ok(body) = serde_json::from_slice::<Value>(&buf[header_end..]) {
                 seen.lock().await.push(body);
             }
-            let (delay, text) = queue
-                .lock()
-                .await
-                .pop_front()
-                .unwrap_or((Duration::ZERO, "stub exhausted".into()));
+            let (delay, message, finish_reason) = queue.lock().await.pop_front().unwrap_or((
+                Duration::ZERO,
+                json!({ "content": "stub exhausted" }),
+                "stop".into(),
+            ));
             tokio::time::sleep(delay).await;
             let body = json!({
                 "choices": [{
-                    "message": { "content": text },
-                    "finish_reason": "stop"
+                    "message": message,
+                    "finish_reason": finish_reason
                 }],
                 "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
             })
@@ -568,4 +581,243 @@ async fn native_tools_and_injected_providers_are_typed_unsupported() {
         .await
         .unwrap_err();
     assert!(matches!(err, SdkError::Unsupported(_)), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Approval/pause protocol (t-1308.10, DR-7): the durable session arm,
+// end-to-end and credential-free — child pauses, SDK discovers and approves
+// the pending record, `agent approvals` resumes across the process
+// boundary and the gated command executes exactly once.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn session_pause_sdk_approval_and_cli_resume_round_trip() {
+    let root = scratch();
+    let marker = root.join("marker");
+    let command = format!("printf ran >> {}", marker.display());
+    // Turn 1: the model calls the gated shell tool -> the child pauses.
+    // The second message is consumed by the CLI resume after approval.
+    let stub = stub_provider_messages(vec![
+        (
+            Duration::ZERO,
+            json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": { "name": "shell", "arguments": json!({ "command": command }).to_string() }
+                }]
+            }),
+            "tool_calls".into(),
+        ),
+        (Duration::ZERO, json!({ "content": "resumed and done" }), "stop".into()),
+    ])
+    .await;
+    let agent = Agent::builder(MODEL)
+        .require_shell_approval()
+        .build()
+        .unwrap();
+    let session = Session::start(&agent, stub_options(&root, &stub))
+        .await
+        .unwrap();
+
+    // The gated turn fails with the pause report (wave-1 session
+    // semantics): the effect did not execute, the pause is durable.
+    let err = session.send("write the marker").await.unwrap_err();
+    match err {
+        SdkError::Turn { message, .. } => {
+            assert!(message.contains("awaiting approval"), "{message}");
+            assert!(message.contains("agent approvals --approve"), "{message}");
+        }
+        other => panic!("expected a paused turn error, got: {other}"),
+    }
+    assert!(!marker.exists(), "gated command must not have executed");
+
+    // Discover and approve via the SDK (same on-disk records as the CLI).
+    let pending = session
+        .next_approval()
+        .await
+        .unwrap()
+        .expect("a pending approval");
+    assert_eq!(pending.kind(), agent_sdk::ApprovalKind::Eval);
+    assert_eq!(pending.request()["command"], json!(command));
+    assert_eq!(pending.record().run_id, session.run_id());
+    let pending_id = pending.pending_id().to_owned();
+    pending.approve().await.unwrap();
+    assert!(
+        session.next_approval().await.unwrap().is_none(),
+        "resolved records are no longer pending"
+    );
+
+    // Resume in a WHOLLY separate process: `agent approvals --approve`
+    // finds the decision already recorded, claims the checkpoint, executes
+    // the command exactly once, and drives the run to completion.
+    let output = tokio::process::Command::new(agent_binary())
+        .args(["approvals", "--approve", &pending_id])
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("AGENT_PROVIDER", &stub.url)
+        .env("AGENT_API_KEY", "stub-key")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent approvals --approve failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("resumed and done"),
+        "the resumed run's final response prints to stdout"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "ran",
+        "the approved command executed exactly once"
+    );
+
+    // A second approve cannot re-execute: the checkpoint claim is
+    // exactly-once.
+    let again = tokio::process::Command::new(agent_binary())
+        .args(["approvals", "--approve", &pending_id])
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("AGENT_PROVIDER", &stub.url)
+        .env("AGENT_API_KEY", "stub-key")
+        .output()
+        .await
+        .unwrap();
+    assert!(!again.status.success(), "double-resume must fail");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("already claimed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+
+    // --list --json shows the resolved record.
+    let listed = tokio::process::Command::new(agent_binary())
+        .args(["approvals", "--list", "--json"])
+        .env("HOME", &root)
+        .output()
+        .await
+        .unwrap();
+    let records: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(records[0]["pending_id"], json!(pending_id));
+    assert_eq!(records[0]["status"], json!("approved"));
+    assert_eq!(records[0]["resolved_by"], json!("sdk"));
+
+    session.stop().await.unwrap();
+}
+
+/// The one-shot arm of the same protocol (same harness, no Session): a
+/// gated one-shot run exits nonzero reporting the pending approval, and
+/// `agent approvals --deny` resumes it with a typed denial the model
+/// reacts to — the command never executes.
+#[tokio::test]
+async fn one_shot_pause_and_cli_deny_resume_round_trip() {
+    let root = scratch();
+    let marker = root.join("marker");
+    let command = format!("printf ran >> {}", marker.display());
+    let stub = stub_provider_messages(vec![
+        (
+            Duration::ZERO,
+            json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": { "name": "shell", "arguments": json!({ "command": command }).to_string() }
+                }]
+            }),
+            "tool_calls".into(),
+        ),
+        (
+            Duration::ZERO,
+            json!({ "content": "understood, skipping it" }),
+            "stop".into(),
+        ),
+    ])
+    .await;
+
+    // One-shot gated run: pauses, persists, exits nonzero with the report.
+    let paused = tokio::process::Command::new(agent_binary())
+        .args([
+            "--model",
+            MODEL,
+            "--require-shell-approval",
+            "write the marker",
+        ])
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("AGENT_PROVIDER", &stub.url)
+        .env("AGENT_API_KEY", "stub-key")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(!paused.status.success(), "a paused one-shot exits nonzero");
+    let stderr = String::from_utf8_lossy(&paused.stderr);
+    assert!(stderr.contains("awaiting approval"), "stderr: {stderr}");
+    assert!(!marker.exists(), "gated command must not have executed");
+
+    // The pause is on disk: find its pending id.
+    let listed = tokio::process::Command::new(agent_binary())
+        .args(["approvals", "--list", "--json"])
+        .env("HOME", &root)
+        .output()
+        .await
+        .unwrap();
+    let records: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(records[0]["status"], json!("awaiting_approval"));
+    assert_eq!(records[0]["kind"], json!("eval"));
+    let pending_id = records[0]["pending_id"].as_str().unwrap().to_owned();
+
+    // Deny (after the pausing process fully exited): the effect fails as a
+    // value, the model reads it and completes the run.
+    let denied = tokio::process::Command::new(agent_binary())
+        .args([
+            "approvals",
+            "--deny",
+            &pending_id,
+            "--by",
+            "ben",
+            "--reason",
+            "not today",
+        ])
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("AGENT_PROVIDER", &stub.url)
+        .env("AGENT_API_KEY", "stub-key")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        denied.status.success(),
+        "deny-resume failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&denied.stdout),
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&denied.stdout).contains("understood, skipping it"),
+        "the model reacted to the typed denial"
+    );
+    assert!(!marker.exists(), "denied command must never execute");
+
+    // The denial (including who/why) is durable, and the model saw the
+    // typed denial value as the tool result in the run's trace.
+    let listed = tokio::process::Command::new(agent_binary())
+        .args(["approvals", "--list", "--json"])
+        .env("HOME", &root)
+        .output()
+        .await
+        .unwrap();
+    let records: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(records[0]["status"], json!("denied"));
+    assert_eq!(records[0]["resolved_by"], json!("ben"));
+    assert_eq!(records[0]["reason"], json!("not today"));
+    let requests = stub.requests.lock().await;
+    let last = requests.last().unwrap().to_string();
+    assert!(last.contains("approval denied: not today"), "{last}");
 }

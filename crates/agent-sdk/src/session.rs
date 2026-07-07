@@ -52,6 +52,7 @@
 use crate::agent::Agent;
 use crate::error::SdkError;
 use crate::runner::EventStream;
+use agent_core::approval::{ApprovalDecision, ApprovalKind, ApprovalStore, PendingEffectRecord};
 use agent_core::public_trace::public_event;
 use agent_core::{EnvPolicy, Event, DEFAULT_MAX_REPAIRS};
 use chrono::{DateTime, Utc};
@@ -353,6 +354,43 @@ impl Session {
         self.attach(&turn_id).await
     }
 
+    /// The next unresolved approval pause of this session, oldest first
+    /// (t-1308.10, DR-7), by polling the run's approvals directory — the
+    /// same on-disk records `agent approvals --list` reads, derived from
+    /// the child's trace path (`<data-dir>/approvals`, a sibling of
+    /// `traces/`). Returns `None` when nothing is awaiting approval.
+    ///
+    /// Wave-1 scope: a session turn that hits an approval gate FAILS with
+    /// [`SdkError::Turn`] (the child reports the pause on its `agent_error`
+    /// machine event, naming the pending id) after durably persisting the
+    /// pause. [`PendingApproval::approve`] / [`PendingApproval::deny`]
+    /// record the decision with the same shared agent-core resolution
+    /// functions the CLI uses; re-entering the paused turn's checkpoint is
+    /// then `agent approvals --approve/--deny <pending_id>` (which finds
+    /// the decision already recorded and resumes), and its outcome lands in
+    /// the run's trace — not in this session's in-child history.
+    pub async fn next_approval(&self) -> Result<Option<PendingApproval>, SdkError> {
+        let Some(dir) = self.approvals_dir() else {
+            return Ok(None);
+        };
+        let store = ApprovalStore::new(dir);
+        let records = store
+            .list()
+            .await
+            .map_err(|err| SdkError::Session(format!("listing pending approvals: {err:#}")))?;
+        Ok(records
+            .into_iter()
+            .find(|record| record.run_id == self.run_id && record.is_awaiting())
+            .map(|record| PendingApproval { record, store }))
+    }
+
+    /// The approvals directory serving this session's run: a sibling of the
+    /// trace directory reported by the child (`.../agent/traces/<run>.jsonl`
+    /// -> `.../agent/approvals`), so it honors the child's `HOME`.
+    fn approvals_dir(&self) -> Option<PathBuf> {
+        Some(self.trace_path.parent()?.parent()?.join("approvals"))
+    }
+
     /// A live [`EventStream`] of the session's public trace events
     /// (docs/TRACE_SCHEMA.md), fed by tailing the child's trace file from
     /// the beginning. Each call returns an independent stream; the stream
@@ -527,6 +565,70 @@ enum Claim {
     Wait(oneshot::Receiver<TurnOutcome>),
 }
 
+/// One unresolved approval pause, discovered by [`Session::next_approval`].
+/// Deciding it calls the same durable agent-core resolution the `agent
+/// approvals` CLI uses; the decision is made exactly once (a second
+/// resolution of the same pending id fails), and neither method re-enters
+/// the paused machine — see [`Session::next_approval`] for the wave-1
+/// resume story.
+#[derive(Debug)]
+pub struct PendingApproval {
+    record: PendingEffectRecord,
+    store: ApprovalStore,
+}
+
+impl PendingApproval {
+    pub fn pending_id(&self) -> &str {
+        &self.record.pending_id
+    }
+
+    /// What kind of effect is gated (`Eval` or `Store`).
+    pub fn kind(&self) -> ApprovalKind {
+        self.record.kind
+    }
+
+    /// The gated request payload preview: for Eval `{command, argv}`, for
+    /// Store `{sink, op, id, item_preview, content_hash}`.
+    pub fn request(&self) -> &Value {
+        &self.record.request
+    }
+
+    /// The full on-disk pending record.
+    pub fn record(&self) -> &PendingEffectRecord {
+        &self.record
+    }
+
+    /// Durably approve the gated effect: when its checkpoint is re-entered
+    /// the effect executes exactly once.
+    pub async fn approve(self) -> Result<(), SdkError> {
+        self.resolve(ApprovalDecision::Approve, None).await
+    }
+
+    /// Durably deny the gated effect: when its checkpoint is re-entered the
+    /// effect binds a typed denial value (errors-as-values) and the program
+    /// continues.
+    pub async fn deny(self, reason: Option<String>) -> Result<(), SdkError> {
+        self.resolve(ApprovalDecision::Deny, reason).await
+    }
+
+    async fn resolve(
+        self,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    ) -> Result<(), SdkError> {
+        self.store
+            .resolve(
+                &self.record.pending_id,
+                decision,
+                Some("sdk".into()),
+                reason,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| SdkError::Session(format!("resolving pending approval: {err:#}")))
+    }
+}
+
 enum LaunchMode {
     Start,
     Resume,
@@ -567,6 +669,9 @@ async fn launch(
         .arg(agent.max_turns.to_string())
         .arg("--eval-timeout-seconds")
         .arg(agent.eval_timeout.as_secs().max(1).to_string());
+    if agent.require_shell_approval {
+        cmd.arg("--require-shell-approval");
+    }
     match mode {
         LaunchMode::Start => {
             cmd.arg("--run-id").arg(Uuid::new_v4().to_string());
@@ -644,6 +749,7 @@ async fn launch(
         "AGENT_MEMORY_DIR",
         "AGENT_HYDRATION_DIR",
         "AGENT_TEMPORAL_DIR",
+        "AGENT_REQUIRE_SHELL_APPROVAL",
     ] {
         cmd.env_remove(var);
     }
@@ -717,6 +823,14 @@ fn reject_unsupported(agent: &Agent) -> Result<(), SdkError> {
              tools, or the child's built-in shell/infer/memory tools in sessions",
             tools.join(", ")
         )));
+    }
+    if agent.on_approval.is_some() {
+        return Err(SdkError::Unsupported(
+            "on_approval hooks are in-process closures and cannot cross the session's process \
+             boundary; session pauses persist durably instead — poll Session::next_approval and \
+             resolve with PendingApproval::approve()/deny() (resume via `agent approvals`)"
+                .into(),
+        ));
     }
     if agent.provider.is_some() {
         return Err(SdkError::Unsupported(

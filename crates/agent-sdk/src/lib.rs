@@ -110,7 +110,9 @@ pub mod testing;
 pub use agent::{Agent, AgentBuilder, Tool, ToolDef, DEFAULT_MAX_TURNS};
 pub use error::SdkError;
 pub use runner::{EventStream, RunHandle, RunResult, Runner};
-pub use session::{Session, SessionOptions, SessionStatus, TurnOptions, TurnResult};
+pub use session::{
+    PendingApproval, Session, SessionOptions, SessionStatus, TurnOptions, TurnResult,
+};
 
 // The SDK's event vocabulary is agent-core's public trace schema
 // (docs/TRACE_SCHEMA.md), re-exported so consumers need only this crate.
@@ -124,3 +126,10 @@ pub use agent_core::public_trace::{
 // trait (for stateful tool implementations).
 pub use agent_core::tool::{ToolHandler, RESERVED_TOOL_NAMES};
 pub use agent_core::{ChatProvider, EnvPolicy, OutputContract};
+
+// The approval/pause protocol (t-1308.10, DR-7): the hook types for
+// AgentBuilder::on_approval and the on-disk record shape surfaced by
+// Session::next_approval.
+pub use agent_core::approval::{
+    ApprovalDecision, ApprovalKind, ApprovalRequest, PendingEffectRecord, PendingStatus,
+};

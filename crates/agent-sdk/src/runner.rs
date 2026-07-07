@@ -9,10 +9,11 @@ use agent_core::ir_interpreter::InMemoryStore;
 use agent_core::public_trace::{public_event, PublicEvent};
 use agent_core::trace::TraceSink;
 use agent_core::{
-    output_contract_failure, run_agent_loop, AgentLoopOptions, AnthropicConfig, AnthropicProvider,
-    ChatMessage, ChatProvider, EvalConfig, Event, GcMode, GcState, GcTiming, IrReplayTrace,
-    JsonlTraceSink, MemorySource, Model, ModelRegistry, PassiveHydrationConfig, ProviderClient,
-    ProviderConfig, ReplayOnlyProvider, Response, SeqConfig, SourceRegistry, TraceLogger,
+    output_contract_failure, run_agent_loop_outcome, AgentLoopOptions, AgentLoopOutcome,
+    AnthropicConfig, AnthropicProvider, ApprovalConfig, ChatMessage, ChatProvider, EvalConfig,
+    Event, GcMode, GcState, GcTiming, IrReplayTrace, JsonlTraceSink, MemorySource, Model,
+    ModelRegistry, PassiveHydrationConfig, ProviderClient, ProviderConfig, ReplayOnlyProvider,
+    Response, SeqConfig, SourceRegistry, TraceLogger,
 };
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
@@ -342,6 +343,13 @@ async fn execute(
         provider,
         hydration,
         tools: agent.tools.clone(),
+        // The in-process approval arm (DR-7): the agent's on_approval hook
+        // decides gated effects at the effect site. No hook + a gated
+        // effect fails closed below (ApprovalRequired) — never auto-approve.
+        approvals: ApprovalConfig {
+            resolutions: Default::default(),
+            hook: agent.on_approval.clone(),
+        },
         passive_hydration: PassiveHydrationConfig::default(),
         trace: trace.clone(),
         eval: EvalConfig {
@@ -364,6 +372,7 @@ async fn execute(
         memory_tools,
         tool_names: agent.tools.names(),
         output_contract: agent.output_contract.clone(),
+        shell_requires_approval: agent.require_shell_approval,
     };
     let mut history = Vec::new();
     if let Some(instructions) = &agent.instructions {
@@ -373,7 +382,7 @@ async fn execute(
 
     let mut store = InMemoryStore::new();
     let mut gc_state = GcState::default();
-    let (value, _machine) = run_agent_loop(
+    let outcome = run_agent_loop_outcome(
         &config,
         &mut store,
         replay.as_ref(),
@@ -393,6 +402,20 @@ async fn execute(
             SdkError::Run(rendered)
         }
     })?;
+    let value = match outcome {
+        AgentLoopOutcome::Complete { value, .. } => value,
+        // Fail closed (DR-7): a gated effect with no on_approval hook does
+        // not execute, and the in-process Runner has no durable pause to
+        // resume in this wave — the run ends as a typed error. Never
+        // auto-approve, never approve on a timeout.
+        AgentLoopOutcome::AwaitingApproval { pending, .. } => {
+            return Err(SdkError::ApprovalRequired {
+                pending_id: pending.pending_id,
+                kind: pending.kind.as_str().to_owned(),
+                request: pending.request.to_string(),
+            });
+        }
+    };
 
     // Exhausted output-schema repairs come back as a typed value (the
     // loop's errors-as-values convention); surface them as the typed SDK

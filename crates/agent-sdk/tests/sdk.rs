@@ -255,6 +255,158 @@ async fn event_stream_sees_the_public_dotted_events() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Approval/pause protocol (t-1308.10, DR-7): in-process Runner arm.
+// ---------------------------------------------------------------------------
+
+fn marker_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("agent-sdk-approval-{}", uuid::Uuid::new_v4()))
+}
+
+fn gated_shell_agent(
+    provider: ScriptedProvider,
+    hook: Option<agent_sdk::ApprovalDecision>,
+    seen: Arc<std::sync::Mutex<Vec<agent_sdk::ApprovalRequest>>>,
+) -> Agent {
+    let mut builder = Agent::builder("mock-model")
+        .provider(Arc::new(provider))
+        .trace_dir(trace_dir())
+        .require_shell_approval();
+    if let Some(decision) = hook {
+        builder = builder.on_approval(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            decision
+        });
+    }
+    builder.build().unwrap()
+}
+
+#[tokio::test]
+async fn on_approval_hook_approves_gated_shell_and_run_completes() {
+    let marker = marker_path();
+    let provider = ScriptedProvider::new()
+        .tool_call(
+            "shell",
+            json!({ "command": format!("printf ran >> {}", marker.display()) }),
+        )
+        .text("command ran");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = gated_shell_agent(
+        provider,
+        Some(agent_sdk::ApprovalDecision::Approve),
+        seen.clone(),
+    );
+
+    let result = Runner::run(&agent, "run it").await.unwrap();
+
+    assert_eq!(result.text, "command ran");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "hook consulted exactly once");
+        assert_eq!(seen[0].kind, agent_sdk::ApprovalKind::Eval);
+        assert!(seen[0].pending_id.starts_with("pa-"));
+        assert!(
+            seen[0].request["command"]
+                .as_str()
+                .unwrap()
+                .starts_with("printf ran"),
+            "{}",
+            seen[0].request
+        );
+    }
+
+    // Both approval events are in the trace and project to the public
+    // dotted names.
+    let events = agent_core::TraceLogger::read_events(&result.trace_path)
+        .await
+        .unwrap();
+    let public: Vec<String> = events
+        .iter()
+        .filter_map(agent_core::public_event)
+        .map(|event| event.event)
+        .collect();
+    assert!(public.iter().any(|name| name == "approval.requested"));
+    assert!(public.iter().any(|name| name == "approval.resolved"));
+}
+
+#[tokio::test]
+async fn on_approval_hook_denial_is_a_value_the_model_reacts_to() {
+    let marker = marker_path();
+    let provider = ScriptedProvider::new()
+        .tool_call(
+            "shell",
+            json!({ "command": format!("printf ran >> {}", marker.display()) }),
+        )
+        .text("understood, not running it");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = gated_shell_agent(provider, Some(agent_sdk::ApprovalDecision::Deny), seen);
+
+    let result = Runner::run(&agent, "run it").await.unwrap();
+
+    // The run COMPLETED: the denial came back to the model as a tool
+    // result (errors-as-values) and it answered.
+    assert_eq!(result.text, "understood, not running it");
+    assert!(!marker.exists(), "denied command must never execute");
+}
+
+#[tokio::test]
+async fn unattended_gated_run_without_hook_fails_closed() {
+    let marker = marker_path();
+    let provider = ScriptedProvider::new()
+        .tool_call(
+            "shell",
+            json!({ "command": format!("printf ran >> {}", marker.display()) }),
+        )
+        .text("never reached");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = gated_shell_agent(provider, None, seen);
+
+    let err = Runner::run(&agent, "run it").await.unwrap_err();
+
+    match err {
+        SdkError::ApprovalRequired {
+            pending_id, kind, ..
+        } => {
+            assert!(pending_id.starts_with("pa-"));
+            assert_eq!(kind, "eval");
+        }
+        other => panic!("expected ApprovalRequired, got: {other}"),
+    }
+    assert!(!marker.exists(), "fail closed: the effect never executed");
+}
+
+#[tokio::test]
+async fn replay_reproduces_hook_approved_run_without_hook_or_reexecution() {
+    let marker = marker_path();
+    let provider = ScriptedProvider::new()
+        .tool_call(
+            "shell",
+            json!({ "command": format!("printf ran >> {}", marker.display()) }),
+        )
+        .text("command ran");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = gated_shell_agent(provider, Some(agent_sdk::ApprovalDecision::Approve), seen);
+    let recorded = Runner::run(&agent, "run it").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+
+    // Replay with NO hook and an exhausted provider: the recorded approval
+    // outcome is data, so nothing pauses, nothing fails closed, and the
+    // command is not re-executed.
+    let replay_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let replay_agent = gated_shell_agent(ScriptedProvider::new(), None, replay_seen);
+    let replayed = Runner::replay(&recorded.trace_path, &replay_agent, "run it")
+        .await
+        .unwrap();
+
+    assert_eq!(replayed.text, recorded.text);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "ran",
+        "replay must not re-execute the approved command"
+    );
+}
+
 #[test]
 fn builder_rejects_reserved_and_duplicate_tool_names() {
     let reserved = Agent::builder("mock-model")

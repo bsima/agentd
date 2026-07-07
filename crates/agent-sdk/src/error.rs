@@ -44,6 +44,23 @@ pub enum SdkError {
     #[error("agent run failed: {0}")]
     Run(String),
 
+    /// An approval-gated effect was reached in an unattended in-process run
+    /// (no [`crate::AgentBuilder::on_approval`] hook): the effect did NOT
+    /// execute and the run failed closed (t-1308.10, DR-7). Register a
+    /// hook, or run the agent through the `agent` CLI, whose pauses persist
+    /// durably and resolve via `agent approvals`.
+    #[error(
+        "approval required for gated {kind} effect (pending {pending_id}); \
+         no on_approval hook is configured, failing closed without executing it: {request}"
+    )]
+    ApprovalRequired {
+        pending_id: String,
+        /// `"eval"` or `"store"`.
+        kind: String,
+        /// The gated request payload, rendered as JSON.
+        request: String,
+    },
+
     /// The requested feature cannot be expressed in this execution mode.
     /// Today this is the [`crate::Session`] facade rejecting agent config
     /// that cannot cross the child-process boundary (native tools, injected

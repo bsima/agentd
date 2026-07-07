@@ -3,6 +3,7 @@
 //! memory). Built once, reusable across [`crate::Runner`] calls.
 
 use crate::error::SdkError;
+use agent_core::approval::{ApprovalDecision, ApprovalHookFn, ApprovalRequest};
 use agent_core::tool::{NativeTool, ToolHandler, ToolRegistry};
 use agent_core::{ChatProvider, EnvPolicy, OutputContract};
 use serde_json::Value;
@@ -92,6 +93,8 @@ pub struct Agent {
     pub(crate) memory_dir: Option<PathBuf>,
     pub(crate) trace_dir: Option<PathBuf>,
     pub(crate) provider: Option<Arc<dyn ChatProvider>>,
+    pub(crate) require_shell_approval: bool,
+    pub(crate) on_approval: Option<ApprovalHookFn>,
 }
 
 impl Agent {
@@ -113,6 +116,8 @@ impl Agent {
             memory_dir: None,
             trace_dir: None,
             provider: None,
+            require_shell_approval: false,
+            on_approval: None,
         }
     }
 
@@ -148,6 +153,8 @@ pub struct AgentBuilder {
     memory_dir: Option<PathBuf>,
     trace_dir: Option<PathBuf>,
     provider: Option<Arc<dyn ChatProvider>>,
+    require_shell_approval: bool,
+    on_approval: Option<ApprovalHookFn>,
 }
 
 impl AgentBuilder {
@@ -228,6 +235,34 @@ impl AgentBuilder {
         self
     }
 
+    /// Gate the built-in shell tool behind human approval (t-1308.10,
+    /// DR-7): each shell command pauses at the approval gate until a
+    /// decision arrives. In-process runs decide via
+    /// [`AgentBuilder::on_approval`]; a gated run with **no** hook FAILS
+    /// CLOSED — the command does not execute and the run errors with
+    /// [`SdkError::ApprovalRequired`]. There is no auto-approval and no
+    /// timeout-approval.
+    pub fn require_shell_approval(mut self) -> Self {
+        self.require_shell_approval = true;
+        self
+    }
+
+    /// Synchronous approval hook for gated effects (the in-process arm of
+    /// the DR-7 protocol). Called at the effect site with the pending
+    /// request (pending id, effect identity, request preview); returns
+    /// [`ApprovalDecision::Approve`] to execute the effect or
+    /// [`ApprovalDecision::Deny`] to bind a typed denial value the model
+    /// can react to (the run continues either way). Both outcomes are
+    /// traced as `approval.requested`/`approval.resolved` and reproduced as
+    /// data on replay.
+    pub fn on_approval<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ApprovalRequest) -> ApprovalDecision + Send + Sync + 'static,
+    {
+        self.on_approval = Some(Arc::new(hook));
+        self
+    }
+
     /// Inject a custom [`ChatProvider`], bypassing model-registry
     /// resolution — the model string is passed to the provider verbatim.
     /// This is the seam for scripted/mock providers
@@ -266,6 +301,8 @@ impl AgentBuilder {
             memory_dir: self.memory_dir,
             trace_dir: self.trace_dir,
             provider: self.provider,
+            require_shell_approval: self.require_shell_approval,
+            on_approval: self.on_approval,
         })
     }
 }
