@@ -1,9 +1,12 @@
 # agentd supervisor design (M2)
 
-Status: **design only — not implemented.** The Haskell supervisor
-(`~/omni/live/Omni/Agentd`) is the working reference; this document is the
-design for its Rust port. Nothing here ships until the open questions are
-settled and the acceptance bar below is met.
+Status: **implemented** (t-1341) as `crates/agentd` (binary: `agentd`). All
+open questions below are decided; the acceptance bar is covered by
+`crates/agentd/tests/supervisor.rs` (credential-free integration tests) and
+`evals/agentd-persistent.sh` (offline end-to-end eval over the real
+binaries). The Rust supervisor is a **clean break** from the Haskell
+supervisor's session layout — see "Migration from the Haskell supervisor"
+below.
 
 ## Goal
 
@@ -34,12 +37,14 @@ reimplement them.
 ```text
 $AGENTD_HOME (default ~/.local/share/agentd)/
   <name>/
-    agent.md            # prompt/frontmatter the session was started with
+    agent.md            # CANONICAL session spec (YAML frontmatter + body)
     fifo                # turn delivery (mkfifo)
     pid                 # supervisor-written, liveness-checked via kill -0
     run-id              # stable AGENT_RUN_ID for traces
     checkpoints/        # --checkpoint-dir
     stdout.jsonl        # captured --json stdout (machine events)
+    stderr.log          # captured child stderr (startup banner, errors)
+    send.lock           # per-session flock taken by `agentd send`
 ```
 
 A session "exists" if its directory exists; it is "running" if the pid is
@@ -66,6 +71,19 @@ Decision: run sessions with `--json` and capture stdout to
 
 This makes `send` restartable: if the sender dies, the response is still on
 disk, keyed by an id the sender can recompute or persist.
+
+### Send timeouts and re-attachment (decided, t-1308.6 / DR-10)
+
+`agentd send --timeout <secs>` times out the **caller**, never the turn: on
+expiry the sender exits with code **124** (the `timeout(1)` convention,
+distinct from 1 = the turn itself errored) after printing the turn id and
+the re-attach command. There is no default kill — a wedged turn is the
+operator's call, via `agentd stop`.
+
+`agentd attach <name> <turn_id>` retrieves a turn's result at any later
+point: it scans `stdout.jsonl` from the start for the matching
+`agent_complete`/`agent_error` and, if the turn is still running, keeps
+tailing (optionally bounded by its own `--timeout`).
 
 ### Turn envelope (v1) — shipped agent-side (t-1308.2)
 
@@ -97,12 +115,18 @@ prompt or a turn envelope:
 
 | Command | Behavior |
 |---|---|
-| `start` | Create the session directory, mkfifo, spawn `agent --fifo ... --checkpoint-dir ... --json`, write pid/run-id. Fails if already running. |
-| `stop` | SIGTERM; the agent's FIFO loop exits on signal (shipped behavior). Escalate to SIGKILL after a timeout. |
-| `resume` | `start` with `--resume <latest checkpoint>`; checkpoint repair on load is the agent's job (shipped behavior). |
-| `status` | Directory walk + `kill -0` + latest checkpoint mtime + last trace event. |
-| `logs` | `tail -f` the trace JSONL (or `stdout.jsonl` with `--raw`). |
-| `gen-systemd` | Emit a `agentd-<name>.service` unit (Restart=on-failure, ExecStart=`agent --fifo ...`) for sessions that should outlive the user session. |
+| `start` | Create the session directory, seed `agent.md` from flags if absent (refused if it exists — the spec is canonical), mkfifo, spawn a detached `agent --fifo ... --checkpoint-dir ... --json` with spec-derived flags, write pid/run-id. Fails if already running. Extra child argv after `--` (eval plumbing like `--replay-trace`). |
+| `stop` | SIGTERM; the agent's FIFO loop exits on signal (shipped behavior). Escalate to SIGKILL after `--grace` (default 5s). |
+| `resume` | `start` with `--resume <latest checkpoint>` (fresh start when none exists yet, so systemd's first ExecStart works); checkpoint repair on load is the agent's job (shipped behavior). Reads `agent.md` fresh, so spec edits apply here. |
+| `send` | Envelope + flock + offset-tail (above); `--timeout` exits 124 and leaves the turn running. |
+| `attach` | Re-attach to a turn by id: print its result from disk, or wait for it. |
+| `status` | Directory walk + `kill -0` + latest checkpoint mtime + last event + pending approval count from the agent's approvals dir (`--json` for scripts). |
+| `logs` | Print/`--follow` the trace JSONL (or `stdout.jsonl` with `--raw`). |
+| `set-model` / `set-provider` / `set-system-prompt` / `set-max-turns` | Edit the canonical `agent.md` frontmatter in place; prints whether a restart is needed. |
+| `gen-systemd` | Emit a `agentd-<name>.service` unit (Type=forking + PIDFile, Restart=on-failure, ExecStart through `agentd resume`, ExecStop through `agentd stop`, GENERATED header) for sessions that should outlive the user session. |
+
+Approvals need no passthrough: `agent approvals` already owns resolution;
+`agentd status` surfaces the pending count per session run.
 
 Crash recovery is `resume`, driven either manually, by systemd
 `Restart=on-failure` (with `ExecStart` going through `agentd resume`), or not
@@ -121,20 +145,31 @@ impossible:
 
 - **The on-disk spec (`<name>/agent.md`) is canonical.** `start` and `resume`
   read it fresh on every launch; nothing regenerates it from a shadow store.
-  There is no DB row to disagree with.
+  There is no DB row to disagree with. Config flags on `start` only SEED a
+  missing spec; once it exists they are refused with a pointer to `set-*`.
 - **Config mutation is a command, not a file convention:**
   `agentd set-model <name> <model>` (and `set-*` generally) edits the
   canonical spec in place and prints whether a restart is needed. Editing
-  `agent.md` by hand is equally valid — same file, same effect.
+  `agent.md` by hand is equally valid — same file, same effect. Unknown
+  frontmatter keys and the body survive edits.
 - **Generated files must not look editable.** Anything the supervisor derives
   (systemd units, pid files) either carries a `GENERATED — edits are
   overwritten by agentd` header or is obviously runtime state. Nothing that
   influences the next launch may be both generated and silently regenerated.
-- Acceptance addition: edit the spec's model (by hand or via `set-model`),
-  `agentd resume`, and verify via the startup banner/`agent_start` trace
-  event (or `/proc/<pid>/environ`) that the new model is live.
+- Acceptance addition (met — `set_model_then_resume_shows_new_model_in_agent_start`):
+  edit the spec's model (by hand or via `set-model`), `agentd resume`, and
+  verify via the `agent_start` machine event that the new model is live.
 
-## Open questions (settle before implementing)
+The spec format is the agent's own markdown-prompt convention: YAML
+frontmatter (`model`, `provider`, `system_prompt`, `max_iterations` — alias
+`max_turns` accepted on read) followed by a markdown body. Two supervisor
+additions: a non-empty body serves as the system prompt when the
+frontmatter has none (the body of `agent.md` *describes the agent*), and an
+optional `args` list of extra `agent` argv appended at launch (e.g.
+`["--memory-dir", "memory"]`). `system_prompt` may be literal text or a
+path resolved relative to the session directory.
+
+## Open questions (all decided)
 
 1. **Concurrent `send` semantics. Decided: Option A** (2026-07-03) — tag
    each turn with a supervisor-generated turn id the agent echoes, via the
@@ -147,15 +182,38 @@ impossible:
    the trace schema (S.2b), and SDK futures all need a turn id anyway. The
    per-session flock is retained regardless of this decision: it guarantees
    frame atomicity beyond `PIPE_BUF`, which is orthogonal to correlation.
-2. **Should `send` have a timeout?** A wedged turn currently blocks the
-   sender forever. Probably: `--timeout` with the turn left running.
-3. **Haskell compatibility.** Does the Rust `agentd` need to read the Haskell
-   supervisor's session layout, or is this a clean break with a migration
-   note? (`evals/agentd-persistent.sh` pins the agent-side contract either
-   way.)
+2. **Should `send` have a timeout? Decided: yes, caller-side only**
+   (t-1308.6 / DR-10, shipped) — `--timeout <secs>` exits 124 with the
+   turn id and the `agentd attach` command; the turn keeps running. No
+   default kill. See "Send timeouts and re-attachment" above.
+3. **Haskell compatibility. Decided: clean break** with a migration note
+   (below). The Rust `agentd` does not read the Haskell supervisor's
+   session layout or DB; `evals/agentd-persistent.sh` now pins the Rust
+   supervisor end-to-end instead of forwarding to the Haskell suite.
 4. **Multi-user / multi-host.** Out of scope for M2 (M5 territory), but the
    directory layout should not bake in single-host assumptions that M5 has to
-   undo — e.g. keep paths relative to `$AGENTD_HOME`.
+   undo — e.g. keep paths relative to `$AGENTD_HOME` (the implementation
+   derives every path from `$AGENTD_HOME/<name>/`, nothing is stored
+   absolute).
+
+## Migration from the Haskell supervisor
+
+The Haskell `agentd` (`~/omni/live/Omni/Agentd`) supervised the same Rust
+`agent` binary, but kept the canonical spec in a DB row and its own session
+layout. The Rust supervisor reads neither. To migrate a session:
+
+1. Stop it under the Haskell supervisor.
+2. `agentd start <name> --model <model> ...` once (or write
+   `$AGENTD_HOME/<name>/agent.md` yourself) to create the canonical spec —
+   this is also the moment hand-editable config becomes real (t-1105).
+3. To carry history over, copy the old session's agent-written checkpoint
+   files (`checkpoint-*.json`, `session-latest.json` — same format, same
+   `agent` binary) into `$AGENTD_HOME/<name>/checkpoints/` before the first
+   `agentd resume <name>`. Without them the session simply starts fresh.
+
+The agent-side contracts (NUL-framed turns, v1 envelope, checkpoint JSON,
+machine events) are unchanged, so nothing about recorded traces or
+checkpoints needs converting.
 
 ## Non-goals
 
@@ -164,14 +222,24 @@ impossible:
 - No multi-agent orchestration — that is `Infer`-calling-`Infer` inside agent
   programs, not a supervisor feature.
 
-## Acceptance
+## Acceptance (met)
 
 - `start`/`send`/`logs`/`stop`/`status`/`resume` work against the shipped
   `agent` binary; the only agent-side change is the turn-id envelope
   (option A — decided 2026-07-03 and shipped in t-1308.2, not drifted
-  into).
+  into). No further agent-side changes were needed.
+  → `crates/agentd/tests/supervisor.rs::start_send_status_stop_roundtrip`,
+  `concurrent_sends_correlate_by_turn_id`.
 - A SIGTERM'd or crashed session resumes from its latest checkpoint with
-  history intact, including the dangling-tool-call repair path.
-- `evals/agentd-persistent.sh` (or its Rust replacement) passes against the
-  Rust supervisor.
-- Generated systemd units survive logout and restart on failure.
+  history intact (the dangling-tool-call repair path is the agent's,
+  covered by `agent-sdk/tests/session.rs`).
+  → `kill_dash_nine_then_resume_keeps_history_intact`.
+- Send timeout leaves the turn running; attach retrieves it.
+  → `send_timeout_leaves_turn_running_and_attach_recovers`.
+- Spec edits are live on resume.
+  → `set_model_then_resume_shows_new_model_in_agent_start`.
+- `evals/agentd-persistent.sh` passes against the Rust supervisor, offline.
+- Generated systemd units survive logout and restart on failure
+  (Type=forking + PIDFile + Restart=on-failure through `agentd resume`;
+  golden-checked in tests, `systemd-analyze verify` in the eval when
+  available).
