@@ -1,7 +1,7 @@
 # GC eval fixtures
 
 Trace fixtures consumed by `cargo test -p agent-core --test gc_evals -- --nocapture`
-(the strategy x cache x pressure comparison matrix from docs/GC.md).
+(the strategy x timing x cache x pressure comparison matrix from docs/GC.md).
 
 ## What lives here
 
@@ -9,10 +9,10 @@ Trace fixtures consumed by `cargo test -p agent-core --test gc_evals -- --nocapt
   `InferCall` whose full prompt contains a tool chain (>= 3 tool calls and
   >= 3 tool results) and runs each strategy against it at several budget
   pressures.
-- Synthetic shapes (chat-heavy, open-tail tool chain, mixed session) are
-  generated in code inside `gc_evals.rs`, labeled `synthetic:` in the table.
-  They stand in for shapes this directory does not cover yet — replacing
-  them with real recordings is always preferred.
+- Synthetic shapes (chat-heavy, open-tail tool chain, mixed session, long
+  tool-heavy session) are generated in code inside `gc_evals.rs`, labeled
+  `synthetic:` in the table. They stand in for shapes this directory does
+  not cover yet — replacing them with real recordings is always preferred.
 
 ## Recording a new fixture
 
@@ -31,7 +31,8 @@ captures the *ungc'd* window — the harness applies strategies itself.
 
 Shapes worth recording (gaps in the current set):
 
-- a long coding session (many shell frames, interleaved narration)
+- a long coding session (many shell frames, interleaved narration) —
+  `synthetic:tool-heavy-long` stands in until a real one is recorded
 - a chat-heavy session with little tool use
 - a hydration-heavy session (large Get/temporal context blocks)
 
@@ -46,11 +47,18 @@ Shapes worth recording (gaps in the current set):
 
 ## Reading the matrix
 
-One row per (case, pressure, strategy, cache policy): tokens before/after,
-reduction %, messages and tool results retained, frames popped (stack),
-stable cache prefix length, prefix invalidation, convergence, and warnings
-when the last user message or the window tail did not survive. Convergence
-is asserted for ring and stack (they carry the front-drop degrade path);
-mark-sweep is best-effort and only reported. The promotion gate
-(`gc_challengers_improve_over_ring_on_tool_chains`) requires challengers to
-retain more structure than ring on tool-chain windows.
+One row per (case, pressure, timing, strategy, cache policy): tokens
+before/after, reduction %, messages and tool results retained, frames popped
+(stack), stable cache prefix length, collection count, prefix-invalidation
+count, convergence, and warnings when the last user message or the window
+tail did not survive. Convergence is asserted for ring and stack (they carry
+the front-drop degrade path) on timings that collect the final window;
+mark-sweep and `every:N` are best-effort and only reported. The promotion
+gate (`gc_challengers_improve_over_ring_on_tool_chains`) requires
+challengers to retain more structure than ring on tool-chain windows.
+
+The timing axis mirrors `--gc-timing`: `final` is one collection on the
+full recorded window (what the first catch-overflow cycle sees); the
+incremental timings (`threshold`, `eager`, `every:4`) replay the session
+growing message-by-message and fire at infer points, threading one
+`GcState` across collections like the runtime loop does.

@@ -424,6 +424,12 @@ runs against a collection of real long-running task traces:
 
 - `evals/gc/`: collection of `.jsonl` trace files (real agent sessions)
 - Metrics: task completion rate, token reduction %, semantic coherence score
+- Matrix axes: strategy x timing x cache policy x budget pressure. The
+  timing axis mirrors `--gc-timing`: `final` (one collection on the full
+  recorded window, what the first catch-overflow cycle sees) plus
+  incremental `threshold`/`eager`/`every:4`, which replay the session
+  growing message-by-message and fire at infer points with one `GcState`
+  threaded across collections
 - Run with: `cargo test --test gc_evals -- --nocapture`
 - Recording new fixtures requires `--trace-full-payloads`: the harness reads
   full `InferCall` prompts, which are preview-only in traces by default

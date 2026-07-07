@@ -3,11 +3,27 @@
 //! Every strategy must be benchmarked before promotion to default. Cases are
 //! real recorded traces (`evals/gc/*.jsonl`, see `evals/gc/README.md` for how
 //! to record more) plus synthetic shapes covering what the recorded set does
-//! not yet: chat-heavy windows, open-tail tool chains, mixed sessions. The
-//! matrix runs strategy x cache-policy x budget-pressure and prints one row
-//! per combination; structural invariants are asserted, comparative quality
-//! is asserted only where docs/GC.md commits to it (challengers must beat
-//! ring on retained structure for tool-chain windows).
+//! not yet: chat-heavy windows, open-tail tool chains, mixed sessions, long
+//! tool-heavy sessions. The matrix runs strategy x timing x cache-policy x
+//! budget-pressure and prints one row per combination; structural invariants
+//! are asserted, comparative quality is asserted only where docs/GC.md
+//! commits to it (challengers must beat ring on retained structure for
+//! tool-chain windows).
+//!
+//! The timing axis simulates *when* GC runs over the life of the session
+//! (mirroring `--gc-timing`, see `interpreter::maybe_collect_prompt`):
+//!
+//! - `final`: one collection on the full recorded window — what the first
+//!   catch-overflow cycle sees.
+//! - `threshold`: replay the session growing message-by-message; before each
+//!   assistant turn (an infer point) collect iff the estimate exceeds the
+//!   budget.
+//! - `eager`: collect at every infer point.
+//! - `every:4`: collect at every 4th infer point.
+//!
+//! Incremental timings thread one `GcState` across all collections, so
+//! cross-turn metadata (frame status, lifecycle tags, infer counts) behaves
+//! as it does in the runtime loop.
 
 use agent_core::{
     estimate_tokens, truncate_oversized_message, ChatMessage, ContextGc, GcState, MarkSweepGc,
@@ -40,6 +56,7 @@ struct TraceCase {
 #[derive(Debug, Clone)]
 struct EvalMetrics {
     strategy: &'static str,
+    timing: Timing,
     cache: &'static str,
     trace: String,
     pressure: f64,
@@ -53,7 +70,12 @@ struct EvalMetrics {
     tool_results_after: usize,
     frames_popped: usize,
     stable_prefix: usize,
-    cache_invalidated: bool,
+    /// How many collections ran (1 for `final`; up to one per infer point
+    /// for the incremental timings).
+    collections: usize,
+    /// How many of those collections invalidated the cached prefix — each
+    /// one is a full-window re-read at the provider.
+    invalidations: usize,
     converged: bool,
     last_user_retained: bool,
     last_message_retained: bool,
@@ -77,37 +99,58 @@ impl Strategy {
 
 const STRATEGIES: [Strategy; 3] = [Strategy::Ring, Strategy::MarkSweep, Strategy::Stack];
 
-/// The full comparison matrix: every case x pressure x strategy x cache
-/// policy. Structural invariants are asserted on every cell; quality numbers
-/// are printed for human comparison and for the promotion gate below.
+/// When GC runs over the simulated session (see module docs). `Final`
+/// approximates catch-overflow's first cycle; the rest mirror `--gc-timing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Timing {
+    Final,
+    Threshold,
+    Eager,
+    EveryN(u64),
+}
+
+impl Timing {
+    fn label(&self) -> String {
+        match self {
+            Self::Final => "final".into(),
+            Self::Threshold => "threshold".into(),
+            Self::Eager => "eager".into(),
+            Self::EveryN(n) => format!("every:{n}"),
+        }
+    }
+
+    /// Whether this timing guarantees a collection on the final window, and
+    /// therefore owes convergence (mark-sweep excepted — it is best-effort
+    /// everywhere). `every:N` legitimately ends between collections.
+    fn collects_final_window(&self) -> bool {
+        !matches!(self, Self::EveryN(_))
+    }
+}
+
+const TIMINGS: [Timing; 4] = [
+    Timing::Final,
+    Timing::Threshold,
+    Timing::Eager,
+    Timing::EveryN(4),
+];
+
+/// The full comparison matrix: every case x pressure x timing x strategy x
+/// cache policy. Structural invariants are asserted on every cell; quality
+/// numbers are printed for human comparison and for the promotion gate below.
 #[test]
 fn gc_strategy_matrix() -> Result<()> {
     let cases = all_cases()?;
     assert!(!cases.is_empty(), "expected at least one eval case");
 
-    println!(
-        "{:<28} {:>5} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>6} {:>5} {:>4}",
-        "case",
-        "press",
-        "strategy",
-        "cache",
-        "budget",
-        "tok",
-        "tok",
-        "red%",
-        "msgs",
-        "tools",
-        "frames",
-        "prefix",
-        "inval",
-        "conv"
-    );
+    print_header();
     for case in &cases {
         for pressure in PRESSURES {
-            for strategy in &STRATEGIES {
-                for preserve in [true, false] {
-                    let metrics = evaluate(case, pressure, strategy, preserve)?;
-                    print_metrics(&metrics);
+            for timing in TIMINGS {
+                for strategy in &STRATEGIES {
+                    for preserve in [true, false] {
+                        let metrics = evaluate(case, pressure, timing, strategy, preserve)?;
+                        print_metrics(&metrics);
+                    }
                 }
             }
         }
@@ -127,9 +170,9 @@ fn gc_challengers_improve_over_ring_on_tool_chains() -> Result<()> {
     );
 
     for case in tool_chains {
-        let ring = evaluate(case, GATE_PRESSURE, &Strategy::Ring, false)?;
+        let ring = evaluate(case, GATE_PRESSURE, Timing::Final, &Strategy::Ring, false)?;
         for challenger_kind in [Strategy::MarkSweep, Strategy::Stack] {
-            let challenger = evaluate(case, GATE_PRESSURE, &challenger_kind, false)?;
+            let challenger = evaluate(case, GATE_PRESSURE, Timing::Final, &challenger_kind, false)?;
             assert!(
                 challenger.messages_after > ring.messages_after
                     || challenger.tool_results_after > ring.tool_results_after,
@@ -150,6 +193,7 @@ fn gc_challengers_improve_over_ring_on_tool_chains() -> Result<()> {
 fn evaluate(
     case: &TraceCase,
     pressure: f64,
+    timing: Timing,
     strategy: &Strategy,
     preserve_prefix: bool,
 ) -> Result<EvalMetrics> {
@@ -157,40 +201,42 @@ fn evaluate(
     let tokens_before = estimate_tokens(&case.prompt);
     let budget = ((tokens_before as f64) * pressure).floor() as usize;
 
-    let mut input = case.prompt.clone();
-    let messages_before = input.len();
-    let tool_results_before = count_tool_results(&input);
-    truncate_oversized_message(&mut input, budget);
+    let messages_before = case.prompt.len();
+    let tool_results_before = count_tool_results(&case.prompt);
 
-    let mut state = GcState::default();
-    let collected = gc.collect(input.clone(), budget, &mut state);
-    let mut state_again = GcState::default();
-    let collected_again = gc.collect(input.clone(), budget, &mut state_again);
+    let run = run_timed(&case.prompt, budget, gc.as_ref(), timing);
+    let run_again = run_timed(&case.prompt, budget, gc.as_ref(), timing);
     assert_eq!(
-        collected,
-        collected_again,
-        "{} on {} must be deterministic across two runs",
+        run.collected,
+        run_again.collected,
+        "{} ({}) on {} must be deterministic across two runs",
         gc.name(),
+        timing.label(),
         case.name
     );
 
+    let collected = run.collected;
     let tokens_after = estimate_tokens(&collected);
     let converged = tokens_after <= budget;
     assert_invariants(&case.prompt, &collected, gc.name(), &case.name);
-    // Ring and stack carry the front-drop degrade path and must always
-    // converge; mark-sweep only evicts complete/evictable lifecycles, so its
-    // convergence is best-effort and reported rather than asserted.
-    if !matches!(strategy, Strategy::MarkSweep) {
+    // Ring and stack carry the front-drop degrade path and must converge
+    // whenever the timing collected the final window; mark-sweep only evicts
+    // complete/evictable lifecycles, so its convergence is best-effort and
+    // reported rather than asserted. every:N can legitimately end between
+    // collections, so it is reported too.
+    if !matches!(strategy, Strategy::MarkSweep) && timing.collects_final_window() {
         assert!(
             converged,
-            "{} on {} must converge under budget: {tokens_after} > {budget}",
+            "{} ({}) on {} must converge under budget: {tokens_after} > {budget}",
             gc.name(),
+            timing.label(),
             case.name
         );
     }
 
     Ok(EvalMetrics {
         strategy: gc.name(),
+        timing,
         cache: if preserve_prefix {
             "preserve"
         } else {
@@ -207,18 +253,92 @@ fn evaluate(
         tool_results_before,
         tool_results_after: count_tool_results(&collected),
         frames_popped: count_frame_annotations(&collected),
-        stable_prefix: stable_prefix_len(&input, &collected),
-        cache_invalidated: state.prefix_invalidated,
+        stable_prefix: stable_prefix_len(&case.prompt, &collected),
+        collections: run.collections,
+        invalidations: run.invalidations,
         converged,
-        last_user_retained: last_user_retained(&input, &collected),
+        last_user_retained: last_user_retained(&case.prompt, &collected),
         // Ring legitimately violates this when the tail is a tool result
         // paired to an old call (pair atomicity drags it out); the table
         // makes that visible instead of an assert hiding it.
-        last_message_retained: input
+        last_message_retained: case
+            .prompt
             .last()
             .zip(collected.last())
             .is_none_or(|(before, after)| before.id == after.id),
     })
+}
+
+struct TimedRun {
+    collected: Vec<ChatMessage>,
+    collections: usize,
+    invalidations: usize,
+}
+
+/// Apply `gc` to the case window under the given timing. `Final` is the
+/// historical single-shot collection; the incremental timings replay the
+/// session growing message-by-message and fire at infer points (right
+/// before each assistant message, plus once on the full window — the
+/// recorded window is itself the prompt of the next infer call), mirroring
+/// `interpreter::maybe_collect_prompt`.
+fn run_timed(
+    prompt: &[ChatMessage],
+    budget: usize,
+    gc: &dyn ContextGc,
+    timing: Timing,
+) -> TimedRun {
+    let mut state = GcState::default();
+    let mut run = TimedRun {
+        collected: Vec::new(),
+        collections: 0,
+        invalidations: 0,
+    };
+    if timing == Timing::Final {
+        let mut window = prompt.to_vec();
+        truncate_oversized_message(&mut window, budget);
+        run.collected = gc.collect(window, budget, &mut state);
+        run.collections = 1;
+        run.invalidations = usize::from(state.prefix_invalidated);
+        return run;
+    }
+
+    let mut window: Vec<ChatMessage> = Vec::new();
+    for message in prompt {
+        if message.role == "assistant" {
+            infer_point(&mut window, budget, gc, timing, &mut state, &mut run);
+        }
+        window.push(message.clone());
+    }
+    infer_point(&mut window, budget, gc, timing, &mut state, &mut run);
+    run.collected = window;
+    run
+}
+
+/// One infer point: decide per the timing policy whether to collect, exactly
+/// as `maybe_collect_prompt` does (with the harness budget standing in for
+/// `context_budget * gc_threshold`).
+fn infer_point(
+    window: &mut Vec<ChatMessage>,
+    budget: usize,
+    gc: &dyn ContextGc,
+    timing: Timing,
+    state: &mut GcState,
+    run: &mut TimedRun,
+) {
+    state.infer_calls += 1;
+    let fire = match timing {
+        Timing::Threshold => estimate_tokens(window) > budget,
+        Timing::Eager => true,
+        Timing::EveryN(n) => state.infer_calls.is_multiple_of(n),
+        Timing::Final => unreachable!("final timing never reaches an infer point"),
+    };
+    if !fire {
+        return;
+    }
+    truncate_oversized_message(window, budget);
+    *window = gc.collect(std::mem::take(window), budget, state);
+    run.collections += 1;
+    run.invalidations += usize::from(state.prefix_invalidated);
 }
 
 /// Invariants every strategy owes every window (docs/GC.md): system messages
@@ -354,6 +474,11 @@ fn synthetic_cases() -> Vec<TraceCase> {
             prompt: mixed_session_prompt(),
             tool_chain: true,
         },
+        TraceCase {
+            name: "synthetic:tool-heavy-long".into(),
+            prompt: tool_heavy_long_prompt(),
+            tool_chain: true,
+        },
     ]
 }
 
@@ -419,6 +544,37 @@ fn mixed_session_prompt() -> Vec<ChatMessage> {
             vec![],
         ));
     }
+    prompt
+}
+
+/// A long tool-heavy coding session: many fat completed frames, minimal
+/// narration, a live user question at the tail. This is the fixture class
+/// where strategies should differ most — stack can pop dozens of dead
+/// frames to annotations, ring can only amputate history wholesale — and it
+/// stands in for the "long coding session" gap in evals/gc/README.md until
+/// a real trace of that shape is recorded.
+fn tool_heavy_long_prompt() -> Vec<ChatMessage> {
+    let mut prompt = vec![
+        ChatMessage::system("You are a coding agent working through a large migration."),
+        ChatMessage::user(
+            "migrate every module to the new error type, running tests after each module",
+        ),
+    ];
+    for index in 0..28 {
+        push_frame(&mut prompt, index + 500, 1200);
+        if index % 7 == 6 {
+            prompt.push(ChatMessage::assistant(
+                Some(format!(
+                    "checkpoint {index}: modules migrated so far, tests green. {}",
+                    lorem(index + 700, 120)
+                )),
+                vec![],
+            ));
+        }
+    }
+    prompt.push(ChatMessage::user(
+        "before you continue: which modules are left, and did anything regress?",
+    ));
     prompt
 }
 
@@ -516,11 +672,34 @@ fn stable_prefix_len(original: &[ChatMessage], collected: &[ChatMessage]) -> usi
         .count()
 }
 
+fn print_header() {
+    println!(
+        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>6} {:>4} {:>5} {:>4}",
+        "case",
+        "press",
+        "timing",
+        "strategy",
+        "cache",
+        "budget",
+        "tok",
+        "tok",
+        "red%",
+        "msgs",
+        "tools",
+        "frames",
+        "prefix",
+        "coll",
+        "inval",
+        "conv"
+    );
+}
+
 fn print_metrics(metrics: &EvalMetrics) {
     println!(
-        "{:<28} {:>5.2} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>6} {:>5} {:>4}{}",
+        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>6} {:>4} {:>5} {:>4}{}",
         metrics.trace,
         metrics.pressure,
+        metrics.timing.label(),
         metrics.strategy,
         metrics.cache,
         metrics.budget,
@@ -533,7 +712,8 @@ fn print_metrics(metrics: &EvalMetrics) {
         metrics.tool_results_before,
         metrics.frames_popped,
         metrics.stable_prefix,
-        metrics.cache_invalidated,
+        metrics.collections,
+        metrics.invalidations,
         metrics.converged,
         match (metrics.last_user_retained, metrics.last_message_retained) {
             (true, true) => "",
