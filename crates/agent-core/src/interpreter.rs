@@ -1171,10 +1171,13 @@ mod tests {
             context_budget: 100,
             pricing: Default::default(),
         };
+        // The last user message is hard-protected (t-1367), so the
+        // droppable ballast is the OLDER user message; system + last user
+        // must fit the threshold budget for convergence to be possible.
         let prompt = vec![
             ChatMessage::system("system"),
             ChatMessage::user("x".repeat(90)),
-            ChatMessage::user("y".repeat(90)),
+            ChatMessage::user("y".repeat(60)),
         ];
         assert!(estimate_tokens(&prompt) > 50);
         assert!(estimate_tokens(&prompt) <= 100);

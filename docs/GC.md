@@ -54,9 +54,12 @@ timings x 3 strategies x 2 cache policies):
   overflow) and its convergence is best-effort: it failed to reach budget
   in 30/60 preserve cells. Use it for tool-heavy batch workloads with
   `--gc-cache ignore`; never pair it with `preserve`.
-- **`ring`.** Simplest and most predictable; right for pure chat. With
-  `--gc-cache ignore` it front-drops the last user message under pressure
-  (24/60 cells) — keep `preserve` on if you use ring.
+- **`ring`.** Simplest and most predictable; right for pure chat.
+  (Historical: before the t-1367 hard guard, ring with `--gc-cache ignore`
+  front-dropped the last user message under pressure — 24/60 t-1339 cells,
+  and 24/60 again on the current fixture set. The last user message is now
+  hard-protected in every strategy; expected drops are zero, asserted by
+  the matrix.)
 - **`semantic`** (t-1350). Scores each message by cosine similarity between
   its embedding and the centroid of the last N messages, and drops the most
   distant first — conversational dead ends and abandoned tangents go before
@@ -72,11 +75,12 @@ timings x 3 strategies x 2 cache policies):
   than chat tokens). Requires a model-registry `embeddings` entry (the same
   one memory retrieval uses, t-1340); without one — or when the endpoint
   fails, or under replay — scoring degrades to a deterministic recency
-  heuristic (ring's oldest-first ordering) rather than erroring. Hard
-  guards: never the system message, never the last user message, tool
-  pairs travel atomically, and the last `--gc-semantic-window` messages
-  (default 8) are immune; `--gc-semantic-floor` (default 0.25 cosine)
-  keeps plausibly-related messages for a second pass. With `--gc-cited-keep`
+  heuristic (ring's oldest-first ordering) rather than erroring. On top of
+  the hard guards every strategy now carries (system + last user + pair
+  atomicity — see Invariants; semantic is where they originated), the last
+  `--gc-semantic-window` messages (default 8) are immune;
+  `--gc-semantic-floor` (default 0.25 cosine) keeps plausibly-related
+  messages for a second pass. With `--gc-cited-keep`
   (default on, t-1351) messages explicitly cited by later ones —
   tool-call-id mentions in text, `infer` `context_refs` — join the
   protected set during the normal sweep phases, so a semantically distant
@@ -262,7 +266,8 @@ headroom for the response). Because strategies are stateless, `gc` itself is
 ## Strategy 1: Ring Buffer (default)
 
 **Policy:** When over budget, drop oldest `assistant`/`user`/`tool` messages
-until under budget. Never drop the system prompt.
+until under budget. Never drop the system prompt or the last user message
+(the t-1367 hard guard — see Invariants).
 
 **Rationale:** Simplest. Correct assumption that recent context is more
 valuable. Stateless — no metadata required.
@@ -511,6 +516,20 @@ pre-pass (`interpreter::collect_prompt`) before the strategy runs:
 
 These hold for `ring`, `mark-sweep`, `stack`, and all future strategies. They
 are the reason GC is correct rather than ad-hoc truncation.
+
+**Hard guards: the system message and the last user message always survive
+(t-1367).** Under any pressure, in every strategy and every degrade phase,
+the system message and the *last user message* — the statement of the live
+task — are never evicted, and tool-call pairs stay atomic through the same
+mechanism (a pair group that would pull a protected message out is skipped
+entirely). Semantic carried these guards from birth (t-1350); ring and stack
+gained them after t-1364 proved their degrade paths could evict the live
+task — the model answered "I'm ready to help!" and the loop accepted the
+non-answer as final. Terminal case: if even the protected set exceeds the
+budget, `collect()` returns an over-budget window and the overflow paths
+(the t-1343 backstop, catch-overflow) own the outcome — the same stance
+semantic always had. The offline matrix asserts zero last-user drops per
+cell (`gc_evals.rs::evaluate`).
 
 **Stateless + deterministic.** `collect(messages, budget, state)` is a pure
 function. No wall-clock reads, no `HashMap` iteration order leaking into the

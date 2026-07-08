@@ -547,6 +547,18 @@ fn evaluate(
     let tokens_after = estimate_tokens(&collected);
     let converged = tokens_after <= budget;
     assert_invariants(&case.prompt, &collected, gc.name(), &case.name);
+    // Hard guard (t-1367): the last user message — the statement of the
+    // live task — survives every strategy under every pressure and cache
+    // policy. Historical: before the guard, ring+ignore dropped it in
+    // 24/60 cells (the t-1364 task-eviction failure); expected drops are
+    // now ZERO everywhere.
+    assert!(
+        last_user_retained(&case.prompt, &collected),
+        "{} ({}) on {} evicted the last user message (t-1367 hard guard)",
+        gc.name(),
+        timing.label(),
+        case.name
+    );
     // Ring and stack carry the front-drop degrade path and must converge on
     // every timing: since the collect-on-overflow backstop (t-1343), every
     // infer point over budget collects — `every:N` can no longer end over
@@ -1280,8 +1292,8 @@ fn count_frame_annotations(messages: &[ChatMessage]) -> usize {
 
 /// Continuation-viability proxy: did the most recent *user* message — the
 /// statement of the task the model is currently doing — survive collection?
-/// Reported per cell rather than asserted: losing it under heavy pressure is
-/// exactly the failure mode the table exists to make visible.
+/// Asserted per cell since t-1367 (hard-protected in every strategy); the
+/// table marker remains as a tripwire should the guard ever regress.
 fn last_user_retained(original: &[ChatMessage], collected: &[ChatMessage]) -> bool {
     let Some(last_user) = original.iter().rev().find(|message| message.role == "user") else {
         return true;

@@ -68,7 +68,10 @@ One row per (case, pressure, timing, strategy, cache policy): tokens
 before/after, reduction %, messages and tool results retained, frames popped
 (stack), stable cache prefix length, collection count, prefix-invalidation
 count, convergence, and warnings when the last user message or the window
-tail did not survive. Convergence is asserted for ring and stack (they carry
+tail did not survive. Last-user survival is asserted per cell since t-1367
+(the hard guard is an invariant of every strategy; the warning marker
+remains as a tripwire) — before the guard, ring+ignore dropped it in 24/60
+cells on this fixture set. Convergence is asserted for ring and stack (they carry
 the front-drop degrade path) on timings that collect the final window;
 mark-sweep and `every:N` are best-effort and only reported. The promotion
 gate (`gc_challengers_improve_over_ring_on_tool_chains`) requires

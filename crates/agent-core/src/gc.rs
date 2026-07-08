@@ -188,7 +188,9 @@ pub struct RingGc {
     /// Preserve the cached prefix: evict oldest-first from the *interior*
     /// (after the pinned prefix region) instead of the front, falling back
     /// to front-drop (and reporting the invalidation) only when preserving
-    /// cannot reach the budget.
+    /// cannot reach the budget. Under either policy the hard guards hold:
+    /// the system message and the last user message survive every phase
+    /// (t-1367, docs/GC.md invariants).
     pub preserve_prefix: bool,
 }
 
@@ -222,7 +224,9 @@ impl Default for MarkSweepGc {
 /// the tool result messages are dropped. The semantic record survives at
 /// ~1% of the tokens, which is why this is the space-efficient choice for
 /// tool-heavy agents. Summaries are pure heuristics — no LLM calls (the
-/// `stack-smart` variant is gated on the eval harness).
+/// `stack-smart` variant is gated on the eval harness). The ring-fallback
+/// phases carry the hard guards: the system message and the last user
+/// message survive every phase (t-1367, docs/GC.md invariants).
 #[derive(Debug, Clone, Copy)]
 pub struct StackFrameGc {
     /// Preserve the cached prefix: only pop frames living entirely after
@@ -489,16 +493,34 @@ impl SemanticGc {
     }
 }
 
-/// The guards that survive even the degrade pass: the system message and
-/// the last user message (the statement of the current task) are never
-/// dropped, no matter the pressure.
-fn semantic_hard_protected_mask(messages: &[ChatMessage]) -> Vec<bool> {
+/// The guards that survive even the degrade passes of EVERY strategy
+/// (docs/GC.md invariants, t-1367): the system message and the last user
+/// message (the statement of the current task) are never dropped, no
+/// matter the pressure. t-1364 proved the failure mode this bans: ring's
+/// and stack's front-drop degrade path evicted the live task, the model
+/// answered "I'm ready to help!", and the loop accepted that as final.
+/// If even this protected set exceeds the budget, collection returns an
+/// over-budget window and the overflow paths (t-1343 backstop,
+/// catch-overflow) own the outcome — the same terminal case semantic has
+/// always had.
+fn hard_protected_mask(messages: &[ChatMessage]) -> Vec<bool> {
     let last_user = messages.iter().rposition(|message| message.role == "user");
     messages
         .iter()
         .enumerate()
         .map(|(index, message)| message.role == "system" || Some(index) == last_user)
         .collect()
+}
+
+/// The hard guards plus the pinned cache prefix: what preserve-mode sweep
+/// phases must not touch. `boundary` 0 (ignore mode) leaves the hard
+/// guards alone.
+fn protected_with_prefix(messages: &[ChatMessage], boundary: usize) -> Vec<bool> {
+    let mut mask = hard_protected_mask(messages);
+    for slot in mask.iter_mut().take(boundary) {
+        *slot = true;
+    }
+    mask
 }
 
 /// Drop unprotected candidates most-distant-first until under budget.
@@ -604,10 +626,7 @@ impl ContextGc for SemanticGc {
             // gc_cache_preserve gate holds every strategy to it) — with
             // system + last user still hard-protected.
             if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-                let mut floor_relaxed = semantic_hard_protected_mask(&messages);
-                for slot in floor_relaxed.iter_mut().take(boundary) {
-                    *slot = true;
-                }
+                let floor_relaxed = protected_with_prefix(&messages, boundary);
                 sweep_semantic(&messages, &mut keep, budget, &floor_relaxed, &scores, None);
             }
             // Phase 4 (degrade, prefix last): even the pinned prefix plus
@@ -616,7 +635,7 @@ impl ContextGc for SemanticGc {
             // invalidation is reported via prefix_invalidated); system and
             // the last user message are never dropped.
             if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-                let hard = semantic_hard_protected_mask(&messages);
+                let hard = hard_protected_mask(&messages);
                 sweep_semantic(&messages, &mut keep, budget, &hard, &scores, None);
             }
         }
@@ -1192,14 +1211,25 @@ impl ContextGc for RingGc {
 
         let mut keep = vec![true; messages.len()];
         // Phase 1: drop oldest-first from the interior (boundary 0 in ignore
-        // mode makes this the classic front-drop).
-        sweep_ring(&messages, &mut keep, budget, boundary);
+        // mode makes this the classic front-drop, minus the hard guards).
+        sweep_ring(
+            &messages,
+            &mut keep,
+            budget,
+            &protected_with_prefix(&messages, boundary),
+        );
         // Phase 2 (preserve fallback): the pinned prefix plus the live tail
         // alone exceed the budget. Overflowing the model is worse than a
-        // cache miss, so degrade to front-drop; the gc_collect event reports
+        // cache miss, so degrade to front-drop — with system + last user
+        // still hard-protected (t-1367) — and the gc_collect event reports
         // the invalidation via state.prefix_invalidated.
         if boundary > 0 && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-            sweep_ring(&messages, &mut keep, budget, 0);
+            sweep_ring(
+                &messages,
+                &mut keep,
+                budget,
+                &hard_protected_mask(&messages),
+            );
         }
 
         let collected: Vec<ChatMessage> = messages
@@ -1249,14 +1279,25 @@ impl ContextGc for StackFrameGc {
         // Phase 2: frames alone were not enough (open frames, chat-heavy
         // windows); drop oldest-first from the interior like ring.
         if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-            sweep_ring(&messages, &mut keep, budget, boundary);
+            sweep_ring(
+                &messages,
+                &mut keep,
+                budget,
+                &protected_with_prefix(&messages, boundary),
+            );
         }
         // Phase 3 (preserve fallback): the pinned prefix plus the live tail
         // alone exceed the budget. Overflowing the model is worse than a
-        // cache miss, so degrade to front-drop; the gc_collect event reports
+        // cache miss, so degrade to front-drop — with system + last user
+        // still hard-protected (t-1367) — and the gc_collect event reports
         // the invalidation via state.prefix_invalidated.
         if boundary > 0 && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-            sweep_ring(&messages, &mut keep, budget, 0);
+            sweep_ring(
+                &messages,
+                &mut keep,
+                budget,
+                &hard_protected_mask(&messages),
+            );
         }
 
         let collected: Vec<ChatMessage> = messages
@@ -1409,30 +1450,25 @@ fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
     lines.join("\n")
 }
 
-fn sweep_ring(messages: &[ChatMessage], keep: &mut [bool], budget: usize, boundary: usize) {
+/// Drop unprotected messages oldest-first until under budget. `protected`
+/// combines the hard guards (system + last user, [`hard_protected_mask`])
+/// with the pinned prefix in preserve mode; tool-call pairs travel
+/// atomically, and a group that would pull a protected message out is
+/// skipped entirely (the same mechanism the semantic sweep uses). When
+/// only protected messages remain, the sweep stops and the window ships
+/// over budget — the overflow paths own that terminal case.
+fn sweep_ring(messages: &[ChatMessage], keep: &mut [bool], budget: usize, protected: &[bool]) {
     while estimate_tokens(&kept_messages(messages, keep)) > budget {
-        let Some(index) = oldest_droppable_index(messages, keep, boundary) else {
+        let Some(index) = messages.iter().enumerate().position(|(idx, message)| {
+            !protected[idx]
+                && keep[idx]
+                && message.role != "system"
+                && atomic_group_avoids_protected(messages, keep, idx, protected)
+        }) else {
             break;
         };
         drop_atomic_group(messages, keep, index);
     }
-}
-
-fn oldest_droppable_index(
-    messages: &[ChatMessage],
-    keep: &[bool],
-    boundary: usize,
-) -> Option<usize> {
-    messages
-        .iter()
-        .enumerate()
-        .find(|(idx, message)| {
-            *idx >= boundary
-                && keep[*idx]
-                && message.role != "system"
-                && atomic_group_stays_past(messages, keep, *idx, boundary)
-        })
-        .map(|(idx, _)| idx)
 }
 
 fn kept_messages(messages: &[ChatMessage], keep: &[bool]) -> Vec<ChatMessage> {
@@ -1703,12 +1739,19 @@ mod tests {
         // The model just got the clippy result back and has not spoken yet:
         // that result is the live working set, not history. Strip the
         // closing narration from the fixture so frame 2 is unincorporated,
-        // and fatten the user turn so it exhausts the pinned-prefix
-        // allowance (otherwise pair-pinning absorbs frame 1 into the
-        // prefix, where preserve mode correctly refuses to pop).
+        // and insert fat assistant narration after the user turn so it
+        // exhausts the pinned-prefix allowance (otherwise pair-pinning
+        // absorbs frame 1 into the prefix, where preserve mode correctly
+        // refuses to pop). The ballast is deliberately NOT the user turn:
+        // the last user message is hard-protected (t-1367), so making it
+        // the droppable filler would force phase 2 to spend the live frame
+        // instead.
         let mut messages = stack_fixture();
         messages.pop();
-        messages[1] = ChatMessage::user("context ".repeat(80));
+        messages.insert(
+            2,
+            ChatMessage::assistant(Some("context ".repeat(80)), vec![]),
+        );
         let mut state = GcState::default();
 
         // Roomy enough to hold the live frame once the older one pops;
@@ -2698,6 +2741,153 @@ mod tests {
         let report = record_recall_overlaps(&messages, &mut state);
         assert_eq!(report.overlap_events, 0);
         assert!(state.recall_hot.is_empty());
+    }
+
+    // ---- hard protection: system + last user survive any pressure (t-1367) ----
+    //
+    // t-1364's failure mode, pinned per strategy: a fat system message (the
+    // runtime-guidance fragment) plus a budget small enough that the degrade
+    // paths fire used to evict the LAST USER MESSAGE — the statement of the
+    // live task — from ring and stack. The guards that only semantic carried
+    // are now an invariant of every strategy.
+
+    /// Fat system message + task + completed tool frames, at a budget the
+    /// protected set barely fits: every degrade phase must fire, and the
+    /// task statement must still be standing.
+    fn adversarial_fixture() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system(format!("operations manual {}", "g".repeat(900))),
+            ChatMessage::user("the task: count the WARN lines in build.log"),
+            ChatMessage::assistant(None, vec![tool_call("call-1")]),
+            ChatMessage::tool("call-1", format!("output {}", "x".repeat(600))),
+            ChatMessage::assistant(Some("step one done".into()), vec![]),
+            ChatMessage::assistant(None, vec![tool_call("call-2")]),
+            ChatMessage::tool("call-2", format!("output {}", "y".repeat(600))),
+        ]
+    }
+
+    fn assert_system_and_last_user_survive(strategy: &dyn ContextGc, budget: usize) {
+        let messages = adversarial_fixture();
+        let last_user = messages[1].id;
+        let mut state = GcState::default();
+        let collected = strategy.collect(messages.clone(), budget, &mut state);
+        assert!(
+            collected.iter().any(|message| message.role == "system"),
+            "{} at budget {budget} dropped the system message: {collected:?}",
+            strategy.name()
+        );
+        assert!(
+            collected.iter().any(|message| message.id == last_user),
+            "{} at budget {budget} evicted the live task (last user message): {collected:?}",
+            strategy.name()
+        );
+        // Pair atomicity holds through the same degrade phases.
+        let live_call_ids: BTreeSet<_> = collected
+            .iter()
+            .flat_map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|call| call.id.clone())
+            })
+            .collect();
+        for message in &collected {
+            if let Some(id) = message.tool_call_id.as_deref() {
+                assert!(
+                    live_call_ids.contains(id),
+                    "{} at budget {budget} orphaned tool result {id}",
+                    strategy.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ring_never_drops_system_or_last_user_under_any_pressure() {
+        // The protected set (fat system + task) is ~330 tokens; sweep from
+        // barely-fits down to absurd. Below the protected floor the window
+        // legitimately ships over budget (the overflow paths own it) — but
+        // the guards still hold.
+        for budget in [800, 400, 340, 200, 50, 1] {
+            for preserve in [true, false] {
+                assert_system_and_last_user_survive(
+                    &RingGc {
+                        preserve_prefix: preserve,
+                    },
+                    budget,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stack_never_drops_system_or_last_user_under_any_pressure() {
+        for budget in [800, 400, 340, 200, 50, 1] {
+            for preserve in [true, false] {
+                assert_system_and_last_user_survive(
+                    &StackFrameGc {
+                        preserve_prefix: preserve,
+                    },
+                    budget,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mark_sweep_never_drops_system_or_last_user_under_any_pressure() {
+        // Mark-sweep only ever evicts complete/evictable lifecycles and user
+        // messages stay Active, so the guarantee is structural — pinned here
+        // so a future lifecycle change cannot silently lose it.
+        for budget in [800, 400, 340, 200, 50, 1] {
+            for preserve in [true, false] {
+                assert_system_and_last_user_survive(
+                    &MarkSweepGc {
+                        preserve_prefix: preserve,
+                    },
+                    budget,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_never_drops_system_or_last_user_under_any_pressure() {
+        // Semantic pioneered the guards (t-1350); same adversarial sweep,
+        // heuristic scoring path (no cached vectors).
+        for budget in [800, 400, 340, 200, 50, 1] {
+            for preserve in [true, false] {
+                assert_system_and_last_user_survive(
+                    &SemanticGc {
+                        preserve_prefix: preserve,
+                        ..semantic_gc()
+                    },
+                    budget,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ring_still_converges_when_protecting_the_task() {
+        // The guards must not cost convergence where convergence is
+        // possible: everything unprotected drops, the window lands under
+        // budget, and the protected set is exactly what remains.
+        let messages = adversarial_fixture();
+        let protected_tokens = estimate_tokens(&[messages[0].clone(), messages[1].clone()]);
+        let budget = protected_tokens + 20;
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: true,
+        }
+        .collect(messages, budget, &mut state);
+        assert!(
+            estimate_tokens(&collected) <= budget,
+            "ring must converge once only the protected set remains: {} > {budget}",
+            estimate_tokens(&collected)
+        );
+        assert_eq!(collected.len(), 2, "{collected:?}");
     }
 
     #[test]
