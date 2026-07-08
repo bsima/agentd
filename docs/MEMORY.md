@@ -313,3 +313,16 @@ shapes do not preclude it (they do not — that is rather the point).
   STATE_KEYS.md replaced by this document's migration table.
 - `evals/` gains a memory round-trip eval: create -> retrieve -> update ->
   retrieve -> delete, deterministic offline.
+
+## Writing your own backend (t-1353)
+
+Everything above is the *design*; the implementer-facing contract — trait
+obligations, registration, write policies and approvals, what replay
+guarantees a provider vs what a provider must guarantee the runtime, and a
+"I want X -> implement Y" decision table — lives in
+[docs/PROVIDERS.md](PROVIDERS.md). A complete out-of-tree provider (a
+read-only workspace-search source, registered on an SDK `Agent` and driven
+through a credential-free `recall` round-trip) ships at
+`crates/agent-sdk/examples/custom_source.rs`, and
+`crates/agent-core/tests/provider_registry.rs` pins that the three in-tree
+backends register through the same public API.
