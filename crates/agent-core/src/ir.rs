@@ -293,9 +293,32 @@ pub enum Terminator {
     Return {
         value: Expr,
     },
+    /// Dynamic-width map-Par (t-1358; docs/GUIDANCE.md §3): `over` evaluates
+    /// to a list at runtime and one branch runs the `body` block per element,
+    /// concurrently. `body`'s first param receives the element; its remaining
+    /// params are bound positionally from `body_args`, evaluated once in the
+    /// parent env at fork (every branch sees the same values). Each branch
+    /// runs its body subgraph to a `Return`, whose value is the branch
+    /// result. `join`'s first param receives the list of branch results in
+    /// declaration (element) order — never completion order; its remaining
+    /// params are bound from `join_args` in the parent env at join.
+    ///
+    /// v1 constraints (validation-enforced, see `validate_program`): no
+    /// `Store` instructions and no approval-gated `Eval`s inside the body
+    /// subgraph; branch env mutations are branch-local and die at the join
+    /// (only the returned value survives). Fixed-width Par is the degenerate
+    /// case (`over` = a literal array). This replaced the never-implemented
+    /// static `Par { branches, join }` sketch, which could not express
+    /// runtime-width fan-out (the only demanded kind) and was rejected by
+    /// the runtime, so no serialized program carries the old shape.
     Par {
-        branches: Vec<BlockId>,
+        over: Expr,
+        body: BlockId,
+        #[serde(default)]
+        body_args: Vec<Expr>,
         join: BlockId,
+        #[serde(default)]
+        join_args: Vec<Expr>,
     },
 }
 
@@ -562,6 +585,9 @@ pub fn validate_program(program: &Program) -> Result<()> {
         validate_unique_vars(&block.params, "block params", *block_id)?;
         validate_local_shadowing(block, *block_id)?;
         validate_terminator_block_refs(program, &block.terminator)?;
+        if let Terminator::Par { body, .. } = &block.terminator {
+            validate_par_body(program, *block_id, *body)?;
+        }
     }
 
     let mut inputs = BTreeMap::<BlockId, std::collections::BTreeSet<Var>>::new();
@@ -599,6 +625,77 @@ pub fn validate_program(program: &Program) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// v1 Par body constraints (t-1358, docs/GUIDANCE.md §3): no demand pattern
+/// writes or pauses inside a branch, so `Store` instructions and
+/// approval-gated `Eval`s are rejected statically in every block reachable
+/// from a Par body. (Store rejection also removes the RequireApproval-sink
+/// pause path wholesale; the only approval gate a branch could still reach
+/// dynamically — e.g. a future gated effect kind — fails that branch at
+/// runtime with a clear error instead of pausing, see the interpreter.)
+/// The scan is conservative: a block shared between the body subgraph and
+/// other control flow is constrained too.
+fn validate_par_body(program: &Program, par_block: BlockId, body: BlockId) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut worklist = vec![body];
+    while let Some(block_id) = worklist.pop() {
+        if !seen.insert(block_id) {
+            continue;
+        }
+        let Some(block) = program.blocks.get(&block_id) else {
+            continue; // dangling refs are reported by validate_terminator_block_refs
+        };
+        for instr in &block.instructions {
+            match instr {
+                Instr::Store { .. } => {
+                    return Err(anyhow!(
+                        "AgentIR Par at block {:?}: Store instruction in block {:?} is \
+                         reachable from the Par body {:?}; Store is not allowed inside \
+                         Par branches (v1, t-1358)",
+                        par_block,
+                        block_id,
+                        body
+                    ));
+                }
+                Instr::Eval { policy, .. } if policy.require_approval => {
+                    return Err(anyhow!(
+                        "AgentIR Par at block {:?}: approval-gated Eval in block {:?} is \
+                         reachable from the Par body {:?}; approval gates are not allowed \
+                         inside Par branches (v1, t-1358) — a branch cannot pause mid-Par",
+                        par_block,
+                        block_id,
+                        body
+                    ));
+                }
+                _ => {}
+            }
+        }
+        worklist.extend(terminator_successor_blocks(&block.terminator));
+    }
+    Ok(())
+}
+
+/// Every block a terminator can transfer control to (for Par: the body and
+/// the join).
+fn terminator_successor_blocks(terminator: &Terminator) -> Vec<BlockId> {
+    match terminator {
+        Terminator::Goto { block, .. } => vec![*block],
+        Terminator::If {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        Terminator::Match { arms, default, .. } => {
+            let mut out = arms.iter().map(|arm| arm.block).collect::<Vec<_>>();
+            if let Some(default) = default {
+                out.push(*default);
+            }
+            out
+        }
+        Terminator::Return { .. } => vec![],
+        Terminator::Par { body, join, .. } => vec![*body, *join],
+    }
 }
 
 fn validate_local_shadowing(block: &Block, block_id: BlockId) -> Result<()> {
@@ -740,10 +837,8 @@ fn validate_terminator_block_refs(program: &Program, terminator: &Terminator) ->
             Ok(())
         }
         Terminator::Return { .. } => Ok(()),
-        Terminator::Par { branches, join } => {
-            for branch in branches {
-                validate_block_ref(program, *branch)?;
-            }
+        Terminator::Par { body, join, .. } => {
+            validate_block_ref(program, *body)?;
             validate_block_ref(program, *join)
         }
     }
@@ -791,7 +886,18 @@ fn validate_terminator_vars(
             Ok(())
         }
         Terminator::Return { value } => validate_expr_vars(value, defined, block_id),
-        Terminator::Par { .. } => Ok(()),
+        Terminator::Par {
+            over,
+            body_args,
+            join_args,
+            ..
+        } => {
+            validate_expr_vars(over, defined, block_id)?;
+            for arg in body_args.iter().chain(join_args) {
+                validate_expr_vars(arg, defined, block_id)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -883,13 +989,36 @@ fn terminator_successors(
             Ok(out)
         }
         Terminator::Return { .. } => Ok(vec![]),
-        Terminator::Par { branches, join } => {
-            let mut out = branches
-                .iter()
-                .map(|branch| (*branch, defined.clone()))
-                .collect::<Vec<_>>();
-            out.push((*join, defined.clone()));
-            Ok(out)
+        Terminator::Par {
+            body,
+            body_args,
+            join,
+            join_args,
+            ..
+        } => {
+            // Arity: the first body/join param is edge-implicit (the element
+            // / the results list); the rest bind positionally from the args.
+            let body_block = program.blocks.get(body).expect("block ref checked");
+            if body_block.params.len() != body_args.len() + 1 {
+                return Err(anyhow!(
+                    "AgentIR Par body {:?} must declare {} params (the element plus one \
+                     per body arg), got {}",
+                    body,
+                    body_args.len() + 1,
+                    body_block.params.len()
+                ));
+            }
+            let join_block = program.blocks.get(join).expect("block ref checked");
+            if join_block.params.len() != join_args.len() + 1 {
+                return Err(anyhow!(
+                    "AgentIR Par join {:?} must declare {} params (the results list plus \
+                     one per join arg), got {}",
+                    join,
+                    join_args.len() + 1,
+                    join_block.params.len()
+                ));
+            }
+            Ok(vec![(*body, defined.clone()), (*join, defined.clone())])
         }
     }
 }
@@ -1340,6 +1469,178 @@ mod tests {
         let decoded: Machine = serde_json::from_value(encoded).unwrap();
 
         assert_eq!(decoded, machine);
+    }
+
+    /// A minimal valid map-Par: entry Pars over a literal list, the body
+    /// returns its element (optionally after `body_instrs`), the join
+    /// returns the results list.
+    fn par_program(body_instrs: Vec<Instr>) -> Program {
+        Program {
+            id: ProgramId("par".into()),
+            entry: BlockId(0),
+            blocks: BTreeMap::from([
+                (
+                    BlockId(0),
+                    Block {
+                        params: vec![],
+                        instructions: vec![],
+                        terminator: Terminator::Par {
+                            over: Expr::Value(serde_json::json!(["a", "b"])),
+                            body: BlockId(1),
+                            body_args: vec![],
+                            join: BlockId(2),
+                            join_args: vec![],
+                        },
+                    },
+                ),
+                (
+                    BlockId(1),
+                    Block {
+                        params: vec![Var("element".into())],
+                        instructions: body_instrs,
+                        terminator: Terminator::Return {
+                            value: Expr::Var(Var("element".into())),
+                        },
+                    },
+                ),
+                (
+                    BlockId(2),
+                    Block {
+                        params: vec![Var("results".into())],
+                        instructions: vec![],
+                        terminator: Terminator::Return {
+                            value: Expr::Var(Var("results".into())),
+                        },
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn par_program_validates_and_par_shape_round_trips() {
+        let program = par_program(vec![]);
+        validate_program(&program).unwrap();
+
+        let encoded = serde_json::to_string(&program).unwrap();
+        let decoded: Program = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, program);
+
+        // The arg lists are serde-defaulted: a Par written without them
+        // still decodes (and means "no extra params beyond the implicit
+        // element / results").
+        let bare = r#"{"Par":{"over":{"Value":[1]},"body":1,"join":2}}"#;
+        let terminator: Terminator = serde_json::from_str(bare).unwrap();
+        assert_eq!(
+            terminator,
+            Terminator::Par {
+                over: Expr::Value(serde_json::json!([1])),
+                body: BlockId(1),
+                body_args: vec![],
+                join: BlockId(2),
+                join_args: vec![],
+            }
+        );
+    }
+
+    /// v1 Par body constraints (t-1358): Store instructions and
+    /// approval-gated Evals are rejected in every block REACHABLE from the
+    /// body, not just the body block itself.
+    #[test]
+    fn validation_rejects_store_and_gated_eval_inside_par_body() {
+        let mut with_store = par_program(vec![]);
+        // Reach the offending block transitively: body -> Goto -> block 3.
+        with_store.blocks.get_mut(&BlockId(1)).unwrap().terminator = Terminator::Goto {
+            block: BlockId(3),
+            args: vec![],
+        };
+        with_store.blocks.insert(
+            BlockId(3),
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Store {
+                    out: Var("stored".into()),
+                    sink: Expr::Value(Value::String("memory".into())),
+                    op: StoreOp::Create,
+                    id: None,
+                    item: Expr::Value(Value::Null),
+                    policy: StorePolicy::default(),
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("stored".into())),
+                },
+            },
+        );
+        let err = validate_program(&with_store).unwrap_err().to_string();
+        assert!(
+            err.contains("Store is not allowed inside Par branches"),
+            "{err}"
+        );
+
+        let mut with_gate = par_program(vec![Instr::Eval {
+            out: Var("gated".into()),
+            request: EvalRequest::Shell {
+                command: Expr::Value(Value::String("true".into())),
+            },
+            policy: EvalPolicy {
+                require_approval: true,
+                ..Default::default()
+            },
+        }]);
+        // The un-gated variant is fine…
+        with_gate.blocks.get_mut(&BlockId(1)).unwrap().instructions[0] = Instr::Eval {
+            out: Var("gated".into()),
+            request: EvalRequest::Shell {
+                command: Expr::Value(Value::String("true".into())),
+            },
+            policy: EvalPolicy::default(),
+        };
+        validate_program(&with_gate).unwrap();
+        // …and the gated one is rejected.
+        with_gate.blocks.get_mut(&BlockId(1)).unwrap().instructions[0] = Instr::Eval {
+            out: Var("gated".into()),
+            request: EvalRequest::Shell {
+                command: Expr::Value(Value::String("true".into())),
+            },
+            policy: EvalPolicy {
+                require_approval: true,
+                ..Default::default()
+            },
+        };
+        let err = validate_program(&with_gate).unwrap_err().to_string();
+        assert!(
+            err.contains("approval gates are not allowed inside Par branches"),
+            "{err}"
+        );
+    }
+
+    /// Body and join declare one implicit leading param (element / results)
+    /// plus one per explicit arg; validation pins the arity.
+    #[test]
+    fn validation_rejects_par_arity_mismatches() {
+        let mut no_body_param = par_program(vec![]);
+        no_body_param.blocks.get_mut(&BlockId(1)).unwrap().params = vec![];
+        no_body_param
+            .blocks
+            .get_mut(&BlockId(1))
+            .unwrap()
+            .terminator = Terminator::Return {
+            value: Expr::Value(Value::Null),
+        };
+        let err = validate_program(&no_body_param).unwrap_err().to_string();
+        assert!(err.contains("Par body"), "{err}");
+        assert!(err.contains("must declare 1 params"), "{err}");
+
+        let mut extra_join_param = par_program(vec![]);
+        extra_join_param
+            .blocks
+            .get_mut(&BlockId(2))
+            .unwrap()
+            .params
+            .push(Var("unbound".into()));
+        let err = validate_program(&extra_join_param).unwrap_err().to_string();
+        assert!(err.contains("Par join"), "{err}");
+        assert!(err.contains("must declare 1 params"), "{err}");
     }
 
     #[test]

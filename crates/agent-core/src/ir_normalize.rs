@@ -76,14 +76,14 @@ pub fn validate_strict_ssa_program(program: &Program) -> Result<()> {
                 ));
             }
         }
-        for (target, args) in terminator_edges_with_args(&block.terminator) {
+        for (target, args, implicit) in terminator_edges_with_args(&block.terminator) {
             let expected = program.blocks.get(&target).expect("validated").params.len();
-            if args.len() != expected {
+            if args.len() + implicit != expected {
                 return Err(anyhow!(
                     "AgentIR strict SSA violation: edge from {:?} to {:?} expected {} args, got {}",
                     block_id,
                     target,
-                    expected,
+                    expected.saturating_sub(implicit),
                     args.len()
                 ));
             }
@@ -335,9 +335,22 @@ fn add_edge_args(
         Terminator::Return { value } => Terminator::Return {
             value: value.clone(),
         },
-        Terminator::Par { branches, join } => Terminator::Par {
-            branches: branches.clone(),
+        // Par edges carry one implicit leading param each (the element on
+        // the body edge, the results list on the join edge); `args_for`
+        // appends by-name Var args for SSA-added params after the existing
+        // positional ones, exactly like every other edge.
+        Terminator::Par {
+            over,
+            body,
+            body_args,
+            join,
+            join_args,
+        } => Terminator::Par {
+            over: over.clone(),
+            body: *body,
+            body_args: args_for(*body, body_args),
             join: *join,
+            join_args: args_for(*join, join_args),
         },
     })
 }
@@ -461,7 +474,8 @@ fn terminator_control_uses(term: &Terminator) -> BTreeSet<Var> {
         Terminator::If { cond, .. } => collect_expr_vars(cond, &mut out),
         Terminator::Match { value, .. } => collect_expr_vars(value, &mut out),
         Terminator::Return { value } => collect_expr_vars(value, &mut out),
-        Terminator::Goto { .. } | Terminator::Par { .. } => {}
+        Terminator::Par { over, .. } => collect_expr_vars(over, &mut out),
+        Terminator::Goto { .. } => {}
     }
     out
 }
@@ -502,7 +516,17 @@ fn terminator_value_uses(term: &Terminator) -> BTreeSet<Var> {
             }
         }
         Terminator::Return { value } => collect_expr_vars(value, &mut out),
-        Terminator::Par { .. } => {}
+        Terminator::Par {
+            over,
+            body_args,
+            join_args,
+            ..
+        } => {
+            collect_expr_vars(over, &mut out);
+            for e in body_args.iter().chain(join_args) {
+                collect_expr_vars(e, &mut out);
+            }
+        }
     }
     out
 }
@@ -523,17 +547,16 @@ fn terminator_successor_ids(term: &Terminator) -> Vec<BlockId> {
             v
         }
         Terminator::Return { .. } => vec![],
-        Terminator::Par { branches, join } => {
-            let mut v = branches.clone();
-            v.push(*join);
-            v
-        }
+        Terminator::Par { body, join, .. } => vec![*body, *join],
     }
 }
 
-fn terminator_edges_with_args(term: &Terminator) -> Vec<(BlockId, &[Expr])> {
+/// Edges with their explicit args plus the count of implicit leading params
+/// on the target that the runtime binds itself (0 everywhere except Par:
+/// the element on the body edge, the results list on the join edge).
+fn terminator_edges_with_args(term: &Terminator) -> Vec<(BlockId, &[Expr], usize)> {
     match term {
-        Terminator::Goto { block, args } => vec![(*block, args.as_slice())],
+        Terminator::Goto { block, args } => vec![(*block, args.as_slice(), 0)],
         Terminator::If {
             then_block,
             then_args,
@@ -541,8 +564,8 @@ fn terminator_edges_with_args(term: &Terminator) -> Vec<(BlockId, &[Expr])> {
             else_args,
             ..
         } => vec![
-            (*then_block, then_args.as_slice()),
-            (*else_block, else_args.as_slice()),
+            (*then_block, then_args.as_slice(), 0),
+            (*else_block, else_args.as_slice(), 0),
         ],
         Terminator::Match {
             arms,
@@ -552,19 +575,24 @@ fn terminator_edges_with_args(term: &Terminator) -> Vec<(BlockId, &[Expr])> {
         } => {
             let mut v = arms
                 .iter()
-                .map(|a| (a.block, a.args.as_slice()))
+                .map(|a| (a.block, a.args.as_slice(), 0))
                 .collect::<Vec<_>>();
             if let Some(d) = default {
-                v.push((*d, default_args.as_slice()));
+                v.push((*d, default_args.as_slice(), 0));
             }
             v
         }
         Terminator::Return { .. } => vec![],
-        Terminator::Par { branches, join } => {
-            let mut v = branches.iter().map(|b| (*b, &[][..])).collect::<Vec<_>>();
-            v.push((*join, &[][..]));
-            v
-        }
+        Terminator::Par {
+            body,
+            body_args,
+            join,
+            join_args,
+            ..
+        } => vec![
+            (*body, body_args.as_slice(), 1),
+            (*join, join_args.as_slice(), 1),
+        ],
     }
 }
 
@@ -772,9 +800,18 @@ fn rename_terminator_uses(term: &Terminator, env: &BTreeMap<Var, Var>) -> Result
         Terminator::Return { value } => Terminator::Return {
             value: rename_expr(value, env)?,
         },
-        Terminator::Par { branches, join } => Terminator::Par {
-            branches: branches.clone(),
+        Terminator::Par {
+            over,
+            body,
+            body_args,
+            join,
+            join_args,
+        } => Terminator::Par {
+            over: rename_expr(over, env)?,
+            body: *body,
+            body_args: rename_exprs(body_args, env)?,
             join: *join,
+            join_args: rename_exprs(join_args, env)?,
         },
     })
 }
@@ -940,9 +977,18 @@ fn map_terminator_blocks(term: &Terminator, map: &BTreeMap<BlockId, BlockId>) ->
         Terminator::Return { value } => Terminator::Return {
             value: value.clone(),
         },
-        Terminator::Par { branches, join } => Terminator::Par {
-            branches: branches.iter().map(|b| map[b]).collect(),
+        Terminator::Par {
+            over,
+            body,
+            body_args,
+            join,
+            join_args,
+        } => Terminator::Par {
+            over: over.clone(),
+            body: map[body],
+            body_args: body_args.clone(),
             join: map[join],
+            join_args: join_args.clone(),
         },
     }
 }
@@ -1107,6 +1153,139 @@ mod tests {
         assert_eq!(
             canonical_program_hash(&p).unwrap(),
             canonical_program_hash(&q).unwrap()
+        );
+    }
+
+    /// A map-Par whose body AND join lean on a dominator-scoped variable
+    /// (`k`, defined in the entry block): the SSA pass must thread it
+    /// through the Par edges as appended params with by-name Var args,
+    /// after the implicit leading param (element / results list).
+    fn par_map_program(ctx_var: &str) -> Program {
+        let k = Var(ctx_var.to_owned());
+        Program {
+            id: ProgramId("par-map".into()),
+            entry: BlockId(10),
+            blocks: BTreeMap::from([
+                (
+                    BlockId(10),
+                    Block {
+                        params: vec![],
+                        instructions: vec![Instr::Let {
+                            out: k.clone(),
+                            expr: Expr::Value(json!("ctx")),
+                        }],
+                        terminator: Terminator::Par {
+                            over: Expr::Value(json!([1, 2])),
+                            body: BlockId(20),
+                            body_args: vec![],
+                            join: BlockId(30),
+                            join_args: vec![],
+                        },
+                    },
+                ),
+                (
+                    BlockId(20),
+                    Block {
+                        params: vec![Var("element".into())],
+                        instructions: vec![Instr::Let {
+                            out: Var("combined".into()),
+                            expr: Expr::Array(vec![
+                                Expr::Var(Var("element".into())),
+                                Expr::Var(k.clone()),
+                            ]),
+                        }],
+                        terminator: Terminator::Return {
+                            value: Expr::Var(Var("combined".into())),
+                        },
+                    },
+                ),
+                (
+                    BlockId(30),
+                    Block {
+                        params: vec![Var("results".into())],
+                        instructions: vec![],
+                        terminator: Terminator::Return {
+                            value: Expr::Array(vec![
+                                Expr::Var(Var("results".into())),
+                                Expr::Var(k),
+                            ]),
+                        },
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn par_normalizes_to_strict_ssa_idempotently() {
+        let p = par_map_program("k");
+        let n1 = normalize_program(&p).unwrap();
+        let n2 = normalize_program(&n1).unwrap();
+        assert_eq!(n1, n2);
+        validate_strict_ssa_program(&n1).unwrap();
+
+        // The dominator-scoped `k` became an appended param on both Par
+        // targets, passed by-name on both Par edges after the existing
+        // (implicit-first) interface.
+        let entry = &n1.blocks[&n1.entry];
+        let Terminator::Par {
+            body,
+            body_args,
+            join,
+            join_args,
+            ..
+        } = &entry.terminator
+        else {
+            panic!("entry keeps its Par terminator: {:?}", entry.terminator);
+        };
+        assert_eq!(n1.blocks[body].params.len(), 2, "element + threaded k");
+        assert_eq!(body_args.len(), 1);
+        assert_eq!(n1.blocks[join].params.len(), 2, "results + threaded k");
+        assert_eq!(join_args.len(), 1);
+    }
+
+    #[test]
+    fn par_alpha_equivalent_and_renumbered_programs_hash_equal() {
+        let p = par_map_program("k");
+        let q = par_map_program("context"); // alpha-renamed local
+        assert_eq!(
+            canonical_program_hash(&p).unwrap(),
+            canonical_program_hash(&q).unwrap()
+        );
+
+        // Renumber the blocks; the canonical hash must not move.
+        let map = BTreeMap::from([
+            (BlockId(10), BlockId(7)),
+            (BlockId(20), BlockId(99)),
+            (BlockId(30), BlockId(3)),
+        ]);
+        let mut blocks = BTreeMap::new();
+        for (old, block) in &p.blocks {
+            let mut b = block.clone();
+            b.terminator = map_terminator_blocks(&b.terminator, &map);
+            blocks.insert(map[old], b);
+        }
+        let renumbered = Program {
+            id: ProgramId("renumbered".into()),
+            entry: map[&p.entry],
+            blocks,
+        };
+        assert_eq!(
+            canonical_program_hash(&p).unwrap(),
+            canonical_program_hash(&renumbered).unwrap()
+        );
+
+        // And a semantically different Par (different over) hashes apart.
+        let mut different = par_map_program("k");
+        let Terminator::Par { over, .. } =
+            &mut different.blocks.get_mut(&BlockId(10)).unwrap().terminator
+        else {
+            unreachable!()
+        };
+        *over = Expr::Value(json!([1, 2, 3]));
+        assert_ne!(
+            canonical_program_hash(&p).unwrap(),
+            canonical_program_hash(&different).unwrap()
         );
     }
 

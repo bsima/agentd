@@ -13,6 +13,7 @@ use crate::op::{ChatMessage, Model, Prompt};
 use crate::prompt_ir::{collect_prompt_ir_sections, compile_prompt_ir, PromptIR};
 use crate::trace::Event;
 use anyhow::{anyhow, Context, Result};
+use async_recursion::async_recursion;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -721,7 +722,7 @@ pub async fn run_ir_steps_with_store_and_replay(
 
 pub async fn run_ir_steps_with_gc(
     config: &SeqConfig,
-    mut machine: Machine,
+    machine: Machine,
     store: &mut dyn IrStore,
     ir_replay: Option<&IrReplayTrace>,
     max_instructions: Option<usize>,
@@ -729,6 +730,36 @@ pub async fn run_ir_steps_with_gc(
 ) -> Result<IrStepOutcome> {
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
+    let (outcome, _instructions_used) = run_ir_steps_inner(
+        config,
+        machine,
+        store,
+        ir_replay,
+        max_instructions,
+        gc_state,
+        &program_hash,
+    )
+    .await?;
+    Ok(outcome)
+}
+
+/// The machine loop proper, shared by top-level runs and Par branch
+/// sub-machines (which recurse into it — hence the boxing). The program is
+/// validated and hashed once by the public entry point; Par branches run
+/// the same program and reuse the parent's hash. Returns the outcome plus
+/// how many instructions this machine actually executed, so a Par fork can
+/// return a branch's unused pre-split step allocation at the join.
+#[async_recursion]
+#[allow(clippy::too_many_arguments)]
+async fn run_ir_steps_inner(
+    config: &SeqConfig,
+    mut machine: Machine,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&'async_recursion IrReplayTrace>,
+    max_instructions: Option<usize>,
+    gc_state: &mut GcState,
+    program_hash: &ProgramHash,
+) -> Result<(IrStepOutcome, usize)> {
     let mut instructions_executed = 0usize;
     // The op_id of the most recent default-toolset ("turn") Infer: dispatched
     // child Infers (toolset overridden, e.g. the agent loop's sub-infer) are
@@ -743,9 +774,12 @@ pub async fn run_ir_steps_with_gc(
             let store = store.in_memory_snapshot().ok_or_else(|| {
                 anyhow!("AgentIR instruction-limit checkpoints require an in-memory store snapshot")
             })?;
-            return Ok(IrStepOutcome::Suspended {
-                checkpoint: IrCheckpoint { machine, store },
-            });
+            return Ok((
+                IrStepOutcome::Suspended {
+                    checkpoint: IrCheckpoint { machine, store },
+                },
+                instructions_executed,
+            ));
         }
         let block = machine
             .program
@@ -765,7 +799,7 @@ pub async fn run_ir_steps_with_gc(
             if let Some(pending) = execute_instr(
                 config,
                 &mut machine,
-                &program_hash,
+                program_hash,
                 site,
                 dynamic_path,
                 ir_replay,
@@ -786,10 +820,13 @@ pub async fn run_ir_steps_with_gc(
                 let store = store.in_memory_snapshot().ok_or_else(|| {
                     anyhow!("AgentIR approval pauses require an in-memory store snapshot")
                 })?;
-                return Ok(IrStepOutcome::AwaitingApproval {
-                    checkpoint: IrCheckpoint { machine, store },
-                    pending,
-                });
+                return Ok((
+                    IrStepOutcome::AwaitingApproval {
+                        checkpoint: IrCheckpoint { machine, store },
+                        pending,
+                    },
+                    instructions_executed,
+                ));
             }
             machine.pc += 1;
             instructions_executed += 1;
@@ -799,7 +836,10 @@ pub async fn run_ir_steps_with_gc(
         match block.terminator {
             Terminator::Return { value } => {
                 let value = eval_expr(&machine.env, &value)?;
-                return Ok(IrStepOutcome::Complete { value, machine });
+                return Ok((
+                    IrStepOutcome::Complete { value, machine },
+                    instructions_executed,
+                ));
             }
             // Every transition folds (from block, arm, to block) into the
             // machine's control path so downstream effect ids encode which
@@ -855,16 +895,279 @@ pub async fn run_ir_steps_with_gc(
                 };
                 goto_block(&mut machine, target, args, arm).await?;
             }
-            Terminator::Par { .. } => {
-                return Err(anyhow!(
-                    "AgentIR Par terminator is not implemented in run_ir_sequential yet"
-                ));
+            // Dynamic-width map-Par (t-1358; docs/GUIDANCE.md §3): fork one
+            // branch machine per element of `over`, run them concurrently,
+            // and join-all in declaration (element) order.
+            Terminator::Par {
+                over,
+                body,
+                body_args,
+                join,
+                join_args,
+            } => {
+                let par_block = machine.block;
+                let over_value = eval_expr(&machine.env, &over)?;
+                let Value::Array(elements) = over_value else {
+                    return Err(anyhow!(
+                        "AgentIR Par.over must evaluate to a list, got {}",
+                        crate::trace::preview(&over_value.to_string(), 128)
+                    ));
+                };
+                let width = elements.len();
+
+                // Pre-split step budget: each branch gets floor(remaining /
+                // width), remainder to earlier branches — deterministic, so
+                // "which branch hit the limit" never depends on scheduling.
+                // Unused allocation is returned at the join (only what a
+                // branch actually executed counts against the parent).
+                let allocations: Vec<Option<usize>> = match max_instructions {
+                    None => vec![None; width],
+                    Some(max) => {
+                        let remaining = max.saturating_sub(instructions_executed);
+                        if width > 0 && remaining < width {
+                            if max < width {
+                                // A suspend could never make progress: even a
+                                // fresh budget of `max` cannot give every
+                                // branch one instruction.
+                                return Err(anyhow!(
+                                    "AgentIR Par width {width} exceeds the whole instruction \
+                                     budget {max}; the fork needs at least one instruction \
+                                     per branch"
+                                ));
+                            }
+                            // Not enough remaining to fork: checkpoint at the
+                            // Par terminator (like the loop-top limit check)
+                            // so a resume with a fresh budget re-forks.
+                            let store = store.in_memory_snapshot().ok_or_else(|| {
+                                anyhow!(
+                                    "AgentIR instruction-limit checkpoints require an \
+                                     in-memory store snapshot"
+                                )
+                            })?;
+                            return Ok((
+                                IrStepOutcome::Suspended {
+                                    checkpoint: IrCheckpoint { machine, store },
+                                },
+                                instructions_executed,
+                            ));
+                        }
+                        let base = remaining / width.max(1);
+                        let extra = remaining % width.max(1);
+                        (0..width)
+                            .map(|index| Some(base + usize::from(index < extra)))
+                            .collect()
+                    }
+                };
+
+                // Bind the body's non-element params once, in the parent env
+                // at fork: every branch sees the same values (validation
+                // guarantees the arity).
+                let body_block = machine
+                    .program
+                    .blocks
+                    .get(&body)
+                    .with_context(|| format!("unknown AgentIR block {body:?}"))?;
+                let element_param = body_block
+                    .params
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("AgentIR Par body {body:?} must declare params"))?;
+                let shared_bindings = body_block.params[1..]
+                    .iter()
+                    .zip(&body_args)
+                    .map(|(param, arg)| Ok((param.clone(), eval_expr(&machine.env, arg)?)))
+                    .collect::<Result<Vec<_>>>()?;
+
+                // Fork the branch machines BEFORE any branch is scheduled:
+                // branch `index` forks the parent control path with the
+                // transition (P, arm = index, body), so every effect id a
+                // branch will mint derives from the fork point, never from
+                // completion order. Branches see a snapshot of the parent
+                // env; their mutations stay branch-local and die at the join
+                // (only the Return value survives, in the results list).
+                let mut branch_runs = Vec::with_capacity(width);
+                for (index, element) in elements.iter().enumerate() {
+                    let mut env = machine.env.clone();
+                    env.insert(element_param.clone(), element.clone());
+                    for (param, value) in &shared_bindings {
+                        env.insert(param.clone(), value.clone());
+                    }
+                    let mut control_path = machine.control_path.clone();
+                    control_path.transition(
+                        par_block,
+                        u32::try_from(index).context("AgentIR Par width exceeds u32")?,
+                        body,
+                    );
+                    let branch = Machine {
+                        program: machine.program.clone(),
+                        block: body,
+                        pc: 0,
+                        env,
+                        effect_visits: machine.effect_visits.clone(),
+                        control_path,
+                        continuation_stack: vec![],
+                        budgets: machine.budgets.clone(),
+                    };
+                    branch_runs.push(run_par_branch(
+                        config,
+                        branch,
+                        ir_replay,
+                        allocations[index],
+                        gc_state.discovered_budget,
+                        program_hash,
+                        index,
+                    ));
+                }
+                // Actual concurrency: all branch futures progress together
+                // (their provider calls and Evals overlap); join_all yields
+                // outcomes in declaration order regardless of completion
+                // order, and never before ALL branches settle — no
+                // cancellation in v1.
+                let outcomes = futures::future::join_all(branch_runs).await;
+
+                let mut results = Vec::with_capacity(width);
+                let mut first_abort: Option<anyhow::Error> = None;
+                for outcome in outcomes {
+                    instructions_executed += outcome.instructions_used;
+                    // Per-site visit counters advanced independently in each
+                    // branch from the same fork snapshot; the max per site is
+                    // an order-independent merge, keeping post-join visits
+                    // deterministic.
+                    for (site, visits) in outcome.effect_visits {
+                        let merged = machine.effect_visits.entry(site).or_insert(0);
+                        *merged = (*merged).max(visits);
+                    }
+                    match outcome.slot {
+                        Ok(value) => results.push(value),
+                        // Abort-polarity failures propagate only after all
+                        // branches settle (join_all above); the first by
+                        // declaration order wins deterministically.
+                        Err(err) => {
+                            if first_abort.is_none() {
+                                first_abort = Some(err);
+                            }
+                        }
+                    }
+                }
+                if let Some(err) = first_abort {
+                    return Err(err);
+                }
+
+                // The continuation folds (P, arm = width, join) onto the
+                // PARENT path — the branch forks were arms 0..width — at a
+                // deterministic moment: after all branches settled.
+                machine.control_path.transition(
+                    par_block,
+                    u32::try_from(width).context("AgentIR Par width exceeds u32")?,
+                    join,
+                );
+                let join_block = machine
+                    .program
+                    .blocks
+                    .get(&join)
+                    .with_context(|| format!("unknown AgentIR block {join:?}"))?;
+                let results_param = join_block
+                    .params
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("AgentIR Par join {join:?} must declare params"))?;
+                let mut env = machine.env.clone();
+                env.insert(results_param, Value::Array(results));
+                for (param, arg) in join_block.params[1..].iter().zip(&join_args) {
+                    env.insert(param.clone(), eval_expr(&machine.env, arg)?);
+                }
+                machine.block = join;
+                machine.pc = 0;
+                machine.env = env;
             }
         }
         // Block transitions count as steps too: a cycle of blocks with empty
         // instruction lists (pure Goto/If/Match loops) must still hit the
         // instruction limit, or the limit is useless as a watchdog.
         instructions_executed += 1;
+    }
+}
+
+/// One settled Par branch, in declaration order (t-1358). `slot` is the
+/// branch's entry in the join results list: a branch that completed — or
+/// whose effect failed under `Bind`, or that exhausted its pre-split step
+/// allocation — settles as `Ok(value)` (errors-as-values), while an
+/// abort-polarity failure settles as `Err` and propagates only after every
+/// sibling has settled, first-by-declaration-order.
+struct ParBranchOutcome {
+    slot: Result<Value>,
+    instructions_used: usize,
+    effect_visits: BTreeMap<String, u64>,
+}
+
+/// Run one Par branch machine to settlement. Branches are isolated
+/// sub-executions: a fresh in-memory store (Store is validation-rejected in
+/// bodies, and branch checkpoints never escape), a fresh GC state seeded
+/// with the parent's discovered context budget, and the pre-split step
+/// allocation as the instruction limit. A branch cannot pause: exhausting
+/// its allocation binds as that branch's error value, and reaching an
+/// approval gate (only possible dynamically — statically gated effects are
+/// validation-rejected in bodies) fails the branch with a clear error.
+async fn run_par_branch(
+    config: &SeqConfig,
+    machine: Machine,
+    ir_replay: Option<&IrReplayTrace>,
+    allocation: Option<usize>,
+    discovered_budget: Option<usize>,
+    program_hash: &ProgramHash,
+    index: usize,
+) -> ParBranchOutcome {
+    let mut store = InMemoryStore::new();
+    let mut gc_state = GcState {
+        discovered_budget,
+        ..Default::default()
+    };
+    match run_ir_steps_inner(
+        config,
+        machine,
+        &mut store,
+        ir_replay,
+        allocation,
+        &mut gc_state,
+        program_hash,
+    )
+    .await
+    {
+        Ok((IrStepOutcome::Complete { value, machine }, used)) => ParBranchOutcome {
+            slot: Ok(value),
+            instructions_used: used,
+            effect_visits: machine.effect_visits,
+        },
+        // v1: no mid-Par checkpoints — a branch that hits its pre-split
+        // instruction allocation fails as that branch's error value (bind
+        // semantics), so siblings and the join still run.
+        Ok((IrStepOutcome::Suspended { checkpoint }, used)) => ParBranchOutcome {
+            slot: Ok(effect_error_value(&anyhow!(
+                "AgentIR Par branch {index} exhausted its instruction allocation of {}",
+                allocation.unwrap_or(0)
+            ))),
+            instructions_used: used,
+            effect_visits: checkpoint.machine.effect_visits,
+        },
+        // v1: approval gates cannot pause inside a Par branch (the machine
+        // cannot checkpoint sibling in-flight state). Statically detectable
+        // gates are validation-rejected before execution; this is the
+        // dynamic case, which fails the branch loudly instead of pausing.
+        Ok((IrStepOutcome::AwaitingApproval { pending, .. }, used)) => ParBranchOutcome {
+            slot: Err(anyhow!(
+                "AgentIR Par branch {index} reached approval-gated {} effect {}; approval \
+                 gates cannot pause inside Par branches (v1, t-1358)",
+                pending.kind.as_str(),
+                pending.effect.effect_id.0
+            )),
+            instructions_used: used,
+            effect_visits: BTreeMap::new(),
+        },
+        Err(err) => ParBranchOutcome {
+            slot: Err(err.context(format!("AgentIR Par branch {index} aborted"))),
+            instructions_used: 0,
+            effect_visits: BTreeMap::new(),
+        },
     }
 }
 
@@ -2193,6 +2496,7 @@ mod tests {
     use crate::gc::GcTiming;
     use crate::hydration::{PassiveHydrationConfig, SourceRegistry};
     use crate::interpreter::{EvalConfig, SeqConfig};
+    use crate::ir::InferPolicy;
     use crate::op::{Response, ToolCall};
     use crate::provider::{ChatProvider, ToolSpec};
     use crate::trace::TraceLogger;
@@ -3426,16 +3730,13 @@ mod tests {
         Ok(())
     }
 
-    /// Par scaffold (t-1058): the sequential interpreter rejects Par today,
-    /// but the control-path scheme already defines its id semantics — each
-    /// branch `b` of a Par at block `P` forks the parent path with the
-    /// transition `(P, arm = b, branch entry)`, so sibling branches derive
-    /// distinct, deterministic, order-independent digests from the same
-    /// parent; the continuation after the join folds `(P, arm =
-    /// branch_count, join)` onto the parent path. Un-ignore and extend once
-    /// Par executes.
+    /// Par control-path forks (t-1058 scaffold, realized by t-1358): branch
+    /// `b` of a Par at block `P` forks the parent path with the transition
+    /// `(P, arm = b, body)` BEFORE any branch is scheduled, so sibling
+    /// branches derive distinct, deterministic, scheduling-independent
+    /// digests from the same parent; the continuation after the join folds
+    /// `(P, arm = width, join)` onto the parent path.
     #[tokio::test]
-    #[ignore = "Par is not implemented; documents the planned per-branch control-path fork"]
     async fn par_branches_fork_the_control_path() -> Result<()> {
         let mut blocks = BTreeMap::new();
         blocks.insert(
@@ -3444,43 +3745,579 @@ mod tests {
                 params: vec![],
                 instructions: vec![],
                 terminator: Terminator::Par {
-                    branches: vec![BlockId(1), BlockId(2)],
-                    join: BlockId(3),
+                    over: Expr::Value(serde_json::json!(["a", "b"])),
+                    body: BlockId(1),
+                    body_args: vec![],
+                    join: BlockId(2),
+                    join_args: vec![],
                 },
             },
         );
-        for id in [1u32, 2] {
-            blocks.insert(
-                BlockId(id),
-                crate::ir::Block {
-                    params: vec![],
-                    instructions: vec![retrieve_instr("hits")],
-                    terminator: Terminator::Goto {
-                        block: BlockId(3),
-                        args: vec![],
-                    },
-                },
-            );
-        }
         blocks.insert(
-            BlockId(3),
+            BlockId(1),
             crate::ir::Block {
-                params: vec![],
-                instructions: vec![],
+                params: vec![Var("element".into())],
+                instructions: vec![retrieve_instr("hits")],
                 terminator: Terminator::Return {
-                    value: Expr::Value(Value::Null),
+                    value: Expr::Var(Var("hits".into())),
+                },
+            },
+        );
+        blocks.insert(
+            BlockId(2),
+            crate::ir::Block {
+                params: vec![Var("results".into())],
+                instructions: vec![retrieve_instr("post_join")],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("results".into())),
                 },
             },
         );
         let machine = machine_with_env("par-ids", blocks, BTreeMap::new());
 
         let effects = recorded_effects(machine).await?;
-        assert_eq!(effects.len(), 2, "one effect per parallel branch");
-        assert_ne!(
-            effects[0].dynamic_path.path, effects[1].dynamic_path.path,
-            "sibling branches must fork distinct control paths"
+        assert_eq!(effects.len(), 3, "one effect per branch plus one post-join");
+
+        // The exact digests are computable without running the machine:
+        // the fork happens at block 0 (parent path empty) with arm = the
+        // element index, and the join continuation folds arm = width.
+        let mut fork0 = crate::ir::ControlPath::default();
+        fork0.transition(BlockId(0), 0, BlockId(1));
+        let mut fork1 = crate::ir::ControlPath::default();
+        fork1.transition(BlockId(0), 1, BlockId(1));
+        let mut joined = crate::ir::ControlPath::default();
+        joined.transition(BlockId(0), 2, BlockId(2));
+
+        // Trace order may interleave branch events, so match by digest.
+        let paths = effects
+            .iter()
+            .map(|effect| effect.dynamic_path.path.as_str())
+            .collect::<Vec<_>>();
+        for expected in [&fork0, &fork1, &joined] {
+            assert!(
+                paths.contains(&expected.digest.as_str()),
+                "expected digest {} among recorded paths {paths:?}",
+                expected.digest
+            );
+        }
+        let mut ids = effects
+            .iter()
+            .map(|effect| effect.effect_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "sibling + post-join effect ids are distinct");
+        Ok(())
+    }
+
+    /// Provider for Par tests: echoes the last user message back as
+    /// "echo:<content>". A `barrier` (a rendezvous sized to the Par width)
+    /// proves the branches are actually in flight together — sequential
+    /// dispatch would deadlock, which the tests convert to a loud failure
+    /// via a timeout. Contents listed in `slow` sleep after the rendezvous
+    /// so their branch settles LAST despite being declared first; contents
+    /// in `fail` return an error instead of a response.
+    struct ParProvider {
+        barrier: Option<tokio::sync::Barrier>,
+        slow: Vec<String>,
+        fail: Vec<String>,
+    }
+
+    impl ParProvider {
+        fn echo() -> Self {
+            Self {
+                barrier: None,
+                slow: vec![],
+                fail: vec![],
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for ParProvider {
+        async fn chat(
+            &self,
+            _model: &Model,
+            _tools: &[ToolSpec],
+            messages: &[ChatMessage],
+        ) -> Result<Response> {
+            let content = messages
+                .last()
+                .and_then(|message| message.content.clone())
+                .unwrap_or_default();
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            if self.slow.contains(&content) {
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            }
+            if self.fail.contains(&content) {
+                return Err(anyhow!("ParProvider failing {content} on purpose"));
+            }
+            Ok(response(&format!("echo:{content}")))
+        }
+    }
+
+    /// entry(0) --Par over--> body(1): build a one-message prompt from the
+    /// element, Infer, return the full response; join(2) returns the
+    /// results list.
+    fn infer_par_machine(over: Expr, on_error: EffectErrorMode) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Par {
+                    over,
+                    body: BlockId(1),
+                    body_args: vec![],
+                    join: BlockId(2),
+                    join_args: vec![],
+                },
+            },
         );
-        assert_ne!(effects[0].effect_id, effects[1].effect_id);
+        blocks.insert(
+            BlockId(1),
+            crate::ir::Block {
+                params: vec![Var("element".into())],
+                instructions: vec![
+                    Instr::Let {
+                        out: Var("prompt".into()),
+                        expr: Expr::Array(vec![Expr::Object(BTreeMap::from([
+                            ("role".into(), Expr::Value(Value::String("user".into()))),
+                            ("content".into(), Expr::Var(Var("element".into()))),
+                        ]))]),
+                    },
+                    Instr::Infer {
+                        out: Var("reply".into()),
+                        model: Expr::Value(Value::String("mock".into())),
+                        prompt: PromptRef::Var(Var("prompt".into())),
+                        policy: InferPolicy {
+                            on_error,
+                            ..Default::default()
+                        },
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("reply".into())),
+                },
+            },
+        );
+        blocks.insert(
+            BlockId(2),
+            crate::ir::Block {
+                params: vec![Var("results".into())],
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("results".into())),
+                },
+            },
+        );
+        machine_with_env("par-infer", blocks, BTreeMap::new())
+    }
+
+    /// entry(0) --Par over--> trivial body(1) returning its element;
+    /// join(2) returns the results list.
+    fn value_par_machine(over: Expr) -> Machine {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Par {
+                    over,
+                    body: BlockId(1),
+                    body_args: vec![],
+                    join: BlockId(2),
+                    join_args: vec![],
+                },
+            },
+        );
+        blocks.insert(
+            BlockId(1),
+            crate::ir::Block {
+                params: vec![Var("element".into())],
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("element".into())),
+                },
+            },
+        );
+        blocks.insert(
+            BlockId(2),
+            crate::ir::Block {
+                params: vec![Var("results".into())],
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Expr::Var(Var("results".into())),
+                },
+            },
+        );
+        machine_with_env("par-values", blocks, BTreeMap::new())
+    }
+
+    /// Join-all in declaration order under an adversarial completion order:
+    /// branch 0 is forced to settle LAST (both branches rendezvous at a
+    /// barrier — proving they run concurrently — then branch 0 sleeps), yet
+    /// the results list still follows element order. A sequential dispatch
+    /// would deadlock at the barrier; the timeout turns that into a failure.
+    #[tokio::test]
+    async fn par_joins_in_declaration_order_under_adversarial_completion() -> Result<()> {
+        let provider = Arc::new(ParProvider {
+            barrier: Some(tokio::sync::Barrier::new(2)),
+            slow: vec!["first".into()],
+            fail: vec![],
+        });
+        let machine = infer_par_machine(
+            Expr::Value(serde_json::json!(["first", "second"])),
+            EffectErrorMode::Abort,
+        );
+        let (value, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_ir_sequential(&config(provider), machine),
+        )
+        .await
+        .expect("branches must dispatch concurrently (sequential dispatch deadlocks here)")?;
+
+        assert_eq!(value[0]["content"], Value::String("echo:first".into()));
+        assert_eq!(value[1]["content"], Value::String("echo:second".into()));
+        Ok(())
+    }
+
+    /// Errors-as-values inside a branch: a Bind-polarity Infer failure
+    /// settles as that branch's error value in its declaration-order slot,
+    /// and the join still runs with every sibling's result intact.
+    #[tokio::test]
+    async fn par_bind_failure_lands_in_its_slot_and_join_runs() -> Result<()> {
+        let provider = Arc::new(ParProvider {
+            barrier: None,
+            slow: vec![],
+            fail: vec!["bad".into()],
+        });
+        let machine = infer_par_machine(
+            Expr::Value(serde_json::json!(["ok", "bad", "also-ok"])),
+            EffectErrorMode::Bind,
+        );
+        let (value, _) = run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value[0]["content"], Value::String("echo:ok".into()));
+        assert_eq!(value[1]["ok"], Value::Bool(false));
+        assert!(
+            value[1]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("failing bad on purpose"),
+            "{value}"
+        );
+        assert_eq!(value[2]["content"], Value::String("echo:also-ok".into()));
+        Ok(())
+    }
+
+    /// Abort-polarity failures propagate only after ALL branches settle,
+    /// and the first failure by DECLARATION order is the reported one even
+    /// when it completes last: branch 0 fails slowly, branch 1 fails fast,
+    /// both error events reach the trace, and the surfaced error names
+    /// branch 0.
+    #[tokio::test]
+    async fn par_abort_reports_first_declared_failure_after_all_settle() -> Result<()> {
+        let provider = Arc::new(ParProvider {
+            barrier: None,
+            slow: vec!["bad-first".into()],
+            fail: vec!["bad-first".into(), "bad-second".into()],
+        });
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let machine = infer_par_machine(
+            Expr::Value(serde_json::json!(["bad-first", "bad-second"])),
+            EffectErrorMode::Abort,
+        );
+        let err = run_ir_sequential(&config_with_trace(provider, trace), machine)
+            .await
+            .expect_err("both branches abort");
+        assert!(
+            err.to_string().contains("Par branch 0"),
+            "declaration order, not completion order, picks the error: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("failing bad-first on purpose"),
+            "{err:#}"
+        );
+
+        // Both branches settled before the abort propagated: each recorded
+        // its own InferError.
+        let errors = TraceLogger::read_events(trace_path)
+            .await?
+            .iter()
+            .filter(|event| matches!(event, Event::InferError { .. }))
+            .count();
+        assert_eq!(errors, 2, "siblings run to completion; no cancellation");
+        Ok(())
+    }
+
+    /// Width edges: an empty list forks nothing and the join still runs
+    /// (with []); width 1 is the degenerate map.
+    #[tokio::test]
+    async fn par_width_zero_and_one() -> Result<()> {
+        let (empty, _) = run_ir_sequential(
+            &config(Arc::new(ParProvider::echo())),
+            value_par_machine(Expr::Value(serde_json::json!([]))),
+        )
+        .await?;
+        assert_eq!(empty, serde_json::json!([]));
+
+        let (single, _) = run_ir_sequential(
+            &config(Arc::new(ParProvider::echo())),
+            value_par_machine(Expr::Value(serde_json::json!(["only"]))),
+        )
+        .await?;
+        assert_eq!(single, serde_json::json!(["only"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn par_over_must_evaluate_to_a_list() -> Result<()> {
+        let err = run_ir_sequential(
+            &config(Arc::new(ParProvider::echo())),
+            value_par_machine(Expr::Value(Value::String("not-a-list".into()))),
+        )
+        .await
+        .expect_err("a non-list over is a runtime type error");
+        assert!(
+            err.to_string().contains("Par.over must evaluate to a list"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// Effect ids are assigned at fork, before any branch is scheduled: two
+    /// runs of the same Par program — with the adversarial slow-first
+    /// scheduling — mint identical id sets.
+    #[tokio::test]
+    async fn par_effect_ids_are_deterministic_across_runs_and_schedules() -> Result<()> {
+        let mut id_sets = Vec::new();
+        for _ in 0..2 {
+            let provider = Arc::new(ParProvider {
+                barrier: Some(tokio::sync::Barrier::new(2)),
+                slow: vec!["first".into()],
+                fail: vec![],
+            });
+            let trace = test_trace();
+            let trace_path = trace.path().clone();
+            let machine = infer_par_machine(
+                Expr::Value(serde_json::json!(["first", "second"])),
+                EffectErrorMode::Abort,
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                run_ir_sequential(&config_with_trace(provider, trace), machine),
+            )
+            .await
+            .expect("concurrent dispatch")?;
+            let mut ids = TraceLogger::read_events(trace_path)
+                .await?
+                .iter()
+                .filter_map(|event| match event {
+                    Event::InferCall { effect, .. } => {
+                        effect.as_deref().map(|e| e.effect_id.0.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids.len(), 2);
+            id_sets.push(ids);
+        }
+        assert_eq!(
+            id_sets[0], id_sets[1],
+            "branch effect ids must not depend on scheduling"
+        );
+        Ok(())
+    }
+
+    /// Replay is id-keyed and order-independent: a recording whose branch
+    /// events are deliberately re-interleaved (branch groups reversed —
+    /// each event stays atomic and every result still follows its own
+    /// call, which the serialized appender guarantees) replays to the same
+    /// value without touching the provider.
+    #[tokio::test]
+    async fn par_replay_is_order_independent() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let machine = infer_par_machine(
+            Expr::Value(serde_json::json!(["a", "b"])),
+            EffectErrorMode::Abort,
+        );
+        let (recorded, _) = run_ir_sequential(
+            &config_with_trace(Arc::new(ParProvider::echo()), trace),
+            machine.clone(),
+        )
+        .await?;
+
+        // Shuffle: group events by op id (first-seen order), then emit the
+        // groups REVERSED — branch b's call/result now precede branch a's.
+        let events = TraceLogger::read_events(trace_path).await?;
+        fn op_id_of(event: &Event) -> Option<u64> {
+            match event {
+                Event::InferCall { op_id, .. }
+                | Event::InferResult { op_id, .. }
+                | Event::InferError { op_id, .. } => Some(*op_id),
+                _ => None,
+            }
+        }
+        let mut groups: Vec<(Option<u64>, Vec<Event>)> = Vec::new();
+        for event in events {
+            let key = op_id_of(&event);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, group)) => group.push(event),
+                None => groups.push((key, vec![event])),
+            }
+        }
+        groups.reverse();
+        let shuffled = groups
+            .into_iter()
+            .flat_map(|(_, group)| group)
+            .collect::<Vec<_>>();
+        let replay = IrReplayTrace::from_events(&shuffled)?;
+
+        let replay_provider = Arc::new(MockProvider::new(vec![]));
+        let mut store = InMemoryStore::new();
+        let (replayed, _) = run_ir_sequential_with_store_and_replay(
+            &config(replay_provider.clone()),
+            machine,
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+
+        assert_eq!(replayed, recorded);
+        assert_eq!(replay_provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    /// Pre-split step budgets: with 3 remaining instructions and width 2 the
+    /// split is [2, 1] (floor + remainder to earlier branches). The body
+    /// costs one Let + Return: branch 0 completes inside its allocation,
+    /// branch 1 exhausts its single step and fails AS A VALUE in its slot
+    /// (bind semantics — the join still runs). The used steps count against
+    /// the parent, which then suspends at the join block; the resumed
+    /// checkpoint completes.
+    #[tokio::test]
+    async fn par_branch_budget_split_is_deterministic_and_exhaustion_binds() -> Result<()> {
+        let mut machine = value_par_machine(Expr::Value(serde_json::json!(["a", "b"])));
+        machine
+            .program
+            .blocks
+            .get_mut(&BlockId(1))
+            .unwrap()
+            .instructions = vec![Instr::Let {
+            out: Var("scratch".into()),
+            expr: Expr::Value(Value::Null),
+        }];
+
+        let config = config(Arc::new(ParProvider::echo()));
+        let outcome = run_ir_steps(&config, machine, 3).await?;
+        let IrStepOutcome::Suspended { checkpoint } = outcome else {
+            panic!("used branch steps count against the parent: {outcome:?}");
+        };
+        assert_eq!(
+            checkpoint.machine.block,
+            BlockId(2),
+            "the join is reached before the parent suspends"
+        );
+
+        let resumed = run_ir_steps(&config, checkpoint.machine, 10).await?;
+        let IrStepOutcome::Complete { value, .. } = resumed else {
+            panic!("resume completes: {resumed:?}");
+        };
+        assert_eq!(value[0], Value::String("a".into()));
+        assert_eq!(value[1]["ok"], Value::Bool(false));
+        assert!(
+            value[1]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("exhausted its instruction allocation of 1"),
+            "branch 1 (the smaller pre-split share) fails as a value: {value}"
+        );
+        Ok(())
+    }
+
+    /// Unused allocation returns at the join: two zero-instruction branches
+    /// each hold an allocation they never use, so a budget that could not
+    /// cover full consumption still completes the join block's work.
+    #[tokio::test]
+    async fn par_unused_branch_allocation_returns_at_the_join() -> Result<()> {
+        let mut machine = value_par_machine(Expr::Value(serde_json::json!(["a", "b"])));
+        machine
+            .program
+            .blocks
+            .get_mut(&BlockId(2))
+            .unwrap()
+            .instructions = vec![Instr::Let {
+            out: Var("scratch".into()),
+            expr: Expr::Value(Value::Null),
+        }];
+
+        // Budget 3: fork splits [2, 1]; branches use 0; the Par transition
+        // costs 1 and the join's Let costs 1 — this completes only because
+        // the unused pre-split steps returned at the join.
+        let outcome = run_ir_steps(&config(Arc::new(ParProvider::echo())), machine, 3).await?;
+        let IrStepOutcome::Complete { value, .. } = outcome else {
+            panic!("unused allocation must return at the join: {outcome:?}");
+        };
+        assert_eq!(value, serde_json::json!(["a", "b"]));
+        Ok(())
+    }
+
+    /// A width the whole budget cannot cover is a deterministic error (a
+    /// suspend could never progress); a width the REMAINING budget cannot
+    /// cover suspends at the Par terminator and re-forks on resume.
+    #[tokio::test]
+    async fn par_fork_budget_edges_error_or_suspend() -> Result<()> {
+        let config = config(Arc::new(ParProvider::echo()));
+
+        let err = run_ir_steps(
+            &config,
+            value_par_machine(Expr::Value(serde_json::json!(["a", "b"]))),
+            1,
+        )
+        .await
+        .expect_err("width 2 cannot fork under a whole budget of 1");
+        assert!(
+            err.to_string()
+                .contains("exceeds the whole instruction budget"),
+            "{err}"
+        );
+
+        // Two entry instructions eat the budget down to 1 remaining at the
+        // fork: suspend (max itself could cover the width), then resume.
+        let mut machine = value_par_machine(Expr::Value(serde_json::json!(["a", "b"])));
+        machine
+            .program
+            .blocks
+            .get_mut(&BlockId(0))
+            .unwrap()
+            .instructions = vec![
+            Instr::Let {
+                out: Var("x".into()),
+                expr: Expr::Value(Value::Null),
+            },
+            Instr::Let {
+                out: Var("y".into()),
+                expr: Expr::Value(Value::Null),
+            },
+        ];
+        let outcome = run_ir_steps(&config, machine, 3).await?;
+        let IrStepOutcome::Suspended { checkpoint } = outcome else {
+            panic!("remaining 1 < width 2 suspends before forking: {outcome:?}");
+        };
+        assert_eq!(checkpoint.machine.block, BlockId(0));
+        let resumed = run_ir_steps(&config, checkpoint.machine, 10).await?;
+        let IrStepOutcome::Complete { value, .. } = resumed else {
+            panic!("resume re-forks: {resumed:?}");
+        };
+        assert_eq!(value, serde_json::json!(["a", "b"]));
         Ok(())
     }
 
