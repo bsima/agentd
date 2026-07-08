@@ -734,13 +734,28 @@ pub fn agent_loop_ir_with_policies(
                     // recover from, not a turn-aborting error.
                     policy: InferPolicy {
                         on_error: EffectErrorMode::Bind,
+                        // The child is a single completion with no tool
+                        // dispatch of its own, so it is offered NO tools
+                        // (t-1346): advertising the parent's toolset only
+                        // invited tool-call answers that nothing would
+                        // execute, which then leaked the serialized
+                        // Response envelope into parent context — the same
+                        // leak t-1120 removed for the text path. An
+                        // explicit child toolset can be granted here later
+                        // without a schema change.
+                        tools: Some(vec![]),
                     },
                 },
                 // Feed back the sub-response *text*, not the serialized
                 // Response envelope (token counts, finish_reason, ids) — the
                 // envelope wastes context and teaches the model to imitate
-                // it. Fall back to the envelope only when there is no text
-                // (e.g. the sub-infer answered with tool calls).
+                // it (t-1120). With no tools offered (t-1346) a well-behaved
+                // child always answers with text, so the empty-content
+                // fallback below no longer triggers on tool-calling
+                // children; it remains the readable surface for bound child
+                // *errors* (the `{"ok":false,...}` value from t-1222, which
+                // has no `content` field) and for degenerate empty
+                // completions.
                 Instr::Let {
                     out: infer_content.clone(),
                     expr: Expr::StringOr {

@@ -416,6 +416,17 @@ pub struct InferPolicy {
     /// Abort (default) vs bind-error-as-value for this Infer site.
     #[serde(default)]
     pub on_error: EffectErrorMode,
+    /// Which tools the provider is offered at this Infer site. `None` (the
+    /// default; absent from serialization, so programs that never set it
+    /// hash identically to before the field existed) means the
+    /// interpreter's full loop toolset. `Some(names)` restricts the offer
+    /// to exactly the named subset of that toolset — `Some(vec![])` offers
+    /// no tools at all, making the call a bare single completion (the
+    /// sub-infer child dispatched by the agent loop's `infer` tool,
+    /// t-1346). The dispatch *site* owns the set, so granting a child an
+    /// explicit toolset later is a value change here, not a schema change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 /// The payload of an `Instr::Eval`. Two variants, one per trust model:
@@ -995,6 +1006,31 @@ mod tests {
         let legacy_null = r#"{"max_turns":null}"#;
         let policy: InferPolicy = serde_json::from_str(legacy_null).unwrap();
         assert_eq!(policy, InferPolicy::default());
+    }
+
+    /// The per-site toolset override (t-1346) must not disturb existing
+    /// program hashes: an unset `tools` never serializes, pre-t-1346
+    /// policies deserialize to `None`, and a set toolset (including the
+    /// empty no-tools list) round-trips.
+    #[test]
+    fn infer_policy_toolset_is_absent_by_default_and_round_trips() {
+        let default_json = serde_json::to_string(&InferPolicy::default()).unwrap();
+        assert!(
+            !default_json.contains("tools"),
+            "default policy grew a tools key: {default_json}"
+        );
+        let old: InferPolicy = serde_json::from_str(r#"{"on_error":"bind"}"#).unwrap();
+        assert_eq!(old.tools, None);
+
+        for tools in [Some(vec![]), Some(vec!["shell".to_owned()])] {
+            let policy = InferPolicy {
+                tools: tools.clone(),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&policy).unwrap();
+            assert!(json.contains("\"tools\""), "{json}");
+            assert_eq!(serde_json::from_str::<InferPolicy>(&json).unwrap(), policy);
+        }
     }
 
     /// EvalRequest grew the Argv variant (t-1308.5). Programs and traces

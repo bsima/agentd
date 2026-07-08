@@ -92,13 +92,18 @@ quality, but because of mechanism structure:
    sub-infer 3.3x more expensive.
 3. **The `infer` schema gives no delegation guidance** — `model` is a bare
    string (no catalog/enum/pricing), and there is no budget knob
-   (`ir_interpreter.rs` `base_ir_tool_specs`; `InferPolicy` has only
-   `on_error`). Hallucinated ids fail closed and cost a full round-trip
+   (`ir_interpreter.rs` `base_ir_tool_specs`; `InferPolicy` carries no
+   budget knob). Hallucinated ids fail closed and cost a full round-trip
    (`child-error-recovery`: 14x the single arm).
-4. **The child is offered the parent's full toolset it can never use**,
-   and a tool-calling child response falls back to serializing the whole
-   Response envelope (usage fields, unexecuted tool calls) into the parent
-   context — the exact leak t-1120 removed for the text path.
+4. **Fixed (t-1346).** The child used to be offered the parent's full
+   toolset it could never use, and a tool-calling child response fell back
+   to serializing the whole Response envelope (usage fields, unexecuted
+   tool calls) into the parent context — the exact leak t-1120 removed for
+   the text path. The sub-infer site now declares an empty toolset
+   (`InferPolicy.tools`, ir_agent.rs `infer_eval`), so the child is a bare
+   single completion whose text feeds back verbatim; the `infer_eval`
+   fallback remains only as the readable surface for bound child errors
+   (t-1222) and degenerate empty completions.
 5. **Trace attribution gaps** — sub-infer events carry `parent_op_id:
    None`, and a failed sub-infer (InferError) contributes nothing to the
    `AgentDone` usage rollup, so attempts are undercounted.

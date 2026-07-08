@@ -896,6 +896,19 @@ async fn execute_instr(
             let prompt = resolve_prompt(config, &machine.env, prompt)?;
             let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
             let mut prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
+            // The Infer site's policy owns the tool offer (t-1346): the
+            // default is the loop's full toolset; an explicit list narrows
+            // it to that subset — an empty list offers nothing, which is
+            // how the agent loop's sub-infer child stays a bare single
+            // completion instead of being teased with tools whose calls
+            // would never be dispatched.
+            let tool_specs = match &policy.tools {
+                None => ir_tool_specs(config),
+                Some(names) => ir_tool_specs(config)
+                    .into_iter()
+                    .filter(|spec| names.contains(&spec.function.name))
+                    .collect(),
+            };
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -926,7 +939,7 @@ async fn execute_instr(
                         None => {
                             config
                                 .provider
-                                .chat(&Model(model.clone()), &ir_tool_specs(config), &prompt)
+                                .chat(&Model(model.clone()), &tool_specs, &prompt)
                                 .await
                         }
                     },
@@ -2712,6 +2725,90 @@ mod tests {
             .map(|spec| spec.function.name.clone())
             .collect();
         assert_eq!(names, vec!["shell", "infer", "remember", "recall"]);
+    }
+
+    /// The Infer site's policy owns the provider tool offer (t-1346):
+    /// default = the loop's full toolset, an explicit list = exactly that
+    /// subset, and an empty list = no tools (the sub-infer child shape —
+    /// its tool calls would never be dispatched, so it must not be offered
+    /// any).
+    #[tokio::test]
+    async fn infer_policy_toolset_controls_the_provider_offer() -> Result<()> {
+        struct ToolRecordingProvider {
+            offers: Mutex<Vec<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl ChatProvider for ToolRecordingProvider {
+            async fn chat(
+                &self,
+                _model: &Model,
+                tools: &[ToolSpec],
+                _messages: &[ChatMessage],
+            ) -> Result<Response> {
+                self.offers.lock().unwrap().push(
+                    tools
+                        .iter()
+                        .map(|spec| spec.function.name.clone())
+                        .collect(),
+                );
+                Ok(response("ok"))
+            }
+        }
+
+        let infer = |out: &str, tools: Option<Vec<String>>| Instr::Infer {
+            out: Var(out.into()),
+            model: Expr::Value(Value::String("mock".into())),
+            prompt: PromptRef::Inline(vec![ChatMessage::user(out.to_owned())]),
+            policy: crate::ir::InferPolicy {
+                tools,
+                ..Default::default()
+            },
+        };
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![
+                    infer("full", None),
+                    infer("subset", Some(vec!["infer".into()])),
+                    infer("bare", Some(vec![])),
+                ],
+                terminator: Terminator::Return {
+                    value: Expr::Value(Value::Null),
+                },
+            },
+        );
+        let machine = Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("toolset-policy".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        };
+        let provider = Arc::new(ToolRecordingProvider {
+            offers: Mutex::new(Vec::new()),
+        });
+        run_ir_sequential(&config(provider.clone()), machine).await?;
+
+        let offers = provider.offers.lock().unwrap().clone();
+        assert_eq!(
+            offers,
+            vec![
+                vec!["shell".to_owned(), "infer".to_owned()],
+                vec!["infer".to_owned()],
+                Vec::<String>::new(),
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -950,11 +950,12 @@ async fn probe_child_context_is_one_bare_user_message() -> Result<()> {
     Ok(())
 }
 
-/// The child is offered the parent's full toolset (ir_interpreter.rs
-/// passes `ir_tool_specs(config)` to EVERY Infer, including the nested
-/// one) even though a child's tool calls are never executed — and the
-/// `infer` tool schema itself gives the model no model catalog, pricing,
-/// or budget guidance for choosing a delegate.
+/// The child is offered NO tools (t-1346): it is a single completion whose
+/// tool calls would never be dispatched, so the sub-infer site declares an
+/// empty toolset (`InferPolicy.tools`, ir_agent.rs `infer_eval`) instead of
+/// the parent's full set. The `infer` tool schema itself (as advertised to
+/// the PARENT) still gives the model no model catalog, pricing, or budget
+/// guidance for choosing a delegate — that deficiency stands.
 #[tokio::test]
 async fn probe_child_toolset_and_infer_schema_guidance() -> Result<()> {
     let script = vec![
@@ -973,25 +974,30 @@ async fn probe_child_toolset_and_infer_schema_guidance() -> Result<()> {
     let prompt = vec![ChatMessage::system("system"), ChatMessage::user("go")];
     run_arm(provider.clone(), PARENT_MODEL, prompt, pricing_table()).await?;
 
-    let child_call = provider
-        .recorded_calls()
-        .into_iter()
+    let calls = provider.recorded_calls();
+    let child_call = calls
+        .iter()
         .find(|call| call.model == CHILD_MODEL)
         .expect("child call recorded");
-    let names: Vec<String> = child_call
-        .tools
-        .iter()
-        .map(|spec| spec.function.name.clone())
-        .collect();
-    // Deficiency pin: the child cannot execute tools (its tool calls are
-    // never dispatched) yet it is told shell and infer are available.
+    // Fix pin (t-1346): the child cannot execute tools (its tool calls are
+    // never dispatched), so it is offered none.
     assert!(
-        names.contains(&"shell".to_string()) && names.contains(&"infer".to_string()),
-        "child is offered the parent's toolset: {names:?}"
+        child_call.tools.is_empty(),
+        "child must be offered no tools, got {:?}",
+        child_call
+            .tools
+            .iter()
+            .map(|spec| &spec.function.name)
+            .collect::<Vec<_>>()
     );
 
-    // Deficiency pin: no model catalog / budget knobs in the infer schema.
-    let infer_spec = child_call
+    // Deficiency pin: no model catalog / budget knobs in the infer schema
+    // the PARENT is offered.
+    let parent_call = calls
+        .iter()
+        .find(|call| call.model == PARENT_MODEL)
+        .expect("parent call recorded");
+    let infer_spec = parent_call
         .tools
         .iter()
         .find(|spec| spec.function.name == "infer")
@@ -1011,11 +1017,14 @@ async fn probe_child_toolset_and_infer_schema_guidance() -> Result<()> {
 }
 
 /// t-1120 decided the sub-response TEXT is fed back, not the Response
-/// envelope — but the envelope fallback resurfaces whenever the child
-/// answers with tool calls (content empty), splicing token counts and an
-/// unexecutable tool-call JSON into the parent's context.
+/// envelope. The envelope fallback used to resurface whenever the child
+/// answered with tool calls (content empty); since t-1346 the child is
+/// offered no tools, so its response is a single text completion and the
+/// parent reads exactly that text — no usage fields, no tool-call JSON.
+/// (The `infer_eval` fallback still exists, but as the readable surface
+/// for bound child errors — see `probe_failed_child_binds_...` below.)
 #[tokio::test]
-async fn probe_tool_calling_child_leaks_the_response_envelope() -> Result<()> {
+async fn probe_child_response_feeds_back_as_bare_text() -> Result<()> {
     let script = vec![
         (
             PARENT_MODEL.to_string(),
@@ -1025,19 +1034,24 @@ async fn probe_tool_calling_child_leaks_the_response_envelope() -> Result<()> {
                 "sub question".into(),
             )]),
         ),
-        (
-            CHILD_MODEL.to_string(),
-            calls(vec![shell_call("call-child-shell", "echo hi")]),
-        ),
+        (CHILD_MODEL.to_string(), text("sub answer")),
         (PARENT_MODEL.to_string(), text("done")),
     ];
     let provider = Arc::new(MeteredProvider::new(&script));
     let prompt = vec![ChatMessage::system("system"), ChatMessage::user("go")];
     run_arm(provider.clone(), PARENT_MODEL, prompt, pricing_table()).await?;
 
-    let final_parent_prompt = provider
-        .recorded_calls()
-        .into_iter()
+    let calls = provider.recorded_calls();
+    let child_call = calls
+        .iter()
+        .find(|call| call.model == CHILD_MODEL)
+        .expect("child call recorded");
+    assert!(
+        child_call.tools.is_empty(),
+        "the child is a bare single completion: no tools offered"
+    );
+    let final_parent_prompt = calls
+        .iter()
         .rfind(|call| call.model == PARENT_MODEL)
         .expect("second parent call recorded");
     let tool_result = final_parent_prompt
@@ -1045,13 +1059,9 @@ async fn probe_tool_calling_child_leaks_the_response_envelope() -> Result<()> {
         .iter()
         .find(|message| message.role == "tool")
         .expect("infer tool result present");
-    let content = tool_result.content.as_deref().unwrap_or_default();
-    // Deficiency pin: the serialized envelope (usage fields + the child's
-    // never-executed tool call) is what the parent reads.
-    assert!(
-        content.contains("input_tokens") && content.contains("call-child-shell"),
-        "envelope fallback leaks usage + unexecuted tool calls: {content}"
-    );
+    // Fix pin (t-1346/t-1120): the parent reads the child's text verbatim,
+    // never the serialized Response envelope.
+    assert_eq!(tool_result.content.as_deref(), Some("sub answer"));
     Ok(())
 }
 
