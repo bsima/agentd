@@ -179,7 +179,7 @@ same `run_id`/`op_id`.
 | `tool.failed` | `ToolError` | `failed` | — | `duration_ms`, `name` |
 | `approval.requested` | `ApprovalRequested` | `started` | gated request payload | `kind`, `pending_id` |
 | `approval.resolved` | `ApprovalResolved` | `completed` | — | `decision`, `effect_id`, `kind`, `pending_id`, `reason`?, `resolved_by`? |
-| `run.completed` | `AgentDone` | `completed` | — | `infer_calls`?, `input_tokens`?, `output_tokens`?, `total_tokens`?, `cached_input_tokens`?, `cost_micro_usd`?, `uncosted_infer_calls`? |
+| `run.completed` | `AgentDone` | `completed` | — | `infer_calls`?, `input_tokens`?, `output_tokens`?, `total_tokens`?, `cached_input_tokens`?, `cost_micro_usd`?, `uncosted_infer_calls`?, `failed_infer_calls`? |
 | `output.validation_failed` | `Custom { name: "output_validation_failed" }` | `failed` | invalid final-output excerpt | `attempt` (1-based), `errors` (string[], capped at 8) |
 
 (`?` = present only when the runtime recorded a value.)
@@ -234,7 +234,11 @@ integer math — see `agent_core::cost`.
 - `run.completed`: rollup of every InferResult recorded in the run —
   integer sums of the per-event values (floats are never accumulated).
   `uncosted_infer_calls` counts infers recorded without cost, so a partial
-  `cost_micro_usd` total is visibly partial. `cached_input_tokens` /
+  `cost_micro_usd` total is visibly partial. `failed_infer_calls` (since
+  1.5, t-1347) counts Infer attempts that ended in `InferError` — a count
+  only, present only when nonzero: the provider error path returns no
+  Response, so a failed attempt's token usage is structurally unavailable
+  and contributes nothing to the sums. `cached_input_tokens` /
   `cost_micro_usd` are absent when no event in the run carried them; the
   whole attr group is absent for infer-less runs and traces recorded before
   1.3. `agent cost --trace <file.jsonl> [--json]` prints the same rollup
@@ -316,6 +320,15 @@ neither constrains the other today.
 
 ## Version history
 
+- **1.5** (t-1347) — additive: sub-infer attribution. `run.completed`
+  gains `failed_infer_calls` (present only when nonzero) counting Infer
+  attempts that ended in `InferError`; failed attempts carry no usage or
+  cost (the provider error path returns no Response), so the token/cost
+  sums are unchanged. Nested `infer.*` events dispatched by the agent
+  loop's `infer` tool now populate the existing `parent_op_id` field with
+  the dispatching turn Infer's `op_id` (no new field; the lineage slot was
+  always in the envelope). Wire `schema_version` stays `1` per the
+  compatibility policy.
 - **1.4** (t-1308.10) — additive: the reserved `approval.requested` /
   `approval.resolved` are now emitted (projected from the new runtime
   `ApprovalRequested`/`ApprovalResolved` events) for approval-gated effects

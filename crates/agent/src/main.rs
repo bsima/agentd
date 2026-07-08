@@ -1158,18 +1158,32 @@ impl CostReport {
         let mut report = Self::default();
         let mut run_index: BTreeMap<String, usize> = BTreeMap::new();
         for event in events {
-            let Event::InferResult {
-                run_id,
-                op_id,
-                input_tokens,
-                output_tokens,
-                total_tokens,
-                cached_input_tokens,
-                cost_micro_usd,
-                ..
-            } = event
-            else {
-                continue;
+            // Successful calls carry usage/cost; failed attempts
+            // (InferError, t-1347) carry none — the provider error path
+            // returns no Response — so they are counted, never summed.
+            let (run_id, op_id, outcome) = match event {
+                Event::InferResult {
+                    run_id,
+                    op_id,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cached_input_tokens,
+                    cost_micro_usd,
+                    ..
+                } => (
+                    run_id,
+                    op_id,
+                    Some((
+                        *input_tokens,
+                        *output_tokens,
+                        *total_tokens,
+                        *cached_input_tokens,
+                        *cost_micro_usd,
+                    )),
+                ),
+                Event::InferError { run_id, op_id, .. } => (run_id, op_id, None),
+                _ => continue,
             };
             let index = *run_index.entry(run_id.clone()).or_insert_with(|| {
                 report.runs.push(RunCostReport {
@@ -1189,13 +1203,12 @@ impl CostReport {
                 &mut run.total,
                 &mut report.total,
             ] {
-                usage.observe_infer(
-                    *input_tokens,
-                    *output_tokens,
-                    *total_tokens,
-                    *cached_input_tokens,
-                    *cost_micro_usd,
-                );
+                match outcome {
+                    Some((input, output, total, cached, cost)) => {
+                        usage.observe_infer(input, output, total, cached, cost);
+                    }
+                    None => usage.observe_infer_error(),
+                }
             }
         }
         report
@@ -1203,30 +1216,43 @@ impl CostReport {
 
     fn render(&self) -> String {
         if self.runs.is_empty() {
-            return "no InferResult events in this trace\n".to_owned();
+            return "no InferResult/InferError events in this trace\n".to_owned();
         }
         let mut out = String::new();
         for run in &self.runs {
+            // The failed column appears only when the run has failed
+            // attempts (t-1347), so all-success tables keep their shape.
+            let show_failed = run.total.failed_infer_calls > 0;
             out.push_str(&format!("Run {}\n", run.run_id));
             out.push_str(&format!(
-                "  {:<40} {:>7} {:>12} {:>12} {:>10} {:>14}\n",
+                "  {:<40} {:>7} {:>12} {:>12} {:>10} {:>14}",
                 "model", "infers", "input tok", "output tok", "cached", "cost (USD)"
             ));
-            for (model, usage) in &run.per_model {
-                out.push_str(&render_usage_row(model, usage));
+            if show_failed {
+                out.push_str(&format!(" {:>7}", "failed"));
             }
-            out.push_str(&render_usage_row("run total", &run.total));
+            out.push('\n');
+            for (model, usage) in &run.per_model {
+                out.push_str(&render_usage_row(model, usage, show_failed));
+            }
+            out.push_str(&render_usage_row("run total", &run.total, show_failed));
             if run.total.uncosted_infer_calls > 0 {
                 out.push_str(&format!(
                     "  uncosted infer calls: {} (no pricing recorded; cost total is partial)\n",
                     run.total.uncosted_infer_calls
                 ));
             }
+            if show_failed {
+                out.push_str(&format!(
+                    "  failed infer calls: {} (no usage recorded; attempts only)\n",
+                    run.total.failed_infer_calls
+                ));
+            }
             out.push('\n');
         }
         if self.runs.len() > 1 {
             out.push_str(&format!(
-                "Total: {} infer(s), {} input + {} output = {} tokens, cost {}{}\n",
+                "Total: {} infer(s), {} input + {} output = {} tokens, cost {}{}{}\n",
                 self.total.infer_calls,
                 self.total.input_tokens,
                 self.total.output_tokens,
@@ -1237,6 +1263,11 @@ impl CostReport {
                     .unwrap_or_else(|| "n/a".into()),
                 if self.total.uncosted_infer_calls > 0 {
                     format!(" ({} uncosted)", self.total.uncosted_infer_calls)
+                } else {
+                    String::new()
+                },
+                if self.total.failed_infer_calls > 0 {
+                    format!(" ({} failed)", self.total.failed_infer_calls)
                 } else {
                     String::new()
                 },
@@ -1267,9 +1298,9 @@ impl CostReport {
     }
 }
 
-fn render_usage_row(label: &str, usage: &RunUsage) -> String {
-    format!(
-        "  {:<40} {:>7} {:>12} {:>12} {:>10} {:>14}\n",
+fn render_usage_row(label: &str, usage: &RunUsage, show_failed: bool) -> String {
+    let mut row = format!(
+        "  {:<40} {:>7} {:>12} {:>12} {:>10} {:>14}",
         label,
         usage.infer_calls,
         usage.input_tokens,
@@ -1282,7 +1313,12 @@ fn render_usage_row(label: &str, usage: &RunUsage) -> String {
             .cost_micro_usd
             .map(format_micro_usd)
             .unwrap_or_else(|| "n/a".into()),
-    )
+    );
+    if show_failed {
+        row.push_str(&format!(" {:>7}", usage.failed_infer_calls));
+    }
+    row.push('\n');
+    row
 }
 
 /// JSON rendering of a rollup: the canonical integer `cost_micro_usd` plus
@@ -3291,6 +3327,66 @@ Total: 4 infer(s), 3060 input + 506 output = 3566 tokens, cost $0.019533 (1 unco
     #[test]
     fn cost_report_on_infer_less_trace_says_so() {
         let rendered = CostReport::from_events(&[]).render();
-        assert!(rendered.contains("no InferResult events"), "{rendered}");
+        assert!(
+            rendered.contains("no InferResult/InferError events"),
+            "{rendered}"
+        );
+    }
+
+    /// Failed attempts (InferError, t-1347) are counted per model and per
+    /// run — attempts only, no usage exists for them — and surface as a
+    /// `failed` column exactly when a run has any.
+    #[test]
+    fn cost_report_counts_failed_calls_and_shows_the_column_when_nonzero() {
+        let mut events = two_run_events();
+        events.push(infer_call("run-a", 9, "eval-dead-model"));
+        events.push(Event::InferError {
+            run_id: "run-a".into(),
+            op_id: 9,
+            parent_op_id: Some(1),
+            error: "model not found (404)".into(),
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        });
+
+        let report = CostReport::from_events(&events);
+        let run_a = &report.runs[0];
+        let dead = &run_a.per_model["eval-dead-model"];
+        assert_eq!(dead.failed_infer_calls, 1);
+        assert_eq!(dead.infer_calls, 0, "no InferResult, no successful call");
+        assert_eq!(dead.total_tokens, 0, "attempts carry no usage");
+        assert_eq!(run_a.total.failed_infer_calls, 1);
+        assert_eq!(report.total.failed_infer_calls, 1);
+        // The all-success run is untouched.
+        assert_eq!(report.runs[1].total.failed_infer_calls, 0);
+
+        let rendered = report.render();
+        assert!(rendered.contains("failed"), "{rendered}");
+        assert!(
+            rendered.contains("failed infer calls: 1 (no usage recorded; attempts only)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(1 failed)"), "{rendered}");
+        // run-b has no failures: its table keeps the pre-t-1347 shape.
+        let run_b_table = rendered
+            .split("Run run-b")
+            .nth(1)
+            .unwrap()
+            .split("Total:")
+            .next()
+            .unwrap();
+        assert!(
+            !run_b_table.contains("failed"),
+            "failed column must be absent for all-success runs: {run_b_table}"
+        );
+
+        // JSON follows RunUsage serialization: key present only when nonzero.
+        let json = report.to_json();
+        assert_eq!(json["total"]["failed_infer_calls"], 1);
+        assert!(json["runs"][1]["total"]
+            .as_object()
+            .unwrap()
+            .get("failed_infer_calls")
+            .is_none());
     }
 }

@@ -15,9 +15,9 @@ Each fixture task runs in two arms against the same task:
 Scores are read from the trace, never estimated: per-`InferResult` token
 usage and `cost_micro_usd` (t-1334), the `RunUsage` rollup stamped on
 `AgentDone`, and effect counts (parent-loop infers = turns, sub-infers,
-Evals, InferErrors). Parent vs sub attribution uses the effect location's
-site block, because the trace carries no parent/child linkage (see
-findings).
+Evals, InferErrors). Parent vs sub attribution uses `parent_op_id`
+(t-1347): sub-infer events carry the dispatching turn Infer's op_id,
+parent-loop events carry none.
 
 ## Fixtures
 
@@ -68,7 +68,7 @@ duplication and per-turn history re-send — not invented constants.
 One row per (fixture, arm): `turns` (parent-loop infer calls), `sub`
 (nested infer calls), `evals`, `errs` (InferErrors), token totals from the
 `AgentDone` rollup, `cost` (total micro-USD as dollars), `parent$`/`sub$`
-(cost attributed by effect site), and `ok` (final answer contains the
+(cost attributed by `parent_op_id` lineage), and `ok` (final answer contains the
 fixture's required needles). The `->` verdict line names the cost winner,
 the ratio, and the structural reason.
 
@@ -104,9 +104,14 @@ quality, but because of mechanism structure:
    single completion whose text feeds back verbatim; the `infer_eval`
    fallback remains only as the readable surface for bound child errors
    (t-1222) and degenerate empty completions.
-5. **Trace attribution gaps** — sub-infer events carry `parent_op_id:
-   None`, and a failed sub-infer (InferError) contributes nothing to the
-   `AgentDone` usage rollup, so attempts are undercounted.
+5. **Fixed (t-1347).** Trace attribution gaps: sub-infer events used to
+   carry `parent_op_id: None`, and a failed sub-infer (InferError)
+   contributed nothing to the `AgentDone` usage rollup, so attempts were
+   undercounted. Sub-infer InferCall/InferResult/InferError events now
+   carry the dispatching parent Infer's op_id, and the rollup counts
+   failed attempts in `failed_infer_calls` (attempts only — the provider
+   error path returns no Response, so their token usage is structurally
+   unavailable).
 
 Each finding is pinned by a `probe_*` test in the harness; fixing the
 mechanism should flip the corresponding probe.

@@ -113,6 +113,7 @@ pub fn price_response(response: &mut crate::op::Response, table: &PricingTable, 
 /// for a full total.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunUsage {
+    /// Successful Infer calls (one per recorded `InferResult`).
     pub infer_calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -122,6 +123,23 @@ pub struct RunUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micro_usd: Option<u64>,
     pub uncosted_infer_calls: u64,
+    /// Failed Infer attempts (one per `InferError`, t-1347): calls that
+    /// dispatched but ended in a terminal error, so they produced no
+    /// `InferResult` and contribute nothing to the token/cost sums above.
+    /// This is a count only: the provider error path returns a bare error
+    /// with no `Response`, so any tokens the provider consumed before
+    /// failing are structurally unavailable — never guessed, never zeroed
+    /// into the sums. Absent from JSON when 0, so pre-t-1347 rollups stay
+    /// byte-identical and deserialize to 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed_infer_calls: u64,
+}
+
+/// serde helper: skip a count field when it is 0 (the field's absence and
+/// zero are the same statement for counts, unlike the Option cost fields).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 impl RunUsage {
@@ -147,9 +165,16 @@ impl RunUsage {
         }
     }
 
-    /// True when no InferResult has been folded in (nothing to report).
+    /// Fold one InferError into the rollup (t-1347). A count only — see
+    /// [`RunUsage::failed_infer_calls`] for why no usage rides along.
+    pub fn observe_infer_error(&mut self) {
+        self.failed_infer_calls += 1;
+    }
+
+    /// True when no Infer outcome (result or error) has been folded in
+    /// (nothing to report).
     pub fn is_empty(&self) -> bool {
-        self.infer_calls == 0
+        self.infer_calls == 0 && self.failed_infer_calls == 0
     }
 }
 
@@ -226,6 +251,7 @@ mod tests {
         usage.observe_infer(10, 5, 15, Some(4), Some(100));
         usage.observe_infer(20, 5, 25, None, Some(50));
         usage.observe_infer(1, 1, 2, None, None);
+        usage.observe_infer_error();
         assert_eq!(usage.infer_calls, 3);
         assert_eq!(usage.input_tokens, 31);
         assert_eq!(usage.output_tokens, 11);
@@ -236,6 +262,9 @@ mod tests {
         // the total is visibly partial rather than silently low.
         assert_eq!(usage.cost_micro_usd, Some(150));
         assert_eq!(usage.uncosted_infer_calls, 1);
+        // The failed attempt is counted apart from the successes and adds
+        // nothing to the token/cost sums (no usage exists for it).
+        assert_eq!(usage.failed_infer_calls, 1);
     }
 
     #[test]
@@ -247,6 +276,25 @@ mod tests {
         let json = serde_json::to_string(&usage).unwrap();
         assert!(!json.contains("cached_input_tokens"), "{json}");
         assert!(!json.contains("cost_micro_usd"), "{json}");
+        // No failures -> no key: pre-t-1347 rollups stay byte-identical.
+        assert!(!json.contains("failed_infer_calls"), "{json}");
+    }
+
+    /// A run whose every Infer failed still has something to report (the
+    /// attempts), the count round-trips, and pre-t-1347 rollup JSON (no
+    /// `failed_infer_calls` key) deserializes to 0.
+    #[test]
+    fn run_usage_failed_calls_round_trip_and_back_compat() {
+        let mut usage = RunUsage::default();
+        usage.observe_infer_error();
+        assert!(!usage.is_empty(), "failed attempts are reportable");
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"failed_infer_calls\":1"), "{json}");
+        assert_eq!(serde_json::from_str::<RunUsage>(&json).unwrap(), usage);
+
+        let old = r#"{"infer_calls":2,"input_tokens":1,"output_tokens":1,"total_tokens":2,"uncosted_infer_calls":0}"#;
+        let usage: RunUsage = serde_json::from_str(old).unwrap();
+        assert_eq!(usage.failed_infer_calls, 0);
     }
 
     #[test]

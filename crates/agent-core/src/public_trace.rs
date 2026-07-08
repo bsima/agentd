@@ -642,6 +642,14 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
                     "uncosted_infer_calls".into(),
                     usage.uncosted_infer_calls.into(),
                 );
+                // Failed attempts (schema 1.5, t-1347): present only when
+                // nonzero, mirroring the rollup's own serialization —
+                // pre-t-1347 traces and all-success runs project without
+                // the key.
+                if usage.failed_infer_calls > 0 {
+                    out.attrs
+                        .insert("failed_infer_calls".into(), usage.failed_infer_calls.into());
+                }
             }
             Some(out)
         }
@@ -1285,6 +1293,7 @@ mod tests {
                 cached_input_tokens: None,
                 cost_micro_usd: Some(132),
                 uncosted_infer_calls: 1,
+                failed_infer_calls: 0,
             }),
             timestamp: ts,
         };
@@ -1301,6 +1310,24 @@ mod tests {
         );
         // Never-reported cached tokens stay absent, not zero.
         assert_eq!(public.attrs.get("cached_input_tokens"), None);
+        // All-success runs project without the failed-attempts key
+        // (schema 1.5, t-1347) ...
+        assert_eq!(public.attrs.get("failed_infer_calls"), None);
+
+        // ... and runs with failed attempts carry the count.
+        let with_failures = Event::AgentDone {
+            run_id: "run".into(),
+            usage: Some(crate::cost::RunUsage {
+                failed_infer_calls: 3,
+                ..Default::default()
+            }),
+            timestamp: ts,
+        };
+        let public = public_event(&with_failures).expect("projects");
+        assert_eq!(
+            public.attrs.get("failed_infer_calls"),
+            Some(&Value::from(3))
+        );
 
         // A pre-t-1334 / infer-less AgentDone projects with no attrs.
         let bare = Event::AgentDone {

@@ -13,10 +13,9 @@
 //! token usage and `cost_micro_usd` (stamped from a fixture pricing table,
 //! t-1334), the `RunUsage` rollup on `AgentDone`, and effect counts
 //! (Infer/Eval/InferError). Parent-loop infers are distinguished from
-//! sub-infers by the effect location's site block (the loop's entry Infer
-//! lives at block 0; the `infer_eval` sub-infer lives elsewhere) because the
-//! trace carries no parent/child linkage — see the harness findings in
-//! evals/infer-infer/README.md.
+//! sub-infers by `parent_op_id` (t-1347): sub-infer events carry the
+//! dispatching turn Infer's op_id, parent-loop events carry none — see the
+//! harness findings in evals/infer-infer/README.md.
 //!
 //! Offline (the default, credential-free, deterministic): both arms run
 //! against a scripted provider that meters usage from the *actual prompts*
@@ -37,10 +36,9 @@
 
 use agent_core::FinishReason;
 use agent_core::{
-    agent_loop_ir, estimate_tokens, run_ir_sequential, BlockId, ChatMessage, ChatProvider,
-    EffectLocation, EvalConfig, Event, GcMode, GcTiming, Model, PassiveHydrationConfig, Pricing,
-    PricingTable, ProviderClient, ProviderConfig, Response, RunUsage, SeqConfig, SourceRegistry,
-    ToolCall, TraceLogger,
+    agent_loop_ir, estimate_tokens, run_ir_sequential, ChatMessage, ChatProvider, EvalConfig,
+    Event, GcMode, GcTiming, Model, PassiveHydrationConfig, Pricing, PricingTable, ProviderClient,
+    ProviderConfig, Response, RunUsage, SeqConfig, SourceRegistry, ToolCall, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -641,16 +639,6 @@ async fn run_arm(
     Ok((content, events))
 }
 
-/// A parent-loop Infer executes at the program's entry block; the nested
-/// infer-tool Infer executes at the `infer_eval` block. The trace carries
-/// no parent/child linkage (`parent_op_id` is always None from the IR
-/// interpreter), so the effect site is the only way to attribute a call —
-/// a harness-level workaround for a mechanism gap.
-fn is_sub_infer(effect: Option<&EffectLocation>) -> Result<bool> {
-    let location = effect.ok_or_else(|| anyhow!("IR InferCall must carry an effect location"))?;
-    Ok(location.site.block != BlockId(0))
-}
-
 fn metrics_from_events(
     arm: Arm,
     events: &[Event],
@@ -674,8 +662,26 @@ fn metrics_from_events(
     let mut done_usage: Option<RunUsage> = None;
     for event in events {
         match event {
-            Event::InferCall { op_id, effect, .. } => {
-                let sub = is_sub_infer(effect.as_deref())?;
+            // A sub-infer carries the dispatching parent Infer's op_id as
+            // parent_op_id (t-1347); parent-loop infers carry none. The
+            // linkage must point at a parent-loop InferCall already seen —
+            // attribution is structural, not effect-site decoding.
+            Event::InferCall {
+                op_id,
+                parent_op_id,
+                ..
+            } => {
+                let sub = match parent_op_id {
+                    Some(parent) => {
+                        anyhow::ensure!(
+                            sub_by_op.get(parent) == Some(&false),
+                            "sub-infer {op_id} must link to a parent-loop InferCall, \
+                             got parent_op_id {parent}"
+                        );
+                        true
+                    }
+                    None => false,
+                };
                 sub_by_op.insert(*op_id, sub);
                 if sub {
                     metrics.sub_infers += 1;
@@ -857,12 +863,18 @@ async fn infer_infer_cost_matrix() -> Result<()> {
                 "{}: per-class cost split must sum to the rollup",
                 fixture.name
             );
-            // Failed calls have no InferResult, so the rollup counts only
-            // successes (a measurement gap — see README findings).
+            // Failed calls have no InferResult, so the success count
+            // excludes them — and since t-1347 the attempts are counted
+            // apart in failed_infer_calls, so nothing vanishes.
             assert_eq!(
                 metrics.usage.infer_calls as usize,
                 metrics.parent_infers + metrics.sub_infers - metrics.infer_errors,
-                "{}: rollup counts successful infers only",
+                "{}: infer_calls counts successful infers",
+                fixture.name
+            );
+            assert_eq!(
+                metrics.usage.failed_infer_calls as usize, metrics.infer_errors,
+                "{}: failed attempts are counted in the rollup",
                 fixture.name
             );
         }
@@ -1066,11 +1078,13 @@ async fn probe_child_response_feeds_back_as_bare_text() -> Result<()> {
 }
 
 /// A failed sub-infer emits InferError (no InferResult), binds as a
-/// recoverable tool value (t-1222) — and disappears from the AgentDone
-/// usage rollup entirely: attempts and their provider-side cost are
-/// unmeasured.
+/// recoverable tool value (t-1222) — and since t-1347 the attempt is
+/// counted in the AgentDone rollup (`failed_infer_calls`) and the
+/// InferError carries the dispatching parent's op_id. Token usage for the
+/// attempt remains structurally unavailable (the provider error path
+/// returns no Response), so it is a count, never a sum.
 #[tokio::test]
-async fn probe_failed_child_binds_but_vanishes_from_usage() -> Result<()> {
+async fn probe_failed_child_binds_and_counts_in_usage() -> Result<()> {
     let script = vec![
         (
             PARENT_MODEL.to_string(),
@@ -1116,10 +1130,34 @@ async fn probe_failed_child_binds_but_vanishes_from_usage() -> Result<()> {
         metrics.sub_infers, 1,
         "the attempt IS in the trace as a call"
     );
-    // Deficiency pin: the rollup only folds InferResults, so the failed
-    // attempt contributes zero calls/tokens/cost to AgentDone usage.
+    // Fix pin (t-1347): successes and failed attempts are counted apart —
+    // the failed attempt no longer vanishes from AgentDone usage. Its
+    // tokens stay unmeasured (no Response exists to read them from).
     assert_eq!(metrics.usage.infer_calls, 2);
+    assert_eq!(metrics.usage.failed_infer_calls, 1);
     assert_eq!(metrics.usage.uncosted_infer_calls, 0);
+
+    // Fix pin (t-1347): the InferError is attributed to its dispatching
+    // parent Infer via parent_op_id, same as a successful sub-infer.
+    let first_parent_op = events
+        .iter()
+        .find_map(|event| match event {
+            Event::InferCall {
+                op_id,
+                parent_op_id: None,
+                ..
+            } => Some(*op_id),
+            _ => None,
+        })
+        .expect("parent-loop InferCall present");
+    let error_parent = events
+        .iter()
+        .find_map(|event| match event {
+            Event::InferError { parent_op_id, .. } => Some(*parent_op_id),
+            _ => None,
+        })
+        .expect("InferError present");
+    assert_eq!(error_parent, Some(first_parent_op));
     Ok(())
 }
 

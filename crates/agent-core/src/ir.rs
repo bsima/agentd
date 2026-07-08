@@ -425,6 +425,12 @@ pub struct InferPolicy {
     /// sub-infer child dispatched by the agent loop's `infer` tool,
     /// t-1346). The dispatch *site* owns the set, so granting a child an
     /// explicit toolset later is a value change here, not a schema change.
+    ///
+    /// A `Some` toolset also marks the Infer as a *dispatched child* call
+    /// (the loop's own turn Infers always use the default): the
+    /// interpreter stamps such calls with the `parent_op_id` of the most
+    /// recent default-toolset Infer, so traces carry the parent/child
+    /// linkage (t-1347).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
 }

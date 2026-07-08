@@ -730,6 +730,13 @@ pub async fn run_ir_steps_with_gc(
     validate_program(&machine.program)?;
     let program_hash = program_hash(&machine.program)?;
     let mut instructions_executed = 0usize;
+    // The op_id of the most recent default-toolset ("turn") Infer: dispatched
+    // child Infers (toolset overridden, e.g. the agent loop's sub-infer) are
+    // stamped with it as parent_op_id, so traces carry the parent/child
+    // linkage (t-1347). Runtime-only lineage — not part of the checkpoint, so
+    // a child re-dispatched after a mid-turn approval pause resumes without a
+    // parent link (op_id counters restart with the logger anyway).
+    let mut last_turn_infer_op_id: Option<u64> = None;
 
     loop {
         if max_instructions.is_some_and(|max| instructions_executed >= max) {
@@ -764,6 +771,7 @@ pub async fn run_ir_steps_with_gc(
                 ir_replay,
                 instr,
                 gc_state,
+                &mut last_turn_infer_op_id,
             )
             .await?
             {
@@ -874,6 +882,7 @@ async fn execute_instr(
     ir_replay: Option<&IrReplayTrace>,
     instr: Instr,
     gc_state: &mut GcState,
+    last_turn_infer_op_id: &mut Option<u64>,
 ) -> Result<Option<crate::approval::ApprovalRequest>> {
     match instr {
         Instr::Let { out, expr } => {
@@ -910,12 +919,23 @@ async fn execute_instr(
                     .collect(),
             };
             let op_id = config.trace.next_op_id();
+            // Trace lineage (t-1347): an overridden toolset marks a
+            // dispatched child call (the loop's own turn Infers use the
+            // default), which carries the dispatching turn Infer's op_id
+            // as parent_op_id on all three of its events. Turn Infers
+            // update the cursor and carry no parent themselves.
+            let parent_op_id = if policy.tools.is_some() {
+                *last_turn_infer_op_id
+            } else {
+                *last_turn_infer_op_id = Some(op_id);
+                None
+            };
             config
                 .trace
                 .emit(&Event::InferCall {
                     run_id: config.trace.run_id().into(),
                     op_id,
-                    parent_op_id: None,
+                    parent_op_id,
                     model: model.clone(),
                     prompt: config.trace_full_payloads.then(|| prompt.clone()),
                     prompt_preview: prompt_preview(&prompt),
@@ -969,7 +989,7 @@ async fn execute_instr(
                         .emit(&Event::InferError {
                             run_id: config.trace.run_id().into(),
                             op_id,
-                            parent_op_id: None,
+                            parent_op_id,
                             error: format!("{err:#}"),
                             duration_ms: millis_u64(started.elapsed()),
                             timestamp: Utc::now(),
@@ -997,7 +1017,7 @@ async fn execute_instr(
                 .emit(&Event::InferResult {
                     run_id: config.trace.run_id().into(),
                     op_id,
-                    parent_op_id: None,
+                    parent_op_id,
                     response: Some(response.clone()),
                     response_preview: response_preview(&response),
                     input_tokens: response.input_tokens,

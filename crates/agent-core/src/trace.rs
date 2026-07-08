@@ -1154,11 +1154,12 @@ pub struct TraceLogger {
     sinks: Arc<Vec<Arc<dyn TraceSink>>>,
     context_env: TraceContextEnv,
     /// Running usage/cost rollup (t-1334): every InferResult emitted through
-    /// this logger (or a clone) is folded in, and an `AgentDone` emitted
-    /// without a usage payload is stamped with the totals. Sums are exact
-    /// integer arithmetic over the recorded per-event values, so replayed
-    /// runs (which re-emit the recorded usage/cost) reproduce the original
-    /// rollup exactly.
+    /// this logger (or a clone) is folded in, every InferError is counted
+    /// (`failed_infer_calls`, t-1347 — failed attempts must not vanish from
+    /// the rollup), and an `AgentDone` emitted without a usage payload is
+    /// stamped with the totals. Sums are exact integer arithmetic over the
+    /// recorded per-event values, so replayed runs (which re-emit the
+    /// recorded usage/cost) reproduce the original rollup exactly.
     usage: Arc<Mutex<crate::cost::RunUsage>>,
 }
 
@@ -1223,11 +1224,12 @@ impl TraceLogger {
         Ok(())
     }
 
-    /// Fold InferResult usage/cost into the run rollup; stamp the rollup
-    /// onto an `AgentDone` that does not already carry one. Returns the
-    /// replacement event when the input event was enriched. AgentDone stays
-    /// untouched when the run recorded no InferResults (absent means
-    /// absent) or when the caller supplied its own rollup.
+    /// Fold InferResult usage/cost (and the InferError attempt count,
+    /// t-1347) into the run rollup; stamp the rollup onto an `AgentDone`
+    /// that does not already carry one. Returns the replacement event when
+    /// the input event was enriched. AgentDone stays untouched when the
+    /// run recorded no Infer outcomes at all (absent means absent) or when
+    /// the caller supplied its own rollup.
     fn fold_usage(&self, event: &Event) -> Option<Event> {
         match event {
             Event::InferResult {
@@ -1245,6 +1247,10 @@ impl TraceLogger {
                     *cached_input_tokens,
                     *cost_micro_usd,
                 );
+                None
+            }
+            Event::InferError { .. } => {
+                self.usage.lock().unwrap().observe_infer_error();
                 None
             }
             Event::AgentDone {
@@ -1617,14 +1623,26 @@ mod tests {
         logger.emit(&infer_result(1, Some(4), Some(100))).await?;
         // A clone shares the rollup, like par branches share the logger.
         logger.clone().emit(&infer_result(2, None, None)).await?;
+        // A failed attempt (t-1347) is counted, not summed: InferError
+        // carries no usage (the provider error path has none to record).
+        logger
+            .emit(&Event::InferError {
+                run_id: "run".into(),
+                op_id: 3,
+                parent_op_id: Some(2),
+                error: "model not found".into(),
+                duration_ms: 1,
+                timestamp: Utc::now(),
+            })
+            .await?;
         logger.emit(&done_event("run")).await?;
 
         let events = recording.events.lock().unwrap();
         let Event::AgentDone {
             usage: Some(usage), ..
-        } = &events[2]
+        } = &events[3]
         else {
-            panic!("AgentDone missing usage rollup: {:?}", events[2]);
+            panic!("AgentDone missing usage rollup: {:?}", events[3]);
         };
         assert_eq!(
             *usage,
@@ -1636,6 +1654,7 @@ mod tests {
                 cached_input_tokens: Some(4),
                 cost_micro_usd: Some(100),
                 uncosted_infer_calls: 1,
+                failed_infer_calls: 1,
             }
         );
         Ok(())
