@@ -157,23 +157,16 @@ impl Arm {
         matches!(self, Self::ToolUnprompted | Self::ToolGuided)
     }
 
-    fn system_prompt(&self, child_model: &str) -> String {
+    fn system_prompt(&self, _child_model: &str) -> String {
         let base = "You are a capable software agent with a shell tool, working in the \
                     current directory. Be efficient: use the fewest steps that complete \
                     the task correctly, then give the final answer.";
         match self {
-            Self::Baseline | Self::ToolUnprompted => base.to_string(),
-            Self::ToolGuided => format!(
-                "{base}\n\nYou can delegate subtasks to a cheaper model by calling the \
-                 `infer` tool with model \"{child_model}\". Delegate when a subtask is \
-                 generation-heavy or requires reading or digesting bulky material — pass \
-                 that material by reference via `context_refs` (the ids of prior tool \
-                 calls from this conversation) instead of pasting it into the prompt. Do \
-                 NOT delegate direct questions you can already answer: delegation costs \
-                 a full round-trip. Child prompts must be self-contained — the child \
-                 sees only the referenced material and your prompt, never this \
-                 conversation."
-            ),
+            // The guided arm's delegation text is no longer handwritten
+            // here: it is the SHIPPED runtime-guidance fragment (t-1359),
+            // delivered by the runtime itself (see Arm::guidance) — the
+            // arms measure exactly what ships.
+            Self::Baseline | Self::ToolUnprompted | Self::ToolGuided => base.to_string(),
             Self::SubagentProcess => format!(
                 "{base}\n\nYou can delegate subtasks by launching a child agent through \
                  the shell tool: run `agent --model {PROCESS_CHILD_ALIAS} 'CHILD \
@@ -185,6 +178,28 @@ impl Arm {
                  answer: a child process costs a full agent run. Child prompts must be \
                  self-contained — the child cannot see this conversation."
             ),
+        }
+    }
+
+    /// Runtime-guidance config per arm (t-1359). The guided arm runs the
+    /// SHIPPED fragment default-on, with the interim delegate catalog
+    /// naming the eval's child model (the same id the old handwritten
+    /// text named) — so the arm measures exactly what a deployment that
+    /// supplies its delegate catalog gets. Every other arm keeps guidance
+    /// off: baseline/tool-unprompted measure the runtime WITHOUT its
+    /// guidance layer (that contrast is this eval's question), and the
+    /// subagent-process arm keeps its handwritten process-delegation
+    /// prompt, which the fragment does not cover.
+    fn guidance(&self, child_model: &str) -> agent_core::RuntimeGuidance {
+        match self {
+            Self::ToolGuided => agent_core::RuntimeGuidance {
+                enabled: true,
+                delegate_models: vec![agent_core::DelegateModel {
+                    id: child_model.to_string(),
+                    pricing: pricing_table().get(child_model).copied(),
+                }],
+            },
+            _ => agent_core::RuntimeGuidance::disabled(),
         }
     }
 }
@@ -498,12 +513,13 @@ async fn run_cell(
     prompt: Vec<ChatMessage>,
     workdir: &Path,
     env: BTreeMap<String, String>,
+    guidance: agent_core::RuntimeGuidance,
 ) -> Result<CellRun> {
     let trace_path = std::env::temp_dir().join(format!("delegation-eval-{}.jsonl", Uuid::new_v4()));
     let trace = TraceLogger::new(Uuid::new_v4().to_string(), trace_path.clone());
     let config = SeqConfig {
         approvals: Default::default(),
-        guidance: Default::default(),
+        guidance,
         tools: Default::default(),
         provider,
         hydration: SourceRegistry::new(),
@@ -908,6 +924,7 @@ async fn replay_cell(path: &Path, fixture: &Fixture) -> Result<(CellMeta, CellMe
         prompt,
         &workdir,
         BTreeMap::new(),
+        arm.guidance(&meta.child_model),
     )
     .await
     .with_context(|| format!("replaying {}", path.display()))?;
@@ -963,9 +980,17 @@ async fn record_missing_cells(dir: &Path) -> Result<()> {
             // themselves); other arms' shell children get none.
             let key_for_children = (arm == Arm::SubagentProcess).then_some(api_key.as_str());
             let env = child_env(&bin_dir, &child_home, key_for_children)?;
-            let run = run_cell(provider, None, &parent_model, prompt, &workdir, env)
-                .await
-                .with_context(|| format!("online cell {} / {}", fixture.name, arm.label()))?;
+            let run = run_cell(
+                provider,
+                None,
+                &parent_model,
+                prompt,
+                &workdir,
+                env,
+                arm.guidance(&child_model),
+            )
+            .await
+            .with_context(|| format!("online cell {} / {}", fixture.name, arm.label()))?;
             let (child_runs, child_cost, child_tokens) = sweep_child_traces(&child_home)?;
             let _ = fs::remove_dir_all(&workdir);
             let _ = fs::remove_dir_all(&child_home);
@@ -1200,6 +1225,7 @@ async fn plumbing_counts_infer_delegation_and_flags() -> Result<()> {
         ],
         &workdir,
         BTreeMap::new(),
+        agent_core::RuntimeGuidance::disabled(),
     )
     .await?;
     let _ = fs::remove_dir_all(&workdir);
@@ -1255,6 +1281,7 @@ async fn plumbing_process_delegation_runs_agent_binary() -> Result<()> {
         vec![ChatMessage::system("plumbing"), ChatMessage::user("go")],
         &workdir,
         child_env(&bin_dir, &child_home, None)?,
+        agent_core::RuntimeGuidance::disabled(),
     )
     .await?;
     let _ = fs::remove_dir_all(&workdir);

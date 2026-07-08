@@ -26,7 +26,7 @@ pinned by `fixture_tasks_never_mention_delegation`):
 |---|---|---|
 | `baseline` | hidden (provider-side filter) | none |
 | `tool-unprompted` | advertised | none |
-| `tool-guided` | advertised | when to delegate (generation-heavy, bulky material via `context_refs`), when NOT to (direct questions), self-contained child prompts, the child model id |
+| `tool-guided` | advertised | the SHIPPED runtime-guidance fragment (t-1359, [docs/GUIDANCE.md](../../docs/GUIDANCE.md) §4): the runtime's own delegation + cost blocks, delivered as its Developer prompt section, plus the interim delegate catalog naming the child model id and rates. Originally a handwritten paragraph with the same content; since t-1359 the arm measures exactly what ships |
 | `subagent-process` | hidden | delegate via the shell tool: `agent --model eval-child '<prompt>'` — a FULL child agent (own loop, own shell tool) |
 
 **Fixtures** (task classes):
@@ -91,10 +91,66 @@ stdin (the runtime's Eval effect already does).
 
 ## Results
 
-Recorded 2026-07-08. Parent `anthropic/claude-haiku-4.5` ($1/$5 per Mtok),
-child `openai/gpt-4o-mini` ($0.15/$0.60), via OpenRouter, provider-default
-temperature, one sample per cell. Whole matrix + probe: **$0.14**.
-Offline replay reproduces this table exactly (asserted per cell).
+**Current recordings (t-1359 re-record, shipped guidance).** Re-recorded
+2026-07-08 after the runtime-guidance delivery shipped: all arms see the
+fattened tool descriptions (t-1359 step 1), and the guided arm's system
+prompt is no longer handwritten — the runtime delivers its shipped
+fragment (delegation + cost blocks + delegate catalog) as its own
+Developer section, whose content hash rides every InferCall's `prompt_ir`
+trace event in these recordings. Same models, provider, and
+one-sample-per-cell caveats as the first recording. Whole matrix:
+**~$0.15**. Offline replay reproduces this table exactly (asserted per
+cell).
+
+```
+fixture              arm               turns  sub  proc evals errs   in_tok  out_tok       cost  wall_s  ok  flag
+doc-synthesis        baseline              2    0     0     3    0     6287      482  $0.008697     4.6 yes  -
+doc-synthesis        tool-unprompted       2    0     0     3    0     6913      463  $0.009228     5.2 yes  missed-op
+doc-synthesis        tool-guided           2    0     0     3    0     7688      464  $0.010008     4.6 yes  missed-op
+doc-synthesis        subagent-process      2    0     0     3    0     6542      485  $0.008967     4.7 yes  missed-op
+dead-end-debugging   baseline              3    0     0     2    0     2938      295  $0.004413     4.9 yes  -
+dead-end-debugging   tool-unprompted       6    0     0     5    0     8965      455  $0.011240     9.5 yes  -
+dead-end-debugging   tool-guided           6    0     0     5    0    11310      408  $0.013350     7.5 yes  -
+dead-end-debugging   subagent-process      3    0     0     2    0     3162      238  $0.004352     4.1 yes  -
+generation-offload   baseline              2    0     0     1    0     4282     2350  $0.016032    22.2 yes  -
+generation-offload   tool-unprompted       2    0     0     1    0     4672     2205  $0.015697    20.0 yes  missed-op
+generation-offload   tool-guided           2    1     0     0    0     4409     2214  $0.011157    27.0 yes  -
+generation-offload   subagent-process      2    0     0     1    0     4526     2451  $0.016781    22.0 yes  missed-op
+restraint-direct     baseline              2    0     0     1    0     1381       69  $0.001726     2.3 yes  -
+restraint-direct     tool-unprompted       1    0     0     0    0      945        5  $0.000970     0.9 yes  -
+restraint-direct     tool-guided           1    0     0     0    0     1332        5  $0.001357     0.9 yes  -
+restraint-direct     subagent-process      1    0     0     0    0      757        5  $0.000782     1.1 yes  -
+count-in-files       baseline              2    0     0     1    0     1451       93  $0.001916     2.3 yes  -
+count-in-files       tool-unprompted       2    0     0     1    0     2088      100  $0.002588     2.9 yes  -
+count-in-files       tool-guided           2    0     0     1    0     2874      112  $0.003434     2.3 yes  -
+count-in-files       subagent-process      2    0     0     1    0     1705       93  $0.002170     3.5 yes  -
+```
+
+**Shipped-text delta, against the promotion gate (docs/GUIDANCE.md §5):**
+same behavioral profile as the handwritten arm. (a) The guided arm
+delegated exactly where the economics pay — `generation-offload`, one
+sub-infer with the correct child id and a clean self-contained child
+prompt — and came out **1.41x cheaper than unprompted** and 1.44x cheaper
+than baseline (first recording: 2.26x/1.5x; single-sample,
+provider-default temperature, so deltas move between recordings) while
+remaining the slowest cell (27.0s: the serialized child round-trip,
+unchanged). (b) Zero `OVER-DELEGATED` flags anywhere; the guided arm
+answered `restraint-direct` in one turn with no tool use. (c) Offline
+replay reproduces the table. New observation for the t-1345 catalog case:
+`tool-unprompted` now sees the fattened `infer` description (descriptions
+ship to every arm) and STILL made zero delegations — description-level
+guidance alone did not flip unprompted delegation, consistent with the
+missing model catalog being the root cause. It did, however, answer the
+restraint fixture in one turn with no tools, which the old unprompted arm
+did not — weak evidence the description text alone teaches some economy.
+
+**First recording (handwritten guided arm; superseded).** Recorded
+2026-07-08 before t-1359 shipped; kept for the findings below, but the
+recordings themselves were replaced by the re-record (offline replay runs
+against the current table above). Parent `anthropic/claude-haiku-4.5`
+($1/$5 per Mtok), child `openai/gpt-4o-mini` ($0.15/$0.60), via
+OpenRouter, provider-default temperature, one sample per cell. Whole
+matrix + probe: **$0.14**.
 
 ```
 fixture              arm               turns  sub  proc evals errs   in_tok  out_tok       cost  wall_s  ok  flag
@@ -131,10 +187,12 @@ decoupled from parent inclination, recorded in
 ERROR lines>'` → exit ok, answer "…is 7." (correct), **$0.000182, 922
 tokens, 2.8s wall**, doing real shell work in its own loop.
 
-## Findings (direct answers, from the data above)
+## Findings (direct answers, from the FIRST recording's data)
 
 Caveats first: one parent model, one sample per cell, provider-default
 temperature — this is a first behavioral reading, not a distribution.
+(The t-1359 re-record above reproduced the same behavioral profile with
+the shipped guidance text; its deltas are noted inline there.)
 
 1. **Used at all?** Essentially no. Across 20 cells there was exactly ONE
    delegation: `tool-guided` on `generation-offload`. Unprompted, the model

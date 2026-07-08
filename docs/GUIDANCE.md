@@ -109,6 +109,13 @@ the shipped fragment as the `tool-guided` arm's system prompt (replacing
 the handwritten text) and require the same behavioral profile — delegation
 on generation-offload with correct child id and `context_refs`, zero
 `OVER-DELEGATED` flags. Recording cost ~$0.14 per matrix run.
+**Done (t-1359):** the re-recorded matrix
+([evals/delegation/README.md](../evals/delegation/README.md), "Current
+recordings") reproduced the profile with the shipped text — one delegation,
+exactly on generation-offload, correct child id, self-contained child
+prompt, 1.41x cheaper than unprompted, zero `OVER-DELEGATED`, offline
+replay asserted. The recordings carry the fragment's section hash on every
+InferCall, so the validated text is pinned byte-exactly.
 
 **Mechanism gaps guidance can't paper over:**
 
@@ -399,7 +406,7 @@ needles.
 
 | pattern | one-line guidance | validation status |
 |---|---|---|
-| Delegation | Delegate generation-heavy/bulky-digest subtasks via `infer` + `context_refs`; never direct questions; costs latency | **Validated** (t-1354: 2.26x, zero over-delegation); re-record with shipped text |
+| Delegation | Delegate generation-heavy/bulky-digest subtasks via `infer` + `context_refs`; never direct questions; costs latency | **Validated with shipped text** (t-1354: 2.26x; t-1359 re-record: 1.41x, zero over-delegation, replay asserted) |
 | Store/Retrieve discipline | Save distilled load-bearing intermediates via `remember` as produced; `recall` instead of re-deriving | Not yet evaluated; new behavioral eval specified above |
 | Eval→Infer chaining | Digest bulky command output by reference (`context_refs`), never by re-reading into your own tokens | Mechanics validated (t-1342, 1.6x); behavioral arm pending |
 | GC awareness | Context is a managed window; extract-or-`remember` on sight; `[frame: ...]` = body gone | Not yet evaluated; arms belong to the GC behavioral eval |
@@ -740,6 +747,8 @@ already filed from t-1354).
    recording run was **$0.14** for the whole matrix + probe
    (haiku-4.5 parent / gpt-4o-mini child via OpenRouter); this is one
    more matrix, same order: **~$0.15**.
+   **Done with t-1359** (~$0.15; see §2.1's validation note and the eval
+   README's shipped-text delta).
 2. **Cost/batching block** — piggybacks on the same matrix (one more arm
    column over the existing five fixtures: +5 cells, **~$0.05**). Metric:
    turn count and cost deltas at unchanged correctness; batched
