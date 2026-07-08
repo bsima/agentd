@@ -426,11 +426,14 @@ cheapest, so cost dashboards would read it as a win. Recommendation
   user message. The fix is mechanical and semantic already has it: hard-
   protect system + last-user in ring/stack (then re-run these 8 cells,
   ~$0.30, to see whether guided-stack becomes defensible).
+  **Done — t-1367; re-run below.**
 - Gate the fragment on budget headroom: delivering ~700 tokens of
   operations prose into a <=2k-token window converts guidance into
   pressure. A simple rule (skip or ship a compact variant when the
   fragment exceeds a few percent of `context_budget`) would have spared
   every guided failure here without touching real deployments.
+  **Done — t-1368 (5%/15% thresholds; the §2.2 memory block was also
+  demoted to draft per the promotion gate).**
 - On today's evidence the behavioral default is mark-sweep, unguided at
   small budgets: only strategy to complete tangent-return in both runs
   (beating the no-GC control on cost), only guided arm to complete
@@ -438,7 +441,123 @@ cheapest, so cost dashboards would read it as a win. Recommendation
   weakness (reclaims little) is what preserves coherence.
 
 Mechanism gaps -> candidate tasks: last-user protection for ring/stack
-(finding 2); budget-aware guidance delivery (finding 5); the loop
-accepting a final answer from a turn whose prompt no longer contains the
-task (finding 2 — the gc_collect stream knows the last user message was
-dropped; the loop could refuse to treat the next no-tool reply as DONE).
+(finding 2 — **landed as t-1367**, see the follow-up below); budget-aware
+guidance delivery (finding 5 — **landed as t-1368**); the loop accepting
+a final answer from a turn whose prompt no longer contains the task
+(finding 2 — the gc_collect stream knows the last user message was
+dropped; the loop could refuse to treat the next no-tool reply as DONE;
+still open, though t-1367 removes the known trigger).
+
+### t-1367 follow-up: the deciding cells, re-run with both fixes
+
+Both recommended fixes landed and the 8 deciding guided ring/stack cells
+were re-recorded 2026-07-08 (same model/provider/defaults as above):
+
+- **t-1367** — ring and stack hard-protect the system message and the
+  last user message through every degrade phase (the guarantee semantic
+  always had; now a docs/GC.md invariant of all strategies, asserted by
+  the offline matrix at zero drops).
+- **t-1368** — fragment delivery is budget-gated: full fragment only when
+  it costs <= 5% of `context_budget`, a 2-4 sentence minimal core up to
+  15%, nothing above that. At these fixtures' 1600-2000-token budgets the
+  fragment is **suppressed**, so a guided cell now differs from its
+  unguided twin only by the gate itself — the ~700-token ballast that
+  caused turn-1 collections is gone. (The §2.2 memory block was also
+  demoted from the full fragment to draft: rem=0/prem=0/rec=0 in all 12
+  guided cells above.)
+
+Each fix invalidated recordings whose replayed collector re-run could no
+longer reproduce them (GC replays live and token-sensitively): t-1367 the
+8 guided ring/stack cells, t-1368 the 8 guided mark-sweep/semantic cells.
+All 16 were deleted with their invalidating commits; the t-1364 table
+above is the historical record. Only the ring/stack cells were re-recorded
+— they carry the t-1367 question; guided mark-sweep/semantic at these
+budgets would measure nothing the unguided arms don't (no fragment
+renders), so they are out of the recording plan until a
+realistic-budget guidance eval exists.
+
+Spend: $0.26 matrix + $0.02 judge = **$0.29** (estimate was ~$0.30).
+Offline replay reproduces every re-recorded cell (asserted per cell, and
+re-verified from a cold offline run).
+
+**Before (t-1364, silent task eviction):** all 8 cells identical — the
+first collection evicted the task statement, the model replied "I'm ready
+to help! Please provide the task steps", and the loop accepted it as
+final. 2 turns, 0 evals, ~$0.0044, `ok=NO` with nothing attempted.
+
+```
+early-needle       ring       on   1     2     1    0    0   0    0   0    1 s:1            3   0     3942       84  $0.004362    2.5  NO    -   0/3
+early-needle       stack      on   1     2     1    0    0   0    0   0    1 s:1            3   0     3942       91  $0.004397    2.5  NO    -   0/3
+early-needle       stack      on   2     2     1    0    0   0    0   0    1 s:1            3   0     3942       90  $0.004392    3.0  NO    -   0/3
+tangent-return     ring       on   1     2     1    0    0   0    0   0    1 s:1            3   0     3978       84  $0.004398    2.4  NO    -   0/3
+tangent-return     stack      on   1     2     1    0    0   0    0   0    1 s:1            3   0     3978       84  $0.004398    2.3  NO    -   0/3
+tangent-return     stack      on   2     2     1    0    0   0    0   0    1 s:1            3   0     3978       90  $0.004428    2.3  NO    -   0/3
+memory-discipline  ring       on   1     2     1    0    0   0    0   0    1 s:1            3   0     3990      107  $0.004525    2.5  NO    -   0/3
+memory-discipline  stack      on   1     2     1    0    0   0    0   0    1 s:1            3   0     3990      100  $0.004490    2.5  NO    -   0/3
+```
+
+**After (t-1367 + t-1368):**
+
+```
+early-needle       ring       on   1    10     9    0    0   0    0   0    6 s:6           42   0    22768      903  $0.027283   15.4  NO  YES   2/3
+early-needle       stack      on   1     9     8    0    0   0    0   0    4 s:4           23   0    20536      656  $0.023816   12.9  NO  YES   2/3
+early-needle       stack      on   2    12    11    1    1   0    0   0    9 s:9           75   0    27378     1016  $0.032458   17.9  NO  YES   0/3
+tangent-return     ring       on   1    27    26   24   11   0    0   0   25 s:25         676   0    45437     2089  $0.055882   40.6  NO    -     -
+tangent-return     stack      on   1    10     9    7    3   0    0   0    8 s:8           64   0    17990      647  $0.021225   26.1  NO    -   0/3
+tangent-return     stack      on   2    27    26   24   11   0    0   0   25 s:25         625   0    48940     1999  $0.058935   47.2  NO    -   0/3
+memory-discipline  ring       on   1     9     6    0    0   1    1   1    6 s:6           12   0    18315      726  $0.021945   15.1 yes    -   3/3
+memory-discipline  stack      on   1     9     6    0    0   1    1   1    6 s:6            6   0    19130      816  $0.023210   13.4 yes    -   3/3
+```
+
+(The tangent/ring judge verdict is recorded but printed `-`: the model
+wrapped its JSON in prose containing an earlier brace, defeating the
+lenient extractor; the response's own conclusion is all three booleans
+false, i.e. a 0/3. Thrash-transcript verdicts remain the least reliable
+rows of the column, as in t-1349.)
+
+**Findings:**
+
+1. **The task-eviction failure is gone: 0/8 cells** (was 8/8). Every
+   re-recorded cell actually attempts the task — 9-27 turns, 6-26 shell
+   steps, the full fixture script visible in the trace. No cell ends on
+   a no-tool "ready to help" reply, and no gc_collect event drops the
+   last user message (now structurally impossible).
+2. **Guided rows now mirror their unguided twins**, as the budget gate
+   predicts (the fragment is suppressed; remaining deltas are sampling
+   variance). memory-discipline: both complete, 3/3 judge, at or below
+   unguided cost — GC again pays for itself when memory discipline is
+   scripted. early-needle: all three cells fail with **confabulated
+   access codes** (cfab YES), the t-1349 finding-3 mode — neither fix
+   claimed to address it, and it persists exactly as in the unguided
+   arms. tangent-return: ring s1 and stack s2 reproduce the 25-collection
+   thrash loop (turn-cap non-answer); stack s1 escaped the loop but
+   answered with the wrong category order after re-fetching.
+3. **The cheapest-failure trap is defused.** t-1364's worst property was
+   that the broken cells were also the cheapest ($0.0044 — a cost
+   dashboard would read task loss as a win). The failure modes that
+   remain (thrash, confabulation) are all visible: expensive, repeated
+   commands, wrong needles.
+
+**Is guided-stack now defensible?** As a *safety* matter, yes: the P0
+failure — silently losing the task and reporting a 2-turn non-answer as
+completion — is mechanically impossible (t-1367), and guidance can no
+longer act as eviction-protected ballast at small budgets (t-1368).
+Guided-stack now behaves exactly like unguided stack. As a *performance*
+matter it is not the winner at extreme pressure: stack still thrashed or
+confabulated on 2 of 3 fixtures here, same as unguided.
+
+**Does the default-strategy question (stack vs mark-sweep) still need
+Ben's decision? Yes — with the urgency changed.** The new numbers remove
+the "stack is indefensible" forcing function; what remains is the same
+behavioral split both prior runs found, unchanged by these fixes:
+mark-sweep is still the only strategy that completes tangent-return
+(both recording generations, cheaper than the no-GC control) and the only
+one whose early-needle failures were honest re-fetches rather than
+fabrications, while stack keeps the best offline retention arithmetic and
+the best worst-case shape on chat-heavy windows. On behavioral evidence
+at extreme pressure the default would be mark-sweep; on retention
+arithmetic and structural predictability it stays stack. Both positions
+are now survivable — the decision is a genuine trade-off, not a bug fix,
+and these budgets (1.6-2k tokens) remain far below real deployments, so
+steady-state evidence at realistic budgets would settle it better than
+another extreme-pressure sample.

@@ -931,28 +931,60 @@ struct CellId {
     sample: u32,
 }
 
-/// The t-1364 recording plan, in SPEND-PRIORITY order: the cells that
-/// decide the guidance-dominates-strategy hypothesis (stack and mark-sweep
-/// ± guidance on the two fixtures where t-1349 saw thrash and
-/// confabulation) come first at n=2; broad coverage — ring/semantic ±
-/// guidance everywhere, all four strategies on memory-discipline, and a
-/// fresh `none` baseline per fixture (the t-1349 baseline predates the
-/// tool-description change) — comes after at n=1. The recorder's budget
-/// cap cuts from the tail, so overspend shrinks coverage before it shrinks
-/// the deciding samples.
+/// The recording plan, in SPEND-PRIORITY order. Two generations:
+///
+/// t-1364 recorded the guidance x strategy matrix. Its guided recordings
+/// were later invalidated in two waves — the t-1367 last-user hard guard
+/// (ring/stack cells whose recorded gc_collect streams embodied the
+/// task-eviction the guard bans) and the t-1368 budget gate (the fragment
+/// those cells recorded under no longer renders at these budgets) — and
+/// deleted; their rows live on in the README as the historical record.
+/// The guided mark-sweep/semantic cells are deliberately NOT re-planned:
+/// at these budgets guided arms now deliver no fragment, so re-recording
+/// them answers no open question the t-1367 re-run does not.
+///
+/// t-1367 verification re-run (first, so the spend cap can never cut it):
+/// the 8 deciding cells — ring/stack x guided x all three fixtures at the
+/// t-1364 sample counts — re-recorded with the hard guard and the budget
+/// gate live. Expected: no more 2-turn task-eviction non-answers; guided
+/// ring/stack attempt the tasks like their unguided twins (the fragment
+/// is suppressed at these budgets, so the guided axis now measures the
+/// gate itself plus sampling variance).
+///
+/// Then the t-1364 unguided coverage and `none` baselines, all recorded.
 fn planned_cells() -> Vec<CellId> {
     let mut cells = Vec::new();
+    // t-1367 re-run: the deciding guided ring/stack cells.
+    for fixture in ["early-needle", "tangent-return", "memory-discipline"] {
+        for arm in [Arm::Ring, Arm::Stack] {
+            cells.push(CellId {
+                fixture,
+                arm,
+                guided: true,
+                sample: 1,
+            });
+            // Stack — the shipped default on trial — keeps its n=2 on the
+            // fixtures where t-1364 saw the deciding failures.
+            if arm == Arm::Stack && fixture != "memory-discipline" {
+                cells.push(CellId {
+                    fixture,
+                    arm,
+                    guided: true,
+                    sample: 2,
+                });
+            }
+        }
+    }
+    // t-1364 unguided coverage, at its recorded sample counts.
     for sample in [1, 2] {
         for fixture in ["early-needle", "tangent-return"] {
             for arm in [Arm::Stack, Arm::MarkSweep] {
-                for guided in [false, true] {
-                    cells.push(CellId {
-                        fixture,
-                        arm,
-                        guided,
-                        sample,
-                    });
-                }
+                cells.push(CellId {
+                    fixture,
+                    arm,
+                    guided: false,
+                    sample,
+                });
             }
         }
     }
@@ -964,16 +996,14 @@ fn planned_cells() -> Vec<CellId> {
             sample: 1,
         });
         for arm in [Arm::Ring, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
-            for guided in [false, true] {
-                let cell = CellId {
-                    fixture,
-                    arm,
-                    guided,
-                    sample: 1,
-                };
-                if !cells.contains(&cell) {
-                    cells.push(cell);
-                }
+            let cell = CellId {
+                fixture,
+                arm,
+                guided: false,
+                sample: 1,
+            };
+            if !cells.contains(&cell) {
+                cells.push(cell);
             }
         }
     }
@@ -1614,10 +1644,10 @@ async fn replay_cell(
 /// cells, never the hypothesis-deciding ones.
 const DEFAULT_SPEND_CAP_USD: f64 = 2.0;
 
-/// Record every planned t-1364 cell that has no recording yet, in plan
-/// order, under the spend cap. Requires a key; spends real money (small
+/// Record every planned cell that has no recording yet, in plan order,
+/// under the spend cap. Requires a key; spends real money (small
 /// fixtures, tiny windows, a cheap model — see README for the measured
-/// total). Legacy t-1349 recordings are never re-recorded.
+/// totals). Legacy t-1349 recordings are never re-recorded.
 async fn record_missing_cells(dir: &Path) -> Result<()> {
     let model = env_model();
     let api_key = online_api_key()?;
