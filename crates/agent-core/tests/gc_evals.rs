@@ -36,9 +36,9 @@
 
 use agent_core::gc::{message_embedding_text, CitationGraph, SemanticGc};
 use agent_core::{
-    content_hash, estimate_tokens, truncate_oversized_message, ChatMessage, ChatProvider,
-    ContextGc, GcState, MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc, StackFrameGc,
-    ToolCall,
+    content_hash, estimate_tokens, is_eviction_marker, truncate_oversized_message, ChatMessage,
+    ChatProvider, ContextGc, GcState, MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc,
+    StackFrameGc, ToolCall,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,10 @@ struct EvalMetrics {
     tool_results_before: usize,
     tool_results_after: usize,
     frames_popped: usize,
+    /// Eviction-marker messages in the collected window (t-1360). Markers
+    /// are recovery affordances, not retained structure — comparative
+    /// gates subtract them from `messages_after`.
+    markers: usize,
     stable_prefix: usize,
     /// How many collections ran (1 for `final`; up to one per infer point
     /// for the incremental timings).
@@ -248,16 +252,21 @@ fn gc_challengers_improve_over_ring_on_tool_chains() -> Result<()> {
                 false,
                 None,
             )?;
+            // Markers are recovery affordances, not retained structure —
+            // subtract them so ring's own marker lines (t-1360) cannot
+            // inflate its structure count past a challenger's.
+            let structure = |metrics: &EvalMetrics| metrics.messages_after - metrics.markers;
             assert!(
-                challenger.messages_after > ring.messages_after
+                structure(&challenger) > structure(&ring)
                     || challenger.tool_results_after > ring.tool_results_after,
                 "{} on {} must retain more coherent structure than RingGc; \
-                 ring kept {} msgs/{} tool results, challenger kept {} msgs/{} tool results",
+                 ring kept {} msgs/{} tool results, challenger kept {} msgs/{} tool results \
+                 (marker lines excluded)",
                 challenger.strategy,
                 challenger.trace,
-                ring.messages_after,
+                structure(&ring),
                 ring.tool_results_after,
-                challenger.messages_after,
+                structure(&challenger),
                 challenger.tool_results_after
             );
         }
@@ -542,6 +551,24 @@ fn evaluate(
         timing.label(),
         case.name
     );
+    // Marker determinism goes deeper than content equality: marker ids are
+    // derived (UUIDv5-style), never freshly minted, so two runs must agree
+    // on ids too (t-1360; ChatMessage equality ignores ids).
+    assert_eq!(
+        run.collected
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>(),
+        run_again
+            .collected
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>(),
+        "{} ({}) on {} must produce identical message ids across two runs",
+        gc.name(),
+        timing.label(),
+        case.name
+    );
 
     let collected = run.collected;
     let tokens_after = estimate_tokens(&collected);
@@ -564,11 +591,38 @@ fn evaluate(
     // infer point over budget collects — `every:N` can no longer end over
     // budget between collections. Mark-sweep only evicts complete/evictable
     // lifecycles, so its convergence is best-effort and reported rather
-    // than asserted.
+    // than asserted. Eviction markers (t-1360) count toward the budget and
+    // must not change any of this — these asserts are the regression net
+    // for the marker ladder's budget honesty.
     if !matches!(strategy, Strategy::MarkSweep) {
         assert!(
             converged,
             "{} ({}) on {} must converge under budget: {tokens_after} > {budget}",
+            gc.name(),
+            timing.label(),
+            case.name
+        );
+    }
+    // Eviction visibility (t-1360): if this cell evicted messages, the
+    // collected window must say so — a `[gc: ...]` marker or a `[frame ...]`
+    // annotation — unless a collection recorded marker suppression (no room
+    // for even the coalesced line). Silent removal is the confabulation
+    // machine the mechanism exists to kill.
+    let collected_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
+    let dropped_any = case
+        .prompt
+        .iter()
+        .any(|message| !collected_ids.contains(&message.id));
+    let visibly_marked = collected.iter().any(|message| {
+        message.content.as_deref().is_some_and(|content| {
+            content.contains(agent_core::EVICTION_MARKER_PREFIX) || content.contains("[frame ")
+        })
+    });
+    if dropped_any {
+        assert!(
+            visibly_marked || run.any_marker_suppression,
+            "{} ({}) on {} evicted messages with no in-window marker and no \
+             recorded suppression (t-1360 eviction visibility)",
             gc.name(),
             timing.label(),
             case.name
@@ -611,6 +665,10 @@ fn evaluate(
         tool_results_before,
         tool_results_after: count_tool_results(&collected),
         frames_popped: count_frame_annotations(&collected),
+        markers: collected
+            .iter()
+            .filter(|message| is_eviction_marker(message))
+            .count(),
         stable_prefix: stable_prefix_len(&case.prompt, &collected),
         collections: run.collections,
         invalidations: run.invalidations,
@@ -632,6 +690,10 @@ struct TimedRun {
     collected: Vec<ChatMessage>,
     collections: usize,
     invalidations: usize,
+    /// Any collection in this run suppressed its eviction markers (no room
+    /// for even the coalesced line at the budget) — the only sanctioned way
+    /// for evictions to leave no in-window marker (t-1360).
+    any_marker_suppression: bool,
 }
 
 /// Apply `gc` to the case window under the given timing. `Final` is the
@@ -651,6 +713,7 @@ fn run_timed(
         collected: Vec::new(),
         collections: 0,
         invalidations: 0,
+        any_marker_suppression: false,
     };
     if timing == Timing::Final {
         let mut window = prompt.to_vec();
@@ -663,6 +726,7 @@ fn run_timed(
         run.collected = gc.collect(window, budget, &mut state);
         run.collections = 1;
         run.invalidations = usize::from(state.prefix_invalidated);
+        run.any_marker_suppression = state.marker_summary.suppressed;
         return run;
     }
 
@@ -712,6 +776,7 @@ fn infer_point(
     *window = gc.collect(std::mem::take(window), budget, state);
     run.collections += 1;
     run.invalidations += usize::from(state.prefix_invalidated);
+    run.any_marker_suppression |= state.marker_summary.suppressed;
 }
 
 /// Invariants every strategy owes every window (docs/GC.md): system messages
@@ -1285,7 +1350,7 @@ fn count_frame_annotations(messages: &[ChatMessage]) -> usize {
             message
                 .content
                 .as_deref()
-                .is_some_and(|content| content.contains("[frame: "))
+                .is_some_and(|content| content.contains("[frame "))
         })
         .count()
 }
@@ -1320,7 +1385,7 @@ fn stable_prefix_len(original: &[ChatMessage], collected: &[ChatMessage]) -> usi
 
 fn print_header() {
     println!(
-        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>6} {:>4} {:>5} {:>4} {:>5}",
+        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>3} {:>6} {:>4} {:>5} {:>4} {:>5}",
         "case",
         "press",
         "timing",
@@ -1333,6 +1398,7 @@ fn print_header() {
         "msgs",
         "tools",
         "frames",
+        "mkr",
         "prefix",
         "coll",
         "inval",
@@ -1343,7 +1409,7 @@ fn print_header() {
 
 fn print_metrics(metrics: &EvalMetrics) {
     println!(
-        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>6} {:>4} {:>5} {:>4} {:>5}{}",
+        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>3} {:>6} {:>4} {:>5} {:>4} {:>5}{}",
         metrics.trace,
         metrics.pressure,
         metrics.timing.label(),
@@ -1358,6 +1424,7 @@ fn print_metrics(metrics: &EvalMetrics) {
         metrics.tool_results_after,
         metrics.tool_results_before,
         metrics.frames_popped,
+        metrics.markers,
         metrics.stable_prefix,
         metrics.collections,
         metrics.invalidations,

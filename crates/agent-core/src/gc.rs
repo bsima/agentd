@@ -41,7 +41,7 @@ pub enum FrameStatus {
     Popped,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GcState {
     /// Mark-sweep lifecycle tags, keyed by stable ChatMessage UUID.
     pub lifecycle: HashMap<MsgId, LifecycleState>,
@@ -87,6 +87,10 @@ pub struct GcState {
     /// exactly what the hot signal exists to expose. Bounded by the run's
     /// own drop history; runtime-only, never serialized.
     pub collected_hashes: BTreeSet<String>,
+    /// What the most recent collect() left behind as eviction markers
+    /// (t-1360). Set by every strategy on every collection, like
+    /// `prefix_invalidated`; read for gc_collect trace events.
+    pub marker_summary: EvictionMarkerSummary,
 }
 
 /// When GC runs, independent of which strategy reclaims tokens (t-1151).
@@ -585,6 +589,27 @@ impl ContextGc for SemanticGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
+        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+            self.collect_inner(messages, budget, state)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "semantic"
+    }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
+    }
+}
+
+impl SemanticGc {
+    fn collect_inner(
+        &self,
+        messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
         let full_boundary = cache_prefix_boundary(&messages, budget).min(messages.len());
         let prefix_snapshot = messages[..full_boundary].to_vec();
         let boundary = if self.preserve_prefix {
@@ -648,14 +673,6 @@ impl ContextGc for SemanticGc {
             .collect();
         state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
         collected
-    }
-
-    fn name(&self) -> &'static str {
-        "semantic"
-    }
-
-    fn cache_preserving(&self) -> bool {
-        self.preserve_prefix
     }
 }
 
@@ -928,6 +945,594 @@ fn recall_hit_contents(content: &str) -> Vec<String> {
     vec![content.to_string()]
 }
 
+// --- Eviction markers (t-1360) ----------------------------------------------
+//
+// The mechanism-level fix for the confabulation failure mode (t-1349/t-1364/
+// t-1367 behavioral evidence: models fabricate evicted content — access
+// codes, categories — instead of recovering or admitting loss, despite
+// do-not-guess guidance). When a collection drops messages, it leaves a
+// compact, deterministic marker line in the window saying WHAT was evicted
+// (kind + identifying handle: tool-call id, recall query, or turn ordinal)
+// and HOW to recover it (re-run the call, recall the memory, ask the user).
+//
+// Marker economics, in order:
+//
+// - CHEAP: a dropped 2000-token result becomes a one-line ~30-token marker,
+//   and N consecutive drops aggregate into ONE marker line, not N.
+// - BUDGET-HONEST: markers count toward the window budget. They are funded
+//   by the sweep's natural overshoot (dropping whole messages lands under
+//   budget with slack); if the per-run markers do not fit, they degrade to
+//   a single "earlier context compacted" line, and if even that does not
+//   fit they are suppressed — a collection never ships over budget because
+//   of its own markers, so every convergence property is unchanged.
+// - DROPPABLE: markers are ordinary assistant messages, never
+//   hard-protected. A later collection may drop one; its eviction count is
+//   absorbed into the replacing marker rather than vanishing silently.
+// - DETERMINISTIC: markers are part of collect()'s pure output. Content
+//   derives only from the dropped messages; ids are UUIDv5 over the dropped
+//   ids, so the same collection produces byte- and id-identical markers.
+//
+// Integration is strategy-uniform via [`with_eviction_markers`], with two
+// strategy-honest carve-outs: a tool result dropped by StackFrameGc's frame
+// pop is NOT double-marked (the surviving `[frame ...]` annotation, which
+// now names the call id and the recovery affordance, IS its marker), and
+// MarkSweepGc's in-place elision annotation is the same `[gc: ...]` family.
+
+/// Every eviction-marker line starts with this. The §2.4 guidance block
+/// describes the format to the model; evals count in-window markers by it.
+pub const EVICTION_MARKER_PREFIX: &str = "[gc:";
+
+/// At most this many evicted items are named per marker line; the rest are
+/// folded into a `+N more` suffix so markers stay cheap under mass drops.
+const MAX_MARKER_ITEMS: usize = 4;
+
+/// What one collection left behind as markers (t-1360). Reported on the
+/// gc_collect trace event so behavioral evals can tell marker-driven
+/// recovery from re-derivation and fabrication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictionMarkerSummary {
+    /// Eviction-marker messages present in the collected window after this
+    /// collection (post-aggregation and fusion; includes markers surviving
+    /// from earlier collections).
+    pub markers: usize,
+    /// Logical tool results evicted by this collection (frame-covered drops
+    /// excluded — the frame annotation is their marker).
+    pub evicted_tool_results: usize,
+    /// Recall (memory) results evicted by this collection.
+    pub evicted_recalls: usize,
+    /// User turns evicted by this collection.
+    pub evicted_user_turns: usize,
+    /// Plain assistant turns evicted by this collection.
+    pub evicted_assistant_turns: usize,
+    /// Degrade: the per-run markers did not fit the budget; a single
+    /// "earlier context compacted" line stands in for all of them.
+    pub coalesced: bool,
+    /// Terminal degrade: not even the coalesced line fit. This collection
+    /// wrote no markers — the trace event still records what was dropped.
+    pub suppressed: bool,
+}
+
+/// Is this message an eviction-marker line written by a previous collection?
+/// Markers are plain assistant messages whose content starts with
+/// [`EVICTION_MARKER_PREFIX`] — recognizable so later collections can absorb
+/// (or coalesce) them instead of letting them vanish silently.
+pub fn is_eviction_marker(message: &ChatMessage) -> bool {
+    message.role == "assistant"
+        && message.tool_call_id.is_none()
+        && message.tool_calls.is_none()
+        && message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.starts_with(EVICTION_MARKER_PREFIX))
+}
+
+/// How many evictions a marker line stands for: its first integer. Defaults
+/// to 1 — a marker always represents at least one eviction.
+fn marker_evicted_count(message: &ChatMessage) -> usize {
+    let content = message.content.as_deref().unwrap_or("");
+    let digits: String = content
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().unwrap_or(1).max(1)
+}
+
+/// Replace the first integer in a marker line (its eviction count) with
+/// `count` — used when fusing adjacent markers.
+fn replace_marker_count(content: &str, count: usize) -> String {
+    let start = match content.find(|c: char| c.is_ascii_digit()) {
+        Some(start) => start,
+        None => return content.to_string(),
+    };
+    let end = content[start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(content.len(), |offset| start + offset);
+    format!("{}{count}{}", &content[..start], &content[end..])
+}
+
+/// Deterministic marker identity: UUIDv5 over the ids of the messages the
+/// marker stands for. No fresh UUIDs, so the same collection produces the
+/// same marker ids every run (the id space is disjoint from the dropped
+/// messages' own ids, so retention metrics never mistake a marker for a
+/// survivor).
+fn marker_id(ids: &[MsgId]) -> MsgId {
+    let seed = ids
+        .iter()
+        .map(MsgId::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let digest = content_hash(&format!("gc-eviction-marker:{seed}"));
+    let mut bytes = [0u8; 16];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .expect("content_hash emits lowercase hex");
+    }
+    Uuid::from_bytes(bytes)
+}
+
+fn marker_message(id: MsgId, content: String) -> ChatMessage {
+    ChatMessage {
+        id,
+        role: "assistant".into(),
+        content: Some(content),
+        tool_call_id: None,
+        tool_calls: None,
+    }
+}
+
+/// One maximal run of consecutively dropped messages, in original order.
+#[derive(Default)]
+struct MarkerRun {
+    start: Option<usize>,
+    /// Messages dropped in this run (markers absorbed from earlier
+    /// collections count via `absorbed`, not here).
+    dropped: usize,
+    /// Eviction counts absorbed from dropped older marker lines.
+    absorbed: usize,
+    /// Named items, e.g. "shell call-3", "recall 'deploy window'",
+    /// "user turn 2".
+    items: Vec<String>,
+    ids: Vec<MsgId>,
+    has_tool: bool,
+    has_recall: bool,
+    has_user: bool,
+}
+
+struct MarkerBuild {
+    /// (original index of the run's first dropped message, marker message).
+    markers: Vec<(usize, ChatMessage)>,
+    summary: EvictionMarkerSummary,
+    /// Total evictions represented (dropped messages plus counts absorbed
+    /// from dropped older markers) — the coalesced line's N.
+    total_evicted: usize,
+    /// Original index of the first dropped message (coalesced placement).
+    first_drop: Option<usize>,
+}
+
+/// Build the marker lines for one collection, from the pre-collection
+/// window and the collection's survivors. Pure text analysis over exactly
+/// the inputs collect() already has — stateless, deterministic, LLM-free.
+fn build_eviction_markers(original: &[ChatMessage], collected: &[ChatMessage]) -> MarkerBuild {
+    let kept: BTreeSet<MsgId> = collected.iter().map(|message| message.id).collect();
+    // Every call id minted in the pre-collection window: tool name,
+    // arguments, and the issuing assistant message (frame-covered check).
+    let mut call_info: HashMap<&str, (&str, &serde_json::Value, MsgId)> = HashMap::new();
+    for message in original {
+        for call in message.tool_calls.as_deref().unwrap_or_default() {
+            call_info.entry(call.id.as_str()).or_insert((
+                call.name.as_str(),
+                &call.arguments,
+                message.id,
+            ));
+        }
+    }
+    // Cited-keep interplay: a marker for an evicted-but-cited message
+    // carries the citing handle (the first citing message's turn ordinal).
+    let citations = CitationGraph::extract(original);
+    let index_of: HashMap<MsgId, usize> = original
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id, index))
+        .collect();
+    let cited_suffix = |message: &ChatMessage| -> String {
+        citations
+            .citers(&message.id)
+            .filter_map(|id| index_of.get(id).copied())
+            .min()
+            .map(|turn| format!(" (cited by turn {})", turn + 1))
+            .unwrap_or_default()
+    };
+
+    let mut build = MarkerBuild {
+        markers: Vec::new(),
+        summary: EvictionMarkerSummary::default(),
+        total_evicted: 0,
+        first_drop: None,
+    };
+    // Call ids already itemized (a dropped pair yields one item, and a call
+    // split across two runs by a kept message is still itemized once).
+    let mut itemized_calls: BTreeSet<String> = BTreeSet::new();
+    let mut run = MarkerRun::default();
+
+    let flush = |run: &mut MarkerRun, build: &mut MarkerBuild| {
+        let taken = std::mem::take(run);
+        let total = taken.dropped + taken.absorbed;
+        if total == 0 {
+            return;
+        }
+        let Some(start) = taken.start else {
+            return;
+        };
+        build.total_evicted += total;
+        let listing = if taken.items.is_empty() {
+            "earlier context".to_string()
+        } else {
+            let shown = taken
+                .items
+                .iter()
+                .take(MAX_MARKER_ITEMS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let extra = taken.items.len().saturating_sub(MAX_MARKER_ITEMS);
+            if extra > 0 {
+                format!("{shown} +{extra} more")
+            } else {
+                shown
+            }
+        };
+        let mut affordances: Vec<&str> = Vec::new();
+        if taken.has_tool {
+            affordances.push("re-run the call");
+        }
+        if taken.has_recall {
+            affordances.push("recall the memory");
+        }
+        if taken.has_user {
+            affordances.push("ask the user again");
+        }
+        let tail = if affordances.is_empty() {
+            "unrecoverable — do not guess".to_string()
+        } else {
+            format!("recover: {} — do not guess", affordances.join(", "))
+        };
+        let content = format!("[gc: {total} evicted — {listing}; {tail}]");
+        build
+            .markers
+            .push((start, marker_message(marker_id(&taken.ids), content)));
+    };
+
+    for (index, message) in original.iter().enumerate() {
+        if kept.contains(&message.id) {
+            flush(&mut run, &mut build);
+            continue;
+        }
+        if build.first_drop.is_none() {
+            build.first_drop = Some(index);
+        }
+        run.start.get_or_insert(index);
+        run.ids.push(message.id);
+        if is_eviction_marker(message) {
+            // A dropped older marker: absorb its count instead of letting
+            // it vanish silently.
+            run.absorbed += marker_evicted_count(message);
+            continue;
+        }
+        run.dropped += 1;
+        match message.role.as_str() {
+            "tool" => {
+                let Some(call_id) = message.tool_call_id.as_deref() else {
+                    build.summary.evicted_assistant_turns += 1;
+                    run.items.push(format!("turn {}", index + 1));
+                    continue;
+                };
+                let Some((name, arguments, issuer)) = call_info.get(call_id) else {
+                    build.summary.evicted_tool_results += 1;
+                    run.has_tool = true;
+                    run.items
+                        .push(format!("tool {call_id}{}", cited_suffix(message)));
+                    continue;
+                };
+                if kept.contains(issuer) {
+                    // Frame-covered (StackFrameGc pop): the surviving
+                    // assistant message was rewritten to a `[frame ...]`
+                    // annotation naming this call and its recovery
+                    // affordance — that annotation IS the marker. Break
+                    // the run so no duplicate `[gc: ...]` line appears.
+                    run.dropped -= 1;
+                    run.ids.pop();
+                    flush(&mut run, &mut build);
+                    continue;
+                }
+                if !itemized_calls.insert(call_id.to_string()) {
+                    continue;
+                }
+                if RECALL_TOOL_NAMES.contains(name) {
+                    let query = arguments
+                        .get("query")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    build.summary.evicted_recalls += 1;
+                    run.has_recall = true;
+                    run.items.push(format!(
+                        "recall '{}'{}",
+                        preview_chars(query, 40),
+                        cited_suffix(message)
+                    ));
+                } else {
+                    build.summary.evicted_tool_results += 1;
+                    run.has_tool = true;
+                    run.items
+                        .push(format!("{name} {call_id}{}", cited_suffix(message)));
+                }
+            }
+            "assistant" => {
+                let calls = message.tool_calls.as_deref().unwrap_or_default();
+                if calls.is_empty() {
+                    build.summary.evicted_assistant_turns += 1;
+                    run.items.push(format!(
+                        "assistant turn {}{}",
+                        index + 1,
+                        cited_suffix(message)
+                    ));
+                } else {
+                    // A dropped call message: pair atomicity means its
+                    // results are dropped too and carry the items; only a
+                    // call whose result never existed (open frame) is
+                    // itemized here so the id stays recoverable.
+                    for call in calls {
+                        let has_result = original
+                            .iter()
+                            .any(|other| other.tool_call_id.as_deref() == Some(call.id.as_str()));
+                        if !has_result && itemized_calls.insert(call.id.clone()) {
+                            build.summary.evicted_tool_results += 1;
+                            run.has_tool = true;
+                            run.items.push(format!("{} {}", call.name, call.id));
+                        }
+                    }
+                }
+            }
+            "user" => {
+                build.summary.evicted_user_turns += 1;
+                run.has_user = true;
+                run.items.push(format!("user turn {}", index + 1));
+            }
+            // System messages are hard-protected and never reach here;
+            // anything unexpected still counts toward the run total.
+            _ => {
+                run.items.push(format!("turn {}", index + 1));
+            }
+        }
+    }
+    flush(&mut run, &mut build);
+    build
+}
+
+/// Splice marker lines into a collected window at their runs' positions.
+/// A marker is never inserted immediately before a tool-result message
+/// (results must stay adjacent to their call), and adjacent marker lines
+/// fuse into one (counts summed) so markers never accumulate.
+fn merge_eviction_markers(
+    original: &[ChatMessage],
+    collected: &[ChatMessage],
+    markers: &[(usize, ChatMessage)],
+) -> Vec<ChatMessage> {
+    let index_of: HashMap<MsgId, usize> = original
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id, index))
+        .collect();
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(collected.len() + markers.len());
+    let mut pending = markers.iter().peekable();
+    for message in collected {
+        let position = index_of.get(&message.id).copied().unwrap_or(usize::MAX);
+        while pending
+            .peek()
+            .is_some_and(|(run_start, _)| *run_start < position)
+        {
+            if message.role == "tool" {
+                // Defer past the tool run: a marker between a call and its
+                // results would break provider pair adjacency.
+                break;
+            }
+            out.push(pending.next().expect("peeked").1.clone());
+        }
+        out.push(message.clone());
+    }
+    for (_, marker) in pending {
+        out.push(marker.clone());
+    }
+    fuse_adjacent_markers(out)
+}
+
+/// Fuse directly adjacent marker lines into one: counts sum, the later
+/// (most recent) marker's text wins. Keeps repeated collections from
+/// stacking marker upon marker.
+fn fuse_adjacent_markers(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if is_eviction_marker(&message) {
+            if let Some(last) = out.last_mut() {
+                if is_eviction_marker(last) {
+                    let combined = marker_evicted_count(last) + marker_evicted_count(&message);
+                    let content = replace_marker_count(
+                        message.content.as_deref().unwrap_or(EVICTION_MARKER_PREFIX),
+                        combined,
+                    );
+                    let fused_id = marker_id(&[last.id, message.id]);
+                    *last = marker_message(fused_id, content);
+                    continue;
+                }
+            }
+        }
+        out.push(message);
+    }
+    out
+}
+
+/// The degrade form: one line standing in for every marker in the window.
+fn coalesced_marker_content(total: usize) -> String {
+    format!(
+        "[gc: earlier context compacted — {total} messages evicted; \
+         recover: re-run tool calls, recall memories, or ask the user — do not guess]"
+    )
+}
+
+/// Extra tokens reserved beyond the rendered markers' own estimate when
+/// re-collecting to make room: a tighter budget can extend the dropped
+/// runs, which grows the marker text by a few tokens.
+const MARKER_RESERVE_PAD: usize = 16;
+
+/// Coalesce a collection's markers into one line: strip every marker still
+/// in the window, absorb their counts, and stand a single compacted line
+/// at the earliest gap. Returns the window with the line merged in.
+fn coalesce_markers(
+    original: &[ChatMessage],
+    collected: &[ChatMessage],
+    build: &MarkerBuild,
+) -> Vec<ChatMessage> {
+    let mut total = build.total_evicted;
+    let mut first_position = build.first_drop.unwrap_or(0);
+    let mut contributing: Vec<MsgId> = Vec::new();
+    let mut stripped: Vec<ChatMessage> = Vec::with_capacity(collected.len());
+    for message in collected {
+        if is_eviction_marker(message) {
+            total += marker_evicted_count(message);
+            contributing.push(message.id);
+            if let Some(position) = original.iter().position(|m| m.id == message.id) {
+                first_position = first_position.min(position);
+            }
+            continue;
+        }
+        stripped.push(message.clone());
+    }
+    contributing.extend(build.markers.iter().map(|(_, marker)| marker.id));
+    let coalesced = marker_message(marker_id(&contributing), coalesced_marker_content(total));
+    merge_eviction_markers(original, &stripped, &[(first_position, coalesced)])
+}
+
+/// Wrap a strategy's core collection with eviction-marker emission
+/// (t-1360). Budget honesty: markers count toward the window budget, so
+/// the ladder makes room for them instead of shipping over budget —
+///
+/// 1. per-run markers into the core's collection, when they fit;
+/// 2. re-collect with the marker cost reserved, then per-run markers;
+/// 3. one coalesced "earlier context compacted" line, into the core's
+///    collection or a re-collection;
+/// 4. nothing — recorded as `suppressed` on the summary, never silent.
+///
+/// Re-collections run on a scratch GcState that is committed only when
+/// their window is the one returned, so the strategy's cross-collection
+/// metadata (frame statuses, lifecycle tags, prefix_invalidated) always
+/// describes the returned window. The wrapper never pushes the window over
+/// budget: every strategy's convergence contract is exactly its core's.
+fn with_eviction_markers<F>(
+    messages: Vec<ChatMessage>,
+    budget: usize,
+    state: &mut GcState,
+    core: F,
+) -> Vec<ChatMessage>
+where
+    F: Fn(Vec<ChatMessage>, usize, &mut GcState) -> Vec<ChatMessage>,
+{
+    let original = messages.clone();
+    let collected = core(messages, budget, state);
+    let build = build_eviction_markers(&original, &collected);
+    let count_markers =
+        |window: &[ChatMessage]| window.iter().filter(|m| is_eviction_marker(m)).count();
+    let finish = |window: Vec<ChatMessage>,
+                  mut summary: EvictionMarkerSummary,
+                  state: &mut GcState|
+     -> Vec<ChatMessage> {
+        summary.markers = count_markers(&window);
+        state.marker_summary = summary;
+        window
+    };
+    if build.markers.is_empty() {
+        return finish(collected, build.summary, state);
+    }
+
+    // Rung 1: per-run markers fit the core's own collection (the sweep's
+    // natural overshoot funds them).
+    let merged = merge_eviction_markers(&original, &collected, &build.markers);
+    if estimate_tokens(&merged) <= budget {
+        return finish(merged, build.summary, state);
+    }
+
+    // Re-collections run at a reduced budget, which also shrinks the
+    // pinned-prefix allowance — so a re-collection may only be accepted if
+    // it keeps the ORIGINAL budget's prefix byte-stable wherever the first
+    // collection did (the preserve-mode billing contract; markers must
+    // never cause a cache invalidation the core did not already commit).
+    let full_boundary = cache_prefix_boundary(&original, budget).min(original.len());
+    let prefix_snapshot = &original[..full_boundary];
+    let first_invalidated = prefix_changed(prefix_snapshot, &collected);
+    let recollect =
+        |reserve: usize, scratch: &mut GcState| -> Option<(Vec<ChatMessage>, MarkerBuild)> {
+            let recollected = core(
+                original.clone(),
+                budget.saturating_sub(reserve).max(1),
+                scratch,
+            );
+            if prefix_changed(prefix_snapshot, &recollected) && !first_invalidated {
+                return None;
+            }
+            scratch.prefix_invalidated = prefix_changed(prefix_snapshot, &recollected);
+            let rebuild = build_eviction_markers(&original, &recollected);
+            Some((recollected, rebuild))
+        };
+
+    // Rung 2: reserve the markers' cost and re-collect, so the markers are
+    // paid for by evicting more content — never by overflowing the budget.
+    let marker_tokens: usize = build
+        .markers
+        .iter()
+        .map(|(_, marker)| estimate_tokens(std::slice::from_ref(marker)))
+        .sum();
+    let reserve = marker_tokens.saturating_add(MARKER_RESERVE_PAD);
+    if reserve <= budget / 4 {
+        let mut scratch = state.clone();
+        if let Some((recollected, rebuild)) = recollect(reserve, &mut scratch) {
+            let remerged = merge_eviction_markers(&original, &recollected, &rebuild.markers);
+            if estimate_tokens(&remerged) <= budget {
+                *state = scratch;
+                return finish(remerged, rebuild.summary, state);
+            }
+        }
+    }
+
+    // Rung 3: one coalesced line, into the core's collection or (when even
+    // that does not fit) a re-collection reserving its cost.
+    let with_line = coalesce_markers(&original, &collected, &build);
+    if estimate_tokens(&with_line) <= budget {
+        let mut summary = build.summary;
+        summary.coalesced = true;
+        return finish(with_line, summary, state);
+    }
+    let line_reserve = estimate_text_tokens(&coalesced_marker_content(build.total_evicted))
+        .saturating_add(estimate_message_overhead_tokens() + MARKER_RESERVE_PAD);
+    if line_reserve <= budget / 2 {
+        let mut scratch = state.clone();
+        if let Some((recollected, rebuild)) = recollect(line_reserve, &mut scratch) {
+            let with_line = coalesce_markers(&original, &recollected, &rebuild);
+            if estimate_tokens(&with_line) <= budget {
+                *state = scratch;
+                let mut summary = rebuild.summary;
+                summary.coalesced = true;
+                return finish(with_line, summary, state);
+            }
+        }
+    }
+
+    // Rung 4 (terminal): no room for even one line. Ship the core's
+    // collection unchanged (markers surviving from earlier collections
+    // stay — the core chose to keep them) and record the suppression.
+    let mut summary = build.summary;
+    summary.suppressed = true;
+    finish(collected, summary, state)
+}
+
 #[derive(Debug, Clone)]
 pub enum GcMode {
     None,
@@ -985,6 +1590,27 @@ impl GcMode {
 impl ContextGc for MarkSweepGc {
     fn collect(
         &self,
+        messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
+        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+            self.collect_inner(messages, budget, state)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "mark-sweep"
+    }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
+    }
+}
+
+impl MarkSweepGc {
+    fn collect_inner(
+        &self,
         mut messages: Vec<ChatMessage>,
         budget: usize,
         state: &mut GcState,
@@ -1024,14 +1650,6 @@ impl ContextGc for MarkSweepGc {
             .collect();
         state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
         collected
-    }
-
-    fn name(&self) -> &'static str {
-        "mark-sweep"
-    }
-
-    fn cache_preserving(&self) -> bool {
-        self.preserve_prefix
     }
 }
 
@@ -1117,7 +1735,13 @@ fn annotate_evictable_tool_results(messages: &mut [ChatMessage], state: &GcState
             .get(tool_call_id)
             .cloned()
             .unwrap_or_else(|| tool_call_id.to_string());
-        message.content = Some(format!("[tool: {summary} -- result incorporated]"));
+        // The `[gc: ...]` marker family (t-1360): the old "result
+        // incorporated" wording reported the call happened while silently
+        // withholding its body — the confabulation-inviting shape. Name
+        // the eviction and the recovery affordance instead.
+        message.content = Some(format!(
+            "[gc: result elided — {summary} ({tool_call_id}); recover: re-run the call — do not guess]"
+        ));
     }
 }
 
@@ -1201,6 +1825,27 @@ impl ContextGc for RingGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
+        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+            self.collect_inner(messages, budget, state)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "ring"
+    }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
+    }
+}
+
+impl RingGc {
+    fn collect_inner(
+        &self,
+        messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
         let boundary = if self.preserve_prefix {
             cache_prefix_boundary(&messages, budget)
         } else {
@@ -1241,9 +1886,22 @@ impl ContextGc for RingGc {
         state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
         collected
     }
+}
+
+impl ContextGc for StackFrameGc {
+    fn collect(
+        &self,
+        messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
+        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+            self.collect_inner(messages, budget, state)
+        })
+    }
 
     fn name(&self) -> &'static str {
-        "ring"
+        "stack"
     }
 
     fn cache_preserving(&self) -> bool {
@@ -1251,8 +1909,8 @@ impl ContextGc for RingGc {
     }
 }
 
-impl ContextGc for StackFrameGc {
-    fn collect(
+impl StackFrameGc {
+    fn collect_inner(
         &self,
         mut messages: Vec<ChatMessage>,
         budget: usize,
@@ -1308,14 +1966,6 @@ impl ContextGc for StackFrameGc {
             .collect();
         state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
         collected
-    }
-
-    fn name(&self) -> &'static str {
-        "stack"
-    }
-
-    fn cache_preserving(&self) -> bool {
-        self.preserve_prefix
     }
 }
 
@@ -1415,8 +2065,12 @@ fn pop_frame(messages: &mut [ChatMessage], keep: &mut [bool], frame: &Frame, sta
     }
 }
 
-/// `[frame: tool(args) -> result]`, one line per call, prefixed with a
-/// preview of the assistant's own narration when it had any. Pure
+/// `[frame call-id: tool(args) -> result]`, one line per call, prefixed
+/// with a preview of the assistant's own narration when it had any. The
+/// call id is the recovery handle, and a truncated result preview says so
+/// explicitly — t-1349 finding 3: an annotation that reports the call
+/// happened while silently withholding its result invites confabulation;
+/// one that names the eviction and the affordance invites recovery. Pure
 /// heuristics by design — an LLM summarization call here would spend
 /// tokens to save tokens (docs/GC.md reserves that for `stack-smart`).
 fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
@@ -1437,15 +2091,29 @@ fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
             .and_then(serde_json::Value::as_str)
             .map(|value| preview_chars(value, 80))
             .unwrap_or_default();
-        let result = frame
+        let full_result = frame
             .results
             .iter()
             .map(|idx| &messages[*idx])
             .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
             .and_then(|message| message.content.as_deref())
-            .map(|content| preview_chars(content.trim(), 120))
+            .map(str::trim)
             .unwrap_or_default();
-        lines.push(format!("[frame: {}({args}) -> {result}]", call.name));
+        if full_result.chars().count() > 120 {
+            // Truncated: spend the line on the eviction notice rather than
+            // a longer sliver of stale preview — the bare preview invites
+            // confabulation, the notice invites recovery.
+            let result = preview_chars(full_result, 80);
+            lines.push(format!(
+                "[frame {}: {}({args}) -> {result} — evicted; re-run to recover]",
+                call.id, call.name
+            ));
+        } else {
+            lines.push(format!(
+                "[frame {}: {}({args}) -> {full_result}]",
+                call.id, call.name
+            ));
+        }
     }
     lines.join("\n")
 }
@@ -1690,9 +2358,18 @@ mod tests {
                 message
                     .content
                     .as_deref()
-                    .is_some_and(|content| content.contains("[frame: shell(cargo test)"))
+                    .is_some_and(|content| content.contains("[frame call-1: shell(cargo test)"))
             })
             .expect("popped frame leaves a summary annotation");
+        // The fat result was truncated in the preview, so the annotation
+        // names the eviction and the recovery affordance (t-1360).
+        assert!(
+            summary
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("evicted; re-run to recover")),
+            "truncated frame previews must carry the recovery affordance: {summary:?}"
+        );
         assert!(
             summary.tool_calls.is_none(),
             "summary annotations carry no tool calls"
@@ -1951,7 +2628,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             tool.content.as_deref(),
-            Some("[tool: read_file /tmp/large.txt -- result incorporated]")
+            Some(
+                "[gc: result elided — read_file /tmp/large.txt (call-1); \
+                 recover: re-run the call — do not guess]"
+            )
         );
         assert_eq!(state.lifecycle[&tool.id], LifecycleState::Evictable);
     }
@@ -2930,5 +3610,298 @@ mod tests {
                     .as_ref()
                     .is_some_and(|calls| calls.iter().any(|call| call.id == "call-1"))
         }));
+    }
+
+    // ---- Eviction markers (t-1360) ------------------------------------------
+
+    /// Ballast + a droppable pair + protected tail, roomy enough that the
+    /// marker fits: the dropped tool result must leave a marker naming the
+    /// call id and the re-run affordance.
+    #[test]
+    fn ring_drop_leaves_a_marker_with_call_id_and_affordance() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({ "command": "cat config/access-code.txt" }),
+                )],
+            ),
+            ChatMessage::tool("call-1", "x".repeat(900)),
+            ChatMessage::assistant(Some("noted".into()), vec![]),
+            ChatMessage::user("now finish the task"),
+        ];
+        let mut state = GcState::default();
+        let budget = 220;
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget, "{collected:?}");
+        let marker = collected
+            .iter()
+            .find(|message| is_eviction_marker(message))
+            .expect("dropped pair must leave an eviction marker");
+        let content = marker.content.as_deref().unwrap();
+        assert!(
+            content.contains("shell call-1"),
+            "handle missing: {content}"
+        );
+        assert!(
+            content.contains("re-run the call") && content.contains("do not guess"),
+            "affordance missing: {content}"
+        );
+        assert_eq!(state.marker_summary.evicted_tool_results, 1);
+        assert_eq!(state.marker_summary.markers, 1);
+        assert!(!state.marker_summary.coalesced);
+        assert!(!state.marker_summary.suppressed);
+    }
+
+    /// N consecutive drops aggregate into ONE marker line whose count is N,
+    /// not N marker lines.
+    #[test]
+    fn consecutive_drops_aggregate_into_one_marker() {
+        let mut messages = vec![ChatMessage::system("system")];
+        for index in 0..4 {
+            messages.push(ChatMessage::assistant(
+                Some(format!("step {index} narration {}", "z".repeat(300))),
+                vec![],
+            ));
+        }
+        messages.push(ChatMessage::user("final question"));
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, 250, &mut state);
+
+        let markers: Vec<_> = collected
+            .iter()
+            .filter(|message| is_eviction_marker(message))
+            .collect();
+        assert_eq!(markers.len(), 1, "one run = one marker: {collected:?}");
+        assert!(
+            markers[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[gc: 3 evicted"),
+            "{markers:?}"
+        );
+    }
+
+    /// A dropped recall result is identified by its memory query, with the
+    /// recall affordance; a dropped user turn gets the ask-again affordance.
+    #[test]
+    fn markers_name_recall_queries_and_user_turns() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old request {}", "q".repeat(400))),
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    "call-9",
+                    "recall",
+                    serde_json::json!({ "query": "deploy window" }),
+                )],
+            ),
+            ChatMessage::tool("call-9", "### deploy-window\nTuesday 9am".repeat(20)),
+            ChatMessage::assistant(Some("noted".into()), vec![]),
+            ChatMessage::user("now the final step"),
+        ];
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, 200, &mut state);
+
+        let text: String = collected
+            .iter()
+            .filter(|message| is_eviction_marker(message))
+            .filter_map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("recall 'deploy window'"), "{text}");
+        assert!(text.contains("recall the memory"), "{text}");
+        assert!(text.contains("user turn 2"), "{text}");
+        assert!(text.contains("ask the user again"), "{text}");
+        assert_eq!(state.marker_summary.evicted_recalls, 1);
+        assert_eq!(state.marker_summary.evicted_user_turns, 1);
+    }
+
+    /// Markers are part of collect()'s pure output: two runs from equal
+    /// inputs produce byte-identical windows AND identical marker ids (no
+    /// fresh UUIDs).
+    #[test]
+    fn markers_are_deterministic_including_ids() {
+        let messages = stack_fixture();
+        let mut state_a = GcState::default();
+        let mut state_b = GcState::default();
+        let a = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages.clone(), 200, &mut state_a);
+        let b = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, 200, &mut state_b);
+        assert_eq!(a, b);
+        assert_eq!(
+            a.iter().map(|message| message.id).collect::<Vec<_>>(),
+            b.iter().map(|message| message.id).collect::<Vec<_>>(),
+            "marker ids must be deterministic"
+        );
+        assert_eq!(state_a.marker_summary, state_b.marker_summary);
+    }
+
+    /// Marker ids are never the dropped messages' own ids, so retention
+    /// metrics (id survival) cannot mistake a marker for its content.
+    #[test]
+    fn markers_do_not_reuse_dropped_ids() {
+        let messages = stack_fixture();
+        let original_ids: BTreeSet<_> = messages.iter().map(|message| message.id).collect();
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, 200, &mut state);
+        for marker in collected.iter().filter(|m| is_eviction_marker(m)) {
+            assert!(
+                !original_ids.contains(&marker.id),
+                "marker must mint a derived id, not reuse a dropped one"
+            );
+        }
+    }
+
+    /// Under further pressure a marker is itself droppable: a second
+    /// collection at a tighter budget absorbs the old marker's count into
+    /// its replacement instead of letting it vanish silently — and never
+    /// ships the window over budget.
+    #[test]
+    fn markers_are_droppable_and_counts_are_absorbed() {
+        let mut messages = vec![ChatMessage::system("system")];
+        for index in 0..3 {
+            messages.push(ChatMessage::assistant(
+                Some(format!("early step {index} {}", "y".repeat(250))),
+                vec![],
+            ));
+        }
+        for index in 0..3 {
+            messages.push(ChatMessage::assistant(
+                Some(format!("late step {index} {}", "w".repeat(250))),
+                vec![],
+            ));
+        }
+        messages.push(ChatMessage::user("wrap up"));
+        let ring = RingGc {
+            preserve_prefix: false,
+        };
+        let mut state = GcState::default();
+        let first = ring.collect(messages, 500, &mut state);
+        let first_marker_count: usize = first
+            .iter()
+            .filter(|m| is_eviction_marker(m))
+            .map(marker_evicted_count)
+            .sum();
+        assert!(first_marker_count > 0, "{first:?}");
+
+        let second = ring.collect(first, 200, &mut state);
+        assert!(estimate_tokens(&second) <= 200, "{second:?}");
+        let second_marker_count: usize = second
+            .iter()
+            .filter(|m| is_eviction_marker(m))
+            .map(marker_evicted_count)
+            .sum();
+        if second.iter().any(is_eviction_marker) {
+            assert!(
+                second_marker_count > first_marker_count,
+                "the replacement marker must absorb the dropped marker's count: \
+                 {second_marker_count} <= {first_marker_count}; {second:?}"
+            );
+        } else {
+            assert!(
+                state.marker_summary.suppressed,
+                "markers may only disappear via the recorded suppression path"
+            );
+        }
+    }
+
+    /// The terminal degrade: when not even one line fits, markers are
+    /// suppressed — recorded on the summary — and the window still
+    /// converges exactly as the core strategy left it.
+    #[test]
+    fn markers_never_break_convergence_and_record_suppression() {
+        let messages = adversarial_fixture();
+        let protected_tokens = estimate_tokens(&[messages[0].clone(), messages[1].clone()]);
+        let budget = protected_tokens + 5;
+        let mut state = GcState::default();
+        let collected = RingGc {
+            preserve_prefix: false,
+        }
+        .collect(messages, budget, &mut state);
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(
+            !collected.iter().any(is_eviction_marker),
+            "no room for markers at this budget: {collected:?}"
+        );
+        assert!(state.marker_summary.suppressed);
+    }
+
+    /// Stack integration: results dropped by a frame pop are covered by the
+    /// surviving `[frame ...]` annotation — no duplicate `[gc: ...]` line.
+    /// (Budget roomy enough that the ring-fallback phase never fires; if an
+    /// annotation is itself dropped later, a `[gc: ...]` marker rightly
+    /// stands in for it.)
+    #[test]
+    fn stack_frame_pops_are_not_double_marked() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        let collected = StackFrameGc::default().collect(messages, 200, &mut state);
+        assert!(
+            collected.iter().any(|message| message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("[frame call-1:"))),
+            "{collected:?}"
+        );
+        assert!(
+            !collected.iter().any(is_eviction_marker),
+            "frame-covered drops must not grow a duplicate marker: {collected:?}"
+        );
+        assert_eq!(state.marker_summary.evicted_tool_results, 0);
+    }
+
+    /// Cited-keep interplay (semantic): a marker for an evicted-but-cited
+    /// message carries the citing handle.
+    #[test]
+    fn marker_for_cited_evicted_message_names_the_citer() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    "call-7",
+                    "shell",
+                    serde_json::json!({ "command": "audit" }),
+                )],
+            ),
+            ChatMessage::tool("call-7", "audit output ".repeat(60)),
+            ChatMessage::assistant(Some("per the output of call-7, proceed".into()), vec![]),
+            ChatMessage::user("finish"),
+        ];
+        let build = build_eviction_markers(&messages, &[messages[0].clone(), messages[4].clone()]);
+        let text: String = build
+            .markers
+            .iter()
+            .filter_map(|(_, marker)| marker.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("shell call-7 (cited by turn 4)"),
+            "cited evicted results must carry the citing handle: {text}"
+        );
     }
 }

@@ -719,6 +719,11 @@ async fn collect_prompt(
     }
     let after_tokens = estimate_tokens(&collected);
     if config.gc_log {
+        // Eviction-marker summary (t-1360): what this collection left
+        // in-window as recovery markers, by count and kind — the signal
+        // behavioral evals use to tell marker-driven recovery from
+        // re-derivation and fabrication.
+        let markers = gc_state.marker_summary;
         let mut data = serde_json::json!({
             "type": "gc_collect",
             "strategy": config.gc.name(),
@@ -731,6 +736,15 @@ async fn collect_prompt(
             "dropped_count": dropped_count,
             "recall_overlap_events": recall_report.overlap_events,
             "recall_hot": recall_report.hot_total,
+            "markers": markers.markers,
+            "marker_kinds": {
+                "tool_result": markers.evicted_tool_results,
+                "recall": markers.evicted_recalls,
+                "user": markers.evicted_user_turns,
+                "assistant": markers.evicted_assistant_turns,
+            },
+            "markers_coalesced": markers.coalesced,
+            "markers_suppressed": markers.suppressed,
         });
         if let Some(cycle) = overflow_cycle {
             let object = data.as_object_mut().expect("gc_collect data is an object");

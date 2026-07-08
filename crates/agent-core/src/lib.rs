@@ -32,8 +32,9 @@ pub use chat_history::ChatHistory;
 pub use cost::{format_micro_usd, Pricing, PricingTable, RunUsage};
 pub use embedding::{content_hash, cosine, Embedder, EmbeddingClient, EmbeddingIndex};
 pub use gc::{
-    estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
-    GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,
+    estimate_tokens, is_eviction_marker, truncate_oversized_message, ContextGc,
+    EvictionMarkerSummary, FrameId, FrameStatus, GcMode, GcState, GcTiming, LifecycleState,
+    MarkSweepGc, MsgId, RingGc, StackFrameGc, EVICTION_MARKER_PREFIX,
 };
 pub use guidance::{
     runtime_guidance_fragment, runtime_guidance_section, DelegateModel, GuidanceCapabilities,

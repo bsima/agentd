@@ -794,6 +794,14 @@ struct CellMetrics {
     overlap_total: u64,
     /// Max gc_collect recall_hot: hot-set size high-water mark.
     recall_hot_max: u64,
+    /// Max gc_collect markers: in-window eviction-marker high-water mark
+    /// (t-1360). 0 on recordings made before the marker mechanism (the
+    /// field is absent there — see the pre-marker replay note in
+    /// `replay_cell`).
+    markers_max: u64,
+    /// gc_collect events whose marker emission was suppressed (no room for
+    /// even the coalesced line at this budget).
+    markers_suppressed: u64,
     usage: RunUsage,
     success: bool,
     /// The final answer asserts the claim marker with a wrong claim value
@@ -815,6 +823,8 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         dropped_total: 0,
         overlap_total: 0,
         recall_hot_max: 0,
+        markers_max: 0,
+        markers_suppressed: 0,
         usage: RunUsage::default(),
         success: fixture_success(fixture, content),
         confabulated: confabulated(fixture, content),
@@ -854,6 +864,16 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                 metrics.recall_hot_max = metrics
                     .recall_hot_max
                     .max(data["recall_hot"].as_u64().unwrap_or(0));
+                // Eviction-marker needles (t-1360): in-window marker
+                // high-water mark and suppression count, for scoring
+                // marker-driven recovery vs re-derivation vs fabrication.
+                // Absent on pre-marker recordings (replayed leniently).
+                metrics.markers_max = metrics
+                    .markers_max
+                    .max(data["markers"].as_u64().unwrap_or(0));
+                if data["markers_suppressed"].as_bool().unwrap_or(false) {
+                    metrics.markers_suppressed += 1;
+                }
                 // Structural: the write-barrier fields must be present on
                 // every gc_collect event (t-1351) — absent fields would
                 // silently zero the behavioral signal.
@@ -1300,7 +1320,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1316,6 +1336,7 @@ fn print_header() {
         "reasons",
         "drop",
         "ovl",
+        "mkr",
         "in_tok",
         "out_tok",
         "cost",
@@ -1339,7 +1360,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1355,6 +1376,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         reasons_label(&metrics.reasons),
         metrics.dropped_total,
         metrics.overlap_total,
+        metrics.markers_max,
         metrics.usage.input_tokens,
         metrics.usage.output_tokens,
         metrics
@@ -1616,13 +1638,28 @@ async fn replay_cell(
                 | Event::InferError { .. }
         )
     });
+    // Pre-marker recordings (before t-1360's eviction markers): GC re-runs
+    // live during replay, and the marker-era collector leaves marker lines
+    // in the window, so the gc stream (dropped counts, tokens, marker
+    // fields) cannot reproduce a recording made without them. Provider
+    // effects still replay by effect id, so answers, turns, tool counts,
+    // and usage must reproduce exactly; the gc-derived fields are reported
+    // from the recording and compared leniently until the cell is
+    // re-recorded (see evals/gc/README.md — fresh recordings are batched
+    // with the next online eval round).
+    let pre_marker_recording = recorded_events.iter().any(|event| {
+        matches!(event, Event::Custom { name, data, .. }
+            if name == "gc_collect" && data.get("markers").is_none())
+    });
     let mut replayed_cmp = replayed.clone();
-    if bound_errors {
+    if bound_errors || pre_marker_recording {
         replayed_cmp.collections = recorded.collections;
         replayed_cmp.reasons = recorded.reasons.clone();
         replayed_cmp.dropped_total = recorded.dropped_total;
         replayed_cmp.overlap_total = recorded.overlap_total;
         replayed_cmp.recall_hot_max = recorded.recall_hot_max;
+        replayed_cmp.markers_max = recorded.markers_max;
+        replayed_cmp.markers_suppressed = recorded.markers_suppressed;
         assert!(
             replayed.collections > 0 || recorded.collections == 0,
             "{}: replay lost the gc_collect stream entirely",

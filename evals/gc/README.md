@@ -276,7 +276,8 @@ overhead. The control (`none`) succeeded everywhere at these window sizes.
   confabulation (finding 3); an annotation that says the RESULT was
   evicted and must be re-fetched (rather than summarizing that the call
   happened) might flip fabrication into recovery. Cheap A/B on this
-  harness.
+  harness. **Done — t-1360** (eviction markers, all strategies; see
+  "Eviction markers" below); the online A/B is t-1369.
 
 ## Guided vs strategy (t-1364, online)
 
@@ -561,3 +562,51 @@ are now survivable — the decision is a genuine trade-off, not a bug fix,
 and these budgets (1.6-2k tokens) remain far below real deployments, so
 steady-state evidence at realistic budgets would settle it better than
 another extreme-pressure sample.
+
+## Eviction markers (t-1360) and recording validity
+
+Three rounds of behavioral evidence (t-1349 finding 3, t-1364 finding 3,
+the t-1367 re-run) converged on one mechanism gap: models fabricate
+evicted content (access codes: `CDBH92`, `7f4e2c91`, ...) instead of
+recovering or admitting loss, because collection was SILENT — nothing in
+the window said what was removed or how to get it back. t-1360 is the
+mechanism-level fix: every strategy's `collect()` now leaves a compact,
+deterministic `[gc: ...]` marker line where it dropped messages — kind,
+identifying handle (tool-call id; recall query; turn ordinal), and the
+recovery affordance ("re-run the call", "recall the memory", "ask the
+user again" — always "do not guess"). Consecutive drops aggregate into
+one line; markers are themselves droppable (a replacing marker absorbs
+the count, degrade coalesces to a single "earlier context compacted"
+line, terminal suppression is recorded on the gc_collect event); markers
+count toward the window budget (the collector re-collects with the
+marker cost reserved rather than overflowing). Stack's `[frame ...]`
+annotations now carry the call id and, when the preview is truncated, an
+explicit "evicted; re-run to recover" clause — a popped frame is its own
+marker, never double-marked. Mark-sweep's elision annotation joined the
+same `[gc: ...]` family. gc_collect events gained `markers`,
+`marker_kinds`, `markers_coalesced`, `markers_suppressed`.
+
+**Offline validation (this repo, asserted):** the matrix asserts, per
+cell, that evictions leave an in-window marker (or recorded
+suppression), that convergence holds with markers included in the
+budget, and that two runs produce identical windows *and identical
+message ids* (marker ids are derived, never minted). The behavioral
+table gained an `mkr` column (in-window marker high-water from
+gc_collect).
+
+**Recording validity:** provider effects replay by effect id regardless
+of prompt bytes, so every existing behavioral recording still replays —
+final answers, turns, tool counts, and usage reproduce exactly. But GC
+re-runs live and token-sensitively during replay, and the marker-era
+collector's gc stream (dropped counts, tokens, marker fields) cannot
+reproduce recordings made without markers (observed: early-needle/ring
+replays 44 drops vs 42 recorded). Pre-marker recordings — detected by
+the absence of the `markers` field on their gc_collect events — replay
+with the gc-derived fields compared leniently (the t-1222 stance);
+everything else stays strict. **Fresh recordings are needed before any
+behavioral claim about markers** — deliberately not recorded with
+t-1360 (key near expiry; batch with the next round): **t-1369**, whose
+deciding question is whether early-needle's fabricators flip to
+re-fetching. The hand-written judge fixture keys were regenerated for
+the marker-era windows (replay-path plumbing only, still not real
+judgments).
