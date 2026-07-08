@@ -1,0 +1,26 @@
+# Eval-owned model registry for the delegation eval's process children
+# (arm D of crates/agent/tests/delegation_evals.rs, t-1354). The harness
+# points arm-D shell children at this directory via XDG_CONFIG_HOME, so the
+# user's ~/.config/agent/models.yaml is never read or touched.
+#
+# The `eval-child` alias is the model the arm-D guidance tells the parent
+# to launch (`agent --model eval-child '<prompt>'`). The pricing block
+# makes the child's own trace carry costed InferResults (t-1334), which the
+# harness sweeps into the cell's child-cost column.
+#
+# The key comes from the environment the harness allowlists into the child
+# process (OPENROUTER_API_KEY) — never from this file.
+
+default_model: eval-child
+
+models:
+  - name: eval-child
+    provider: openai-compatible
+    base_url: https://openrouter.ai/api/v1
+    api_key: $OPENROUTER_API_KEY
+    api_id: openai/gpt-4o-mini
+    context: 128000
+    pricing:
+      input_per_mtok_usd: 0.15
+      output_per_mtok_usd: 0.60
+    display: Delegation-eval process child (cheap)

@@ -4,6 +4,11 @@ Measures whether the agent loop's `infer` tool — the model making a nested
 Infer call to delegate a subtask to another model — earns its cost. Harness:
 `cargo test -p agent-core --test infer_infer_evals -- --nocapture`.
 
+Scope note: the arms here are SCRIPTED — they pin the structural cost
+mechanics, not model behavior. Whether a real model *chooses* to delegate,
+shows restraint, and can drive a process subagent is the companion
+delegation-behavior eval (t-1354): [../delegation/](../delegation/README.md).
+
 ## What it measures
 
 Each fixture task runs in two arms against the same task:
