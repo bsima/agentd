@@ -2553,8 +2553,16 @@ async fn shutdown_signal() {
     }
 }
 
+/// The CLI's default System text: identity and stance only. The
+/// operational sentences that used to live here (when to use the shell
+/// tool, how it executes) moved into the shell ToolSpec description and
+/// the runtime-guidance fragment (t-1359, docs/GUIDANCE.md §4 step 3), so
+/// a --system-prompt override no longer deletes the runtime's only
+/// operational text — user instructions replace THIS text (the System
+/// section) while runtime guidance rides its own Developer section on
+/// every tool-bearing model call.
 fn base_system_prompt() -> &'static str {
-    "You are a standalone agent runner. Use the shell tool when you need to inspect or change the environment. The shell tool executes command strings with the configured shell inside the current process environment. When finished, answer concisely."
+    "You are a standalone agent runner. When finished, answer concisely."
 }
 
 async fn build_system_prompt(override_prompt: Option<String>) -> Result<String> {
@@ -2688,6 +2696,27 @@ fn trace_path(run_id: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t-1359 step 3: --system-prompt replaces only the System text. The
+    /// operational sentences that once lived in the default (shell-tool
+    /// usage) moved into the shell ToolSpec description and the
+    /// runtime-guidance fragment, so an override deletes nothing
+    /// operational — and the default no longer duplicates what the
+    /// runtime now delivers itself.
+    #[tokio::test]
+    async fn system_prompt_override_replaces_only_the_system_section() -> Result<()> {
+        let custom = build_system_prompt(Some("You are a mars rover.".into())).await?;
+        assert!(custom.starts_with("You are a mars rover."));
+        assert!(!custom.contains("standalone agent runner"));
+
+        let default = build_system_prompt(None).await?;
+        assert!(default.starts_with(base_system_prompt()));
+        assert!(
+            !default.contains("shell tool"),
+            "operational text moved out of the system prompt (t-1359): {default}"
+        );
+        Ok(())
+    }
 
     fn budget_exhausted_response(tool_calls: Vec<agent_core::ToolCall>) -> agent_core::Response {
         let mut metadata = serde_json::Map::new();

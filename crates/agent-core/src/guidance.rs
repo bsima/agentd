@@ -13,6 +13,16 @@
 //! dispatch time (`ir_tool_specs`), not program content, and recorded Infer
 //! results replay by effect id regardless of prompt bytes. Pinned by test.
 
+/// Shipped `shell` tool description. Carries the operational sentences
+/// that used to live only in the CLI's default system prompt — where any
+/// `--system-prompt` override silently deleted them (GUIDANCE.md §4
+/// migration step 3). As a tool description it survives every prompt
+/// configuration.
+pub const SHELL_TOOL_DESCRIPTION: &str =
+    "Execute a command string with the configured shell, inside the \
+     runtime's current process environment. Use it when you need to \
+     inspect or change the environment.";
+
 /// Shipped `infer` tool description (docs/GUIDANCE.md §2.1 delegation +
 /// §2.3 by-reference digestion, condensed to schema-description prose).
 pub const INFER_TOOL_DESCRIPTION: &str =

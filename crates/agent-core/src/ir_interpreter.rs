@@ -2192,7 +2192,7 @@ fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
             kind: "function".into(),
             function: crate::provider::ToolFunctionSpec {
                 name: "shell".into(),
-                description: "Execute a command string using the configured shell.".into(),
+                description: crate::guidance::SHELL_TOOL_DESCRIPTION.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": { "command": { "type": "string" } },

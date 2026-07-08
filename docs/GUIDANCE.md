@@ -616,6 +616,12 @@ deletes the runtime's only operational text.
 3. Move the CLI's `base_system_prompt()` operational sentences into the
    fragment, so `--system-prompt` composes instead of destroys.
    Per-block promotion thereafter follows §5's gate.
+   **Shipped (t-1359)** — the shell-usage sentences moved into the shell
+   ToolSpec description (recorded below); the CLI default keeps identity
+   text only, and `--system-prompt` (CLI flag, prompt-file frontmatter,
+   the agentd supervisor's agent.md instructions, SDK `instructions`)
+   replaces only that System text while the fragment rides its own
+   Developer section — pinned by crates/agent/tests/guidance_compose.rs.
 
 ### Shipped per-tool descriptions (t-1359)
 
@@ -623,6 +629,13 @@ The step-1 text as it ships, from `crates/agent-core/src/guidance.rs`
 (`ir_tool_specs` consumes these constants). The catalog's drafted bullets
 are condensed to schema-description prose here; this record and the
 constants are the same text by contract — edit both in the same commit.
+
+`shell` (the §4 step-3 move — the sentences a `--system-prompt` override
+used to silently delete):
+
+> Execute a command string with the configured shell, inside the
+> runtime's current process environment. Use it when you need to inspect
+> or change the environment.
 
 `infer` (§2.1 + §2.3):
 

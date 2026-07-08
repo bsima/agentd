@@ -281,7 +281,7 @@ impl SeqConfig {
             kind: "function".into(),
             function: ToolFunctionSpec {
                 name: "shell".into(),
-                description: "Execute a command string using the configured shell.".into(),
+                description: crate::guidance::SHELL_TOOL_DESCRIPTION.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": { "command": { "type": "string" } },
