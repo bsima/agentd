@@ -589,6 +589,8 @@ deletes the runtime's only operational text.
 1. Fatten tool descriptions with the per-tool drafted text (2.1–2.3).
    No new mechanism; A/B through the existing t-1354 harness (a
    description-only arm is a new row, not a new harness).
+   **Shipped (t-1359)** — exact text recorded in "Shipped per-tool
+   descriptions" below.
 2. Introduce the fragment mechanism: capability-keyed assembly →
    PromptIR Developer/Constraint section; flag + SDK toggle; fragment
    hash in traces. Ship with only eval-validated blocks default-on
@@ -597,6 +599,59 @@ deletes the runtime's only operational text.
 3. Move the CLI's `base_system_prompt()` operational sentences into the
    fragment, so `--system-prompt` composes instead of destroys.
    Per-block promotion thereafter follows §5's gate.
+
+### Shipped per-tool descriptions (t-1359)
+
+The step-1 text as it ships, from `crates/agent-core/src/guidance.rs`
+(`ir_tool_specs` consumes these constants). The catalog's drafted bullets
+are condensed to schema-description prose here; this record and the
+constants are the same text by contract — edit both in the same commit.
+
+`infer` (§2.1 + §2.3):
+
+> Delegate a subtask to another (usually cheaper) model and return its
+> response. Delegate when the subtask is generation-heavy (long
+> boilerplate, many candidates to write up) or requires digesting bulky
+> material you have already fetched — pass that material by reference via
+> context_refs; never paste large tool output into the prompt (copying it
+> costs output-rate tokens and the copy rides your history afterward). Do
+> NOT delegate questions you can answer directly, or work a one-line
+> command can do: a delegation costs a full provider round-trip of
+> serialized latency. Child prompts must be self-contained — the child
+> sees only your prompt and the referenced tool results, never this
+> conversation, and has no tools.
+
+`infer.context_refs` (§2.3):
+
+> ids of prior tool calls from this conversation (e.g. a shell call's id):
+> each referenced call's result is delivered to the sub-model directly,
+> ahead of the prompt, without being repeated here. Use this for bulky
+> output you only need distilled — you can issue the fetch and the
+> delegation in the same turn.
+
+`remember` (§2.2 — replaces the cross-session-only framing §2.2 identifies
+as the unguided failure mode):
+
+> Save a distilled fact to persistent memory. Save load-bearing
+> intermediate results as soon as you produce them — decisions, distilled
+> findings, computed values later steps depend on — because old tool
+> output may be evicted from your context and a fact you did not save may
+> be gone when you need it. Save the distilled fact, not raw output: one
+> or two sentences with the concrete values in them. Anything worth
+> keeping beyond this session — user preferences, project conventions,
+> decisions — also belongs here.
+
+`recall` (§2.2):
+
+> Search persistent memory by keywords and return matching notes. When you
+> need something you saw earlier and it is no longer in view, recall it
+> instead of re-running commands or guessing.
+
+None of this text enters the program hash or effect identity (tool
+descriptions are provider-offer material assembled from config at
+dispatch, not program content), so wording is tunable without breaking
+replay of old traces — pinned by
+`guidance::tests::tool_descriptions_never_enter_the_program_or_its_hash`.
 
 ## 5. Eval plan
 

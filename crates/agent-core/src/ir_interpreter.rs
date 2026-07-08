@@ -1769,9 +1769,7 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
             kind: "function".into(),
             function: crate::provider::ToolFunctionSpec {
                 name: "remember".into(),
-                description: "Save a fact to persistent memory for future sessions. \
-                              Use when something is worth keeping beyond this conversation."
-                    .into(),
+                description: crate::guidance::REMEMBER_TOOL_DESCRIPTION.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1797,8 +1795,7 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
             kind: "function".into(),
             function: crate::provider::ToolFunctionSpec {
                 name: "recall".into(),
-                description: "Search persistent memory by keywords and return matching notes."
-                    .into(),
+                description: crate::guidance::RECALL_TOOL_DESCRIPTION.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1831,11 +1828,7 @@ fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
             kind: "function".into(),
             function: crate::provider::ToolFunctionSpec {
                 name: "infer".into(),
-                description: "Ask another model a focused sub-question and return its \
-                              response. Pass bulky material (documents, logs, prior tool \
-                              output) by reference via context_refs instead of copying it \
-                              into the prompt."
-                    .into(),
+                description: crate::guidance::INFER_TOOL_DESCRIPTION.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1844,10 +1837,7 @@ fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
                         "context_refs": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "ids of prior tool calls from this conversation \
-                                            (e.g. a shell call's id): each referenced call's \
-                                            result is delivered to the sub-model directly, \
-                                            ahead of the prompt, without being repeated here"
+                            "description": crate::guidance::INFER_CONTEXT_REFS_DESCRIPTION
                         }
                     },
                     "required": ["model", "prompt"]

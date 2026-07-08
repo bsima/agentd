@@ -4,6 +4,7 @@ pub mod chat_history;
 pub mod cost;
 pub mod embedding;
 pub mod gc;
+pub mod guidance;
 pub mod hydration;
 pub mod interpreter;
 pub mod ir;
