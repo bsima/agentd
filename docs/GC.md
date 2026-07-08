@@ -23,7 +23,7 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 
 | Knob | What it does | When it wins | Flag |
 |---|---|---|---|
-| `stack` (default) | Pops completed tool frames to one-line `[frame: ...]` annotations; ring fallback otherwise | Tool-heavy sessions; best replay-completion (never dropped the task statement) | `--gc stack` |
+| `stack` (default) | Pops completed tool frames to one-line `[frame ...]` annotations; ring fallback otherwise | Tool-heavy sessions; best replay-completion (never dropped the task statement) | `--gc stack` |
 | `ring` | Drops oldest messages first | Chat-only windows; simplest, most predictable | `--gc ring` |
 | `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
 | `semantic` | Drops messages semantically distant from the recent thread (abandoned tangents first) | Long meandering sessions with dead ends; needs a registry `embeddings` entry | `--gc semantic` |
@@ -314,8 +314,9 @@ pinned    — never evict (system prompt, key decisions)
 - Tool call + result pairs are marked `complete` once the *next* assistant
   message references or incorporates the result.
 - Large `tool_result` messages (e.g., `read_file` output) are tagged
-  `evictable` after being incorporated — replaced with a one-line annotation:
-  `[tool: read_file /path — result incorporated]`
+  `evictable` after being incorporated — replaced with a one-line annotation
+  in the eviction-marker family (t-1360):
+  `[gc: result elided — read_file /path (call-1); recover: re-run the call — do not guess]`
 - System prompt and PromptIR `pinned` sections are always `pinned`.
 
 **Implementation:**
@@ -369,7 +370,12 @@ complete — result received
 popped   — replaced with summary annotation
 ```
 
-**Summary format:** `[frame: <tool_name>(<summary_of_args>) → <summary_of_result>]`
+**Summary format:** `[frame <call_id>: <tool_name>(<summary_of_args>) → <summary_of_result>]`
+— plus, when the result preview truncates, an explicit `— evicted; re-run
+to recover` clause (t-1360: an annotation that reports the call happened
+while silently withholding its body invites confabulation; one that names
+the eviction and the affordance invites recovery). The call id is the
+recovery handle.
 
 **Summarization:** Use pure heuristics for v1 — truncate tool results to first
 N chars + "…[truncated]". Do NOT use an LLM summarization call for v1: it adds
@@ -509,6 +515,66 @@ pre-pass (`interpreter::collect_prompt`) before the strategy runs:
   checkpoints — and are bounded by the run's own history.
 - **No strategy consumes it yet.** It is deliberately signal-only: t-1167's
   generational design is its first customer.
+
+---
+
+## Eviction markers (t-1360): the model must know WHAT was dropped
+
+Three behavioral eval rounds (t-1349, t-1364, the t-1367 re-run —
+evals/gc/README.md) found the same failure: when a collection silently
+removes an early tool result the task needs later, models **fabricate**
+its content (confidently wrong access codes) instead of recovering it or
+admitting loss — and do-not-guess guidance alone did not stop it. Silent
+removal is the confabulation machine; eviction visibility is the
+mechanism-level fix.
+
+**The mechanism.** When any strategy's `collect()` drops messages, it
+leaves a compact marker line (an ordinary assistant message) at the gap:
+
+```
+[gc: 2 evicted — shell call-3; recover: re-run the call — do not guess]
+[gc: 1 evicted — recall 'deploy window'; recover: recall the memory — do not guess]
+[gc: 3 evicted — user turn 2, assistant turn 4; recover: ask the user again — do not guess]
+[gc: earlier context compacted — 41 messages evicted; recover: re-run tool calls, recall memories, or ask the user — do not guess]
+```
+
+Kind, identifying handle (tool-call id — the re-run-by-id and citation
+handle; recall query; turn ordinal), recovery affordance. An
+evicted-but-cited message carries its citing handle (`cited by turn N` —
+the cited-keep interplay). Strategy integration is honest, not
+duplicated: a stack frame pop's surviving `[frame call-id: ...]`
+annotation IS the marker for its results (never double-marked), and
+mark-sweep's in-place elision annotation is the same `[gc: ...]` family.
+
+**Marker economics (all enforced by the offline matrix):**
+
+- **Cheap + aggregatable:** a dropped 2000-token result becomes one
+  ~30-token line; N consecutive drops share one line (item list capped,
+  `+K more`).
+- **Budget-honest:** markers count toward the window budget. The ladder
+  in `with_eviction_markers`: per-run markers when the sweep's overshoot
+  funds them → re-collect with the marker cost reserved (rejected if it
+  would invalidate the original budget's pinned prefix when the core
+  didn't — markers never break the preserve billing contract) → one
+  coalesced line → recorded suppression. A collection never ships over
+  budget because of its own markers; convergence contracts are exactly
+  the core strategies'.
+- **Droppable, never silently:** markers are unprotected assistant
+  messages; a later collection that drops one absorbs its count into the
+  replacing marker, adjacent markers fuse, and total suppression is
+  recorded (`markers_suppressed`) on the gc_collect event.
+- **Deterministic:** marker content is a pure function of the dropped
+  set; ids are sha256-derived from the dropped ids (never minted), so the
+  same collection yields byte- and id-identical output — `collect()`
+  stays pure.
+
+**Observability:** gc_collect events carry `markers` (in-window count),
+`marker_kinds` (tool_result/recall/user/assistant), `markers_coalesced`,
+`markers_suppressed`. The behavioral harness surfaces the high-water
+count as the `mkr` column so marker-driven recovery, re-derivation, and
+fabrication are distinguishable. Guidance §2.4 (docs/GUIDANCE.md)
+describes the marker format to the model — mechanism first, text second.
+Online behavioral validation of the markers is t-1369.
 
 ---
 

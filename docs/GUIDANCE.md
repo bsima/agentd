@@ -258,8 +258,10 @@ plus the cost columns.
 ### 2.4 GC awareness (your context is a managed window)
 
 **What.** Tell the model its context is not an append-only log: results
-get popped to `[frame: ...]` annotations, durable facts belong in memory,
-and (where the strategy supports it) citing a result by id protects it.
+get popped to `[frame ...]` annotations, evicted content is replaced by
+`[gc: ...]` markers naming what was removed and how to recover it
+(t-1360), durable facts belong in memory, and (where the strategy
+supports it) citing a result by id protects it.
 
 **When it pays.** Any session long enough to trigger collection.
 Grounding: the t-1339 strategy matrix (stack retains 63–70% of messages,
@@ -269,22 +271,27 @@ pops result bodies to ~1% of their tokens) and the cited-keep fixture
 
 **Unguided failure mode.** The model assumes verbatim availability of
 everything it ever saw: quotes from evicted bodies (confabulation risk),
-re-runs expensive commands, or is confused by `[frame: ...]` annotations
-it was never told about. No behavioral eval data yet; the GC behavioral
-eval (SDK sessions, `evals/gc/`) is the natural home for these arms.
+re-runs expensive commands, or is confused by `[frame ...]` annotations
+it was never told about. Behavioral data: t-1349 finding 3 and t-1364
+finding 3 (evals/gc/README.md) — models confidently fabricated evicted
+access codes, and do-not-guess text alone did not stop them, which is
+why t-1360 made the mechanism itself speak (eviction markers) and this
+block now merely describes it.
 
 **Drafted guidance** (ships when GC is enabled — which is the CLI
 default; the SDK's in-process `Runner` runs no GC and gets no block):
 
 > Your context window is managed. In long sessions, old tool results are
-> collapsed to one-line `[frame: ...]` annotations or dropped entirely.
+> collapsed to one-line `[frame ...]` annotations or replaced by
+> `[gc: ...]` eviction markers.
 >
 > - Extract what matters from a result when you see it — into your reply,
 >   or into memory with `remember`. Do not plan to re-read old output
 >   verbatim later.
-> - A `[frame: ...]` annotation means the result body is gone. If you
->   need it, re-run the command or `recall` the saved fact — do not guess
->   at what it contained.
+> - A `[frame ...]` or `[gc: ...]` line means that content is gone. The
+>   marker names what was evicted and how to recover it: re-run the named
+>   tool call, `recall` the named memory, or ask the user again — do not
+>   guess at what it contained.
 
 And, **only** when `semantic` + `cited-keep` is the active strategy:
 
@@ -295,16 +302,19 @@ And, **only** when `semantic` + `cited-keep` is the active strategy:
 (Shipped variant, t-1359: when GC is active but the memory tools are
 *not* offered, the `remember`/`recall` cross-references drop out — "into
 your reply, or into memory with `remember`" becomes "into your reply",
-and "re-run the command or `recall` the saved fact" becomes "re-run the
-command". Guidance naming tools the model does not have is noise; both
-variants live in `guidance.rs` as `GC_BLOCK_WITH_MEMORY` /
+and "re-run the named tool call, `recall` the named memory, or ask the
+user again" becomes "re-run the named tool call or ask the user again".
+Guidance naming tools the model does not have is noise; both variants
+live in `guidance.rs` as `GC_BLOCK_WITH_MEMORY` /
 `GC_BLOCK_WITHOUT_MEMORY`.)
 
 **Validation.** Arms inside the GC behavioral eval (guidance
 present/absent under forced pressure); metrics: confabulation needles
 (claims about evicted content), redundant re-execution count, task
 completion. Owned by the GC eval effort; this doc only specifies the
-arms.
+arms. The t-1360 text edit (markers) invalidates the prior recording per
+the §5 gate; the re-record is batched into t-1369 with the marker
+mechanism's own online validation.
 
 **Mechanism gaps:**
 
@@ -315,11 +325,12 @@ arms.
   lands for `stack` (listed as future work in docs/GC.md) before the
   sentence ships. Guidance must never claim protection the active
   strategy does not implement.
-- **GC pressure is invisible to the model.** There is no in-window signal
-  that a collection is imminent (the annotations only appear after the
-  fact). A one-line injected notice ("context at 85%; N results were
-  collapsed") would let save-before-eviction be *reactive* instead of
-  unconditional. Candidate mechanism task.
+- **GC pressure is invisible to the model.** Post-fact visibility landed
+  with t-1360 (eviction markers say what a collection removed and how to
+  recover it), but there is still no in-window signal that a collection
+  is *imminent*. A one-line injected notice ("context at 85%; N results
+  were collapsed") would let save-before-eviction be *reactive* instead
+  of unconditional. Candidate mechanism task.
 
 ### 2.5 Cost awareness (economy as a stance; usage surfacing as a gap)
 
@@ -427,7 +438,7 @@ needles.
 | Delegation | Delegate generation-heavy/bulky-digest subtasks via `infer` + `context_refs`; never direct questions; costs latency | **Validated with shipped text** (t-1354: 2.26x; t-1359 re-record: 1.41x, zero over-delegation, replay asserted) |
 | Store/Retrieve discipline | Save distilled load-bearing intermediates via `remember` as produced; `recall` instead of re-deriving | **A/B failed — demoted to draft** (t-1364: zero movement in 12 guided cells; t-1368). Tool descriptions remain shipped |
 | Eval→Infer chaining | Digest bulky command output by reference (`context_refs`), never by re-reading into your own tokens | Mechanics validated (t-1342, 1.6x); behavioral arm pending |
-| GC awareness | Context is a managed window; extract-or-`remember` on sight; `[frame: ...]` = body gone | Evaluated at extreme pressure only (t-1364: did not stop confabulation there); still shipped, full-variant only, budget-gated per §4 |
+| GC awareness | Context is a managed window; extract-or-`remember` on sight; `[frame ...]`/`[gc: ...]` = content gone, marker names the recovery | Text alone did not stop confabulation (t-1364); t-1360 paired it with the eviction-marker mechanism the text now describes — online A/B is t-1369. Shipped, budget-gated per §4 |
 | Cost awareness | Fewest steps; cheapest correct path; batch independent tool calls in one turn | Partially evidenced (t-1354 restraint generalization); explicit A/B pending |
 | Approval awareness | Gated effects pause durably; denial is an answer, not an error — never re-attempt | Not yet evaluated; offline-scriptable via SDK `on_approval` |
 
@@ -763,9 +774,10 @@ under an active strategy, memory core when the tools are offered, nothing
 when neither applies):
 
 > Your context window is managed: old tool results are collapsed or
-> dropped under pressure. Extract what matters from a result when you see
-> it; if a result you need is gone, re-run the command — do not guess at
-> what it contained.
+> dropped under pressure, and a `[gc: ...]` or `[frame ...]` marker names
+> what was evicted and how to recover it. Extract what matters from a
+> result when you see it; if a result you need is gone, re-run the
+> command — do not guess at what it contained.
 >
 > Save load-bearing values with `remember` as you produce them — the
 > distilled fact, not raw output — and `recall` them instead of re-running

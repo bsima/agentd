@@ -224,8 +224,9 @@ impl Default for MarkSweepGc {
 /// Strategy 3 (docs/GC.md): model each tool invocation+result as an
 /// activation frame. When over budget, pop completed frames oldest-first:
 /// the assistant tool-call message is rewritten in place to a one-line
-/// `[frame: tool(args) -> result]` annotation (keeping its stable id) and
-/// the tool result messages are dropped. The semantic record survives at
+/// `[frame call-id: tool(args) -> result]` annotation (keeping its stable
+/// id; a truncated preview carries an explicit "evicted; re-run to
+/// recover" clause, t-1360) and the tool result messages are dropped. The semantic record survives at
 /// ~1% of the tokens, which is why this is the space-efficient choice for
 /// tool-heavy agents. Summaries are pure heuristics — no LLM calls (the
 /// `stack-smart` variant is gated on the eval harness). The ring-fallback

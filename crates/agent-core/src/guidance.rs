@@ -134,29 +134,35 @@ conventions, decisions — always belongs in memory.";
 /// §2.4 GC-awareness block, memory-tools variant. Delivered only when a GC
 /// strategy is active AND the memory tools are offered (the
 /// `remember`/`recall` cross-references would otherwise name tools the
-/// model does not have).
+/// model does not have). The marker sentences describe the REAL t-1360
+/// mechanism (gc.rs eviction markers + frame annotations) — mechanism
+/// first, text describing it second, per the strategy-honesty rule.
 pub const GC_BLOCK_WITH_MEMORY: &str = "\
 Your context window is managed. In long sessions, old tool results are \
-collapsed to one-line `[frame: ...]` annotations or dropped entirely.
+collapsed to one-line `[frame ...]` annotations or replaced by `[gc: ...]` \
+eviction markers.
 
 - Extract what matters from a result when you see it — into your reply, \
 or into memory with `remember`. Do not plan to re-read old output \
 verbatim later.
-- A `[frame: ...]` annotation means the result body is gone. If you need \
-it, re-run the command or `recall` the saved fact — do not guess at what \
-it contained.";
+- A `[frame ...]` or `[gc: ...]` line means that content is gone. The \
+marker names what was evicted and how to recover it: re-run the named \
+tool call, `recall` the named memory, or ask the user again — do not \
+guess at what it contained.";
 
 /// §2.4 GC-awareness block, no-memory variant: the same text with the
 /// `remember`/`recall` cross-references removed (recorded as the shipped
 /// no-memory variant in docs/GUIDANCE.md).
 pub const GC_BLOCK_WITHOUT_MEMORY: &str = "\
 Your context window is managed. In long sessions, old tool results are \
-collapsed to one-line `[frame: ...]` annotations or dropped entirely.
+collapsed to one-line `[frame ...]` annotations or replaced by `[gc: ...]` \
+eviction markers.
 
 - Extract what matters from a result when you see it — into your reply. \
 Do not plan to re-read old output verbatim later.
-- A `[frame: ...]` annotation means the result body is gone. If you need \
-it, re-run the command — do not guess at what it contained.";
+- A `[frame ...]` or `[gc: ...]` line means that content is gone. The \
+marker names what was evicted and how to recover it: re-run the named \
+tool call or ask the user again — do not guess at what it contained.";
 
 /// §2.4 citation-protection line. Strategy-conditional (GUIDANCE.md gap
 /// 6): cited-keep is implemented for the `semantic` strategy only, so this
@@ -206,12 +212,15 @@ pub const FULL_FRAGMENT_BUDGET_SHARE: f32 = 0.05;
 pub const MINIMAL_FRAGMENT_BUDGET_SHARE: f32 = 0.15;
 
 /// Minimal-variant GC core (§2.4 distilled; ships when a GC strategy is
-/// active and the full fragment does not fit the budget).
+/// active and the full fragment does not fit the budget). One sentence on
+/// eviction markers (t-1360) — small budgets are exactly where GC fires
+/// most, so the marker format cannot be full-variant-only.
 pub const MINIMAL_GC_CORE: &str = "\
 Your context window is managed: old tool results are collapsed or dropped \
-under pressure. Extract what matters from a result when you see it; if a \
-result you need is gone, re-run the command — do not guess at what it \
-contained.";
+under pressure, and a `[gc: ...]` or `[frame ...]` marker names what was \
+evicted and how to recover it. Extract what matters from a result when \
+you see it; if a result you need is gone, re-run the command — do not \
+guess at what it contained.";
 
 /// Minimal-variant memory core (ships when the memory tools are offered
 /// and the full fragment does not fit the budget). One sentence — this is
@@ -483,7 +492,8 @@ mod tests {
         });
         assert!(infer.contains(DELEGATION_BLOCK));
         assert!(!infer.contains("persistent memory"));
-        assert!(!infer.contains("[frame:"));
+        assert!(!infer.contains("[frame"));
+        assert!(!infer.contains("[gc:"));
         assert!(!infer.contains("human approval"));
         assert!(infer.contains(COST_BLOCK));
 

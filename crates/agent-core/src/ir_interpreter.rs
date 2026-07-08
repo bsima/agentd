@@ -3386,7 +3386,7 @@ mod tests {
         // Capabilities not live in this config render no block: no memory
         // backend, no GC, no gated effect.
         assert!(!system.contains("persistent memory"));
-        assert!(!system.contains("[frame:"));
+        assert!(!system.contains("[frame"));
         assert!(!system.contains("human approval"));
 
         assert!(
