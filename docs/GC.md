@@ -1,7 +1,7 @@
 # agentd Context GC Design
 
-Status: **`ring`, `mark-sweep`, and `stack` are implemented** (with `--gc`,
-`--gc-threshold`, `--gc-log`, `--gc-timing`, the
+Status: **`ring`, `mark-sweep`, `stack`, and `semantic` are implemented**
+(with `--gc`, `--gc-threshold`, `--gc-log`, `--gc-timing`, the
 `truncate_oversized_message` pre-pass, pair atomicity, and the eval
 harness). **`stack` is the default strategy** (t-1348, promoted on the
 t-1339 strategy-matrix data). **`--gc-cache preserve|ignore` is
@@ -26,6 +26,7 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 | `stack` (default) | Pops completed tool frames to one-line `[frame: ...]` annotations; ring fallback otherwise | Tool-heavy sessions; best replay-completion (never dropped the task statement) | `--gc stack` |
 | `ring` | Drops oldest messages first | Chat-only windows; simplest, most predictable | `--gc ring` |
 | `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
+| `semantic` | Drops messages semantically distant from the recent thread (abandoned tangents first) | Long meandering sessions with dead ends; needs a registry `embeddings` entry | `--gc semantic` |
 | `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
 | cache `preserve` (default) | Pins system prompt + oldest ~25% of budget; evicts interior | Cached providers: zero prefix invalidations | `--gc-cache preserve` |
 | cache `ignore` | Front-drop allowed; maximal reclaim | No prompt caching in use | `--gc-cache ignore` |
@@ -55,6 +56,26 @@ timings x 3 strategies x 2 cache policies):
 - **`ring`.** Simplest and most predictable; right for pure chat. With
   `--gc-cache ignore` it front-drops the last user message under pressure
   (24/60 cells) — keep `preserve` on if you use ring.
+- **`semantic`** (t-1350). Scores each message by cosine similarity between
+  its embedding and the centroid of the last N messages, and drops the most
+  distant first — conversational dead ends and abandoned tangents go before
+  older but on-topic history, which no position-based strategy can do. On
+  the tangent-abandoned fixture at gate pressure it drops 88% of the
+  tangent while retaining 100% of the relevant thread (stack: 25%/89%
+  preserve, 12%/78% ignore), without regressing stack's replay-completion
+  on any existing fixture class. When it wins: long meandering sessions
+  that explore and abandon approaches. Costs: one embeddings API call per
+  collection pre-pass for uncached messages (visible as
+  `gc_semantic_embed{embedded,cached,failed}` under `--gc-log` — embedding
+  tokens are billed by the provider but are orders of magnitude cheaper
+  than chat tokens). Requires a model-registry `embeddings` entry (the same
+  one memory retrieval uses, t-1340); without one — or when the endpoint
+  fails, or under replay — scoring degrades to a deterministic recency
+  heuristic (ring's oldest-first ordering) rather than erroring. Hard
+  guards: never the system message, never the last user message, tool
+  pairs travel atomically, and the last `--gc-semantic-window` messages
+  (default 8) are immune; `--gc-semantic-floor` (default 0.25 cosine)
+  keeps plausibly-related messages for a second pass.
 - **Cache `preserve`.** Delivered exactly what it promises: 0 prefix
   invalidations across all 180 preserve cells vs 733 across ignore cells.
   Every invalidation is a full-window re-read at provider prices, so on
@@ -89,6 +110,8 @@ agent --gc none                # disable GC entirely (hard overflow = error)
 agent --gc-log                 # emit gc_collect trace events (for debugging)
 agent --gc-cache <mode>        # prefix-cache policy: preserve | ignore (default: preserve)
 agent --gc-timing <when>       # threshold | catch-overflow | eager | every:N (default: threshold)
+agent --gc-semantic-window <N> # semantic: recent-window size (centroid + recency floor; default: 8)
+agent --gc-semantic-floor <f>  # semantic: similarity floor (default: 0.25)
 ```
 
 `--gc none` restores the current behavior and is important for deterministic
@@ -157,6 +180,7 @@ Strategies (planned, not all implemented at once):
 | `ring`         | Drop oldest messages when buffer fills           | implemented |
 | `mark-sweep`   | Evict "dead" sections by type annotation         | implemented |
 | `stack`        | Pop completed tool-call frames to summaries      | implemented (default) |
+| `semantic`     | Drop messages semantically distant from the recent thread | implemented |
 | `generational` | Hot/warm/cold compaction (JVM-style)             | future      |
 | `refcount`     | Dependency-graph reachability eviction           | future      |
 
@@ -371,6 +395,30 @@ JSON. The requirement is that the estimate be a *conservative upper bound*
 (over-count). The worst case must be GC firing slightly early (mildly lossy),
 never an overflow we failed to prevent. Cheap + conservative beats accurate +
 optimistic.
+
+**The cache-consuming pattern (async inputs without breaking statelessness).**
+A strategy that wants expensive/async inputs — embeddings today, anything
+similar tomorrow — must not compute them inside `collect()` (which is
+synchronous, deterministic, and LLM-free by the first invariant). The
+sanctioned shape, following the t-1166 design-note precedent, is a split:
+
+- an **async pre-pass** in `interpreter::collect_prompt` (the layer with
+  async + config access, where the t-1343 backstop also lives) computes the
+  inputs and writes them into a `GcState` cache keyed by *message content
+  hash* — it runs after `truncate_oversized_message` because truncation
+  rewrites content, and it covers the scheduled, backstop, and overflow
+  collection paths uniformly;
+- `collect()` **consumes the cache read-only**. A missing entry — the
+  pre-pass never ran (no config, replay), failed (endpoint outage), or the
+  session resumed (GcState never serializes into checkpoints) — falls back
+  to a deterministic heuristic, never an error and never a provider call.
+
+Within a session the cache makes re-collections stable; across runs, the
+same window plus the same cached values produce an identical collection
+(asserted by the eval harness, which mirrors the pre-pass with a
+deterministic mock). The pre-pass must prune entries whose content left
+the window so the cache stays bounded by the live window.
+`SemanticGc`/`GcState.embeddings` is the reference implementation.
 
 ---
 
