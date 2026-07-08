@@ -277,7 +277,9 @@ overhead. The control (`none`) succeeded everywhere at these window sizes.
   evicted and must be re-fetched (rather than summarizing that the call
   happened) might flip fabrication into recovery. Cheap A/B on this
   harness. **Done — t-1360** (eviction markers, all strategies; see
-  "Eviction markers" below); the online A/B is t-1369.
+  "Eviction markers" below); the online A/B is t-1369 (**ran — see the
+  marker-era section at the end: the flip is real for recovery
+  attempts, partial for answers**).
 
 ## Guided vs strategy (t-1364, online)
 
@@ -607,6 +609,181 @@ everything else stays strict. **Fresh recordings are needed before any
 behavioral claim about markers** — deliberately not recorded with
 t-1360 (key near expiry; batch with the next round): **t-1369**, whose
 deciding question is whether early-needle's fabricators flip to
-re-fetching. The hand-written judge fixture keys were regenerated for
-the marker-era windows (replay-path plumbing only, still not real
-judgments).
+re-fetching. **Done — t-1369, next section.** The hand-written judge
+fixture keys were regenerated for the marker-era windows (replay-path
+plumbing only, still not real judgments).
+
+## Marker-era re-record (t-1369, online): do the fabricators flip?
+
+The deciding question, after three generations of the same finding
+(t-1349 finding 3, t-1364 finding 3, the t-1367 re-run): models
+fabricated evicted content because collection was silent — do they flip
+to honest recovery (re-run / recall / admit) now that t-1360 markers
+name what was evicted and how to get it back?
+
+**Design.** 14 cells re-recorded 2026-07-08 on the marker-era runtime
+(0199d44 + c70e98f), same model/provider/defaults as every prior round
+(`anthropic/claude-haiku-4.5` via OpenRouter), priority-ordered under a
+$1.50 cap:
+
+1. **early-needle x all four strategies x guided, n=2** — the deciding
+   cells. Guided is the shipped default; at these budgets the t-1368
+   gate suppresses the fragment entirely (~700 tokens > the 15%
+   ceiling), so **the markers are the whole intervention** — c70e98f's
+   §2.4 marker text never renders here (its promotion-gate re-record is
+   satisfied by this batch, but only degenerately; see residuals).
+2. **early-needle stack unguided, n=2** — the marker-vs-text isolation
+   pair: with the fragment suppressed, a guided cell's prompt is
+   byte-identical to its unguided twin, so the guided/unguided delta
+   bounds sampling variance rather than measuring text.
+3. tangent-return stack + mark-sweep guided n=1 (does marker presence
+   change thrash?), and memory-discipline ring + stack guided n=1
+   (spot cells).
+
+The stale pre-marker recordings at these 8 pre-existing paths were
+deleted (the t-1364/t-1367 tables above are the historical record);
+remaining pre-marker cells still replay leniently. New columns, all
+programmatic from traces: `mkref` (assistant texts quoting literal
+`[gc` / `[frame` marker syntax — prose like "evicted" is deliberately
+not counted because the shipped `remember` tool description uses that
+word in every cell's offer), `rcov` (recovery action: probe re-fetch
+beyond the task's allowance, or `recall` beyond the fixture's scripted
+count), `admt` (a failed final answer that admits the value is
+unavailable instead of asserting one; phrase-check lower bound).
+
+Spend: $0.70 matrix + $0.05 judge = **$0.75** (cap $1.50). Offline
+replay reproduces every cell (asserted per cell, re-verified from a
+cold offline run — the marker-era cells replay strictly, gc stream
+included).
+
+### Results (the 14 marker-era cells)
+
+```
+fixture            arm        guid s turns evals  rpt refx rem prem rec coll reasons     drop ovl mkr mkref   in_tok  out_tok       cost wall_s  ok cfab rcov admt judge
+early-needle       ring       on   1    21    20    8    2   0    0   0   18 s:18         316   0   1     0    50466     1828  $0.059606   38.2  NO  YES  yes    -   1/3
+early-needle       ring       on   2    16    15    5    3   0    0   0   13 s:13         174   0   1     0    37223     1319  $0.043818   27.7  NO  YES  yes    -   0/3
+early-needle       mark-sweep on   1    10     9    0    1   0    0   0    5 s:5           38   0   1     0    23187      723  $0.026802   15.2  NO    -  yes    -   1/3
+early-needle       mark-sweep on   2    10     9    0    0   0    0   0    6 s:6           42   0   1     0    23508      935  $0.028183   18.2  NO  YES    -    -   1/3
+early-needle       stack      off  1    27    30   22    4   0    0   1   22 s:22         620   0   1     0    65871     2498  $0.078361   42.0  NO    -  yes    -   0/3
+early-needle       stack      off  2    27    30   21    4   0    0   1   22 s:22         657   0   1     0    65728     2531  $0.078383   46.4  NO  YES  yes    -   1/3
+early-needle       stack      on   1    27    22   13    4   1    0   3   22 s:22         567   0   1     0    66269     2456  $0.078549   47.2  NO    -  yes    -   0/3
+early-needle       stack      on   2    27    25   11    2   0    0   1   22 s:22         564   0   1     0    66018     2287  $0.077453   46.9  NO    -  yes    -   0/3
+early-needle       semantic   on   1    16    13    4    1   0    0   2   11 s:11         156   0   2     0    38566     1368  $0.045406   25.0  NO    -  yes    -   0/3
+early-needle       semantic   on   2    18    16    6    0   0    0   1   13 s:13         212   0   2     1    43650     1600  $0.051650   29.7  NO  YES  yes    -   1/3
+tangent-return     mark-sweep on   1     8     5    0    0   2    0   0    6 s:6           10   0   1     0    18071      849  $0.022316   17.2 yes    -    -    -   3/3
+tangent-return     stack      on   1    27    21   19    9   5    0   0   25 s:25         595   0   1     0    55443     2341  $0.067148   48.5  NO    -  yes    -   0/3
+memory-discipline  ring       on   1     9     6    0    0   1    1   1    6 s:6           46   0   1     0    18894      766  $0.022724   17.0  NO    -    -    -   0/3
+memory-discipline  stack      on   1     9     6    0    0   1    1   1    6 s:6            6   0   0     0    19036      719  $0.022631   15.0 yes    -    -    -   3/3
+```
+
+The early-needle final answers, verbatim (the true code is
+`MX-7749-KESTREL`, true total 21): ring s1 `ACCESS 7B2X9K TOTAL 21`,
+ring s2 `ACCESS 7K9X2M TOTAL 21`, mark-sweep s1
+`ACCESS MX-7749-KESTREL TOTAL 28`, mark-sweep s2
+`ACCESS sk-7d42c991 TOTAL 25`, semantic s1
+`ACCESS MX-7749-KESTREL TOTAL 33`, semantic s2 `ACCESS 7K9mR2 TOTAL
+22`; all four stack cells hit the 26-turn cap mid-recovery with no
+final line.
+
+**The pre-marker baseline for contrast** — the current-descriptions
+early-needle GC cells from the two prior generations (t-1364 unguided
+rows above; t-1367 re-run guided rows above): 9 cells, **cfab 7/9**,
+recovery actions (refx>0) 4/9, unprompted recall **0/9** — as in every
+prior generation ("nobody reached for recall unprompted", t-1349
+finding 3).
+
+### Verdict: markers flip fabrication into recovery ATTEMPTS — reliably — but not yet into recovered ANSWERS
+
+Caveats as always: one model, n<=2, extreme budgets (1.6-2k tokens),
+provider-default temperature.
+
+1. **Recovery actions: 4/9 -> 9/10.** Every marker-era early-needle
+   cell except mark-sweep s2 took at least one recovery action the
+   marker affordances name. **Unprompted recall: 0/9 -> 6/10** — the
+   first unprompted `recall` calls in three generations of this eval
+   (stack s1 issued three; semantic s1 two), plus the first unprompted
+   `remember`s (stack guided s1; tangent mark-sweep, rem=2). The
+   marker's "recall the memory" affordance is demonstrably read: the
+   memory tools were offered identically in every prior round and
+   never touched outside the scripted fixture.
+2. **Fabrication: 7/9 -> 4/10 cells** (of answering cells, 7/9 ->
+   4/6). And the two honest answers are the first GC cells on this
+   fixture to end with the REAL code since t-1349's single ring
+   re-fetch: mark-sweep s1 and semantic s1 both re-fetched
+   (semantic also recalled) and answered `MX-7749-KESTREL`, failing
+   only arithmetic — the honest-slip failure mode, not confabulation.
+3. **The residual fabrications are recovery that didn't survive to
+   the answer.** Ring s1/s2 re-ran `cat config/access-code.txt` two
+   and three times (rcov yes) — and still fabricated: under 13-18
+   collections the re-fetched result was itself re-evicted before
+   step 9, and at answer time the model guessed rather than re-fetch
+   once more. Recovery attempted != recovery delivered when nothing
+   protects a just-recovered value (see the t-1166/t-1167 note
+   below).
+4. **Stack traded fabrication for a non-terminating recovery loop.**
+   All four stack cells (guided and unguided alike) ran to the turn
+   cap re-fetching, recalling, and re-counting (refx 2-4, rec 1-3,
+   22 collections, ~$0.078 = 2.4x control) — honest, expensive, and
+   answerless. Pre-marker stack answered cheaply and wrongly;
+   marker-era stack never answers. That is the t-1367 trade
+   (cheapest-failure trap defused: the failure is now visible and
+   costly) extended to this fixture, and it wants a termination
+   affordance, not more recovery pressure.
+5. **Nobody admits loss: admt 0/14.** The marker says "re-run the
+   call — do not guess"; models re-ran or guessed, but no cell ever
+   answered "the code is unavailable". Admission may need an explicit
+   affordance ("if recovery fails, say so") — currently only in the
+   suppressed §2.4 text.
+6. **Markers alone suffice for the attempt-flip; the text adds nothing
+   measurable here.** The stack guided/unguided quadruple —
+   byte-identical prompts, fragment suppressed — behaved as one
+   population (27 turns, 22 collections, refx 2-4, rec 1-3, $0.077-
+   0.079). Attribution: the flip is the markers' (the only delta vs
+   the pre-marker generation on identical tool descriptions), and
+   guidance-on vs off at these budgets measures nothing, as the
+   t-1368 gate predicts. Whether §2.4's text adds anything ON TOP of
+   markers is only measurable at budgets where it renders (>= ~4.7k).
+7. **Thrash is marker-insensitive.** Tangent-return stack still looped
+   (25 collections, refx 9) — the restart loop is driven by evicted
+   progress narration, which markers name but cannot replace.
+   Mark-sweep completed tangent-return again (3/3 judge, $0.0223,
+   fourth straight generation), this time remembering unprompted.
+   Memory-discipline: stack perfect (3/3); ring recovered the token
+   correctly via scripted recall but miscounted WARNs (11 vs 6) — an
+   arithmetic slip, n=1 sampling variance against its pre-marker pass.
+8. **Marker mechanics behaved:** in-window marker high-water was 1-2
+   in every cell (fusion/coalescing kept markers from accumulating
+   across 22-25 collections), no suppressions, and marker-era cells
+   replay strictly — dropped counts, marker fields and all. `mkref`
+   was ~0 (one quote, semantic s2): models act on markers without
+   quoting them, so `rcov` deltas, not quotes, carry the attribution.
+
+**For t-1166/t-1167's parked designs:** markers change what
+compaction must preserve. The recovery affordance makes the *handle*
+(tool-call id, memory slug) load-bearing rather than the content —
+compaction can be aggressive about content if handles survive. But
+finding 3 is the new constraint: a recovered value must be
+*re-protectable* or recovery is wasted spend — the strongest in-vivo
+argument yet for the t-1351/t-1167 direction (recall/re-fetch overlap
+tracking feeding a hot set that collection respects), and finding 4
+wants a loop-termination signal (the t-1349 progress-narration gap
+again: "you already re-ran this; steps 1-N are done").
+
+**Default-strategy note (the open stack vs mark-sweep decision):** this
+run moves nothing against mark-sweep and adds one point against stack
+at extreme pressure — mark-sweep produced the only honest early-needle
+answer, the only tangent-return completion (fourth straight
+generation), and both at the lowest GC-arm cost, while stack converted
+its cheap wrong answers into turn-cap recovery loops. The trade-off
+framing from the t-1367 follow-up stands; the evidence gap is still
+steady-state behavior at realistic budgets.
+
+**Honest residuals:** fabrication persists in 4/10 deciding cells;
+stack's recovery loop never terminates; no admissions anywhere; §2.4's
+marker text is behaviorally unvalidated at any budget where it
+actually renders (this batch discharges c70e98f's re-record obligation
+only because no cell renders the text); the two thrash-transcript
+judge verdicts (early-needle stack unguided s2, tangent stack guided
+s1) again wrapped their JSON in prose and remain the least reliable
+rows; and no early-needle GC cell has ever passed both needles —
+the honest ceiling at these budgets is "right code, wrong sum".

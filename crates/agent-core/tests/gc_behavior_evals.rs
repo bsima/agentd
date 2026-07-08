@@ -79,6 +79,28 @@
 //! final answer asserts the fixture's claim marker with a wrong value —
 //! fabricated content for evicted material; needle-absence programmatic
 //! check, corroborated by the judge's grounded_final_answer).
+//!
+//! Marker axis (t-1369): t-1360 gave every strategy eviction markers — a
+//! deterministic `[gc: ...]` line naming what was dropped (tool-call id,
+//! recall query, turn ordinal) and the recovery affordance ("re-run the
+//! call" / "recall the memory" / "ask the user again" — always "do not
+//! guess"), and stack's `[frame ...]` annotations an explicit
+//! "evicted; re-run to recover" clause. The deciding question: do the
+//! early-needle fabricators (t-1349 finding 3, reproduced twice) flip to
+//! honest recovery now that eviction is named instead of silent? At these
+//! budgets the t-1368 gate suppresses the guidance fragment entirely, so
+//! the markers themselves are the intervention — a guided cell's prompt
+//! differs from its unguided twin by nothing, which the early-needle
+//! stack guided/unguided pairs measure directly (any delta is sampling
+//! variance, not text effect). Marker-reaction metrics, all from traces:
+//! `mkref` (assistant texts quoting marker syntax — the literal `[gc` /
+//! `[frame` strings, which only an in-window marker can supply; the
+//! `remember` tool description says "evicted", so prose-level mentions
+//! are deliberately NOT counted), `rcov` (recovery action: re-ran the
+//! probe command beyond the task's allowance, or recall beyond the
+//! fixture's scripted count), and `admt` (the final answer admits the
+//! value is unavailable instead of asserting one — admission-phrase
+//! check on failed cells, a lower bound).
 
 use agent_core::gc::SemanticGc;
 use agent_core::{
@@ -273,6 +295,9 @@ struct Fixture {
     probe: &'static str,
     /// How many probe-matching commands the task itself asks for.
     probe_allowance: usize,
+    /// How many `recall` calls the task script itself asks for; recalls
+    /// beyond this count as recovery actions (t-1369 `rcov`).
+    scripted_recalls: usize,
     /// Deterministic working-directory content.
     files: Vec<(&'static str, String)>,
 }
@@ -466,6 +491,7 @@ fn fixtures() -> Vec<Fixture> {
             claim_marker: "ACCESS",
             probe: "access-code",
             probe_allowance: 1,
+            scripted_recalls: 0,
             files: vec![
                 ("manual.txt", filler_lines(&MANUAL_WORDS, 1, 36, "manual: ")),
                 ("config/access-code.txt", format!("{ACCESS_CODE}\n")),
@@ -504,6 +530,7 @@ fn fixtures() -> Vec<Fixture> {
             claim_marker: "CATEGORIES",
             probe: "app.log",
             probe_allowance: 2,
+            scripted_recalls: 0,
             files: vec![
                 ("app.log", app_log()),
                 ("poems/verse-1.txt", filler_lines(&POEM_WORDS, 3, 52, "")),
@@ -545,6 +572,7 @@ fn fixtures() -> Vec<Fixture> {
             claim_marker: "DEPLOY",
             probe: "deploy-token",
             probe_allowance: 1,
+            scripted_recalls: 1,
             files: vec![
                 (
                     "build/toolchain.txt",
@@ -646,6 +674,40 @@ fn confabulated(fixture: &Fixture, content: &str) -> bool {
         ordered_needles_present(content, &fixture.ordered_needles)
     };
     !claim_ok
+}
+
+/// Marker-reaction needle (t-1369): does an assistant text quote eviction-
+/// marker syntax? Keyed on the literal `[gc` / `[frame` strings, which only
+/// an in-window marker (t-1360) can supply. Deliberately NOT keyed on
+/// "evicted"/"re-run" prose: the shipped `remember`/`recall` tool
+/// descriptions use those words in every cell's offer, guided or not, so a
+/// prose match cannot be attributed to a marker. A lower bound — a model
+/// reacting to a marker without quoting it is not counted.
+fn mentions_marker(content: &str) -> bool {
+    content.contains("[gc") || content.contains("[frame")
+}
+
+/// Honest-loss admission (t-1369): the final answer flags the value as
+/// unavailable instead of asserting one. Phrase check on a short final
+/// answer — a lower-bound heuristic, only meaningful on failed cells
+/// (a successful answer has nothing to admit).
+fn admits_loss(content: &str) -> bool {
+    const ADMISSIONS: [&str; 12] = [
+        "evicted",
+        "was lost",
+        "lost from",
+        "no longer",
+        "not available",
+        "unavailable",
+        "unable to",
+        "cannot",
+        "can't",
+        "could not",
+        "couldn't",
+        "do not have",
+    ];
+    let lower = content.to_lowercase();
+    ADMISSIONS.iter().any(|phrase| lower.contains(phrase))
 }
 
 // --- cell runner -----------------------------------------------------------------
@@ -802,6 +864,18 @@ struct CellMetrics {
     /// gc_collect events whose marker emission was suppressed (no room for
     /// even the coalesced line at this budget).
     markers_suppressed: u64,
+    /// Assistant texts quoting eviction-marker syntax (`[gc` / `[frame`) —
+    /// the model demonstrably read a marker (t-1369; lower bound, see
+    /// [`mentions_marker`]).
+    marker_mentions: usize,
+    /// Recovery action taken (t-1369): probe re-fetch beyond the task's
+    /// allowance, or recall beyond the fixture's scripted count — the
+    /// marker affordances ("re-run the call", "recall the memory") acted
+    /// on, whatever prompted them.
+    recovered: bool,
+    /// Failed cell whose final answer admits the value is unavailable
+    /// instead of asserting one (t-1369; see [`admits_loss`]).
+    admitted: bool,
     usage: RunUsage,
     success: bool,
     /// The final answer asserts the claim marker with a wrong claim value
@@ -825,6 +899,9 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         recall_hot_max: 0,
         markers_max: 0,
         markers_suppressed: 0,
+        marker_mentions: 0,
+        recovered: false,
+        admitted: false,
         usage: RunUsage::default(),
         success: fixture_success(fixture, content),
         confabulated: confabulated(fixture, content),
@@ -837,6 +914,16 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
             Event::InferCall { parent_op_id, .. } => {
                 if parent_op_id.is_none() {
                     metrics.turns += 1;
+                }
+            }
+            Event::InferResult {
+                response: Some(response),
+                ..
+            } => {
+                // Marker-reaction needle (t-1369): the model's own text
+                // quoting `[gc` / `[frame` — it demonstrably read a marker.
+                if mentions_marker(&response.content) {
+                    metrics.marker_mentions += 1;
                 }
             }
             Event::EvalCall { command, .. } => {
@@ -887,6 +974,11 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         }
     }
     metrics.needle_refetches = probe_hits.saturating_sub(fixture.probe_allowance);
+    // Recovery actions (t-1369): the marker affordances acted on — re-run
+    // the named call (probe re-fetch) or recall beyond the script.
+    metrics.recovered =
+        metrics.needle_refetches > 0 || metrics.recall_calls > fixture.scripted_recalls;
+    metrics.admitted = !metrics.success && admits_loss(content);
     metrics.usage = done_usage
         .ok_or_else(|| anyhow!("trace has no AgentDone usage rollup (t-1334 instrument)"))?;
     Ok(metrics)
@@ -951,7 +1043,31 @@ struct CellId {
     sample: u32,
 }
 
-/// The recording plan, in SPEND-PRIORITY order. Two generations:
+/// The recording plan, in SPEND-PRIORITY order. Three generations:
+///
+/// t-1369 marker-era re-record (first, so the spend cap can never cut it):
+/// t-1360 gave every strategy eviction markers, which invalidated the
+/// pre-marker recordings' gc streams (replayed leniently, but no basis
+/// for any behavioral claim about markers). The deciding cells:
+///
+/// 1. early-needle x all four strategies x guided, n=2 — do the
+///    fabricators flip to honest recovery (re-run / recall / admit) now
+///    that markers name what was evicted and how to get it back? Guided
+///    is the shipped default; at these budgets the t-1368 gate suppresses
+///    the fragment, so the markers are the whole intervention.
+/// 2. early-needle stack unguided, n=2 — the marker-vs-text isolation
+///    pair: with the fragment suppressed, guided and unguided prompts are
+///    byte-identical, so any guided/unguided delta here bounds sampling
+///    variance rather than measuring a text effect.
+/// 3. tangent-return stack + mark-sweep guided, n=1 — does marker
+///    presence change the thrash loop?
+/// 4. memory-discipline ring + stack guided, n=1 — spot cells: does a
+///    marker naming an evicted recall change memory discipline?
+///
+/// The stale pre-marker recordings at these paths were deleted with this
+/// change (the t-1364/t-1367 tables in evals/gc/README.md are the
+/// historical record); the remaining pre-marker cells keep replaying
+/// leniently. Earlier generations:
 ///
 /// t-1364 recorded the guidance x strategy matrix. Its guided recordings
 /// were later invalidated in two waves — the t-1367 last-user hard guard
@@ -974,6 +1090,41 @@ struct CellId {
 /// Then the t-1364 unguided coverage and `none` baselines, all recorded.
 fn planned_cells() -> Vec<CellId> {
     let mut cells = Vec::new();
+    // t-1369 marker-era cells, in deciding-question-first order.
+    for arm in [Arm::Ring, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
+        for sample in [1, 2] {
+            cells.push(CellId {
+                fixture: "early-needle",
+                arm,
+                guided: true,
+                sample,
+            });
+        }
+    }
+    for sample in [1, 2] {
+        cells.push(CellId {
+            fixture: "early-needle",
+            arm: Arm::Stack,
+            guided: false,
+            sample,
+        });
+    }
+    for arm in [Arm::Stack, Arm::MarkSweep] {
+        cells.push(CellId {
+            fixture: "tangent-return",
+            arm,
+            guided: true,
+            sample: 1,
+        });
+    }
+    for arm in [Arm::Ring, Arm::Stack] {
+        cells.push(CellId {
+            fixture: "memory-discipline",
+            arm,
+            guided: true,
+            sample: 1,
+        });
+    }
     // t-1367 re-run: the deciding guided ring/stack cells.
     for fixture in ["early-needle", "tangent-return", "memory-discipline"] {
         for arm in [Arm::Ring, Arm::Stack] {
@@ -1027,7 +1178,16 @@ fn planned_cells() -> Vec<CellId> {
             }
         }
     }
-    cells
+    // Later generations re-plan cells earlier ones already carry (the
+    // t-1369 block owns several t-1367/t-1364 paths): first occurrence —
+    // highest priority — wins.
+    let mut unique: Vec<CellId> = Vec::with_capacity(cells.len());
+    for cell in cells {
+        if !unique.contains(&cell) {
+            unique.push(cell);
+        }
+    }
+    unique
 }
 
 fn write_cell_recording(path: &Path, meta: &CellMeta, events: &[Event]) -> Result<()> {
@@ -1320,7 +1480,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1337,12 +1497,15 @@ fn print_header() {
         "drop",
         "ovl",
         "mkr",
+        "mkref",
         "in_tok",
         "out_tok",
         "cost",
         "wall_s",
         "ok",
         "cfab",
+        "rcov",
+        "admt",
         "judge",
     );
 }
@@ -1360,7 +1523,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1377,6 +1540,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         metrics.dropped_total,
         metrics.overlap_total,
         metrics.markers_max,
+        metrics.marker_mentions,
         metrics.usage.input_tokens,
         metrics.usage.output_tokens,
         metrics
@@ -1386,6 +1550,8 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         meta.wall_ms as f64 / 1000.0,
         if metrics.success { "yes" } else { "NO" },
         if metrics.confabulated { "YES" } else { "-" },
+        if metrics.recovered { "yes" } else { "-" },
+        if metrics.admitted { "yes" } else { "-" },
         judge,
     );
 }
@@ -1856,6 +2022,7 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         claim_marker: "RESULT",
         probe: "fat.txt",
         probe_allowance: 1,
+        scripted_recalls: 0,
         files: vec![("fat.txt", filler(&MANUAL_WORDS, 9, 6000))],
     };
     let provider = Arc::new(ScriptedProvider::new(vec![
@@ -1926,6 +2093,18 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         "correct answer is not a confabulation"
     );
     assert!(
+        metrics.recovered,
+        "re-fetch + unscripted recall count as recovery actions (t-1369)"
+    );
+    assert!(
+        !metrics.admitted,
+        "a successful answer has nothing to admit"
+    );
+    assert_eq!(
+        metrics.marker_mentions, 0,
+        "scripted turns never quote marker syntax"
+    );
+    assert!(
         metrics.collections > 0,
         "two 6KB tool results under a 400-token budget must collect"
     );
@@ -1953,6 +2132,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
         claim_marker: "RESULT",
         probe: "fat.txt",
         probe_allowance: 1,
+        scripted_recalls: 0,
         files: vec![("fat.txt", filler(&MANUAL_WORDS, 9, 6000))],
     };
     let provider = Arc::new(ScriptedProvider::new(vec![
@@ -2061,6 +2241,28 @@ fn confabulation_flag_detects_fabricated_claims() {
         .unwrap();
     assert!(confabulated(memory, "DEPLOY TOKEN-1234-FAKE WARNS 6"));
     assert!(!confabulated(memory, "DEPLOY TOKEN-9QX-RAVEN-7734 WARNS 6"));
+}
+
+/// Marker-reaction needles (t-1369): syntax quotes count, prose does not
+/// (the shipped `remember` description says "evicted" in every cell's
+/// offer, so prose can never be attributed to a marker); admissions flag
+/// unavailable-value answers, not asserted ones.
+#[test]
+fn marker_reaction_needles() {
+    assert!(mentions_marker(
+        "A [gc: 3 evicted — shell call-2; recover: re-run the call] line is present."
+    ));
+    assert!(mentions_marker(
+        "I see [frame call-1: shell(cat manual.txt) -> ... — evicted; re-run to recover]."
+    ));
+    assert!(!mentions_marker(
+        "old tool output may be evicted from your context — I will re-run the command"
+    ));
+    assert!(admits_loss(
+        "The access code was evicted from context and I cannot recover it."
+    ));
+    assert!(admits_loss("ACCESS <no longer available> TOTAL 21"));
+    assert!(!admits_loss("ACCESS MX-7749-KESTREL TOTAL 21"));
 }
 
 /// Judge book round-trip: a record written the way the online path writes
