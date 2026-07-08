@@ -184,6 +184,14 @@ Both map cleanly onto the existing effect/handler vocabulary and the stable-effe
 
 The important rule, unchanged across all of these: failure behavior must be visible in traces and replay. A failed effect always has a stable effect ID and an error event (`InferError`/`StoreError`/`RetrieveError`), whether it then aborts, binds, or (in future) resumes — not just a missing result.
 
+## Nested delegation: the `infer` tool
+
+The agent loop exposes an `infer` tool so the model can dispatch a nested `Infer` directly: `{model, prompt, context_refs?}`. The child is a bare single completion — it is offered no tools (`InferPolicy.tools = Some([])`, t-1346), its text feeds back verbatim as the tool result (t-1120), and a failed dispatch (e.g. a hallucinated model id) binds as a readable tool result rather than aborting the turn (t-1222). Trace lineage rides on `parent_op_id` (t-1347).
+
+**Pass-by-reference (t-1344).** `context_refs` is an optional array of tool-call ids — the ids the model itself minted when calling tools, already visible in its own context as `tool_calls[].id` / `tool_call_id`, so nothing extra needs surfacing. At dispatch, the loop program resolves each id against history (`Expr::SelectToolResults`, a pure total expression) and assembles the referenced tool results into the child's messages server-side. The material therefore never transits parent output tokens, and the arguments retained in parent history stay small (refs + prompt) — by-copy delegation of material cost 5x the input rate to emit and then rode history every later turn (see evals/infer-infer/README.md for the measured economics). Results append to history as the tool loop walks one assistant turn, so a batch like `[shell fetch, infer(context_refs=[that shell id])]` resolves within the same turn. An unresolved ref binds as a tool result naming the missing ids; the child is not dispatched.
+
+**Child message structure.** Optional system slot first (`AgentLoopOptions.infer_system_prompt` — owned by the dispatch site, never the model, and part of the program hash like every other loop knob), then one user message per referenced result under a short provenance header, then the instruction prompt. Without refs the child still receives exactly one bare user message: parent history never leaks into the child implicitly.
+
 ## `Par` semantics
 
 `Par` should have deterministic semantics before it becomes a core runtime feature.
