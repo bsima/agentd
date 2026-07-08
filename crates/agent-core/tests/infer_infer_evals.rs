@@ -134,6 +134,42 @@ fn infer_ref_call(id: &str, model: &str, prompt: &str, context_refs: &[&str]) ->
     )
 }
 
+/// Replace the digits of every `"duration_ms":<n>` with `0` so wall-clock
+/// noise in real Eval results never enters token metering.
+fn normalize_wallclock(text: &str) -> String {
+    let needle = "\"duration_ms\":";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(needle) {
+        let split = idx + needle.len();
+        out.push_str(&rest[..split]);
+        rest = &rest[split..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 {
+            out.push('0');
+            rest = &rest[digits..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn normalize_wallclock_zeroes_durations_and_leaves_the_rest() {
+    assert_eq!(
+        normalize_wallclock(r#"{"ok":true,"duration_ms":1234,"stdout":"x"}"#),
+        r#"{"ok":true,"duration_ms":0,"stdout":"x"}"#
+    );
+    assert_eq!(
+        normalize_wallclock(r#"a "duration_ms":7 b "duration_ms":890 c"#),
+        r#"a "duration_ms":0 b "duration_ms":0 c"#
+    );
+    assert_eq!(
+        normalize_wallclock("no durations here"),
+        "no durations here"
+    );
+}
+
 fn shell_call(id: &str, command: &str) -> ToolCall {
     ToolCall::new(id, "shell", serde_json::json!({ "command": command }))
 }
@@ -203,7 +239,19 @@ impl ChatProvider for MeteredProvider {
         if let Some(error) = turn.error {
             return Err(anyhow!("{error}"));
         }
-        let input_tokens = estimate_tokens(messages) as u32;
+        // Real Eval results carry wall-clock `duration_ms`; its digit count
+        // varies run to run and would make token metering nondeterministic
+        // (observed: ±3 tokens flaking the determinism assertions). Meter
+        // with durations normalized; everything else must match exactly.
+        let normalized: Vec<ChatMessage> = messages
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                m.content = m.content.as_deref().map(normalize_wallclock);
+                m
+            })
+            .collect();
+        let input_tokens = estimate_tokens(&normalized) as u32;
         let output_tokens = approx_output_tokens(&turn);
         Ok(Response {
             content: turn.content,
