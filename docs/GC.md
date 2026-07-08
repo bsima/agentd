@@ -27,6 +27,7 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 | `ring` | Drops oldest messages first | Chat-only windows; simplest, most predictable | `--gc ring` |
 | `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
 | `semantic` | Drops messages semantically distant from the recent thread (abandoned tangents first) | Long meandering sessions with dead ends; needs a registry `embeddings` entry | `--gc semantic` |
+| `cited-keep` (default on, semantic only) | Messages cited by later ones (id mentions, `context_refs`) join the protected set | A recent turn builds on an old, off-topic tool result | `--gc-cited-keep false` to disable |
 | `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
 | cache `preserve` (default) | Pins system prompt + oldest ~25% of budget; evicts interior | Cached providers: zero prefix invalidations | `--gc-cache preserve` |
 | cache `ignore` | Front-drop allowed; maximal reclaim | No prompt caching in use | `--gc-cache ignore` |
@@ -75,7 +76,12 @@ timings x 3 strategies x 2 cache policies):
   guards: never the system message, never the last user message, tool
   pairs travel atomically, and the last `--gc-semantic-window` messages
   (default 8) are immune; `--gc-semantic-floor` (default 0.25 cosine)
-  keeps plausibly-related messages for a second pass.
+  keeps plausibly-related messages for a second pass. With `--gc-cited-keep`
+  (default on, t-1351) messages explicitly cited by later ones —
+  tool-call-id mentions in text, `infer` `context_refs` — join the
+  protected set during the normal sweep phases, so a semantically distant
+  result a recent message builds on ("per the output of call-X…") survives;
+  see the Citation signals section.
 - **Cache `preserve`.** Delivered exactly what it promises: 0 prefix
   invalidations across all 180 preserve cells vs 733 across ignore cells.
   Every invalidation is a full-window re-read at provider prices, so on
@@ -112,6 +118,7 @@ agent --gc-cache <mode>        # prefix-cache policy: preserve | ignore (default
 agent --gc-timing <when>       # threshold | catch-overflow | eager | every:N (default: threshold)
 agent --gc-semantic-window <N> # semantic: recent-window size (centroid + recency floor; default: 8)
 agent --gc-semantic-floor <f>  # semantic: similarity floor (default: 0.25)
+agent --gc-cited-keep <bool>   # semantic: protect messages cited by later ones (default: true)
 ```
 
 `--gc none` restores the current behavior and is important for deterministic
@@ -181,8 +188,14 @@ Strategies (planned, not all implemented at once):
 | `mark-sweep`   | Evict "dead" sections by type annotation         | implemented |
 | `stack`        | Pop completed tool-call frames to summaries      | implemented (default) |
 | `semantic`     | Drop messages semantically distant from the recent thread | implemented |
-| `generational` | Hot/warm/cold compaction (JVM-style)             | future      |
-| `refcount`     | Dependency-graph reachability eviction           | future      |
+| `generational` | Hot/warm/cold compaction (JVM-style)             | future (t-1167; consumes the citation + recall signals below) |
+| `refcount`     | Dependency-graph reachability eviction           | future (the citation graph below is its reachability structure) |
+
+Cross-strategy modifier:
+
+| Name         | Description                                                    | Status      |
+|--------------|----------------------------------------------------------------|-------------|
+| `cited-keep` | Messages cited by later ones join the protected set (t-1351)   | implemented for `semantic` (`--gc-cited-keep`, default on) |
 
 ---
 
@@ -361,6 +374,136 @@ for after the eval harness exists to justify the tradeoff.
 **Key insight:** This is the most space-efficient strategy for tool-heavy
 agents. A deep chain of `bash` + `read_file` turns can compress from 20k tokens
 to ~200 tokens of annotations without losing the semantic record.
+
+---
+
+## Citation signals (t-1351): RC-via-citation and the recall write-barrier
+
+Position (`ring`, `stack`) and topic (`semantic`) are *proxies* for whether a
+message still matters. Citation is direct evidence: a fat tool result that no
+later message references is dead weight; one that a later turn quotes by id or
+re-pulls through `context_refs` is load-bearing regardless of its age or its
+topic. This section defines the citation graph, the `cited-keep` modifier
+built on it, and the recall-overlap write-barrier signal — the inputs the
+future `generational` (t-1167) and `refcount` strategies are designed against.
+
+### The citation graph
+
+Nodes are the window's messages (keyed by stable `ChatMessage` UUID); the
+interesting targets are tool-result messages. Edges point **citing message →
+cited message** and come in three kinds, ordered by precision:
+
+| Edge kind | Source | Semantics |
+|---|---|---|
+| `context_refs` | An `infer` tool call whose arguments carry `context_refs: [ids]` (t-1344) | Explicit citation **by construction**: the model asked for that tool result to be re-materialized into a child's context. Highest precision. |
+| id-mention | A message's *text content* contains a tool-call id minted earlier in the window, at token boundaries (`call-1` does not match inside `call-10`) | The model referred to the call/result by name ("per the output of call-X, proceed with…"). The structural pair members — the assistant message that *issued* the call and the tool message that *answers* it — carry the id by construction and are excluded; only third-party mentions are citations. |
+| recall-overlap | A `recall` tool result re-injects content whose hash matches content already in (or previously collected from) the window | Not a static edge but a temporal **re-reference event** — see the write-barrier section below. It lives in `GcState`, not in the per-window graph, because it needs cross-collection memory. |
+
+The citation target is the tool-*result* message when it exists in the window
+(that is where the tokens are), else the dispatching call message. Protecting
+the result implicitly protects its dispatching call: pair atomicity means no
+sweep can drop a group that would pull a protected member out.
+
+`parent_op_id` lineage (t-1347) links sub-infer children to their dispatching
+calls **in the trace**. It corroborates `context_refs` edges for offline
+analysis (the t-1349 behavioral eval can join both), but it is not visible in
+the message window, so it is deliberately *not* a `collect()` input — the
+graph a strategy sees is computable from the window alone.
+
+**Out of scope, on purpose: content-similarity citation.** A later message
+that paraphrases a tool result without naming it is *similar* to it — and
+similarity is `SemanticGc`'s mechanism, already scored by embeddings. Keeping
+the mechanisms orthogonal is the design: **similarity says "on-topic",
+citation says "load-bearing"**, and a message can be either, both, or
+neither. Blurring citation into fuzzy content matching would just rebuild a
+worse SemanticGc inside the citation extractor.
+
+### The orthogonality 2x2
+
+| | **cited** | **uncited** |
+|---|---|---|
+| **on-topic (similar to recent thread)** | Keep with high confidence — both signals agree. | Keep under normal pressure — semantic score already protects it; drops only in later phases. |
+| **distant (dissimilar)** | **The gap this task closes.** Semantic-only GC drops it first (below the floor); `cited-keep` retains it. Canonical case: an old lookup on another topic that a recent message builds on ("per the output of call-X…"). | Drop first — the abandoned tangent. Both signals agree it is dead. |
+
+### Determinism: extraction lives INSIDE collect()
+
+Citation extraction is pure text analysis over exactly the inputs `collect()`
+already has: string scans for ids and `context_refs` arrays over the window.
+It is stateless, deterministic, synchronous, and LLM-free — so it runs
+**inside `collect()`** (`CitationGraph::extract`, `cited_mask`). This is the
+opposite placement from embeddings, and the invariant explains why: the GC
+invariant bans *provider calls and nondeterminism* inside `collect()`, not
+computation. Embeddings need an async provider → pre-pass + `GcState` cache
+(t-1350). Citations need neither, so no cache, no pre-pass, no degrade mode —
+`collect()` stays a pure function of `(messages, budget, state)` with the
+graph derived on the fly.
+
+The recall-overlap signal is the exception that proves the rule: deciding
+"this recall re-injected something we *previously collected*" requires
+memory of past collections, which no pure function of the current window
+has. So it lives in `GcState` (`recall_hot`, `collected_hashes`), written by
+the interpreter pre-pass — the same home and the same write-side/read-side
+split as the t-1350 embedding cache.
+
+### `cited-keep`: the modifier, and what each strategy can do with the graph
+
+`cited-keep` adds cited messages to a strategy's *protected set* during the
+normal sweep phases. It is a heuristic guard with the same strength as
+semantic's recency floor — weaker than the preserve-prefix billing contract
+and the system/last-user hard guards — so in the degrade phases it relaxes
+together with the floor: under enough pressure a cited message still drops
+before the window overflows the model.
+
+- **`semantic` + `cited-keep` (implemented, `--gc-cited-keep`, default on).**
+  The exact integration point the t-1350 report named: cited-but-
+  semantically-distant messages survive phases 1–2. Gated by the
+  cited-distant eval fixture (below).
+- **`ring`/`stack`/`mark-sweep` + `cited-keep` (future).** Same shape: skip
+  cited atomic groups in the primary sweep, take them only in the degrade
+  pass. For `stack`, a cited frame should also resist *popping* (the
+  citation refers to the result body, which popping destroys).
+- **`refcount` (future).** The graph is the strategy: roots = system + last
+  user + recency floor; keep what is reachable over citation edges, evict
+  unreachable-first in topological age order.
+
+### What generational (t-1167) inherits
+
+Generational GC needs promotion signals; this task builds both, so t-1167
+starts from observed re-reference behavior instead of speculation:
+
+- **Citation in-degree → warm.** A result cited once is demonstrably
+  load-bearing: promote out of the nursery ("young, evict cheaply") into
+  warm ("referenced; compact, don't drop").
+- **Recall-overlap → hot.** A recall hit that re-injects content already
+  seen — especially content *previously collected* — is a write barrier
+  firing in the JVM sense: a mutation (the recall) just created a reference
+  from the live working set to old-generation data. That content is hot;
+  re-evicting or re-dropping it thrashes (evict → recall → re-inject →
+  evict). `GcState.recall_hot` is exactly the hot-set membership,
+  `collected_hashes` the old-generation extent.
+- **Neither signal + semantically distant → cold.** The 2x2's bottom-right
+  cell, already handled by semantic today.
+
+### The recall-overlap write-barrier (v1 mechanics)
+
+Recorded by `gc::record_recall_overlaps`, called from the interpreter
+pre-pass (`interpreter::collect_prompt`) before the strategy runs:
+
+- A window message is a *recall result* when its `tool_call_id` resolves to
+  a tool call named `recall` (the agent loop's memory tool).
+- Its hit contents (the JSON array of `SourceResult`s; the whole text as one
+  chunk when it does not parse) are content-hashed (trimmed) and
+  membership-checked against (a) the hashes of every other window message's
+  content and (b) `GcState.collected_hashes` — contents of messages dropped
+  by earlier collections this run. v1 is exact-hash membership; fuzzy
+  overlap is future work and must stay out of `collect()` regardless.
+- Matches land in `GcState.recall_hot` and are reported on the `gc_collect`
+  event as `recall_overlap_events` (this collection) and `recall_hot`
+  (cumulative set size), so the t-1349 behavioral eval can observe the
+  signal. Both sets are runtime-only — `GcState` never serializes into
+  checkpoints — and are bounded by the run's own history.
+- **No strategy consumes it yet.** It is deliberately signal-only: t-1167's
+  generational design is its first customer.
 
 ---
 
