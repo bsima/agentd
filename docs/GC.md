@@ -1,16 +1,71 @@
 # agentd Context GC Design
 
-Status: **`ring` and `mark-sweep` are implemented** (with `--gc`,
-`--gc-threshold`, `--gc-log`, the `truncate_oversized_message` pre-pass, pair
-atomicity, and the eval harness). **`--gc-cache preserve|ignore` is
+Status: **`ring`, `mark-sweep`, and `stack` are implemented** (with `--gc`,
+`--gc-threshold`, `--gc-log`, `--gc-timing`, the
+`truncate_oversized_message` pre-pass, pair atomicity, and the eval
+harness). **`stack` is the default strategy** (t-1348, promoted on the
+t-1339 strategy-matrix data). **`--gc-cache preserve|ignore` is
 implemented** and `preserve` is the default: the system prompt plus the
 oldest ~25% of the budget are pinned as the stable cache prefix, eviction
 happens in the interior, and ring falls back to front-drop (reported via
-`cache_invalidated` on the `gc_collect` event, which is now observed per
+`cache_invalidated` on the `gc_collect` event, which is observed per
 collection rather than static per strategy) only when preserving cannot
 reach the budget. `tests/gc_evals.rs::gc_cache_preserve_keeps_prefix_stable`
-gates the preserve behavior. **`stack` is designed but not implemented.**
-The `gc_collect` event reports `dropped_count`, not `frames_popped`.
+gates the preserve behavior. Every timing composes with the
+collect-on-overflow backstop (t-1343, see Trigger Policy). The `gc_collect`
+event reports `dropped_count`, not `frames_popped`.
+
+## Defaults and quick reference
+
+Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
+--gc-threshold 0.85`. (The SDK's in-process `Runner` runs no GC; SDK
+`Session`s spawn the `agent` CLI and inherit these defaults.)
+
+| Knob | What it does | When it wins | Flag |
+|---|---|---|---|
+| `stack` (default) | Pops completed tool frames to one-line `[frame: ...]` annotations; ring fallback otherwise | Tool-heavy sessions; best replay-completion (never dropped the task statement) | `--gc stack` |
+| `ring` | Drops oldest messages first | Chat-only windows; simplest, most predictable | `--gc ring` |
+| `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
+| `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
+| cache `preserve` (default) | Pins system prompt + oldest ~25% of budget; evicts interior | Cached providers: zero prefix invalidations | `--gc-cache preserve` |
+| cache `ignore` | Front-drop allowed; maximal reclaim | No prompt caching in use | `--gc-cache ignore` |
+| timing `threshold` (default) | Collect when the estimate crosses budget x 0.85 | Almost always; cheapest proactive timing | `--gc-timing threshold` |
+| timing `catch-overflow` | No estimate trigger; collect + retry on provider overflow | Untrustworthy token estimates | `--gc-timing catch-overflow` |
+| timing `eager` / `every:N` | Collect every (Nth) infer call | Rarely — eager is pure waste; every:N buys nothing over threshold | `--gc-timing eager\|every:N` |
+
+## Choosing a strategy
+
+Grounded in the t-1339 matrix (360 cells: 5 cases x 3 pressures x 4
+timings x 3 strategies x 2 cache policies):
+
+- **`stack` (default).** The best retention/robustness trade: never dropped
+  the current task statement in any of 120 cells (ring+ignore lost it in
+  24/60 — the worst replay-completion failure observed), retains 63–70% of
+  messages vs ring's 51–53% at the same token cost, and keeps a semantic
+  record of popped frames at ~1% of their tokens. On chat-heavy windows it
+  degrades exactly to ring, so it has no pathological case. Cost: old tool
+  result *bodies* go first — anything needed verbatim from an old result is
+  gone.
+- **`mark-sweep`.** Best raw reduction on tool-heavy batch shapes (83.9%
+  while keeping every message on the long tool-heavy case). But it does
+  *nothing* on pure chat (0.0% reduction, all 12 chat-heavy cells hard
+  overflow) and its convergence is best-effort: it failed to reach budget
+  in 30/60 preserve cells. Use it for tool-heavy batch workloads with
+  `--gc-cache ignore`; never pair it with `preserve`.
+- **`ring`.** Simplest and most predictable; right for pure chat. With
+  `--gc-cache ignore` it front-drops the last user message under pressure
+  (24/60 cells) — keep `preserve` on if you use ring.
+- **Cache `preserve`.** Delivered exactly what it promises: 0 prefix
+  invalidations across all 180 preserve cells vs 733 across ignore cells.
+  Every invalidation is a full-window re-read at provider prices, so on
+  cached providers `preserve` is strictly cheaper; only switch to `ignore`
+  if you have confirmed you don't use prompt caching.
+- **Timing.** Keep `threshold`. `eager` pays 2–4x the collections for
+  identical output. `every:N` used to leave windows over budget between
+  collections (7/15 ring and stack cells); the collect-on-overflow
+  backstop (t-1343) now collects before any over-budget dispatch
+  regardless of timing, so this is a redundancy question, not a safety
+  one.
 
 ## Overview
 
@@ -28,7 +83,7 @@ constraints and tradeoffs legible.
 ## CLI Flags
 
 ```
-agent --gc <strategy>          # default: ring
+agent --gc <strategy>          # default: stack
 agent --gc-threshold <0.0-1.0> # trigger GC at this fraction of budget (default: 0.85)
 agent --gc none                # disable GC entirely (hard overflow = error)
 agent --gc-log                 # emit gc_collect trace events (for debugging)
@@ -83,17 +138,25 @@ whose 0.85 trigger never fired). The timings:
 - `eager`: collect to the threshold target before every infer call.
 - `every:N`: collect to the threshold target on every Nth infer call.
 
-The gc_collect event carries `timing` and `target_budget` fields so
-`--gc-log` makes all four timings observable.
+Every timing is composed with the **collect-on-overflow backstop**
+(t-1343): if the assembled prompt would exceed the full context budget at
+Infer time and the timing policy did not fire, a collection runs before
+dispatch anyway. This closes the gap where `every:N` (and a threshold
+configured above 1.0) could dispatch over-budget windows between scheduled
+collections.
+
+The gc_collect event carries `timing`, `target_budget`, and `reason`
+(`scheduled` | `backstop` | `overflow`) fields so `--gc-log` makes all
+four timings — and the backstop — observable.
 
 Strategies (planned, not all implemented at once):
 
 | Name           | Description                                      | Status      |
 |----------------|--------------------------------------------------|-------------|
 | `none`         | No GC; overflow = hard error                     | implemented |
-| `ring`         | Drop oldest messages when buffer fills           | implemented (default) |
+| `ring`         | Drop oldest messages when buffer fills           | implemented |
 | `mark-sweep`   | Evict "dead" sections by type annotation         | implemented |
-| `stack`        | Pop completed tool-call frames to summaries      | implemented |
+| `stack`        | Pop completed tool-call frames to summaries      | implemented (default) |
 | `generational` | Hot/warm/cold compaction (JVM-style)             | future      |
 | `refcount`     | Dependency-graph reachability eviction           | future      |
 
@@ -376,6 +439,13 @@ This avoids the hard overflow and gives the response enough headroom — when
 the estimate is honest. `--gc-timing catch-overflow` inverts the policy for
 the case where it isn't: skip the proactive check, let the provider reject,
 then collect and retry inside the same turn (see CLI Flags above).
+
+Independent of the timing policy, `maybe_collect_prompt` applies the
+collect-on-overflow backstop (t-1343): a prompt whose estimate exceeds the
+full context budget is collected before dispatch no matter what the timing
+would have decided, emitted as `gc_collect{reason: "backstop"}`. If
+collection still cannot reach the budget, the existing overflow behavior
+(catch-overflow retries, provider error) applies unchanged.
 
 ---
 
