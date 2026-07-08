@@ -56,14 +56,37 @@
 //! There are NO hand-written behavioral recordings; offline without
 //! recordings is a documented no-op and the always-on tests below are
 //! plumbing-only.
+//!
+//! Guidance axis (t-1364): t-1349 found the offline champion (stack)
+//! thrashing and three of four strategies confabulating evicted content —
+//! and remember/recall discipline rescuing everything. The follow-up
+//! hypothesis: GUIDANCE dominates STRATEGY — the shipped runtime-guidance
+//! fragment (t-1359: GC-awareness §2.4 + memory-discipline §2.2 blocks)
+//! changes behavior more than swapping collectors does, and eliminates
+//! confabulation. Each t-1364 cell is (fixture, arm, guided, sample):
+//! guided cells run the SHIPPED `RuntimeGuidance::default()`, unguided
+//! cells `RuntimeGuidance::disabled()`. The t-1349 recordings could NOT be
+//! reused as the unguided arms: commit a6592f8 (t-1359 step 1) rewrote the
+//! shell/remember/recall/infer tool descriptions, which enter every cell's
+//! provider offer — so the unguided arms were re-recorded on the current
+//! descriptions, and the legacy recordings are replayed separately (still
+//! a valid regression check; no longer a valid comparison arm). Guidance
+//! is prompt-bytes only, so replay works either way — but GC re-runs the
+//! live token-sensitive collector during replay, so each cell's replay
+//! must run the guidance setting it was recorded under (meta carries it).
+//! New metrics for the t-1364 question: `prem` (remember calls BEFORE the
+//! first collection — proactive saves, the §2.2 behavior) and `cfab` (the
+//! final answer asserts the fixture's claim marker with a wrong value —
+//! fabricated content for evicted material; needle-absence programmatic
+//! check, corroborated by the judge's grounded_final_answer).
 
 use agent_core::gc::SemanticGc;
 use agent_core::{
     agent_loop_ir_with_options, run_ir_sequential_with_store_and_replay, ChatMessage, ChatProvider,
     Embedder, EnvPolicy, EvalConfig, Event, GcMode, GcTiming, InMemoryStore, IrReplayTrace,
     MarkSweepGc, MemorySource, Model, PassiveHydrationConfig, Pricing, PricingTable,
-    ProviderClient, ProviderConfig, ReplayOnlyProvider, Response, RingGc, RunUsage, SeqConfig,
-    SourceRegistry, StackFrameGc, ToolCall, TraceLogger,
+    ProviderClient, ProviderConfig, ReplayOnlyProvider, Response, RingGc, RunUsage,
+    RuntimeGuidance, SeqConfig, SourceRegistry, StackFrameGc, ToolCall, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -229,7 +252,17 @@ struct Fixture {
     context_budget: usize,
     /// Programmatic success needles on the final answer. Pure-numeric
     /// needles match on token boundaries, text needles by substring.
+    /// CONTRACT: `needles[0]` is the evictable claim value (the early tool
+    /// result the task needs again late) — the confabulation check keys on
+    /// it.
     needles: Vec<&'static str>,
+    /// The final-line marker the task's answer format requires ("ACCESS",
+    /// "CATEGORIES", "DEPLOY"). Confabulation = the marker is present (the
+    /// model ASSERTED an answer) while the claim value is wrong/absent —
+    /// fabricated content standing in for evicted material. A cell that
+    /// gives no final line (thrash, turn-cap clip) is a non-answer, not a
+    /// confabulation.
+    claim_marker: &'static str,
     /// Ordered needles that must appear in this order after the final
     /// answer marker (F2's category ranking); empty = no order check.
     ordered_needles: Vec<&'static str>,
@@ -430,6 +463,7 @@ fn fixtures() -> Vec<Fixture> {
             context_budget: 2000,
             needles: vec![ACCESS_CODE, "21"],
             ordered_needles: vec![],
+            claim_marker: "ACCESS",
             probe: "access-code",
             probe_allowance: 1,
             files: vec![
@@ -467,6 +501,7 @@ fn fixtures() -> Vec<Fixture> {
             context_budget: 1600,
             needles: vec!["CATEGORIES", "timeout", "checksum", "quota"],
             ordered_needles: vec!["timeout", "checksum", "quota"],
+            claim_marker: "CATEGORIES",
             probe: "app.log",
             probe_allowance: 2,
             files: vec![
@@ -507,6 +542,7 @@ fn fixtures() -> Vec<Fixture> {
             context_budget: 1700,
             needles: vec![DEPLOY_TOKEN, "6"],
             ordered_needles: vec![],
+            claim_marker: "DEPLOY",
             probe: "deploy-token",
             probe_allowance: 1,
             files: vec![
@@ -590,6 +626,28 @@ fn fixture_success(fixture: &Fixture, content: &str) -> bool {
         && ordered_needles_present(content, &fixture.ordered_needles)
 }
 
+/// The confabulation flag (t-1364): the final answer ASSERTS the fixture's
+/// answer format (claim marker present) while the claim itself is wrong —
+/// for order fixtures the category order, otherwise `needles[0]` (the
+/// evicted early tool result). This is t-1349 finding 3 made programmatic:
+/// a fabricated `ACCESS CDBH92 ...` flags, a thrash cell that never
+/// answers does not, and a wrong-arithmetic-but-right-code answer does not
+/// (arithmetic slips are not fabricated recall of evicted content).
+fn confabulated(fixture: &Fixture, content: &str) -> bool {
+    if !content
+        .to_lowercase()
+        .contains(&fixture.claim_marker.to_lowercase())
+    {
+        return false;
+    }
+    let claim_ok = if fixture.ordered_needles.is_empty() {
+        needle_present(content, fixture.needles[0])
+    } else {
+        ordered_needles_present(content, &fixture.ordered_needles)
+    };
+    !claim_ok
+}
+
 // --- cell runner -----------------------------------------------------------------
 
 fn materialize_fixture(fixture: &Fixture) -> Result<PathBuf> {
@@ -617,6 +675,20 @@ struct CellSpec {
     gc: GcMode,
     context_budget: usize,
     prompt: Vec<ChatMessage>,
+    /// The t-1364 axis: guided cells run the SHIPPED
+    /// `RuntimeGuidance::default()` (empty delegate catalog — exactly what
+    /// a stock deployment gets), unguided cells run `disabled()`. Replay
+    /// must use the recording's setting: guidance is prompt bytes, and the
+    /// live collector re-run during replay is token-sensitive.
+    guidance: RuntimeGuidance,
+}
+
+fn cell_guidance(guided: bool) -> RuntimeGuidance {
+    if guided {
+        RuntimeGuidance::default()
+    } else {
+        RuntimeGuidance::disabled()
+    }
 }
 
 /// One session: the memory-enabled agent loop under the arm's GC mode at
@@ -639,12 +711,11 @@ async fn run_cell(
     );
     let config = SeqConfig {
         approvals: Default::default(),
-        // Guidance off (t-1359): GC replay re-runs the live collector, which
-        // is token-sensitive — the runtime-guidance fragment would shift
-        // collection cadence against recordings made without it. The
-        // guidance-arm cells specified in docs/GUIDANCE.md §2.2/§2.4 will
-        // toggle this per arm when they land.
-        guidance: agent_core::guidance::RuntimeGuidance::disabled(),
+        // Per-cell (t-1364): the guided arms run the shipped fragment, the
+        // unguided arms and all t-1349 legacy replays run disabled — GC
+        // replay re-runs the live token-sensitive collector, so the setting
+        // must match what the recording ran under (CellMeta.guided).
+        guidance: spec.guidance.clone(),
         tools: Default::default(),
         provider,
         hydration: SourceRegistry::new().register_backend(MemorySource::new(memory_dir.into())),
@@ -706,6 +777,11 @@ struct CellMetrics {
     /// re-acquiring the needle it had been given.
     needle_refetches: usize,
     remember_calls: usize,
+    /// Remember calls issued BEFORE the first collection fired — proactive
+    /// saves (the §2.2 guided behavior), as opposed to saves scrambled
+    /// together after eviction already happened. On a `none` cell every
+    /// remember is trivially proactive.
+    proactive_remembers: usize,
     recall_calls: usize,
     /// gc_collect events: how many collections actually fired.
     collections: usize,
@@ -720,6 +796,9 @@ struct CellMetrics {
     recall_hot_max: u64,
     usage: RunUsage,
     success: bool,
+    /// The final answer asserts the claim marker with a wrong claim value
+    /// (see [`confabulated`]) — fabricated content for evicted material.
+    confabulated: bool,
 }
 
 fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Result<CellMetrics> {
@@ -729,6 +808,7 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         repeat_evals: 0,
         needle_refetches: 0,
         remember_calls: 0,
+        proactive_remembers: 0,
         recall_calls: 0,
         collections: 0,
         reasons: BTreeMap::new(),
@@ -737,6 +817,7 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         recall_hot_max: 0,
         usage: RunUsage::default(),
         success: fixture_success(fixture, content),
+        confabulated: confabulated(fixture, content),
     };
     let mut seen_commands: BTreeSet<String> = BTreeSet::new();
     let mut probe_hits = 0usize;
@@ -757,7 +838,12 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                     probe_hits += 1;
                 }
             }
-            Event::StoreCall { .. } => metrics.remember_calls += 1,
+            Event::StoreCall { .. } => {
+                metrics.remember_calls += 1;
+                if metrics.collections == 0 {
+                    metrics.proactive_remembers += 1;
+                }
+            }
             Event::RetrieveCall { .. } => metrics.recall_calls += 1,
             Event::Custom { name, data, .. } if name == "gc_collect" => {
                 metrics.collections += 1;
@@ -801,6 +887,13 @@ struct CellMeta {
     arm: String,
     model: String,
     context_budget: usize,
+    /// The t-1364 guidance axis (defaults false: the legacy t-1349
+    /// recordings predate it and ran unguided).
+    #[serde(default)]
+    guided: bool,
+    /// Sample index within the cell (n=2 on the hypothesis-deciding cells).
+    #[serde(default = "default_sample")]
+    sample: u32,
     /// Online wall time — replays report this, not their own.
     wall_ms: u64,
     /// The online run's final answer; replay must reproduce it.
@@ -808,8 +901,83 @@ struct CellMeta {
     recorded_at: String,
 }
 
-fn cell_path(dir: &Path, fixture: &str, arm: Arm) -> PathBuf {
+fn default_sample() -> u32 {
+    1
+}
+
+/// t-1349 legacy recording path: pre-a6592f8 tool descriptions, guidance
+/// off. Kept replayable, but no longer a valid comparison arm (module
+/// docs).
+fn legacy_cell_path(dir: &Path, fixture: &str, arm: Arm) -> PathBuf {
     dir.join(format!("{fixture}--{}.jsonl", arm.label()))
+}
+
+/// t-1364 cell path: the guidance axis and sample index are part of the
+/// cell identity.
+fn cell_path(dir: &Path, fixture: &str, arm: Arm, guided: bool, sample: u32) -> PathBuf {
+    dir.join(format!(
+        "{fixture}--{}--{}-s{sample}.jsonl",
+        arm.label(),
+        if guided { "guided" } else { "unguided" }
+    ))
+}
+
+/// One planned t-1364 cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellId {
+    fixture: &'static str,
+    arm: Arm,
+    guided: bool,
+    sample: u32,
+}
+
+/// The t-1364 recording plan, in SPEND-PRIORITY order: the cells that
+/// decide the guidance-dominates-strategy hypothesis (stack and mark-sweep
+/// ± guidance on the two fixtures where t-1349 saw thrash and
+/// confabulation) come first at n=2; broad coverage — ring/semantic ±
+/// guidance everywhere, all four strategies on memory-discipline, and a
+/// fresh `none` baseline per fixture (the t-1349 baseline predates the
+/// tool-description change) — comes after at n=1. The recorder's budget
+/// cap cuts from the tail, so overspend shrinks coverage before it shrinks
+/// the deciding samples.
+fn planned_cells() -> Vec<CellId> {
+    let mut cells = Vec::new();
+    for sample in [1, 2] {
+        for fixture in ["early-needle", "tangent-return"] {
+            for arm in [Arm::Stack, Arm::MarkSweep] {
+                for guided in [false, true] {
+                    cells.push(CellId {
+                        fixture,
+                        arm,
+                        guided,
+                        sample,
+                    });
+                }
+            }
+        }
+    }
+    for fixture in ["early-needle", "tangent-return", "memory-discipline"] {
+        cells.push(CellId {
+            fixture,
+            arm: Arm::NoGc,
+            guided: false,
+            sample: 1,
+        });
+        for arm in [Arm::Ring, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
+            for guided in [false, true] {
+                let cell = CellId {
+                    fixture,
+                    arm,
+                    guided,
+                    sample: 1,
+                };
+                if !cells.contains(&cell) {
+                    cells.push(cell);
+                }
+            }
+        }
+    }
+    cells
 }
 
 fn write_cell_recording(path: &Path, meta: &CellMeta, events: &[Event]) -> Result<()> {
@@ -1102,14 +1270,17 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:>5} {:>5} {:>4} {:>4} {:>3} {:>3} {:>4} {:<11} {:>4} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>5}",
         "fixture",
         "arm",
+        "guid",
+        "s",
         "turns",
         "evals",
         "rpt",
         "refx",
         "rem",
+        "prem",
         "rec",
         "coll",
         "reasons",
@@ -1120,6 +1291,7 @@ fn print_header() {
         "cost",
         "wall_s",
         "ok",
+        "cfab",
         "judge",
     );
 }
@@ -1137,14 +1309,17 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:>5} {:>5} {:>4} {:>4} {:>3} {:>3} {:>4} {:<11} {:>4} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>5}",
         fixture,
         arm.label(),
+        if meta.guided { "on" } else { "off" },
+        meta.sample,
         metrics.turns,
         metrics.eval_calls,
         metrics.repeat_evals,
         metrics.needle_refetches,
         metrics.remember_calls,
+        metrics.proactive_remembers,
         metrics.recall_calls,
         metrics.collections,
         reasons_label(&metrics.reasons),
@@ -1158,6 +1333,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
             .map_or_else(|| "-".into(), agent_core::format_micro_usd),
         meta.wall_ms as f64 / 1000.0,
         if metrics.success { "yes" } else { "NO" },
+        if metrics.confabulated { "YES" } else { "-" },
         judge,
     );
 }
@@ -1221,10 +1397,18 @@ async fn gc_behavior_matrix() -> Result<()> {
     }
 
     let mut judge = JudgeBook::load(judge_book_path()?, online)?;
+    let fixtures = fixtures();
+
+    // Section 1 — t-1349 legacy recordings: pre-a6592f8 tool descriptions,
+    // guidance off. Still replayed (regression: old recordings must keep
+    // replaying), printed apart because they are NOT comparable with the
+    // t-1364 rows — the remember/recall/shell/infer descriptions the model
+    // saw differ.
+    println!("== t-1349 legacy cells (pre-guidance tool descriptions) ==");
     print_header();
-    for fixture in fixtures() {
+    for fixture in &fixtures {
         for arm in Arm::ALL {
-            let path = cell_path(&dir, fixture.name, arm);
+            let path = legacy_cell_path(&dir, fixture.name, arm);
             if !path.exists() {
                 println!(
                     "{:<18} {:<10} skipped: no recording ({})",
@@ -1234,38 +1418,93 @@ async fn gc_behavior_matrix() -> Result<()> {
                 );
                 continue;
             }
-            let (meta, metrics, events) = replay_cell(&path, &fixture).await?;
-            // The point of the small budget: collections must actually have
-            // fired in the recorded session, or the cell measures nothing.
-            if arm.collects() {
-                assert!(
-                    metrics.collections > 0,
-                    "{}/{}: GC never fired — the cell measures nothing; \
-                     shrink the budget or fatten the fixture",
-                    fixture.name,
-                    arm.label()
-                );
-            } else {
-                assert_eq!(
-                    metrics.collections, 0,
-                    "{}/none: control arm must not collect",
-                    fixture.name
-                );
-            }
-            let cell = format!("{}|{}", fixture.name, arm.label());
-            let verdict = judge
-                .verdict(&cell, &fixture.task, &events, &meta.final_content)
-                .await?
-                .map(|verdict| verdict.display());
-            print_row(
-                fixture.name,
-                arm,
-                &metrics,
-                &meta,
-                verdict.as_deref().unwrap_or("-"),
-            );
+            replay_and_print(&path, fixture, arm, false, &mut judge).await?;
         }
     }
+
+    // Section 2 — the t-1364 guidance x strategy matrix, all cells on the
+    // current tool descriptions. `none`+guided is deliberately unplanned
+    // (guidance without GC is not this run's hypothesis; budget went to
+    // n=2 on the deciding cells instead).
+    println!();
+    println!("== t-1364 guidance x strategy (current tool descriptions) ==");
+    print_header();
+    let planned = planned_cells();
+    for fixture in &fixtures {
+        for arm in Arm::ALL {
+            for guided in [false, true] {
+                for sample in [1, 2] {
+                    let path = cell_path(&dir, fixture.name, arm, guided, sample);
+                    if !path.exists() {
+                        let cell = CellId {
+                            fixture: fixture.name,
+                            arm,
+                            guided,
+                            sample,
+                        };
+                        if planned.contains(&cell) {
+                            println!(
+                                "{:<18} {:<10} {:<4} {} skipped: planned cell not recorded",
+                                fixture.name,
+                                arm.label(),
+                                if guided { "on" } else { "off" },
+                                sample,
+                            );
+                        }
+                        continue;
+                    }
+                    replay_and_print(&path, fixture, arm, guided, &mut judge).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replay one cell, assert the firing invariant, judge it, print the row.
+async fn replay_and_print(
+    path: &Path,
+    fixture: &Fixture,
+    arm: Arm,
+    guided: bool,
+    judge: &mut JudgeBook,
+) -> Result<()> {
+    let (meta, metrics, events) = replay_cell(path, fixture, guided).await?;
+    // The point of the small budget: collections must actually have fired
+    // in the recorded session, or the cell measures nothing.
+    if arm.collects() {
+        assert!(
+            metrics.collections > 0,
+            "{}/{}: GC never fired — the cell measures nothing; \
+             shrink the budget or fatten the fixture",
+            fixture.name,
+            arm.label()
+        );
+    } else {
+        assert_eq!(
+            metrics.collections, 0,
+            "{}/none: control arm must not collect",
+            fixture.name
+        );
+    }
+    let cell = format!(
+        "{}|{}|{}|s{}",
+        fixture.name,
+        arm.label(),
+        if meta.guided { "guided" } else { "unguided" },
+        meta.sample
+    );
+    let verdict = judge
+        .verdict(&cell, &fixture.task, &events, &meta.final_content)
+        .await?
+        .map(|verdict| verdict.display());
+    print_row(
+        fixture.name,
+        arm,
+        &metrics,
+        &meta,
+        verdict.as_deref().unwrap_or("-"),
+    );
     Ok(())
 }
 
@@ -1277,6 +1516,7 @@ async fn gc_behavior_matrix() -> Result<()> {
 async fn replay_cell(
     path: &Path,
     fixture: &Fixture,
+    expect_guided: bool,
 ) -> Result<(CellMeta, CellMetrics, Vec<Event>)> {
     let (meta, recorded_events) = load_cell_recording(path)?;
     anyhow::ensure!(
@@ -1284,6 +1524,13 @@ async fn replay_cell(
         "{}: recording is for fixture {}",
         path.display(),
         meta.fixture
+    );
+    anyhow::ensure!(
+        meta.guided == expect_guided,
+        "{}: recording's guidance setting ({}) does not match its cell ({})",
+        path.display(),
+        meta.guided,
+        expect_guided
     );
     let arm = Arm::from_label(&meta.arm)?;
     let replay = IrReplayTrace::from_events(&recorded_events)
@@ -1303,6 +1550,7 @@ async fn replay_cell(
             gc: arm.gc_mode(),
             context_budget: meta.context_budget,
             prompt,
+            guidance: cell_guidance(meta.guided),
         },
         &workdir,
         &memory_dir,
@@ -1360,66 +1608,112 @@ async fn replay_cell(
     Ok((meta, recorded, recorded_events))
 }
 
-/// Record every cell that has no recording yet. Requires a key; spends real
-/// money (small fixtures, tiny windows, a cheap model — see README for the
-/// measured total).
+/// The recording pass's spend ceiling (USD), enforced across the run from
+/// each cell's AgentDone rollup; override with AGENT_EVAL_SPEND_CAP_USD.
+/// `planned_cells` is priority-ordered so hitting the cap drops coverage
+/// cells, never the hypothesis-deciding ones.
+const DEFAULT_SPEND_CAP_USD: f64 = 2.0;
+
+/// Record every planned t-1364 cell that has no recording yet, in plan
+/// order, under the spend cap. Requires a key; spends real money (small
+/// fixtures, tiny windows, a cheap model — see README for the measured
+/// total). Legacy t-1349 recordings are never re-recorded.
 async fn record_missing_cells(dir: &Path) -> Result<()> {
     let model = env_model();
     let api_key = online_api_key()?;
     let client: Arc<dyn ChatProvider> = Arc::new(online_client(&model)?);
+    let cap_usd: f64 = std::env::var("AGENT_EVAL_SPEND_CAP_USD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SPEND_CAP_USD);
+    let mut spent_micro: u64 = 0;
+    let fixtures = fixtures();
 
-    for fixture in fixtures() {
-        for arm in Arm::ALL {
-            let path = cell_path(dir, fixture.name, arm);
-            if path.exists() {
-                continue;
-            }
-            println!("recording {} / {} ...", fixture.name, arm.label());
-            let prompt = vec![
-                ChatMessage::system(system_prompt()),
-                ChatMessage::user(fixture.task.clone()),
-            ];
-            let workdir = materialize_fixture(&fixture)?;
-            let memory_dir =
-                std::env::temp_dir().join(format!("gc-behavior-mem-{}", Uuid::new_v4()));
-            fs::create_dir_all(&memory_dir)?;
-            let run = run_cell(
-                client.clone(),
-                None,
-                CellSpec {
-                    model: model.clone(),
-                    gc: arm.gc_mode(),
-                    context_budget: fixture.context_budget,
-                    prompt,
-                },
-                &workdir,
-                &memory_dir,
-            )
-            .await
-            .with_context(|| format!("online cell {} / {}", fixture.name, arm.label()))?;
-            let _ = fs::remove_dir_all(&workdir);
-            let _ = fs::remove_dir_all(&memory_dir);
-
-            let meta = CellMeta {
-                fixture: fixture.name.into(),
-                arm: arm.label().into(),
-                model: model.clone(),
-                context_budget: fixture.context_budget,
-                wall_ms: run.wall_ms,
-                final_content: run.content.clone(),
-                recorded_at: Utc::now().to_rfc3339(),
-            };
-            write_cell_recording(&path, &meta, &run.events)?;
-            // Credential hygiene: the recording must not embed the key
-            // (shell children get an allowlist env of PATH only, but the
-            // check is unconditional).
-            let written = fs::read_to_string(&path)?;
-            anyhow::ensure!(
-                !written.contains(api_key.as_str()),
-                "{}: recording embeds the API key — do not commit",
-                path.display()
-            );
+    for cell in planned_cells() {
+        let path = cell_path(dir, cell.fixture, cell.arm, cell.guided, cell.sample);
+        if path.exists() {
+            continue;
         }
+        let label = format!(
+            "{} / {} / {} / s{}",
+            cell.fixture,
+            cell.arm.label(),
+            if cell.guided { "guided" } else { "unguided" },
+            cell.sample
+        );
+        if spent_micro as f64 / 1e6 >= cap_usd {
+            println!("SKIPPING {label}: spend cap ${cap_usd} reached");
+            continue;
+        }
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == cell.fixture)
+            .ok_or_else(|| anyhow!("planned cell names unknown fixture {}", cell.fixture))?;
+        println!("recording {label} ...");
+        let prompt = vec![
+            ChatMessage::system(system_prompt()),
+            ChatMessage::user(fixture.task.clone()),
+        ];
+        let workdir = materialize_fixture(fixture)?;
+        let memory_dir = std::env::temp_dir().join(format!("gc-behavior-mem-{}", Uuid::new_v4()));
+        fs::create_dir_all(&memory_dir)?;
+        let run = run_cell(
+            client.clone(),
+            None,
+            CellSpec {
+                model: model.clone(),
+                gc: cell.arm.gc_mode(),
+                context_budget: fixture.context_budget,
+                prompt,
+                guidance: cell_guidance(cell.guided),
+            },
+            &workdir,
+            &memory_dir,
+        )
+        .await
+        .with_context(|| format!("online cell {label}"))?;
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&memory_dir);
+
+        let cell_micro = run
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::AgentDone {
+                    usage: Some(usage), ..
+                } => usage.cost_micro_usd,
+                _ => None,
+            })
+            .unwrap_or(0);
+        spent_micro += cell_micro;
+        println!(
+            "  recorded {label}: {} (cumulative {})",
+            agent_core::format_micro_usd(cell_micro),
+            agent_core::format_micro_usd(spent_micro),
+        );
+
+        let meta = CellMeta {
+            fixture: fixture.name.into(),
+            arm: cell.arm.label().into(),
+            model: model.clone(),
+            context_budget: fixture.context_budget,
+            guided: cell.guided,
+            sample: cell.sample,
+            wall_ms: run.wall_ms,
+            final_content: run.content.clone(),
+            recorded_at: Utc::now().to_rfc3339(),
+        };
+        write_cell_recording(&path, &meta, &run.events)?;
+        // Credential hygiene: the recording must not embed the key
+        // (shell children get an allowlist env of PATH only, but the
+        // check is unconditional).
+        let written = fs::read_to_string(&path)?;
+        anyhow::ensure!(
+            !written.contains(api_key.as_str()),
+            "{}: recording embeds the API key — do not commit",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -1492,6 +1786,7 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         context_budget: 400,
         needles: vec!["391"],
         ordered_needles: vec![],
+        claim_marker: "RESULT",
         probe: "fat.txt",
         probe_allowance: 1,
         files: vec![("fat.txt", filler(&MANUAL_WORDS, 9, 6000))],
@@ -1533,6 +1828,9 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
                 ChatMessage::system("plumbing"),
                 ChatMessage::user("what is 17 * 23?"),
             ],
+            // Guided, so plumbing also proves run_cell works under the
+            // shipped fragment (the t-1364 guided arms' configuration).
+            guidance: cell_guidance(true),
         },
         &workdir,
         &memory_dir,
@@ -1551,7 +1849,15 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         "second probe hit is a re-fetch"
     );
     assert_eq!(metrics.remember_calls, 1);
+    assert_eq!(
+        metrics.proactive_remembers, 0,
+        "the remember fired after collections had already started"
+    );
     assert_eq!(metrics.recall_calls, 1);
+    assert!(
+        !metrics.confabulated,
+        "correct answer is not a confabulation"
+    );
     assert!(
         metrics.collections > 0,
         "two 6KB tool results under a 400-token budget must collect"
@@ -1577,6 +1883,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
         context_budget: 400,
         needles: vec![],
         ordered_needles: vec![],
+        claim_marker: "RESULT",
         probe: "fat.txt",
         probe_allowance: 1,
         files: vec![("fat.txt", filler(&MANUAL_WORDS, 9, 6000))],
@@ -1600,6 +1907,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
             gc: Arm::NoGc.gc_mode(),
             context_budget: fixture.context_budget,
             prompt: vec![ChatMessage::system("plumbing"), ChatMessage::user("go")],
+            guidance: cell_guidance(false),
         },
         &workdir,
         &memory_dir,
@@ -1618,12 +1926,14 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
 #[tokio::test]
 async fn plumbing_recording_roundtrip() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("gc-behavior-rec-{}", Uuid::new_v4()));
-    let path = cell_path(&dir, "roundtrip", Arm::Stack);
+    let path = cell_path(&dir, "roundtrip", Arm::Stack, true, 2);
     let meta = CellMeta {
         fixture: "roundtrip".into(),
         arm: Arm::Stack.label().into(),
         model: DEFAULT_MODEL.into(),
         context_budget: 2000,
+        guided: true,
+        sample: 2,
         wall_ms: 1234,
         final_content: "ACCESS X TOTAL 21".into(),
         recorded_at: Utc::now().to_rfc3339(),
@@ -1637,9 +1947,53 @@ async fn plumbing_recording_roundtrip() -> Result<()> {
     let (loaded_meta, loaded_events) = load_cell_recording(&path)?;
     assert_eq!(loaded_meta.final_content, meta.final_content);
     assert_eq!(loaded_meta.context_budget, meta.context_budget);
+    assert!(loaded_meta.guided);
+    assert_eq!(loaded_meta.sample, 2);
     assert_eq!(loaded_events, events);
     fs::remove_dir_all(&dir)?;
     Ok(())
+}
+
+/// Legacy t-1349 meta lines (no guided/sample fields) must keep loading:
+/// guidance defaults off, sample defaults 1 — exactly the configuration
+/// those cells ran under.
+#[test]
+fn plumbing_legacy_meta_defaults() -> Result<()> {
+    let legacy = r#"{"fixture":"early-needle","arm":"stack","model":"m","context_budget":2000,"wall_ms":1,"final_content":"x","recorded_at":"t"}"#;
+    let meta: CellMeta = serde_json::from_str(legacy)?;
+    assert!(!meta.guided);
+    assert_eq!(meta.sample, 1);
+    Ok(())
+}
+
+/// The confabulation flag (t-1364): asserted-but-wrong flags, silence and
+/// correct answers do not, and the order fixture keys on category order.
+#[test]
+fn confabulation_flag_detects_fabricated_claims() {
+    let fixtures = fixtures();
+    let early = fixtures.iter().find(|f| f.name == "early-needle").unwrap();
+    // t-1349's actual stack hallucination shape:
+    assert!(confabulated(early, "ACCESS CDBH92 TOTAL 21"));
+    assert!(!confabulated(early, "ACCESS MX-7749-KESTREL TOTAL 21"));
+    // Wrong arithmetic with the right code is a slip, not fabrication:
+    assert!(!confabulated(early, "ACCESS MX-7749-KESTREL TOTAL 19"));
+    // A thrash cell that never answers is a non-answer, not a confabulation:
+    assert!(!confabulated(early, ""));
+    assert!(!confabulated(early, "I could not finish the steps."));
+
+    let tangent = fixtures
+        .iter()
+        .find(|f| f.name == "tangent-return")
+        .unwrap();
+    assert!(confabulated(tangent, "CATEGORIES: checksum,timeout,quota"));
+    assert!(!confabulated(tangent, "CATEGORIES: timeout,checksum,quota"));
+
+    let memory = fixtures
+        .iter()
+        .find(|f| f.name == "memory-discipline")
+        .unwrap();
+    assert!(confabulated(memory, "DEPLOY TOKEN-1234-FAKE WARNS 6"));
+    assert!(!confabulated(memory, "DEPLOY TOKEN-9QX-RAVEN-7734 WARNS 6"));
 }
 
 /// Judge book round-trip: a record written the way the online path writes

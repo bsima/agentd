@@ -131,7 +131,7 @@ firing is asserted per cell from the gc_collect events.
 |---|---|---|
 | `early-needle` | 9 steps; an early tool result (an access code) is needed again in the final answer, with bulky ballast before and after | 2000 |
 | `tangent-return` | log analysis, then a deliberate bulky tangent (two poems, distinct vocabulary), then return to the log thread | 1600 |
-| `memory-discipline` | read a token, `remember` it, bulk work, `recall` it late — memory tools across GC pressure | 1600 |
+| `memory-discipline` | read a token, `remember` it, bulk work, `recall` it late — memory tools across GC pressure | 1700 |
 
 **Scoring, all from traces:** programmatic needles on the final answer
 (numeric needles token-boundary-matched; the tangent fixture also checks
@@ -274,3 +274,168 @@ overhead. The control (`none`) succeeded everywhere at these window sizes.
   evicted and must be re-fetched (rather than summarizing that the call
   happened) might flip fabrication into recovery. Cheap A/B on this
   harness.
+
+## Guided vs strategy (t-1364, online)
+
+t-1349 ended on an inversion (mark-sweep behaved best, the offline champion
+thrashed, three of four strategies confabulated) and one bright spot:
+memory discipline rescued everything. The follow-up hypothesis: **guidance
+dominates strategy choice** — the shipped runtime-guidance fragment
+(t-1359: GC-awareness §2.4 + memory-discipline §2.2 blocks, default-on
+since d79fad3) changes behavior more than swapping collectors does, and
+eliminates confabulation.
+
+**Design.** The t-1349 harness gained a guidance axis: each cell is
+(fixture, arm, guided, sample). Guided cells run the SHIPPED
+`RuntimeGuidance::default()`; unguided cells run `disabled()`. Memory
+tools are offered in every cell (unchanged from t-1349 — all three
+fixtures already ran the memory-enabled loop). The t-1349 recordings could
+NOT be reused as the unguided arms: commit a6592f8 (t-1359 step 1) rewrote
+the shell/remember/recall/infer tool descriptions, which enter every
+cell's provider offer — so all unguided arms were re-recorded on the
+current descriptions, and the legacy recordings are kept and replayed as a
+separate regression section, no longer a comparison arm. n=2 on the
+hypothesis-deciding cells (stack and mark-sweep ± guidance on
+`early-needle`/`tangent-return`), n=1 elsewhere; `none`+guided was left
+unrecorded (guidance without GC is not this run's question). New columns:
+`prem` (remember calls before the first collection — proactive saves) and
+`cfab` (the answer asserts the fixture's final-line marker with a wrong
+claim value while the true evicted needle is absent — fabrication, not
+mere failure; a thrash cell that never answers is a non-answer, not a
+confabulation). Recorded 2026-07-08, same model/provider/defaults as
+t-1349 (`anthropic/claude-haiku-4.5` via OpenRouter). Spend: $1.13
+matrix + $0.10 judge. Offline replay reproduces the table per cell
+(asserted; guided cells replay with guidance on — the collector re-run is
+token-sensitive, so the setting must match the recording).
+
+### Results
+
+```
+fixture            arm        guid s turns evals  rpt refx rem prem rec coll reasons     drop ovl   in_tok  out_tok       cost wall_s  ok cfab judge
+early-needle       none       off  1     9     8    0    0   0    0   0    0 -              0   0    29250      671  $0.032605   12.1 yes    -   3/3
+early-needle       ring       off  1     9     8    0    0   0    0   0    4 s:4           20   0    20694      709  $0.024239   12.8  NO  YES   1/3
+early-needle       ring       on   1     2     1    0    0   0    0   0    1 s:1            3   0     3942       84  $0.004362    2.5  NO    -   0/3
+early-needle       mark-sweep off  1    11    10    1    1   0    0   0    8 s:8           66   0    26248      909  $0.030793   14.9  NO    -   0/3
+early-needle       mark-sweep off  2    10     9    1    1   0    0   0    7 s:7           52   0    23689      705  $0.027214   13.0  NO    -   0/3
+early-needle       mark-sweep on   1    17    16    0    1   0    0   0   16 s:16         202   0    42618     1479  $0.050013   25.1  NO  YES   0/3
+early-needle       mark-sweep on   2     9     8    0    0   0    0   0    8 s:8           20   0    22531      745  $0.026256   13.7  NO  YES   1/3
+early-needle       stack      off  1    11    10    1    1   0    0   0    8 s:8           53   0    25060      806  $0.029090   14.9  NO  YES   0/3
+early-needle       stack      off  2     9     8    0    0   0    0   0    4 s:4           23   0    20634      696  $0.024114   12.6  NO  YES   2/3
+early-needle       stack      on   1     2     1    0    0   0    0   0    1 s:1            3   0     3942       91  $0.004397    2.5  NO    -   0/3
+early-needle       stack      on   2     2     1    0    0   0    0   0    1 s:1            3   0     3942       90  $0.004392    3.0  NO    -   0/3
+early-needle       semantic   off  1    13    12    4    0   0    0   0    9 s:9           90   0    29969     1201  $0.035974   17.4  NO  YES   0/3
+early-needle       semantic   on   1    27    26   25    0   0    0   0   26 s:26         702   0    56430     1737  $0.065115   36.0  NO    -   0/3
+tangent-return     none       off  1     6     5    0    0   0    0   0    0 -              0   0    19255      530  $0.021905    9.9 yes    -   1/3
+tangent-return     ring       off  1    27    26   24   11   0    0   0   25 s:25         676   0    45410     2007  $0.055445   39.5  NO    -   0/3
+tangent-return     ring       on   1     2     1    0    0   0    0   0    1 s:1            3   0     3978       84  $0.004398    2.4  NO    -   0/3
+tangent-return     mark-sweep off  1     9     8    0    3   0    0   0    7 s:7            8   0    19756      696  $0.023236   13.7 yes    -   1/3
+tangent-return     mark-sweep off  2     6     5    0    0   0    0   0    4 s:4            6   0    12764      541  $0.015469    9.9 yes    -   3/3
+tangent-return     mark-sweep on   1    26    30   25   10   0    0   0   25 s:25         645   0    72384     2640  $0.085584   45.5 yes    -   0/3
+tangent-return     mark-sweep on   2    27    26   21    9   0    0   0   26 s:26         650   0    71938     2465  $0.084263   45.7  NO    -   0/3
+tangent-return     stack      off  1    27    26   24   11   0    0   0   25 s:25         625   0    48948     1979  $0.058843   38.5  NO    -   0/3
+tangent-return     stack      off  2    27    26   24   11   0    0   0   25 s:25         622   0    49183     1981  $0.059088   41.6  NO    -   0/3
+tangent-return     stack      on   1     2     1    0    0   0    0   0    1 s:1            3   0     3978       84  $0.004398    2.3  NO    -   0/3
+tangent-return     stack      on   2     2     1    0    0   0    0   0    1 s:1            3   0     3978       90  $0.004428    2.3  NO    -   0/3
+tangent-return     semantic   off  1    27    26   24    4   0    0   0   25 s:25         660   0    48994     2168  $0.059834   43.3  NO    -   0/3
+tangent-return     semantic   on   1    27    30   25   25   0    0   0   26 s:26         786   0    57402     1877  $0.066787   36.3  NO    -   0/3
+memory-discipline  none       off  1     9     6    0    0   1    1   1    0 -              0   0    22502      842  $0.026712   14.8 yes    -   3/3
+memory-discipline  ring       off  1     9     6    0    0   1    1   1    6 s:6           46   0    18169      761  $0.021974   14.1  NO    -   0/3
+memory-discipline  ring       on   1     2     1    0    0   0    0   0    1 s:1            3   0     3990      107  $0.004525    2.5  NO    -   0/3
+memory-discipline  mark-sweep off  1     9     6    0    0   1    1   1    6 s:6            0   0    19491      841  $0.023696   12.8 yes    -   3/3
+memory-discipline  mark-sweep on   1     9     6    0    0   1    0   1    8 s:8           56   0    20530      776  $0.024410   12.2  NO    -   0/3
+memory-discipline  stack      off  1     9     6    0    0   1    1   1    6 s:6            6   0    19231      824  $0.023351   13.9 yes    -   3/3
+memory-discipline  stack      on   1     2     1    0    0   0    0   0    1 s:1            3   0     3990      100  $0.004490    2.5  NO    -   0/3
+memory-discipline  semantic   off  1    11     6    0    0   3    1   1    8 s:8           26   0    24545     1053  $0.029810   15.4 yes    -   2/3
+memory-discipline  semantic   on   1    27    26   25    0   0    0   0   26 s:26         702   0    57726     2180  $0.068626   36.1  NO    -   1/3
+```
+
+### Verdict: REFUTED — guidance dominated, with the opposite sign
+
+Caveats as before (one model, n<=2, provider-default temperature), plus
+the load-bearing one: at these budgets (1600-2000 tokens) the fragment
+(~650-700 tokens: delegation + memory + GC + cost blocks) is **33-44% of
+the whole context budget**, and system-message content is protected from
+eviction by every strategy. Real deployments run windows 10-100x larger,
+where the fragment is noise — this run measures guidance under extreme
+pressure, which is exactly where GC's failure modes live.
+
+1. **The hypothesis's magnitude claim held; its direction claim failed.**
+   The guidance axis produced far larger behavioral deltas than any
+   strategy swap — by destroying cells, not rescuing them. Guided arms:
+   1 success in 12 cells (mark-sweep, tangent s1, at 5.5x the unguided
+   cost). Unguided arms: 5 successes in 13. Best unguided strategy
+   (mark-sweep: 3/4 fixtures-samples ok, $0.015-0.031) beats the best
+   guided cell, never mind the worst (stack guided: 0/5, task lost by
+   turn 2, every sample).
+2. **Ring and stack + guidance = silent task loss, 5/5 cells, n=2
+   reproducible.** The fragment fattens the system message; the first
+   tool result trips the 0.85 threshold on turn 1-2; ring's and stack's
+   degrade paths have NO last-user-message guard (only semantic
+   hard-protects the task statement; mark-sweep refuses incomplete
+   lifecycles), so the collection evicts the task itself; the model
+   replies "I'm ready to help! Please provide the task steps" and the
+   loop accepts a no-tool-call reply as the final answer. 2 turns,
+   ~$0.0044, identical signature on all three fixtures.
+3. **Guidance did not eliminate confabulation — it relocated it.**
+   `early-needle`, the confabulation fixture: unguided, ring/stack/
+   semantic fabricated access codes (`e2c7f891`, `BATCH-2024`,
+   `AX7K92QM`; cfab 4 of 6 GC cells) while mark-sweep re-fetched the real
+   code honestly (refx=1, failed only on arithmetic). Guided, the ONLY
+   strategy that still reached the final step — mark-sweep — fabricated
+   codes in BOTH samples (`7f4e2c91`, `42857`) despite the §2.4 text
+   saying "re-run the command or `recall` — do not guess". The other
+   guided arms produced no answer at all (task loss or thrash), which is
+   why their cfab column is clean: dead agents don't confabulate.
+4. **The §2.2 memory block changed nothing measurable.** rem=0, prem=0,
+   rec=0 in every guided cell outside the scripted memory fixture — no
+   proactive saves, no recall-instead-of-refetch, same as unguided and
+   same as t-1349. On `memory-discipline` itself the guided cells did
+   scripted remember/recall no better than unguided (and lost the WARN
+   count or the task). No cell reacted to a `[frame: ...]` annotation by
+   recovering; guided stack never lived long enough to see one.
+5. **The strategies that keep the task thrash instead.** Guided
+   mark-sweep and semantic collected essentially every turn (16-26
+   collections vs 4-9 unguided): the fragment is permanent uncollectable
+   ballast, so the usable interior shrinks below one turn's working set —
+   the t-1349 restart loop, now guidance-induced. Guided semantic on
+   `memory-discipline` went 27 turns/$0.069 where unguided went
+   9-11/$0.030.
+6. **Unguided arms vs t-1349 (tool-description delta, uncontrolled
+   provider variance):** tangent-return reproduced exactly (mark-sweep
+   the only GC survivor, cheaper than control; ring/stack/semantic
+   thrash-looped); early-needle got worse (ring now confabulates instead
+   of re-fetching; all four strategies failed); memory-discipline mostly
+   reproduced (ring lost the WARN count). The t-1349 topline — mark-sweep
+   behaviorally safest under pressure, retention-arithmetic winners
+   fragile — held on re-record.
+
+### What this means for the default strategy
+
+t-1348 flipped the default to stack on offline retention data; t-1349
+inverted that behaviorally; this run says **guided-stack is not
+defensible at high context pressure**: with the shipped default-on
+guidance, stack (and ring) silently lose the task statement and report a
+2-turn non-answer as completion — the worst failure in the table, and the
+cheapest, so cost dashboards would read it as a win. Recommendation
+(decision Ben's):
+
+- Do not keep stack as default while its degrade path can evict the last
+  user message. The fix is mechanical and semantic already has it: hard-
+  protect system + last-user in ring/stack (then re-run these 8 cells,
+  ~$0.30, to see whether guided-stack becomes defensible).
+- Gate the fragment on budget headroom: delivering ~700 tokens of
+  operations prose into a <=2k-token window converts guidance into
+  pressure. A simple rule (skip or ship a compact variant when the
+  fragment exceeds a few percent of `context_budget`) would have spared
+  every guided failure here without touching real deployments.
+- On today's evidence the behavioral default is mark-sweep, unguided at
+  small budgets: only strategy to complete tangent-return in both runs
+  (beating the no-GC control on cost), only guided arm to complete
+  anything, honest re-fetch where others fabricated. Its known offline
+  weakness (reclaims little) is what preserves coherence.
+
+Mechanism gaps -> candidate tasks: last-user protection for ring/stack
+(finding 2); budget-aware guidance delivery (finding 5); the loop
+accepting a final answer from a turn whose prompt no longer contains the
+task (finding 2 — the gc_collect stream knows the last user message was
+dropped; the loop could refuse to treat the next no-tool reply as DONE).
