@@ -401,6 +401,7 @@ async fn execute(
         tool_names: agent.tools.names(),
         output_contract: agent.output_contract.clone(),
         shell_requires_approval: agent.require_shell_approval,
+        infer_system_prompt: None,
     };
     let mut history = Vec::new();
     if let Some(instructions) = &agent.instructions {

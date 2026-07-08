@@ -1554,6 +1554,7 @@ async fn resume_run(
         tool_names: vec![],
         output_contract,
         shell_requires_approval: facts.shell_requires_approval,
+        infer_system_prompt: None,
     };
     let mut ir_store = checkpoint.store.clone();
     let mut gc_state = agent_core::GcState::default();
@@ -2018,6 +2019,7 @@ async fn run_turn(
             tool_names: runtime.config.tools.names(),
             output_contract: runtime.output_contract.clone(),
             shell_requires_approval: runtime.shell_requires_approval,
+            infer_system_prompt: None,
         };
         let outcome = agent_core::run_agent_loop_outcome(
             &runtime.config,

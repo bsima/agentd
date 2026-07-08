@@ -395,6 +395,29 @@ pub enum Expr {
     },
     Array(Vec<Expr>),
     Object(BTreeMap<String, Expr>),
+    /// Array concatenation: both operands must evaluate to arrays. Added
+    /// for assembling sub-infer child prompts (t-1344) — a static prefix
+    /// (e.g. a system message) joined to a dynamically-sized message list,
+    /// which `Push` (append-one) cannot express.
+    Concat {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Resolve tool-call ids against a chat-message history (t-1344, the
+    /// `infer` tool's `context_refs`). `history` is an array of chat
+    /// messages; `ids` evaluates to an array of tool-call id strings — the
+    /// ids the model itself minted when calling tools, visible in its own
+    /// context as `tool_calls[].id` / `tool_call_id`. Evaluates to
+    /// `{"messages": [...], "missing": [...]}`: one user-role message per
+    /// resolved id (first occurrence order, duplicates dropped) carrying
+    /// the referenced tool result verbatim, and the ids (or non-string
+    /// elements, serialized) that resolved to nothing. Total and pure —
+    /// malformed model input lands in `missing` for the program to branch
+    /// on, never an interpreter error.
+    SelectToolResults {
+        history: Var,
+        ids: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -920,9 +943,14 @@ fn validate_expr_vars(
         | Expr::Or { left, right }
         | Expr::And { left, right }
         | Expr::Add { left, right }
-        | Expr::Sub { left, right } => {
+        | Expr::Sub { left, right }
+        | Expr::Concat { left, right } => {
             validate_expr_vars(left, defined, block_id)?;
             validate_expr_vars(right, defined, block_id)
+        }
+        Expr::SelectToolResults { history, ids } => {
+            validate_var(history, defined, block_id)?;
+            validate_expr_vars(ids, defined, block_id)
         }
         Expr::Push { base, value } => {
             validate_var(base, defined, block_id)?;
@@ -1036,6 +1064,33 @@ mod tests {
             let json = serde_json::to_string(&policy).unwrap();
             assert!(json.contains("\"tools\""), "{json}");
             assert_eq!(serde_json::from_str::<InferPolicy>(&json).unwrap(), policy);
+        }
+    }
+
+    /// Expr grew the Concat / SelectToolResults variants (t-1344, sub-infer
+    /// context references). Externally-tagged enums are additive: programs
+    /// serialized before the variants existed keep deserializing (and
+    /// hashing) unchanged, and the new variants round-trip. Programs that
+    /// USE the new variants are new programs — their hash difference is the
+    /// point, pinned by `agent_loop_ir` tests, not here.
+    #[test]
+    fn expr_context_ref_variants_round_trip_and_leave_old_json_alone() {
+        let legacy = r#"{"Push":{"base":"history","value":{"Value":1}}}"#;
+        let old: Expr = serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&old).unwrap(), legacy);
+
+        for expr in [
+            Expr::Concat {
+                left: Box::new(Expr::Var(Var("a".into()))),
+                right: Box::new(Expr::Array(vec![Expr::Value(Value::Null)])),
+            },
+            Expr::SelectToolResults {
+                history: Var("history".into()),
+                ids: Box::new(Expr::Var(Var("refs".into()))),
+            },
+        ] {
+            let encoded = serde_json::to_string(&expr).unwrap();
+            assert_eq!(serde_json::from_str::<Expr>(&encoded).unwrap(), expr);
         }
     }
 

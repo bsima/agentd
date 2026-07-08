@@ -1831,12 +1831,24 @@ fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
             kind: "function".into(),
             function: crate::provider::ToolFunctionSpec {
                 name: "infer".into(),
-                description: "Ask the model a focused sub-question and return its response.".into(),
+                description: "Ask another model a focused sub-question and return its \
+                              response. Pass bulky material (documents, logs, prior tool \
+                              output) by reference via context_refs instead of copying it \
+                              into the prompt."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "model": { "type": "string" },
-                        "prompt": { "type": "string" }
+                        "prompt": { "type": "string" },
+                        "context_refs": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "ids of prior tool calls from this conversation \
+                                            (e.g. a shell call's id): each referenced call's \
+                                            result is delivered to the sub-model directly, \
+                                            ahead of the prompt, without being repeated here"
+                        }
                     },
                     "required": ["model", "prompt"]
                 }),
@@ -1991,7 +2003,101 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
             }
             Ok(Value::Object(object))
         }
+        Expr::Concat { left, right } => {
+            let left = eval_expr(env, left)?;
+            let right = eval_expr(env, right)?;
+            match (left, right) {
+                (Value::Array(mut left), Value::Array(right)) => {
+                    left.extend(right);
+                    Ok(Value::Array(left))
+                }
+                (left, right) => Err(anyhow!(
+                    "AgentIR Concat expected two arrays, got {left} and {right}"
+                )),
+            }
+        }
+        Expr::SelectToolResults { history, ids } => {
+            let history = env
+                .get(history)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", history))?;
+            let messages = history.as_array().ok_or_else(|| {
+                anyhow!("AgentIR SelectToolResults expected array, got {history}")
+            })?;
+            let ids = eval_expr(env, ids)?;
+            Ok(select_tool_results(messages, &ids))
+        }
     }
+}
+
+/// Resolve tool-call ids against a chat-message history (t-1344): the model
+/// references prior tool results by the ids it minted itself
+/// (`tool_calls[].id` on assistant messages, echoed as `tool_call_id` on the
+/// result). Returns `{"messages": [...], "missing": [...]}`: one user-role
+/// message per resolved id — the referenced result verbatim under a short
+/// provenance header — in first-occurrence order (duplicates dropped), plus
+/// every id (or non-string element, serialized) that resolved to nothing.
+/// Total on model-shaped garbage by design: bad refs land in `missing` for
+/// the program to answer as a tool result, never an interpreter error.
+fn select_tool_results(messages: &[Value], ids: &Value) -> Value {
+    // Index the history once: id -> tool name (from the assistant call) and
+    // id -> result content (from the tool message).
+    let mut names = std::collections::BTreeMap::<&str, &str>::new();
+    let mut results = std::collections::BTreeMap::<&str, String>::new();
+    for message in messages {
+        for call in message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(id), Some(name)) = (
+                call.get("id").and_then(Value::as_str),
+                call.get("name").and_then(Value::as_str),
+            ) {
+                names.insert(id, name);
+            }
+        }
+        if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+            let content = match message.get("content") {
+                Some(Value::String(content)) => content.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            results.insert(id, content);
+        }
+    }
+
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let elements = match ids.as_array() {
+        Some(elements) => elements.as_slice(),
+        // A non-array `context_refs` is one unresolvable ref: its
+        // serialization, so the error result names what was sent.
+        None => std::slice::from_ref(ids),
+    };
+    for element in elements {
+        let Some(id) = element.as_str() else {
+            missing.push(Value::String(element.to_string()));
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        match results.get(id) {
+            Some(content) => {
+                let name = names.get(id).copied().unwrap_or("unknown");
+                resolved.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "Referenced result of tool call {id} ({name}):\n{content}"
+                    ),
+                }));
+            }
+            None => missing.push(Value::String(id.into())),
+        }
+    }
+    serde_json::json!({ "messages": resolved, "missing": missing })
 }
 
 fn has_pending_tool_calls(value: &Value) -> Result<bool> {

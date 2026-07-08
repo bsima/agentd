@@ -47,9 +47,9 @@ pub use ir::{
     ProgramId, PromptRef, RetrievePolicy, StoreOp, StorePolicy, Terminator, ToolPolicy, Var,
 };
 pub use ir_agent::{
-    agent_loop_ir, agent_loop_ir_with_options, agent_loop_ir_with_policies,
-    agent_loop_ir_with_tools, resume_agent_loop_outcome, run_agent_loop, run_agent_loop_outcome,
-    AgentLoopOptions, AgentLoopOutcome,
+    agent_loop_ir, agent_loop_ir_for_options, agent_loop_ir_with_options,
+    agent_loop_ir_with_policies, agent_loop_ir_with_tools, resume_agent_loop_outcome,
+    run_agent_loop, run_agent_loop_outcome, AgentLoopOptions, AgentLoopOutcome,
 };
 pub use ir_interpreter::{
     run_ir_sequential, run_ir_sequential_with_gc, run_ir_sequential_with_store,

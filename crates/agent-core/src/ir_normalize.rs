@@ -625,9 +625,14 @@ fn collect_expr_vars(expr: &Expr, out: &mut BTreeSet<Var>) {
         | Expr::Or { left, right }
         | Expr::And { left, right }
         | Expr::Add { left, right }
-        | Expr::Sub { left, right } => {
+        | Expr::Sub { left, right }
+        | Expr::Concat { left, right } => {
             collect_expr_vars(left, out);
             collect_expr_vars(right, out);
+        }
+        Expr::SelectToolResults { history, ids } => {
+            out.insert(history.clone());
+            collect_expr_vars(ids, out);
         }
         Expr::Push { base, value } => {
             out.insert(base.clone());
@@ -862,6 +867,14 @@ fn rename_expr(expr: &Expr, env: &BTreeMap<Var, Var>) -> Result<Expr> {
         Expr::Sub { left, right } => Expr::Sub {
             left: Box::new(rename_expr(left, env)?),
             right: Box::new(rename_expr(right, env)?),
+        },
+        Expr::Concat { left, right } => Expr::Concat {
+            left: Box::new(rename_expr(left, env)?),
+            right: Box::new(rename_expr(right, env)?),
+        },
+        Expr::SelectToolResults { history, ids } => Expr::SelectToolResults {
+            history: rename_var(history, env)?,
+            ids: Box::new(rename_expr(ids, env)?),
         },
         Expr::Push { base, value } => Expr::Push {
             base: rename_var(base, env)?,

@@ -69,6 +69,47 @@ pub fn agent_loop_ir_with_policies(
     native_tools: &[String],
     shell_requires_approval: bool,
 ) -> Machine {
+    build_agent_loop_ir(
+        model,
+        prompt,
+        max_turns,
+        memory_tools,
+        native_tools,
+        shell_requires_approval,
+        None,
+    )
+}
+
+/// The agent loop built from [`AgentLoopOptions`], the one entry point that
+/// exposes every program-shaping knob — including the sub-infer child's
+/// system-prompt slot (t-1344). Like every other knob, the slot is part of
+/// the program: configuring it changes the program hash.
+pub fn agent_loop_ir_for_options(
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    options: &AgentLoopOptions,
+) -> Machine {
+    build_agent_loop_ir(
+        model,
+        prompt,
+        max_turns,
+        options.memory_tools,
+        &options.tool_names,
+        options.shell_requires_approval,
+        options.infer_system_prompt.as_deref(),
+    )
+}
+
+fn build_agent_loop_ir(
+    model: Model,
+    prompt: Prompt,
+    max_turns: usize,
+    memory_tools: bool,
+    native_tools: &[String],
+    shell_requires_approval: bool,
+    infer_system_prompt: Option<&str>,
+) -> Machine {
     let entry = BlockId(0);
     let done = BlockId(1);
     let prepare_tools = BlockId(2);
@@ -93,9 +134,14 @@ pub fn agent_loop_ir_with_policies(
     let recall_tool = BlockId(21);
     let remember_store = BlockId(22);
     let recall_retrieve = BlockId(23);
+    // Sub-infer context references (t-1344): resolve `context_refs` against
+    // history before dispatching the child, or answer with a readable error
+    // naming the unresolved ids.
+    let infer_resolve = BlockId(24);
+    let infer_bad_refs = BlockId(25);
     // Native tool dispatch arms (t-1308.7): a dispatch/body block pair per
-    // registered tool, from block id 24 up.
-    let native_base = 24u32;
+    // registered tool, from block id 26 up.
+    let native_base = 26u32;
     let native_dispatch = |index: usize| BlockId(native_base + 2 * index as u32);
     let native_body = |index: usize| BlockId(native_base + 2 * index as u32 + 1);
     // Where an unmatched name falls through to after the built-in arms:
@@ -143,6 +189,12 @@ pub fn agent_loop_ir_with_policies(
     let eval_result = Var("eval_result".into());
     let infer_model = Var("infer_model".into());
     let infer_prompt_text = Var("infer_prompt_text".into());
+    let infer_context_refs = Var("infer_context_refs".into());
+    let infer_resolved = Var("infer_resolved".into());
+    let infer_missing = Var("infer_missing".into());
+    let infer_missing_empty = Var("infer_missing_empty".into());
+    let infer_ref_messages = Var("infer_ref_messages".into());
+    let infer_child_base = Var("infer_child_base".into());
     let infer_prompt = Var("infer_prompt".into());
     let infer_result = Var("infer_result".into());
     let infer_content = Var("infer_content".into());
@@ -707,8 +759,92 @@ pub fn agent_loop_ir_with_policies(
                 cond: Expr::Var(invalid_infer_arguments),
                 then_block: invalid_arguments,
                 then_args: vec![],
-                else_block: infer_eval,
+                else_block: infer_resolve,
                 else_args: vec![],
+            },
+        },
+    );
+
+    // Context references (t-1344): the model passes material to the child
+    // BY REFERENCE — `context_refs` names prior tool calls by the ids the
+    // model itself minted, and the referenced results are assembled into
+    // the child's messages here, at dispatch, without ever transiting the
+    // parent's output tokens or riding its history as argument copies.
+    blocks.insert(
+        infer_resolve,
+        Block {
+            params: vec![],
+            instructions: vec![
+                Instr::Let {
+                    out: infer_context_refs.clone(),
+                    expr: Expr::FieldOr {
+                        base: arguments.clone(),
+                        field: "context_refs".into(),
+                        default: Box::new(Expr::Array(vec![])),
+                    },
+                },
+                Instr::Let {
+                    out: infer_resolved.clone(),
+                    expr: Expr::SelectToolResults {
+                        history: history.clone(),
+                        ids: Box::new(Expr::Var(infer_context_refs.clone())),
+                    },
+                },
+                Instr::Let {
+                    out: infer_missing.clone(),
+                    expr: Expr::Field {
+                        base: infer_resolved.clone(),
+                        field: "missing".into(),
+                    },
+                },
+                Instr::Let {
+                    out: infer_missing_empty.clone(),
+                    expr: Expr::IsEmpty {
+                        base: infer_missing.clone(),
+                    },
+                },
+            ],
+            terminator: Terminator::If {
+                cond: Expr::Var(infer_missing_empty),
+                then_block: infer_eval,
+                then_args: vec![],
+                else_block: infer_bad_refs,
+                else_args: vec![],
+            },
+        },
+    );
+
+    // A bad reference is a recoverable tool result naming the unresolved
+    // ids (errors-as-values, t-1222), never a turn abort: the model can
+    // re-check the id it meant and retry.
+    blocks.insert(
+        infer_bad_refs,
+        Block {
+            params: vec![],
+            instructions: vec![Instr::Let {
+                out: invalid_message.clone(),
+                expr: Expr::Object(BTreeMap::from([
+                    ("ok".into(), Expr::Value(Value::Bool(false))),
+                    (
+                        "error".into(),
+                        Expr::Value(Value::String("unresolved_context_refs".into())),
+                    ),
+                    (
+                        "message".into(),
+                        Expr::Value(Value::String(
+                            "context_refs must be ids of tool calls whose results \
+                             appear earlier in this conversation"
+                                .into(),
+                        )),
+                    ),
+                    ("missing".into(), Expr::Var(infer_missing.clone())),
+                ])),
+            }],
+            terminator: Terminator::Goto {
+                block: append_tool,
+                args: vec![Expr::ToString {
+                    value: Box::new(Expr::Var(invalid_message.clone())),
+                }],
             },
         },
     );
@@ -718,12 +854,39 @@ pub fn agent_loop_ir_with_policies(
         Block {
             params: vec![],
             instructions: vec![
+                // The child gets a proper message structure (t-1344): an
+                // optional system slot owned by the dispatch site (loop
+                // config, never the model), the referenced material as
+                // user messages, then the instruction prompt last.
+                Instr::Let {
+                    out: infer_ref_messages.clone(),
+                    expr: Expr::Field {
+                        base: infer_resolved.clone(),
+                        field: "messages".into(),
+                    },
+                },
+                Instr::Let {
+                    out: infer_child_base.clone(),
+                    expr: match infer_system_prompt {
+                        Some(system) => Expr::Concat {
+                            left: Box::new(Expr::Array(vec![Expr::Object(BTreeMap::from([
+                                ("role".into(), Expr::Value(Value::String("system".into()))),
+                                ("content".into(), Expr::Value(Value::String(system.into()))),
+                            ]))])),
+                            right: Box::new(Expr::Var(infer_ref_messages.clone())),
+                        },
+                        None => Expr::Var(infer_ref_messages.clone()),
+                    },
+                },
                 Instr::Let {
                     out: infer_prompt.clone(),
-                    expr: Expr::Array(vec![Expr::Object(BTreeMap::from([
-                        ("role".into(), Expr::Value(Value::String("user".into()))),
-                        ("content".into(), Expr::Var(infer_prompt_text)),
-                    ]))]),
+                    expr: Expr::Push {
+                        base: infer_child_base.clone(),
+                        value: Box::new(Expr::Object(BTreeMap::from([
+                            ("role".into(), Expr::Value(Value::String("user".into()))),
+                            ("content".into(), Expr::Var(infer_prompt_text)),
+                        ]))),
+                    },
                 },
                 Instr::Infer {
                     out: infer_result.clone(),
@@ -1246,6 +1409,12 @@ pub struct AgentLoopOptions {
     /// a resolver (hook or pre-loaded resolution) a gated shell command
     /// pauses the run instead of executing.
     pub shell_requires_approval: bool,
+    /// System prompt for sub-infer children dispatched via the `infer` tool
+    /// (t-1344): when set, every child prompt starts with this system
+    /// message, ahead of any `context_refs` material and the instruction.
+    /// Owned by the dispatch site (loop configuration), never the model,
+    /// and part of the program — setting it changes the program hash.
+    pub infer_system_prompt: Option<String>,
 }
 
 /// Run the agent loop with loop-level post-processing (t-1308.4): build the
@@ -1356,14 +1525,7 @@ pub async fn run_agent_loop_outcome(
             .await?;
     }
 
-    let mut machine = agent_loop_ir_with_policies(
-        model.clone(),
-        prompt,
-        max_turns,
-        options.memory_tools,
-        &options.tool_names,
-        options.shell_requires_approval,
-    );
+    let mut machine = agent_loop_ir_for_options(model.clone(), prompt, max_turns, options);
     machine.effect_visits = effect_visits;
     drive_agent_loop(
         config, store, ir_replay, gc_state, model, max_turns, options, machine,
@@ -1519,14 +1681,7 @@ fn repair_machine(
         }
         messages.push(serde_json::json!({ "role": "user", "content": repair_prompt(errors) }));
     }
-    let mut machine = agent_loop_ir_with_policies(
-        model,
-        vec![],
-        max_turns,
-        options.memory_tools,
-        &options.tool_names,
-        options.shell_requires_approval,
-    );
+    let mut machine = agent_loop_ir_for_options(model, vec![], max_turns, options);
     machine.env.insert(Var("history".into()), history);
     machine.effect_visits = done.effect_visits.clone();
     machine
@@ -1723,6 +1878,196 @@ mod tests {
             .expect("infer tool result in final prompt");
         assert_eq!(tool_message.content.as_deref(), Some("sub answer"));
         Ok(())
+    }
+
+    /// Context references (t-1344): the child's prompt is assembled at
+    /// dispatch from the tool results the parent names by id — the material
+    /// reaches the child without the parent re-emitting it in arguments.
+    #[tokio::test]
+    async fn agent_loop_ir_infer_context_refs_assemble_child_prompt() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-sh",
+                    "shell",
+                    serde_json::json!({ "command": "printf doc-material" }),
+                )],
+            ),
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-inf",
+                    "infer",
+                    serde_json::json!({
+                        "model": "mock",
+                        "prompt": "summarize the referenced output",
+                        "context_refs": ["call-sh"]
+                    }),
+                )],
+            ),
+            response("digest", vec![]),
+            response("done", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("go")],
+            4,
+        );
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+        assert_eq!(value["content"], Value::String("done".into()));
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 4, "two parent turns, one child, one final");
+        let child_prompt = &prompts[2];
+        assert_eq!(
+            child_prompt.len(),
+            2,
+            "referenced material then instruction: {child_prompt:?}"
+        );
+        assert_eq!(child_prompt[0].role, "user");
+        let referenced = child_prompt[0].content.as_deref().unwrap_or_default();
+        assert!(
+            referenced.starts_with("Referenced result of tool call call-sh (shell):"),
+            "provenance header names the call: {referenced}"
+        );
+        assert!(
+            referenced.contains("doc-material"),
+            "the referenced shell result travels verbatim: {referenced}"
+        );
+        assert_eq!(
+            child_prompt[1].content.as_deref(),
+            Some("summarize the referenced output")
+        );
+        // And the child's answer feeds back as bare text, as before.
+        let tool_message = prompts[3]
+            .iter()
+            .rfind(|message| message.role == "tool")
+            .expect("infer tool result in final prompt");
+        assert_eq!(tool_message.content.as_deref(), Some("digest"));
+        Ok(())
+    }
+
+    /// A context_ref that resolves to nothing is a recoverable tool result
+    /// naming the unresolved ids (errors-as-values, t-1222) — the child is
+    /// never dispatched.
+    #[tokio::test]
+    async fn agent_loop_ir_infer_unresolved_context_ref_binds_error() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-inf",
+                    "infer",
+                    serde_json::json!({
+                        "model": "mock",
+                        "prompt": "summarize",
+                        "context_refs": ["call-nope"]
+                    }),
+                )],
+            ),
+            response("recovered", vec![]),
+        ]));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("go")],
+            4,
+        );
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+        assert_eq!(value["content"], Value::String("recovered".into()));
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2, "no child dispatch on a bad reference");
+        let tool_message = prompts[1]
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("error tool result present");
+        let content = tool_message.content.as_deref().unwrap_or_default();
+        assert!(
+            content.contains("unresolved_context_refs") && content.contains("call-nope"),
+            "readable error names the unresolved id: {content}"
+        );
+        Ok(())
+    }
+
+    /// The child's system slot (t-1344) is owned by the dispatch site: when
+    /// the loop is configured with `infer_system_prompt`, every child prompt
+    /// starts with that system message — ahead of referenced material and
+    /// the instruction.
+    #[tokio::test]
+    async fn agent_loop_ir_infer_system_prompt_slot_prepends_system_message() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-inf",
+                    "infer",
+                    serde_json::json!({ "model": "mock", "prompt": "sub question" }),
+                )],
+            ),
+            response("sub answer", vec![]),
+            response("done", vec![]),
+        ]));
+        let options = AgentLoopOptions {
+            infer_system_prompt: Some("You are a terse delegate.".into()),
+            ..Default::default()
+        };
+        let machine = agent_loop_ir_for_options(
+            Model("mock".into()),
+            vec![
+                ChatMessage::system("parent system"),
+                ChatMessage::user("go"),
+            ],
+            4,
+            &options,
+        );
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider.clone()), machine).await?;
+        assert_eq!(value["content"], Value::String("done".into()));
+
+        let child_prompt = &provider.prompts()[1];
+        assert_eq!(child_prompt.len(), 2, "{child_prompt:?}");
+        assert_eq!(child_prompt[0].role, "system");
+        assert_eq!(
+            child_prompt[0].content.as_deref(),
+            Some("You are a terse delegate.")
+        );
+        assert_eq!(child_prompt[1].role, "user");
+        assert_eq!(child_prompt[1].content.as_deref(), Some("sub question"));
+        Ok(())
+    }
+
+    /// The child config is program: setting the system slot changes the
+    /// program hash (replay against a differently-configured loop must
+    /// diverge), and the options builder with default options is the same
+    /// program as the positional builder.
+    #[test]
+    fn infer_system_prompt_changes_the_program_hash() {
+        let build = |options: &AgentLoopOptions| {
+            crate::ir::program_hash(
+                &agent_loop_ir_for_options(
+                    Model("mock".into()),
+                    vec![ChatMessage::user("hello")],
+                    4,
+                    options,
+                )
+                .program,
+            )
+            .unwrap()
+        };
+        let default_hash = build(&AgentLoopOptions::default());
+        let with_system = build(&AgentLoopOptions {
+            infer_system_prompt: Some("child system".into()),
+            ..Default::default()
+        });
+        assert_ne!(default_hash, with_system);
+        let positional = crate::ir::program_hash(
+            &agent_loop_ir(Model("mock".into()), vec![ChatMessage::user("hello")], 4).program,
+        )
+        .unwrap();
+        assert_eq!(default_hash, positional);
     }
 
     #[tokio::test]
@@ -2738,6 +3083,7 @@ mod tests {
             tool_names: Vec::new(),
             output_contract: contract,
             shell_requires_approval: false,
+            infer_system_prompt: None,
         };
         let (value, machine) = run_agent_loop(
             &config,
@@ -2935,6 +3281,7 @@ mod tests {
                 tool_names: Vec::new(),
                 output_contract: Some(contract_a.clone()),
                 shell_requires_approval: false,
+                infer_system_prompt: None,
             };
             let (value, _machine) = run_agent_loop(
                 &config,
@@ -2970,6 +3317,7 @@ mod tests {
                     tool_names: Vec::new(),
                     output_contract: contract,
                     shell_requires_approval: false,
+                    infer_system_prompt: None,
                 };
                 run_agent_loop(
                     &config,
