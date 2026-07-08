@@ -682,10 +682,35 @@ async fn collect_prompt(
             }
         }
     }
+    // Recall-overlap write-barrier pre-pass (t-1351): a recall result that
+    // re-injects content already in (or previously collected from) the
+    // window marks that content HOT in GcState.recall_hot. Pure and
+    // synchronous, but it lives here rather than inside collect() because
+    // "previously collected" needs cross-collection state. Signal-only:
+    // no strategy consumes it yet (t-1167 generational input); it is
+    // observable on the gc_collect event below.
+    let recall_report = crate::gc::record_recall_overlaps(&prompt, gc_state);
+    // Snapshot (id, content-key) pairs so the contents of whatever this
+    // collection drops can join GcState.collected_hashes afterwards.
+    let before_contents: Vec<(uuid::Uuid, String)> = prompt
+        .iter()
+        .filter_map(|message| {
+            message
+                .content
+                .as_deref()
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| (message.id, crate::gc::recall_content_key(content)))
+        })
+        .collect();
     let before_ids: BTreeSet<_> = prompt.iter().map(|message| message.id).collect();
     let collected = config.gc.collect(prompt, target_budget, gc_state);
     let after_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
     let dropped_count = before_ids.difference(&after_ids).count();
+    for (id, key) in before_contents {
+        if !after_ids.contains(&id) {
+            gc_state.collected_hashes.insert(key);
+        }
+    }
     let after_tokens = estimate_tokens(&collected);
     if config.gc_log {
         let mut data = serde_json::json!({
@@ -698,6 +723,8 @@ async fn collect_prompt(
             "tokens_after": after_tokens,
             "cache_invalidated": gc_state.prefix_invalidated,
             "dropped_count": dropped_count,
+            "recall_overlap_events": recall_report.overlap_events,
+            "recall_hot": recall_report.hot_total,
         });
         if let Some(cycle) = overflow_cycle {
             let object = data.as_object_mut().expect("gc_collect data is an object");
@@ -1320,6 +1347,120 @@ mod tests {
             })
             .expect("the failure must be observable under --gc-log");
         assert_eq!(embed_event["failed"], true);
+        Ok(())
+    }
+
+    /// The recall-overlap write-barrier (t-1351) is recorded by the pre-pass
+    /// and observable on the gc_collect event, so the behavioral eval
+    /// (t-1349) can watch it fire. Ring is the strategy here on purpose:
+    /// the signal is strategy-independent and consumed by none yet.
+    #[tokio::test]
+    async fn gc_collect_reports_recall_overlap_signal() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = SeqConfig {
+            approvals: Default::default(),
+            tools: Default::default(),
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: crate::gc::GcMode::Ring(crate::gc::RingGc::default()),
+            gc_threshold: 0.5,
+            gc_log: true,
+            gc_timing: GcTiming::Threshold,
+            context_budget: 300,
+            pricing: Default::default(),
+        };
+        let note = "the planner fix is raising the statistics target";
+        let prompt = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(note),
+            ChatMessage::assistant(
+                None,
+                vec![tool_call(
+                    "call-recall",
+                    "recall",
+                    serde_json::json!({ "query": "planner" }),
+                )],
+            ),
+            ChatMessage::tool(
+                "call-recall",
+                serde_json::json!([{ "source": "memory", "kind": "Semantic", "content": note }])
+                    .to_string(),
+            ),
+            ChatMessage::user("x".repeat(600)),
+        ];
+
+        let mut state = crate::gc::GcState::default();
+        let _ = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(
+            state
+                .recall_hot
+                .contains(&crate::gc::recall_content_key(note)),
+            "the pre-pass must mark the re-injected content hot"
+        );
+        let events = TraceLogger::read_events(trace_path).await?;
+        let collect_event = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_collect" => Some(data),
+                _ => None,
+            })
+            .expect("gc_collect event under --gc-log");
+        assert_eq!(collect_event["recall_overlap_events"], 1);
+        assert_eq!(collect_event["recall_hot"], 1);
+        Ok(())
+    }
+
+    /// Dropped message contents join GcState.collected_hashes so a later
+    /// recall re-injecting them still registers as a write-barrier event.
+    #[tokio::test]
+    async fn gc_collect_records_dropped_contents_for_the_write_barrier() -> Result<()> {
+        let config = SeqConfig {
+            approvals: Default::default(),
+            tools: Default::default(),
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            trace: test_trace(),
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: crate::gc::GcMode::Ring(crate::gc::RingGc {
+                preserve_prefix: false,
+            }),
+            gc_threshold: 0.5,
+            gc_log: false,
+            gc_timing: GcTiming::Threshold,
+            context_budget: 100,
+            pricing: Default::default(),
+        };
+        let doomed = "z".repeat(90);
+        let prompt = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(doomed.clone()),
+            ChatMessage::user("y".repeat(90)),
+        ];
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(collected
+            .iter()
+            .all(|message| message.content.as_deref() != Some(doomed.as_str())));
+        assert!(
+            state
+                .collected_hashes
+                .contains(&crate::gc::recall_content_key(&doomed)),
+            "dropped content must be remembered for later recall overlap"
+        );
         Ok(())
     }
 

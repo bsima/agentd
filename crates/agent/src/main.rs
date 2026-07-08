@@ -165,6 +165,13 @@ struct Args {
     /// dropped once every below-floor candidate is gone.
     #[arg(long, default_value_t = agent_core::gc::DEFAULT_SEMANTIC_SIMILARITY_FLOOR)]
     gc_semantic_floor: f32,
+    /// Citation-aware keep for `--gc semantic` (t-1351): messages cited by
+    /// later ones — tool-call-id mentions in text, `infer` context_refs —
+    /// join the protected set during the normal sweep phases, so a
+    /// cited-but-semantically-distant result survives. Pass `false` for
+    /// pure similarity scoring.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gc_cited_keep: bool,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -606,6 +613,7 @@ async fn main() -> Result<()> {
                         recent_window: args.gc_semantic_window,
                         similarity_floor: args.gc_semantic_floor,
                         embedder: embedder.clone(),
+                        cited_keep: args.gc_cited_keep,
                     })
                 }
             }

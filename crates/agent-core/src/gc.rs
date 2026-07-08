@@ -70,6 +70,23 @@ pub struct GcState {
     /// whose content left the window, bounding the cache to the live
     /// window.
     pub embeddings: HashMap<String, Vec<f32>>,
+    /// Recall-overlap write-barrier signal (t-1351): content hashes
+    /// ([`recall_content_key`]) marked HOT because a `recall` tool result
+    /// re-injected content already present in — or previously collected
+    /// from — the window. Written by [`record_recall_overlaps`] in the
+    /// interpreter pre-pass; consumed by NO strategy yet, by design — it is
+    /// the promotion signal generational GC (t-1167) is specified against,
+    /// and it is observable today via `recall_overlap_events`/`recall_hot`
+    /// on the gc_collect event. Runtime-only like `embeddings`: never
+    /// serialized into checkpoints.
+    pub recall_hot: BTreeSet<String>,
+    /// Content hashes of messages dropped by earlier collections this run
+    /// (written by `interpreter::collect_prompt` after each collect), so a
+    /// recall that re-injects *collected* content still registers as a
+    /// write-barrier event — the "evict, recall, re-inject" thrash loop is
+    /// exactly what the hot signal exists to expose. Bounded by the run's
+    /// own drop history; runtime-only, never serialized.
+    pub collected_hashes: BTreeSet<String>,
 }
 
 /// When GC runs, independent of which strategy reclaims tokens (t-1151).
@@ -269,6 +286,15 @@ pub struct SemanticGc {
     /// ([`Self::prime_cache`]); `collect()` never touches it, which is
     /// what keeps collect() synchronous, deterministic, and offline.
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// The `cited-keep` modifier (t-1351, docs/GC.md "Citation signals"):
+    /// messages cited by later ones ([`cited_mask`]) join the protected set
+    /// during the normal sweep phases, so a cited-but-semantically-distant
+    /// result — the 2x2's gap cell — survives. Citation is a heuristic
+    /// guard with the same strength as the recency floor: it relaxes in the
+    /// degrade phases, below the preserve-prefix billing contract and the
+    /// system/last-user hard guards. Extraction is pure text analysis and
+    /// runs inside collect() (unlike embeddings — no cache, no pre-pass).
+    pub cited_keep: bool,
 }
 
 impl Default for SemanticGc {
@@ -278,6 +304,7 @@ impl Default for SemanticGc {
             recent_window: DEFAULT_SEMANTIC_RECENT_WINDOW,
             similarity_floor: DEFAULT_SEMANTIC_SIMILARITY_FLOOR,
             embedder: None,
+            cited_keep: true,
         }
     }
 }
@@ -292,6 +319,7 @@ impl std::fmt::Debug for SemanticGc {
                 "embedder",
                 &self.embedder.as_ref().map(|embedder| embedder.model_id()),
             )
+            .field("cited_keep", &self.cited_keep)
             .finish()
     }
 }
@@ -545,7 +573,17 @@ impl ContextGc for SemanticGc {
 
         let mut keep = vec![true; messages.len()];
         if estimate_tokens(&messages) > budget {
-            let protected = self.protected_mask(&messages, boundary);
+            let mut protected = self.protected_mask(&messages, boundary);
+            // cited-keep (t-1351): cited messages are protected through the
+            // normal sweep phases. They are NOT in the phase-3/4 masks, so
+            // like the recency floor they relax under degrade pressure —
+            // heuristic guard, not a hard one. Pure text analysis, so it
+            // runs right here inside collect().
+            if self.cited_keep {
+                for (slot, cited) in protected.iter_mut().zip(cited_mask(&messages)) {
+                    *slot = *slot || cited;
+                }
+            }
             let scores = self.scores(&messages, state);
             // Phase 1: clearly-unrelated candidates (below the floor),
             // most distant first.
@@ -600,6 +638,275 @@ impl ContextGc for SemanticGc {
     fn cache_preserving(&self) -> bool {
         self.preserve_prefix
     }
+}
+
+// --- Citation signals (t-1351) ----------------------------------------------
+//
+// docs/GC.md "Citation signals": position and topic are proxies for whether a
+// message still matters; citation is direct evidence. Extraction is pure text
+// analysis over exactly the inputs collect() already has — stateless,
+// deterministic, synchronous, LLM-free — so unlike embeddings it runs INSIDE
+// collect(), with no cache, no pre-pass, and no degrade mode.
+
+/// The citation graph of one window: which messages are *cited* — referenced
+/// by a later message's text (tool-call-id mention) or pulled by reference
+/// into a sub-infer child (the `infer` tool's `context_refs`, t-1344).
+///
+/// Edges point citing message -> cited message. The cited target is the
+/// tool-*result* message when it exists in the window (that is where the
+/// tokens live), else the dispatching call message; protecting the result
+/// implicitly protects its call because pair atomicity refuses to split
+/// them. The structural pair members — the assistant message that issued a
+/// call and the tool message answering it — carry the id by construction
+/// and never count as citing it.
+///
+/// Content-similarity citation (paraphrase without the id) is deliberately
+/// NOT an edge kind: similarity is [`SemanticGc`]'s mechanism. Similarity
+/// says "on-topic", citation says "load-bearing" — keeping the extractor
+/// exact keeps the two signals orthogonal (docs/GC.md, the 2x2).
+#[derive(Debug, Clone, Default)]
+pub struct CitationGraph {
+    /// Cited message id -> the ids of the messages citing it.
+    cited_by: HashMap<MsgId, BTreeSet<MsgId>>,
+}
+
+impl CitationGraph {
+    /// Build the graph for one window. Pure and total: malformed
+    /// `context_refs` entries and ids that resolve to nothing are ignored,
+    /// never an error.
+    pub fn extract(messages: &[ChatMessage]) -> Self {
+        // Every tool-call id minted in the window, with its dispatching
+        // call index and (when present) its result index. First occurrence
+        // wins, matching the interpreter's resolution order.
+        let mut sites: Vec<(String, usize, Option<usize>)> = Vec::new();
+        let mut site_index: HashMap<String, usize> = HashMap::new();
+        for (index, message) in messages.iter().enumerate() {
+            for call in message.tool_calls.as_deref().unwrap_or_default() {
+                if !site_index.contains_key(&call.id) {
+                    site_index.insert(call.id.clone(), sites.len());
+                    sites.push((call.id.clone(), index, None));
+                }
+            }
+            if let Some(result_of) = &message.tool_call_id {
+                if let Some(&site) = site_index.get(result_of) {
+                    let (_, call_index, result_index) = &mut sites[site];
+                    if *call_index < index && result_index.is_none() {
+                        *result_index = Some(index);
+                    }
+                }
+            }
+        }
+
+        let mut graph = Self::default();
+        for (index, message) in messages.iter().enumerate() {
+            // context_refs edges: the model asked for these results to be
+            // re-materialized into a child's context — explicit citations
+            // by construction (t-1344), no text scanning needed.
+            for call in message.tool_calls.as_deref().unwrap_or_default() {
+                let refs = call
+                    .arguments
+                    .get("context_refs")
+                    .and_then(serde_json::Value::as_array);
+                for id in refs
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                {
+                    graph.add_edge(messages, &sites, &site_index, id, index);
+                }
+            }
+            // id-mention edges: the message's own text names the call
+            // ("per the output of call-X, proceed with..."). Token-boundary
+            // match so `call-1` never fires inside `call-10`.
+            let Some(text) = message.content.as_deref() else {
+                continue;
+            };
+            for (id, call_index, _) in &sites {
+                // The id exists only from its dispatching call onward.
+                if index > *call_index && mentions_id(text, id) {
+                    graph.add_edge(messages, &sites, &site_index, id, index);
+                }
+            }
+        }
+        graph
+    }
+
+    fn add_edge(
+        &mut self,
+        messages: &[ChatMessage],
+        sites: &[(String, usize, Option<usize>)],
+        site_index: &HashMap<String, usize>,
+        id: &str,
+        citing: usize,
+    ) {
+        let Some(&site) = site_index.get(id) else {
+            return;
+        };
+        let (_, call_index, result_index) = &sites[site];
+        let target = result_index.unwrap_or(*call_index);
+        // The structural pair members never cite themselves.
+        if citing == target || citing == *call_index {
+            return;
+        }
+        self.cited_by
+            .entry(messages[target].id)
+            .or_default()
+            .insert(messages[citing].id);
+    }
+
+    /// Is this message cited by at least one other message?
+    pub fn is_cited(&self, id: &MsgId) -> bool {
+        self.cited_by.contains_key(id)
+    }
+
+    /// The messages citing `id` (empty when uncited). In-degree is the
+    /// warm-promotion signal generational GC (t-1167) consumes.
+    pub fn citers(&self, id: &MsgId) -> impl Iterator<Item = &MsgId> {
+        self.cited_by.get(id).into_iter().flatten()
+    }
+
+    /// Total number of citation edges in the window.
+    pub fn edge_count(&self) -> usize {
+        self.cited_by.values().map(BTreeSet::len).sum()
+    }
+}
+
+/// Per-index cited mask over a window: the `cited-keep` modifier any
+/// strategy can OR into its protected set (docs/GC.md). [`SemanticGc`] is
+/// the first consumer.
+pub fn cited_mask(messages: &[ChatMessage]) -> Vec<bool> {
+    let graph = CitationGraph::extract(messages);
+    messages
+        .iter()
+        .map(|message| graph.is_cited(&message.id))
+        .collect()
+}
+
+/// Does `text` contain `id` as a standalone token? Boundaries are
+/// non-identifier characters, so `call-1` does not match inside `call-10`
+/// or `recall-1x`.
+fn mentions_id(text: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let is_id_char = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-';
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(found) = text[start..].find(id) {
+        let begin = start + found;
+        let end = begin + id.len();
+        let open = begin == 0 || !is_id_char(bytes[begin - 1]);
+        let close = end == bytes.len() || !is_id_char(bytes[end]);
+        if open && close {
+            return true;
+        }
+        start = begin + 1;
+    }
+    false
+}
+
+/// What one recall-overlap pre-pass observed, reported on the gc_collect
+/// event (`recall_overlap_events` / `recall_hot`) so the behavioral eval
+/// (t-1349) can watch the write-barrier fire.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecallOverlapReport {
+    /// Overlapping recall hits found in this window (a hit counts every
+    /// pass it stays in the window: re-observation is the signal).
+    pub overlap_events: usize,
+    /// Cumulative size of `GcState.recall_hot` after this pass.
+    pub hot_total: usize,
+}
+
+/// Tool names whose results re-inject memory content — the write-barrier
+/// sources. Today just the agent loop's `recall` tool (ir_agent.rs).
+const RECALL_TOOL_NAMES: [&str; 1] = ["recall"];
+
+/// The hash key for recall-overlap membership: content hash of the trimmed
+/// text. Trimming forgives leading/trailing whitespace differences between
+/// the stored note and the window message; anything fuzzier is future work
+/// (and must stay out of collect() regardless — docs/GC.md).
+pub fn recall_content_key(text: &str) -> String {
+    content_hash(text.trim())
+}
+
+/// The recall-overlap write-barrier pre-pass (t-1351, docs/GC.md): for each
+/// `recall` tool result in the window, hash its hit contents and check them
+/// against (a) every other window message's content and (b) contents
+/// previously collected from the window (`GcState.collected_hashes`).
+/// Matches mark the content HOT in `GcState.recall_hot` — a re-reference
+/// event: the model pulled back something it already had (or something GC
+/// took away), so dropping it again would thrash.
+///
+/// Pure, synchronous, and total, but it lives in the pre-pass rather than
+/// inside collect() because "previously collected" requires cross-collection
+/// state that no pure function of the current window has. NOT consumed by
+/// any strategy yet — it is t-1167 generational input, signal-only.
+pub fn record_recall_overlaps(
+    messages: &[ChatMessage],
+    state: &mut GcState,
+) -> RecallOverlapReport {
+    let mut call_names: HashMap<&str, &str> = HashMap::new();
+    for message in messages {
+        for call in message.tool_calls.as_deref().unwrap_or_default() {
+            call_names.entry(call.id.as_str()).or_insert(&call.name);
+        }
+    }
+    let is_recall_result = |message: &ChatMessage| {
+        message.role == "tool"
+            && message.tool_call_id.as_deref().is_some_and(|id| {
+                call_names
+                    .get(id)
+                    .is_some_and(|name| RECALL_TOOL_NAMES.contains(name))
+            })
+    };
+
+    // What the recall could be re-injecting: every OTHER window message's
+    // content (recall results themselves are excluded so two identical
+    // recalls do not vouch for each other).
+    let window_keys: BTreeSet<String> = messages
+        .iter()
+        .filter(|message| !is_recall_result(message))
+        .filter_map(|message| message.content.as_deref())
+        .filter(|content| !content.trim().is_empty())
+        .map(recall_content_key)
+        .collect();
+
+    let mut report = RecallOverlapReport::default();
+    for message in messages.iter().filter(|message| is_recall_result(message)) {
+        let Some(content) = message.content.as_deref() else {
+            continue;
+        };
+        for chunk in recall_hit_contents(content) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            let key = recall_content_key(&chunk);
+            if window_keys.contains(&key) || state.collected_hashes.contains(&key) {
+                state.recall_hot.insert(key);
+                report.overlap_events += 1;
+            }
+        }
+    }
+    report.hot_total = state.recall_hot.len();
+    report
+}
+
+/// The hit contents inside one recall result. The recall tool renders a
+/// Retrieve result as a JSON array of `SourceResult`s, each with a `content`
+/// string; anything that does not parse that way is treated as one opaque
+/// chunk. Total: never an error.
+fn recall_hit_contents(content: &str) -> Vec<String> {
+    if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(content) {
+        let hits: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect();
+        if !hits.is_empty() {
+            return hits;
+        }
+    }
+    vec![content.to_string()]
 }
 
 #[derive(Debug, Clone)]
@@ -1810,6 +2117,7 @@ mod tests {
             recent_window: 2,
             similarity_floor: 0.25,
             embedder: None,
+            cited_keep: true,
         }
     }
 
@@ -2097,6 +2405,299 @@ mod tests {
         assert_eq!(report.embedded, 0);
         assert!(!report.failed);
         assert!(state.embeddings.is_empty());
+    }
+
+    // ---- Citation signals (t-1351) ------------------------------------------
+
+    /// system + user + one completed read_file frame + closing narration.
+    /// No third-party message mentions the call id: zero citations.
+    fn uncited_frame_fixture() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("audit the dependency tree"),
+            ChatMessage::assistant(None, vec![read_file_call("call-audit", "/tmp/deps.txt")]),
+            ChatMessage::tool("call-audit", "vulnerable: libfoo 1.2 ".repeat(30)),
+            ChatMessage::assistant(Some("Reviewed the audit output.".into()), vec![]),
+        ]
+    }
+
+    #[test]
+    fn citation_graph_structural_pair_members_are_not_citations() {
+        // The dispatching call carries the id in tool_calls and the result
+        // in tool_call_id — by construction, not as citations.
+        let messages = uncited_frame_fixture();
+        let graph = CitationGraph::extract(&messages);
+        assert_eq!(graph.edge_count(), 0, "{graph:?}");
+        assert!(messages.iter().all(|message| !graph.is_cited(&message.id)));
+    }
+
+    #[test]
+    fn citation_graph_extracts_id_mentions_and_context_refs() {
+        let mut messages = uncited_frame_fixture();
+        let result_id = messages[3].id;
+        // id-mention: a later message names the call in its text.
+        messages.push(ChatMessage::assistant(
+            Some("Per the output of call-audit, libfoo is the vulnerable one.".into()),
+            vec![],
+        ));
+        let mention_id = messages.last().unwrap().id;
+        // context_refs: an infer dispatch pulls the result by reference
+        // (t-1344) — an explicit citation by construction.
+        messages.push(ChatMessage::assistant(
+            None,
+            vec![ToolCall::new(
+                "call-child",
+                "infer",
+                serde_json::json!({
+                    "prompt": "summarize the finding",
+                    "context_refs": ["call-audit", "no-such-id", 7],
+                }),
+            )],
+        ));
+        let refs_id = messages.last().unwrap().id;
+
+        let graph = CitationGraph::extract(&messages);
+        assert!(
+            graph.is_cited(&result_id),
+            "the tool result is the citation target: {graph:?}"
+        );
+        let citers: BTreeSet<_> = graph.citers(&result_id).copied().collect();
+        assert_eq!(citers, BTreeSet::from([mention_id, refs_id]));
+        // Unknown/malformed context_refs entries are ignored, never errors.
+        assert_eq!(graph.edge_count(), 2);
+    }
+
+    #[test]
+    fn citation_id_mentions_require_token_boundaries() {
+        let mut messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(None, vec![tool_call("call-1")]),
+            ChatMessage::tool("call-1", "one"),
+            ChatMessage::assistant(None, vec![tool_call("call-10")]),
+            ChatMessage::tool("call-10", "ten"),
+        ];
+        let one = messages[2].id;
+        let ten = messages[4].id;
+        messages.push(ChatMessage::assistant(
+            Some("proceed per call-10 (and my recall-1x note)".into()),
+            vec![],
+        ));
+
+        let graph = CitationGraph::extract(&messages);
+        assert!(graph.is_cited(&ten));
+        assert!(
+            !graph.is_cited(&one),
+            "call-1 must not match inside call-10: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn citation_of_an_open_call_targets_the_call_message() {
+        let mut messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(None, vec![tool_call("call-open")]),
+        ];
+        let call_msg = messages[1].id;
+        messages.push(ChatMessage::user("while call-open runs, check the logs"));
+        let graph = CitationGraph::extract(&messages);
+        assert!(graph.is_cited(&call_msg));
+    }
+
+    /// system + planner task + a distant-but-later-cited frame + a distant
+    /// uncited noise message + recent on-topic tail whose last message cites
+    /// the frame by id. Axis 1 = distant, axis 0 = the recent topic.
+    fn cited_distant_fixture(state: &mut GcState) -> Vec<ChatMessage> {
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user(format!("fix the query planner {}", "p".repeat(120))),
+            ChatMessage::assistant(
+                Some("Running the dependency audit first.".into()),
+                vec![read_file_call("call-audit", "/tmp/deps.txt")],
+            ),
+            ChatMessage::tool("call-audit", format!("audit output {}", "a".repeat(300))),
+            ChatMessage::assistant(Some(format!("noise sidebar {}", "n".repeat(300))), vec![]),
+            ChatMessage::user("back to the planner"),
+            ChatMessage::assistant(
+                Some(
+                    "Per the output of call-audit, pinning libfoo and applying the planner fix."
+                        .into(),
+                ),
+                vec![],
+            ),
+        ];
+        for (index, message) in messages.iter().enumerate() {
+            let axis = usize::from(matches!(index, 2..=4));
+            cache_axis(state, message, axis);
+        }
+        messages
+    }
+
+    #[test]
+    fn semantic_cited_keep_retains_the_cited_distant_frame() {
+        let mut state = GcState::default();
+        let messages = cited_distant_fixture(&mut state);
+        let cited_result = messages[3].id;
+        let noise = messages[4].id;
+        let budget = estimate_tokens(&messages) - 60;
+
+        // Baseline deficiency (cited_keep off): the cited frame is the
+        // oldest most-distant candidate, so pure similarity drops it first.
+        let baseline = SemanticGc {
+            cited_keep: false,
+            ..semantic_gc()
+        };
+        let mut baseline_state = GcState {
+            embeddings: state.embeddings.clone(),
+            ..Default::default()
+        };
+        let collected = baseline.collect(messages.clone(), budget, &mut baseline_state);
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(
+            !collected.iter().any(|message| message.id == cited_result),
+            "without citations the cited-but-distant frame dies: {collected:?}"
+        );
+
+        // cited-keep: the citation protects the frame through the normal
+        // phases; the uncited noise pays instead.
+        let collected = semantic_gc().collect(messages, budget, &mut state);
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(
+            collected.iter().any(|message| message.id == cited_result),
+            "cited-keep must retain the cited frame: {collected:?}"
+        );
+        assert!(
+            !collected.iter().any(|message| message.id == noise),
+            "the uncited distant noise drops instead: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_cited_keep_relaxes_under_degrade_pressure() {
+        // Citation is a heuristic guard, not a hard one: when even the
+        // protected set exceeds the budget, cited messages relax with the
+        // recency floor while system + last user stay hard-protected.
+        let mut state = GcState::default();
+        let messages = cited_distant_fixture(&mut state);
+        let cited_result = messages[3].id;
+        let last_user = messages[5].id;
+        let budget = estimate_tokens(&messages[..1]) + 40;
+
+        let collected = semantic_gc().collect(messages, budget, &mut state);
+
+        assert!(
+            !collected.iter().any(|message| message.id == cited_result),
+            "degrade pressure overrides cited-keep: {collected:?}"
+        );
+        assert!(collected.iter().any(|message| message.role == "system"));
+        assert!(collected.iter().any(|message| message.id == last_user));
+    }
+
+    // ---- recall-overlap write-barrier (t-1351) -------------------------------
+
+    fn recall_frame(id: &str, hits: serde_json::Value) -> [ChatMessage; 2] {
+        [
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    id,
+                    "recall",
+                    serde_json::json!({ "query": "planner fix" }),
+                )],
+            ),
+            ChatMessage::tool(id, hits.to_string()),
+        ]
+    }
+
+    #[test]
+    fn recall_overlap_marks_reinjected_window_content_hot() {
+        let note = "the planner fix is raising the statistics target";
+        let mut messages = vec![ChatMessage::system("system"), ChatMessage::user(note)];
+        messages.extend(recall_frame(
+            "call-recall",
+            serde_json::json!([
+                { "source": "memory", "kind": "Semantic", "content": note },
+                { "source": "memory", "kind": "Semantic", "content": "unrelated note" },
+            ]),
+        ));
+        let mut state = GcState::default();
+
+        let report = record_recall_overlaps(&messages, &mut state);
+
+        assert_eq!(report.overlap_events, 1, "only the matching hit fires");
+        assert_eq!(report.hot_total, 1);
+        assert!(state.recall_hot.contains(&recall_content_key(note)));
+    }
+
+    #[test]
+    fn recall_overlap_matches_previously_collected_content() {
+        // The thrash loop the signal exists to expose: GC dropped it, the
+        // model recalled it right back.
+        let dropped = "the audit finding GC evicted two turns ago";
+        let mut state = GcState::default();
+        state.collected_hashes.insert(recall_content_key(dropped));
+        let mut messages = vec![ChatMessage::system("system")];
+        messages.extend(recall_frame(
+            "call-recall",
+            serde_json::json!([{ "source": "memory", "kind": "Semantic", "content": dropped }]),
+        ));
+
+        let report = record_recall_overlaps(&messages, &mut state);
+
+        assert_eq!(report.overlap_events, 1);
+        assert!(state.recall_hot.contains(&recall_content_key(dropped)));
+    }
+
+    #[test]
+    fn recall_overlap_unparseable_result_falls_back_to_whole_content() {
+        // A recall result that is not a JSON hit array is treated as one
+        // opaque chunk; exact (trimmed) window membership still fires.
+        let note = "plain text recall payload";
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("  {note}  ")),
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    "call-recall",
+                    "recall",
+                    serde_json::json!({ "query": "payload" }),
+                )],
+            ),
+            ChatMessage::tool("call-recall", note),
+        ];
+        let mut state = GcState::default();
+        let report = record_recall_overlaps(&messages, &mut state);
+        assert_eq!(report.overlap_events, 1);
+    }
+
+    #[test]
+    fn recall_overlap_ignores_other_tools_and_non_overlapping_hits() {
+        let note = "content that also appears in a shell result";
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(note),
+            // A shell result echoing window content is not a memory
+            // re-injection: no write barrier.
+            ChatMessage::assistant(None, vec![tool_call("call-shell")]),
+            ChatMessage::tool("call-shell", note),
+            // A recall whose hits overlap nothing stays cold.
+            ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    "call-recall",
+                    "recall",
+                    serde_json::json!({ "query": "other" }),
+                )],
+            ),
+            ChatMessage::tool(
+                "call-recall",
+                serde_json::json!([{ "content": "a note nobody has seen" }]).to_string(),
+            ),
+        ];
+        let mut state = GcState::default();
+        let report = record_recall_overlaps(&messages, &mut state);
+        assert_eq!(report.overlap_events, 0);
+        assert!(state.recall_hot.is_empty());
     }
 
     #[test]
