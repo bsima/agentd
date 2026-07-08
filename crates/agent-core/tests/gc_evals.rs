@@ -21,6 +21,11 @@
 //! - `eager`: collect at every infer point.
 //! - `every:4`: collect at every 4th infer point.
 //!
+//! All incremental timings compose with the runtime's collect-on-overflow
+//! backstop (t-1343): an infer point whose window estimate exceeds the
+//! budget collects regardless of the timing policy, so no timing dispatches
+//! an over-budget window.
+//!
 //! Incremental timings thread one `GcState` across all collections, so
 //! cross-turn metadata (frame status, lifecycle tags, infer counts) behaves
 //! as it does in the runtime loop.
@@ -127,13 +132,6 @@ impl Timing {
             Self::Eager => "eager".into(),
             Self::EveryN(n) => format!("every:{n}"),
         }
-    }
-
-    /// Whether this timing guarantees a collection on the final window, and
-    /// therefore owes convergence (mark-sweep excepted — it is best-effort
-    /// everywhere). `every:N` legitimately ends between collections.
-    fn collects_final_window(&self) -> bool {
-        !matches!(self, Self::EveryN(_))
     }
 }
 
@@ -246,12 +244,13 @@ fn evaluate(
     let tokens_after = estimate_tokens(&collected);
     let converged = tokens_after <= budget;
     assert_invariants(&case.prompt, &collected, gc.name(), &case.name);
-    // Ring and stack carry the front-drop degrade path and must converge
-    // whenever the timing collected the final window; mark-sweep only evicts
-    // complete/evictable lifecycles, so its convergence is best-effort and
-    // reported rather than asserted. every:N can legitimately end between
-    // collections, so it is reported too.
-    if !matches!(strategy, Strategy::MarkSweep) && timing.collects_final_window() {
+    // Ring and stack carry the front-drop degrade path and must converge on
+    // every timing: since the collect-on-overflow backstop (t-1343), every
+    // infer point over budget collects — `every:N` can no longer end over
+    // budget between collections. Mark-sweep only evicts complete/evictable
+    // lifecycles, so its convergence is best-effort and reported rather
+    // than asserted.
+    if !matches!(strategy, Strategy::MarkSweep) {
         assert!(
             converged,
             "{} ({}) on {} must converge under budget: {tokens_after} > {budget}",
@@ -377,6 +376,12 @@ fn infer_point(
         Timing::EveryN(n) => state.infer_calls.is_multiple_of(n),
         Timing::Final => unreachable!("final timing never reaches an infer point"),
     };
+    // Collect-on-overflow backstop (t-1343), mirroring
+    // `maybe_collect_prompt`: no timing policy ever dispatches a window
+    // whose estimate exceeds the budget without collecting first, so
+    // `every:N` can no longer leave the window over budget between its
+    // scheduled collections.
+    let fire = fire || estimate_tokens(window) > budget;
     if !fire {
         return;
     }

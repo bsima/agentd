@@ -63,6 +63,13 @@ pub struct GcState {
 /// Token estimates diverge from provider tokenizers, so a purely
 /// estimate-driven threshold can sit idle while the provider hard-rejects;
 /// catch-overflow makes the provider the source of truth instead.
+///
+/// Every timing is additionally composed with the collect-on-overflow
+/// backstop (t-1343, `interpreter::maybe_collect_prompt`): if the assembled
+/// prompt would exceed the full context budget at Infer time and the timing
+/// policy did not fire, a collection runs before dispatch anyway (emitted
+/// as `gc_collect{reason: "backstop"}`). Periodic timings like `every:N`
+/// therefore cannot leave the window over budget between collections.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GcTiming {
     /// Collect when the estimated prompt size crosses

@@ -549,7 +549,15 @@ pub(crate) async fn collect_for_overflow(
     cycle: usize,
 ) -> Result<(Prompt, usize)> {
     let target_budget = (estimate_tokens(&prompt) >> cycle).max(1);
-    let collected = collect_prompt(config, prompt, gc_state, target_budget, Some(cycle)).await?;
+    let collected = collect_prompt(
+        config,
+        prompt,
+        gc_state,
+        target_budget,
+        Some(cycle),
+        "overflow",
+    )
+    .await?;
     Ok((collected, target_budget))
 }
 
@@ -590,21 +598,39 @@ pub(crate) async fn maybe_collect_prompt(
             None => (false, threshold_target),
         },
     };
-    if !should_collect {
-        return Ok(prompt);
+    if should_collect {
+        return collect_prompt(config, prompt, gc_state, target_budget, None, "scheduled").await;
     }
-    collect_prompt(config, prompt, gc_state, target_budget, None).await
+    // Collect-on-overflow backstop (t-1343): no timing policy fired, but the
+    // assembled prompt already exceeds the model context budget, so
+    // dispatching it would overflow. This is the every:N
+    // between-collections gap (and a threshold configured above 1.0) the
+    // t-1339 matrix exposed: timing decides when GC runs *proactively*; it
+    // never licenses shipping a prompt we already estimate over budget.
+    // Collect before dispatch regardless of timing mode; if collection
+    // still cannot reach the budget, the existing overflow behavior
+    // (catch-overflow retries, provider error) applies unchanged.
+    if before_tokens > config.context_budget {
+        let backstop_target = threshold_target.min(config.context_budget).max(1);
+        return collect_prompt(config, prompt, gc_state, backstop_target, None, "backstop").await;
+    }
+    Ok(prompt)
 }
 
 /// Unconditionally truncate + collect `prompt` to `target_budget`, emitting
 /// the gc_truncate/gc_collect events. `overflow_cycle` is set when this
 /// collection was triggered reactively by a provider context overflow.
+/// `reason` marks why the collection ran on the gc_collect event:
+/// `"scheduled"` (the timing policy fired), `"backstop"` (the prompt
+/// exceeded the context budget between scheduled collections, t-1343), or
+/// `"overflow"` (a provider overflow triggered a catch-overflow cycle).
 async fn collect_prompt(
     config: &SeqConfig,
     mut prompt: Prompt,
     gc_state: &mut GcState,
     target_budget: usize,
     overflow_cycle: Option<usize>,
+    reason: &'static str,
 ) -> Result<Prompt> {
     let before_tokens = estimate_tokens(&prompt);
     let truncated_count = truncate_oversized_message(&mut prompt, target_budget);
@@ -635,6 +661,7 @@ async fn collect_prompt(
             "type": "gc_collect",
             "strategy": config.gc.name(),
             "timing": config.gc_timing.name(),
+            "reason": reason,
             "target_budget": target_budget,
             "tokens_before": before_tokens,
             "tokens_after": after_tokens,
@@ -1228,6 +1255,116 @@ mod tests {
             "every:2 collects on calls 2 and 4: {collects:?}"
         );
         assert_eq!(collects[0]["timing"], "every-n");
+        assert_eq!(collects[0]["reason"], "scheduled");
+        Ok(())
+    }
+
+    /// t-1343: `every:N` used to dispatch over-budget prompts between its
+    /// scheduled collections (7/15 ring and stack cells in the t-1339
+    /// matrix). The backstop collects at any infer point whose prompt
+    /// exceeds the full context budget, regardless of the schedule.
+    #[tokio::test]
+    async fn every_n_backstop_collects_before_over_budget_dispatch() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = timing_config(
+            Arc::new(MockProvider::new(vec![])),
+            trace,
+            GcTiming::EveryN(4),
+        );
+        config.context_budget = 100;
+        // First infer call: 1 % 4 != 0, so the schedule alone would ship
+        // this prompt over budget.
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..4).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(90)))));
+        assert!(estimate_tokens(&prompt) > config.context_budget);
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(
+            estimate_tokens(&collected) <= config.context_budget,
+            "no over-budget dispatch: {} > {}",
+            estimate_tokens(&collected),
+            config.context_budget
+        );
+        let collects = gc_collect_events(trace_path).await?;
+        assert_eq!(collects.len(), 1, "{collects:?}");
+        assert_eq!(collects[0]["reason"], "backstop");
+        assert_eq!(collects[0]["timing"], "every-n");
+        Ok(())
+    }
+
+    /// t-1343: the threshold path has the same exposure when the configured
+    /// threshold sits above the full budget (estimate between the two would
+    /// dispatch over budget without ever crossing the trigger).
+    #[tokio::test]
+    async fn threshold_backstop_covers_thresholds_above_budget() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = timing_config(
+            Arc::new(MockProvider::new(vec![])),
+            trace,
+            GcTiming::Threshold,
+        );
+        config.context_budget = 100;
+        config.gc_threshold = 1.5; // trigger at 150 — above the budget
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..3).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(90)))));
+        let before = estimate_tokens(&prompt);
+        assert!(
+            before > 100 && before < 150,
+            "test setup: estimate {before} must sit between budget and threshold"
+        );
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(estimate_tokens(&collected) <= config.context_budget);
+        let collects = gc_collect_events(trace_path).await?;
+        assert_eq!(collects.len(), 1, "{collects:?}");
+        assert_eq!(collects[0]["reason"], "backstop");
+        assert_eq!(collects[0]["timing"], "threshold");
+        // The backstop target never exceeds the budget even though the
+        // threshold target does.
+        assert_eq!(collects[0]["target_budget"], 100);
+        Ok(())
+    }
+
+    /// t-1343: a backstop collection is an ordinary collection — under
+    /// `--gc-cache preserve` (the strategy default here) it must keep the
+    /// pinned prefix byte-stable, exactly like a scheduled one.
+    #[tokio::test]
+    async fn backstop_respects_preserve_cache_semantics() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = timing_config(
+            Arc::new(MockProvider::new(vec![])),
+            trace,
+            GcTiming::EveryN(4),
+        );
+        config.context_budget = 100;
+        let mut prompt = vec![ChatMessage::system("system")];
+        prompt.extend((0..4).map(|i| ChatMessage::user(format!("{i}-{}", "x".repeat(90)))));
+        let system_id = prompt[0].id;
+        assert!(estimate_tokens(&prompt) > config.context_budget);
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(
+            !state.prefix_invalidated,
+            "preserve-mode backstop must not invalidate the cached prefix"
+        );
+        assert_eq!(
+            collected.first().map(|message| message.id),
+            Some(system_id),
+            "the pinned prefix must survive the backstop untouched"
+        );
+        let collects = gc_collect_events(trace_path).await?;
+        assert_eq!(collects.len(), 1, "{collects:?}");
+        assert_eq!(collects[0]["reason"], "backstop");
+        assert_eq!(collects[0]["cache_invalidated"], false);
         Ok(())
     }
 

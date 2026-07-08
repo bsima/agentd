@@ -140,7 +140,9 @@ struct Args {
     /// budget fraction; `catch-overflow` trusts the provider instead of the
     /// token estimate — on a context-overflow error it collects to a
     /// shrinking budget and retries the same turn; `eager` collects before
-    /// every infer call; `every:N` collects on every Nth infer call.
+    /// every infer call; `every:N` collects on every Nth infer call. All
+    /// timings also collect before dispatch whenever the assembled prompt
+    /// would exceed the context budget (the overflow backstop, t-1343).
     #[arg(long, default_value = "threshold")]
     gc_timing: GcTiming,
     /// Enable OpenTelemetry OTLP export to this collector endpoint. Also enabled by OTEL_EXPORTER_OTLP_ENDPOINT.
