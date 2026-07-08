@@ -639,6 +639,12 @@ async fn run_cell(
     );
     let config = SeqConfig {
         approvals: Default::default(),
+        // Guidance off (t-1359): GC replay re-runs the live collector, which
+        // is token-sensitive — the runtime-guidance fragment would shift
+        // collection cadence against recordings made without it. The
+        // guidance-arm cells specified in docs/GUIDANCE.md §2.2/§2.4 will
+        // toggle this per arm when they land.
+        guidance: agent_core::guidance::RuntimeGuidance::disabled(),
         tools: Default::default(),
         provider,
         hydration: SourceRegistry::new().register_backend(MemorySource::new(memory_dir.into())),

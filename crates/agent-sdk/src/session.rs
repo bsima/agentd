@@ -693,6 +693,11 @@ async fn launch(
     if let Some(instructions) = &agent.instructions {
         cmd.arg("--system-prompt").arg(instructions);
     }
+    if !agent.runtime_guidance {
+        // The builder opt-out rides into the spawned CLI (t-1359): sessions
+        // and in-process runs honor `.runtime_guidance(false)` identically.
+        cmd.arg("--no-runtime-guidance");
+    }
     if let Some(dir) = &agent.memory_dir {
         cmd.arg("--memory-dir").arg(dir);
     }

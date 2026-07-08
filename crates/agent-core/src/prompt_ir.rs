@@ -424,13 +424,18 @@ fn refresh_prompt_ir_tokens(ir: &mut PromptIR) {
 
 pub fn compile_prompt_ir(ir: &PromptIR) -> Prompt {
     let mut prompt = ir.base_messages.clone();
+    let mut instruction_sections = Vec::new();
     let mut context_sections = Vec::new();
     let mut direct_messages = Vec::new();
 
     for section in ordered_sections(&ir.sections) {
         match section.role {
+            // Instruction-authority sections (t-1297 boundary): rendered
+            // into the system message directly, ahead of and apart from the
+            // "Hydrated context" block, so retrieved data can never
+            // masquerade as runtime instructions (docs/GUIDANCE.md §4).
             SectionRole::System | SectionRole::Developer => {
-                context_sections.push(render_section(section));
+                instruction_sections.push(render_section(section));
             }
             SectionRole::Context => context_sections.push(render_section(section)),
             SectionRole::User => direct_messages.push(ChatMessage::user(section.content.clone())),
@@ -445,6 +450,9 @@ pub fn compile_prompt_ir(ir: &PromptIR) -> Prompt {
         }
     }
 
+    if !instruction_sections.is_empty() {
+        append_to_system(&mut prompt, instruction_sections.join("\n\n"));
+    }
     if !context_sections.is_empty() {
         inject_context_sections(&mut prompt, context_sections.join("\n\n"));
     }
@@ -466,7 +474,10 @@ fn render_section(section: &Section) -> String {
 }
 
 fn inject_context_sections(prompt: &mut Prompt, context: String) {
-    let block = format!("Hydrated context:\n\n{context}");
+    append_to_system(prompt, format!("Hydrated context:\n\n{context}"));
+}
+
+fn append_to_system(prompt: &mut Prompt, block: String) {
     if let Some(system) = prompt.iter_mut().find(|message| message.role == "system") {
         match &mut system.content {
             Some(content) if !content.is_empty() => {
@@ -563,6 +574,39 @@ mod tests {
             .unwrap()
             .contains("Hydrated context"));
         assert!(prompt[0].content.as_deref().unwrap().contains("hello"));
+        Ok(())
+    }
+
+    /// Instruction-authority sections (System/Developer) render into the
+    /// system message directly and ahead of the "Hydrated context" block
+    /// (t-1297 authority boundary; docs/GUIDANCE.md §4): retrieved data
+    /// must never masquerade as runtime instructions.
+    #[test]
+    fn developer_sections_render_apart_from_hydrated_context() -> Result<()> {
+        let ir = PromptIR::new(
+            vec![ChatMessage::system("base")],
+            vec![
+                Section::passive_temporal("recent", "Recent", "context text".into()),
+                crate::guidance::runtime_guidance_section("guidance text".into()),
+            ],
+        )?;
+
+        let prompt = compile_prompt_ir(&ir);
+
+        assert_eq!(prompt.len(), 1);
+        let system = prompt[0].content.as_deref().unwrap();
+        assert!(system.starts_with("base"));
+        assert!(system.contains("## runtime-guidance\nguidance text"));
+        let guidance_at = system.find("## runtime-guidance").unwrap();
+        let hydrated_at = system.find("Hydrated context:").unwrap();
+        assert!(
+            guidance_at < hydrated_at,
+            "instruction sections precede hydrated context: {system}"
+        );
+        assert!(
+            !system[..hydrated_at].contains("context text"),
+            "retrieved content stays inside the Hydrated context block"
+        );
         Ok(())
     }
 

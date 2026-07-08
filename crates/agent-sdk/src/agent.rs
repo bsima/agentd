@@ -97,6 +97,7 @@ pub struct Agent {
     pub(crate) provider: Option<Arc<dyn ChatProvider>>,
     pub(crate) require_shell_approval: bool,
     pub(crate) on_approval: Option<ApprovalHookFn>,
+    pub(crate) runtime_guidance: bool,
 }
 
 impl Agent {
@@ -121,6 +122,7 @@ impl Agent {
             provider: None,
             require_shell_approval: false,
             on_approval: None,
+            runtime_guidance: true,
         }
     }
 
@@ -159,6 +161,7 @@ pub struct AgentBuilder {
     provider: Option<Arc<dyn ChatProvider>>,
     require_shell_approval: bool,
     on_approval: Option<ApprovalHookFn>,
+    runtime_guidance: bool,
 }
 
 impl AgentBuilder {
@@ -292,6 +295,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Runtime operations guidance (t-1359, docs/GUIDANCE.md §4): the
+    /// capability-keyed fragment the runtime injects as its own
+    /// Developer/Constraint prompt section on tool-bearing model calls.
+    /// Default ON. `runtime_guidance(false)` is the explicit, total
+    /// opt-out — it removes only the runtime fragment (your
+    /// [`AgentBuilder::instructions`] are untouched), for deterministic
+    /// evals or agents that ship their own operations manual.
+    pub fn runtime_guidance(mut self, enabled: bool) -> Self {
+        self.runtime_guidance = enabled;
+        self
+    }
+
     /// Inject a custom [`ChatProvider`], bypassing model-registry
     /// resolution — the model string is passed to the provider verbatim.
     /// This is the seam for scripted/mock providers
@@ -333,6 +348,7 @@ impl AgentBuilder {
             provider: self.provider,
             require_shell_approval: self.require_shell_approval,
             on_approval: self.on_approval,
+            runtime_guidance: self.runtime_guidance,
         })
     }
 }

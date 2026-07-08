@@ -1,11 +1,12 @@
 # Runtime operations guidance (t-1356)
 
-Status: **design + drafted guidance + eval plan — nothing here is wired in
-yet.** This document specifies what operations guidance the runtime should
-ship to its models, why it is a runtime component rather than user prompt
-material, how it should be delivered, and how each piece gets validated
-before it ships default-on. The delivery mechanism itself is future work;
-the drafted guidance text below is written as it would ship.
+Status: **shipped (t-1359): per-tool descriptions + the capability-keyed
+runtime fragment, default-on** — see "Shipped per-tool descriptions" and
+"Shipped fragment delivery" in §4 for the exact text and keying, and §5's
+promotion-gate note for what shipped ahead of its A/B (t-1364 validates).
+This document specifies what operations guidance the runtime ships to its
+models, why it is a runtime component rather than user prompt material,
+how it is delivered, and how each piece gets validated.
 
 ## 1. The thesis: the system prompt is a runtime component
 
@@ -160,10 +161,15 @@ final answers contradicting evicted intermediates.
 > - Save the distilled fact, not raw output: one or two sentences with the
 >   concrete values in them.
 > - When you need something you saw earlier and it is no longer in view,
->   `recall` it instead of re-running commands or guessing. Recalled
->   content is retained preferentially.
+>   `recall` it instead of re-running commands or guessing.
 > - Anything worth keeping beyond this session — user preferences, project
 >   conventions, decisions — always belongs in memory.
+
+(An earlier draft ended the recall bullet with "Recalled content is
+retained preferentially." That sentence ships only when a GC strategy
+actually consumes `recall_hot` — t-1167, the first mechanism gap below —
+per the strategy-honesty rule of §2.4: guidance must never claim retention
+the active strategy does not implement.)
 
 **Validation.** New behavioral eval (t-1354 methodology): long-horizon
 fixtures where a fact computed early is needed after GC has run (`--gc
@@ -178,9 +184,9 @@ the GC eval surface (`gc_evals.rs`, `evals/gc/`).
 
 - **"Retained preferentially" is today a signal, not a behavior**: no GC
   strategy consumes `recall_hot` yet (generational, t-1167, is its first
-  customer). The drafted sentence is forward-true (recall re-injection
-  puts content back in the live window regardless) but the *preferential
-  retention* claim only fully lands with t-1167. Ship order matters.
+  customer). The retention sentence is therefore held out of the shipped
+  block (see the parenthetical above) and returns with t-1167. Ship order
+  matters.
 - **The model can't see GC pressure** (see §2.4's gap): "before GC
   pressure" is undetectable from inside; the model can only adopt
   save-early discipline unconditionally.
@@ -260,6 +266,14 @@ And, **only** when `semantic` + `cited-keep` is the active strategy:
 > - Referring to a tool call by its id in your text (for example, "per
 >   the output of call-12") marks that result as load-bearing and
 >   protects it from eviction.
+
+(Shipped variant, t-1359: when GC is active but the memory tools are
+*not* offered, the `remember`/`recall` cross-references drop out — "into
+your reply, or into memory with `remember`" becomes "into your reply",
+and "re-run the command or `recall` the saved fact" becomes "re-run the
+command". Guidance naming tools the model does not have is noise; both
+variants live in `guidance.rs` as `GC_BLOCK_WITH_MEMORY` /
+`GC_BLOCK_WITHOUT_MEMORY`.)
 
 **Validation.** Arms inside the GC behavioral eval (guidance
 present/absent under forced pressure); metrics: confabulation needles
@@ -596,6 +610,9 @@ deletes the runtime's only operational text.
    hash in traces. Ship with only eval-validated blocks default-on
    (initially: delegation cross-reference + cost/batching if its A/B
    clears; see §5).
+   **Shipped (t-1359)** — with ALL blocks default-on ahead of their A/Bs,
+   per Ben's approval; see the promotion-gate note in §5 and the
+   "Shipped fragment delivery" record below.
 3. Move the CLI's `base_system_prompt()` operational sentences into the
    fragment, so `--system-prompt` composes instead of destroys.
    Per-block promotion thereafter follows §5's gate.
@@ -653,6 +670,42 @@ dispatch, not program content), so wording is tunable without breaking
 replay of old traces — pinned by
 `guidance::tests::tool_descriptions_never_enter_the_program_or_its_hash`.
 
+### Shipped fragment delivery (t-1359)
+
+The step-2 mechanism as it ships. Block texts are the §2 drafted guidance
+verbatim (constants in `crates/agent-core/src/guidance.rs`; the doc and
+the constants move together), assembled per Infer call and delivered as a
+PromptIR section with `SectionRole::Developer`,
+`CompositionMode::Constraint`, `Priority::High`, `SectionOrigin::Static {
+name: "runtime-guidance" }`. The section's content hash rides a
+`prompt_ir` Custom trace event on every delivering InferCall, so a trace
+proves which guidance version the model saw. Opt-out is
+`--no-runtime-guidance` (CLI, persisted in resume facts) and
+`.runtime_guidance(false)` (SDK builder, honored by both in-process runs
+and spawned sessions).
+
+Delivery keying (the §2 conditionality invariant, plus one delivery-level
+gate):
+
+| block | renders when |
+|---|---|
+| fragment as a whole | guidance enabled AND the call offers ≥1 tool (a bare sub-infer child is not operating the runtime) |
+| delegation (§2.1 + §2.3 bullet) | `infer` in the call's tool offer |
+| delegate-catalog line (§2.1, interim pending t-1345) | delegation block on AND the deployment supplied `RuntimeGuidance.delegate_models` (the runtime cannot yet promise which ids the run's provider resolves, so the CLI default is empty) |
+| memory discipline (§2.2, minus the t-1167 retention sentence) | `remember`/`recall` in the call's tool offer |
+| GC awareness (§2.4; with/without-memory variant) | a GC strategy is active |
+| cited-keep line (§2.4) | strategy is `semantic` with `cited-keep` on — strategy-honest per gap 6 |
+| approval awareness (§2.6) | any effect in the run's config is gated (an Eval site with `require_approval`, or a sink whose writes require approval) |
+| cost awareness (§2.5) | unconditional within a delivered fragment |
+
+Prompt bytes never affect effect identity or replay (recorded Infer
+results match by effect id) — pinned by
+`replay_reproduces_results_regardless_of_guidance_setting`
+(ir_interpreter.rs). One recording-validity consequence: GC *behavioral*
+replays re-run the live token-sensitive collector, so `evals/gc/`
+recordings made without the fragment replay with guidance off until that
+harness records guidance arms of its own.
+
 ## 5. Eval plan
 
 **Methodology** (inherited from t-1354): arm = guidance section present vs
@@ -708,6 +761,16 @@ text edit invalidates the validation and requires a re-record (cheap by
 construction: every run above is well under a dollar). Each default-on
 block cites its recording in this document, the same way GC strategy
 promotion cites the t-1339 matrix.
+
+**What actually shipped (t-1359), against this gate.** Per Ben's
+approval, the whole step-2 fragment shipped default-ON ahead of its
+per-block A/Bs — delegation (validated by t-1354 and re-recorded with the
+shipped text, see §2.1), cost/batching, memory discipline, GC awareness,
+and approval awareness included. The gate above still governs the TEXT:
+each block's wording stays frozen-with-recording, and the re-run filed as
+**t-1364 validates the shipped fragment immediately after this ships** —
+its recordings become the citations this section requires. Blocks whose
+A/Bs later fail the gate get demoted to the flag, not reworded in place.
 
 ## 6. Comparative grounding: how mature harnesses do this
 

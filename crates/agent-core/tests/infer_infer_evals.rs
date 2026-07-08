@@ -784,6 +784,7 @@ async fn run_arm(
     let trace = TraceLogger::new(Uuid::new_v4().to_string(), trace_path.clone());
     let config = SeqConfig {
         approvals: Default::default(),
+        guidance: Default::default(),
         tools: Default::default(),
         provider,
         hydration: SourceRegistry::new(),

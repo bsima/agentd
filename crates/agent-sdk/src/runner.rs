@@ -391,6 +391,13 @@ async fn execute(
             resolutions: Default::default(),
             hook: agent.on_approval.clone(),
         },
+        // Runtime guidance (t-1359): default-on; the builder's
+        // `.runtime_guidance(false)` removes the fragment and nothing else.
+        guidance: if agent.runtime_guidance {
+            Default::default()
+        } else {
+            agent_core::guidance::RuntimeGuidance::disabled()
+        },
         passive_hydration: PassiveHydrationConfig::default(),
         trace: trace.clone(),
         eval: EvalConfig {

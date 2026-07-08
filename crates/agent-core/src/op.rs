@@ -656,6 +656,7 @@ mod tests {
             std::env::temp_dir().join(format!("agent-core-op-test-{}.jsonl", Uuid::new_v4()));
         SeqConfig {
             approvals: Default::default(),
+            guidance: Default::default(),
             tools: Default::default(),
             provider: Arc::new(NoopProvider),
             hydration: SourceRegistry::new(),

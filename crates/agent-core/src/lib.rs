@@ -35,6 +35,10 @@ pub use gc::{
     estimate_tokens, truncate_oversized_message, ContextGc, FrameId, FrameStatus, GcMode, GcState,
     GcTiming, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,
 };
+pub use guidance::{
+    runtime_guidance_fragment, runtime_guidance_section, DelegateModel, GuidanceCapabilities,
+    RuntimeGuidance, RUNTIME_GUIDANCE_SECTION,
+};
 pub use hydration::{
     HydrationSink, HydrationSource, PassiveHydrationConfig, PassiveSource, Provenance, SinkId,
     SinkItem, SinkWritePolicy, SourceCapability, SourceKind, SourceParams, SourceRegistry,

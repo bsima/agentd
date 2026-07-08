@@ -1484,6 +1484,11 @@ mod tests {
         let trace = TraceLogger::new("golden-run", trace_path.clone());
         let config = SeqConfig {
             approvals: Default::default(),
+            // Guidance off: the golden pins the public projection of the
+            // recorded effects, and the runtime-guidance fragment (t-1359)
+            // would ride every InferCall's payload_preview. Its delivery is
+            // pinned by ir_interpreter's own tests.
+            guidance: crate::guidance::RuntimeGuidance::disabled(),
             tools: Default::default(),
             provider,
             hydration: crate::hydration::SourceRegistry::new(),

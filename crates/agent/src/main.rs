@@ -182,6 +182,14 @@ struct Args {
     /// any later process — with `agent approvals --approve/--deny`.
     #[arg(long, env = "AGENT_REQUIRE_SHELL_APPROVAL")]
     require_shell_approval: bool,
+    /// Disable the runtime-guidance prompt fragment (t-1359,
+    /// docs/GUIDANCE.md): the capability-keyed operations text the runtime
+    /// injects as its own Developer section alongside — never instead of —
+    /// your --system-prompt. Opt out for deterministic prompt-sensitive
+    /// runs or when shipping your own operations manual; tool descriptions
+    /// are unaffected.
+    #[arg(long)]
+    no_runtime_guidance: bool,
     /// One-shot prompt text or path to a .md/.markdown prompt file. Omit when using --fifo or NUL-framed stdin sessions.
     prompt: Option<String>,
     #[command(subcommand)]
@@ -440,12 +448,21 @@ struct ResumeFacts {
     memory_tools: bool,
     #[serde(default)]
     shell_requires_approval: bool,
+    /// Whether the paused run had runtime guidance on (t-1359); serde
+    /// default `true` matches the flag's default, so pre-field records
+    /// resume with guidance exactly like a fresh run.
+    #[serde(default = "default_runtime_guidance")]
+    runtime_guidance: bool,
     eval_timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     eval_cwd: Option<PathBuf>,
     eval_env: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     eval_max_output_bytes: Option<usize>,
+}
+
+fn default_runtime_guidance() -> bool {
+    true
 }
 
 #[tokio::main]
@@ -578,6 +595,13 @@ async fn main() -> Result<()> {
         // durably and resolve via `agent approvals` (t-1308.10). Resume
         // drivers load resolutions into this config before re-entering.
         approvals: Default::default(),
+        // Runtime guidance (t-1359) ships default-on; --no-runtime-guidance
+        // removes the fragment and nothing else.
+        guidance: if args.no_runtime_guidance {
+            agent_core::guidance::RuntimeGuidance::disabled()
+        } else {
+            Default::default()
+        },
         tools: Default::default(),
         provider,
         hydration: hydration.clone(),
@@ -664,6 +688,7 @@ async fn main() -> Result<()> {
             output_schema: args.output_schema.clone(),
             memory_tools: args.memory_dir.is_some(),
             shell_requires_approval: args.require_shell_approval,
+            runtime_guidance: !args.no_runtime_guidance,
             eval_timeout_seconds: args.eval_timeout_seconds,
             eval_cwd: args.eval_cwd.clone(),
             eval_env: match args.eval_env {
@@ -1556,6 +1581,14 @@ async fn resume_run(
         .insert(record.effect_id.clone(), resolution);
     let config = SeqConfig {
         approvals,
+        // Resume with the paused run's guidance setting (t-1359): the
+        // fragment never affects effect-id replay or the checkpointed
+        // history, only what the next live Infer sees.
+        guidance: if facts.runtime_guidance {
+            Default::default()
+        } else {
+            agent_core::guidance::RuntimeGuidance::disabled()
+        },
         tools: Default::default(),
         provider,
         hydration,

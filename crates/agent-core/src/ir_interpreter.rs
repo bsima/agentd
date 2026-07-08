@@ -1205,9 +1205,6 @@ async fn execute_instr(
                 dynamic_path.clone(),
             )?;
             let model = string_expr(&machine.env, &model, "Infer.model")?;
-            let prompt = resolve_prompt(config, &machine.env, prompt)?;
-            let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
-            let mut prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             // The Infer site's policy owns the tool offer (t-1346): the
             // default is the loop's full toolset; an explicit list narrows
             // it to that subset — an empty list offers nothing, which is
@@ -1221,6 +1218,14 @@ async fn execute_instr(
                     .filter(|spec| names.contains(&spec.function.name))
                     .collect(),
             };
+            let prompt = resolve_prompt(config, &machine.env, prompt)?;
+            // Runtime guidance rides ahead of hydration so the fragment
+            // lands in the prefix-stable region of the system message,
+            // before any per-turn hydrated context.
+            let prompt =
+                apply_runtime_guidance(config, &machine.program, &tool_specs, prompt).await?;
+            let prompt = hydrate_infer_prompt(config, &Value::Null, prompt).await?;
+            let mut prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             let op_id = config.trace.next_op_id();
             // Trace lineage (t-1347): an overridden toolset marks a
             // dispatched child call (the loop's own turn Infers use the
@@ -2056,6 +2061,74 @@ async fn goto_block(
     Ok(())
 }
 
+/// Inject the runtime-guidance fragment (t-1359, docs/GUIDANCE.md §4):
+/// assemble the capability-keyed operations text from this call's live
+/// capabilities and deliver it as a PromptIR Developer/Constraint section
+/// (`Static { name: "runtime-guidance" }`). The section's content hash
+/// rides the per-InferCall `prompt_ir` trace event exactly like hydration
+/// sections, so any trace proves which guidance version the model saw.
+///
+/// Delivery conditions: the config's guidance switch is on AND the call
+/// offers at least one tool — a bare completion (the loop's sub-infer
+/// child, `policy.tools: Some([])`) is not operating the runtime and gets
+/// no fragment. Within a delivered fragment each block is keyed to its
+/// capability; the §2.5 cost block is unconditional.
+///
+/// Prompt bytes never affect effect identity or replay (recorded Infer
+/// results are matched by effect id), so guidance can be tuned, toggled,
+/// or re-keyed without breaking replay of old traces — pinned by
+/// `replay_reproduces_results_regardless_of_guidance_setting` below.
+async fn apply_runtime_guidance(
+    config: &SeqConfig,
+    program: &crate::ir::Program,
+    tool_specs: &[crate::provider::ToolSpec],
+    prompt: Prompt,
+) -> Result<Prompt> {
+    if !config.guidance.enabled || tool_specs.is_empty() {
+        return Ok(prompt);
+    }
+    let offered = |name: &str| tool_specs.iter().any(|spec| spec.function.name == name);
+    let caps = crate::guidance::GuidanceCapabilities {
+        infer: offered("infer"),
+        memory: offered("remember") && offered("recall"),
+        gc: config.gc.enabled(),
+        // Strategy-honest citation guidance (GUIDANCE.md gap 6): the
+        // protection line renders only where cited-keep actually runs.
+        cited_keep: matches!(&config.gc, crate::gc::GcMode::Semantic(gc) if gc.cited_keep),
+        approvals: run_has_gated_effects(config, program),
+        delegate_models: config.guidance.delegate_models.clone(),
+    };
+    let fragment = crate::guidance::runtime_guidance_fragment(&caps);
+    let section = crate::guidance::runtime_guidance_section(fragment);
+    let prompt_ir = PromptIR::new(prompt, vec![section])?;
+    config
+        .trace
+        .emit(&Event::Custom {
+            run_id: config.trace.run_id().into(),
+            name: "prompt_ir".into(),
+            data: serde_json::to_value(prompt_ir.trace(config.trace_full_prompt_ir))?,
+            timestamp: Utc::now(),
+        })
+        .await?;
+    Ok(compile_prompt_ir(&prompt_ir))
+}
+
+/// Whether any effect in the run's config is gated behind approval
+/// (GUIDANCE.md §2.6's delivery condition): an Eval site with
+/// `require_approval`, or a registered sink whose writes require approval.
+fn run_has_gated_effects(config: &SeqConfig, program: &crate::ir::Program) -> bool {
+    program.blocks.values().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|instr| matches!(instr, Instr::Eval { policy, .. } if policy.require_approval))
+    }) || config
+        .hydration
+        .sinks()
+        .iter()
+        .any(|sink| sink.write_policy() == crate::hydration::SinkWritePolicy::RequireApproval)
+}
+
 /// Tool list shown to the provider: shell + infer always; remember/recall
 /// appear automatically whenever a memory backend is registered (settled
 /// question 6 — an unreachable sink is a trap, so registration IS the
@@ -2572,6 +2645,7 @@ mod tests {
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
             approvals: Default::default(),
+            guidance: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -2652,7 +2726,12 @@ mod tests {
             budgets: Default::default(),
         };
 
-        let (value, _machine) = run_ir_sequential(&config(provider.clone()), machine).await?;
+        // Guidance off: this test pins exact prompt bytes across the
+        // continuation, which the runtime-guidance system section would
+        // prepend to (its delivery is pinned by its own tests below).
+        let mut config = config(provider.clone());
+        config.guidance = crate::guidance::RuntimeGuidance::disabled();
+        let (value, _machine) = run_ir_sequential(&config, machine).await?;
 
         assert_eq!(value, Value::String("second".into()));
         let prompts = provider.prompts();
@@ -3228,6 +3307,250 @@ mod tests {
                 Vec::<String>::new(),
             ]
         );
+        Ok(())
+    }
+
+    // --- runtime guidance delivery (t-1359, docs/GUIDANCE.md §4) ---------
+
+    fn guidance_probe_machine() -> Machine {
+        let infer = |out: &str, tools: Option<Vec<String>>| Instr::Infer {
+            out: Var(out.into()),
+            model: Expr::Value(Value::String("mock".into())),
+            prompt: PromptRef::Inline(vec![ChatMessage::user(out.to_owned())]),
+            policy: crate::ir::InferPolicy {
+                tools,
+                ..Default::default()
+            },
+        };
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            BlockId(0),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![infer("turn", None), infer("bare", Some(vec![]))],
+                terminator: Terminator::Return {
+                    value: Expr::Field {
+                        base: Var("turn".into()),
+                        field: "content".into(),
+                    },
+                },
+            },
+        );
+        Machine {
+            program: crate::ir::Program {
+                id: crate::ir::ProgramId("guidance-probe".into()),
+                entry: BlockId(0),
+                blocks,
+            },
+            block: BlockId(0),
+            pc: 0,
+            env: BTreeMap::new(),
+            effect_visits: BTreeMap::new(),
+            control_path: Default::default(),
+            continuation_stack: vec![],
+            budgets: Default::default(),
+        }
+    }
+
+    /// Default-on delivery, keyed to the call's tool offer: the turn Infer
+    /// (full toolset) gets the fragment as a system section; the bare
+    /// sub-infer child (`tools: Some([])`) is not operating the runtime
+    /// and gets nothing.
+    #[tokio::test]
+    async fn runtime_guidance_rides_tool_bearing_infers_only() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+        run_ir_sequential(&config(provider.clone()), guidance_probe_machine()).await?;
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2);
+        let system = prompts[0][0].content.as_deref().unwrap_or_default();
+        assert_eq!(prompts[0][0].role, "system");
+        assert!(system.contains("## runtime-guidance"));
+        assert!(system.contains(crate::guidance::DELEGATION_BLOCK));
+        assert!(system.contains(crate::guidance::COST_BLOCK));
+        // Capabilities not live in this config render no block: no memory
+        // backend, no GC, no gated effect.
+        assert!(!system.contains("persistent memory"));
+        assert!(!system.contains("[frame:"));
+        assert!(!system.contains("human approval"));
+
+        assert!(
+            !prompts[1].iter().any(|message| message
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime-guidance")),
+            "a bare completion child must get no fragment"
+        );
+        Ok(())
+    }
+
+    /// Config-level capability keying: memory backend registered, semantic
+    /// GC with cited-keep, and a gated Eval in the program (unreachable —
+    /// gating is a config fact, not an execution fact) light up their
+    /// blocks, including the strategy-conditional cited-keep line.
+    #[tokio::test]
+    async fn runtime_guidance_blocks_key_to_live_capabilities() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+        let mut config = config(provider.clone());
+        config.hydration =
+            SourceRegistry::new().register_backend(crate::memory::MemorySource::new(memory_dir()));
+        config.gc = GcMode::Semantic(crate::gc::SemanticGc {
+            preserve_prefix: true,
+            recent_window: 8,
+            similarity_floor: 0.35,
+            embedder: None,
+            cited_keep: true,
+        });
+        let mut machine = guidance_probe_machine();
+        machine.program.blocks.insert(
+            BlockId(9),
+            crate::ir::Block {
+                params: vec![],
+                instructions: vec![Instr::Eval {
+                    out: Var("gated".into()),
+                    request: crate::ir::EvalRequest::Shell {
+                        command: Expr::Value(Value::String("true".into())),
+                    },
+                    policy: crate::ir::EvalPolicy {
+                        timeout_ms: None,
+                        require_approval: true,
+                    },
+                }],
+                terminator: Terminator::Return {
+                    value: Expr::Value(Value::Null),
+                },
+            },
+        );
+        run_ir_sequential(&config, machine).await?;
+
+        let prompts = provider.prompts();
+        let system = prompts[0][0].content.as_deref().unwrap_or_default();
+        assert!(system.contains(crate::guidance::MEMORY_BLOCK));
+        assert!(system.contains(crate::guidance::GC_BLOCK_WITH_MEMORY));
+        assert!(system.contains(crate::guidance::GC_CITED_KEEP_LINE));
+        assert!(system.contains(crate::guidance::APPROVAL_BLOCK));
+        Ok(())
+    }
+
+    /// The cited-keep line is strategy-honest end to end (GUIDANCE.md gap
+    /// 6): the default stack strategy has no citation protection, so the
+    /// line must not render under it.
+    #[tokio::test]
+    async fn runtime_guidance_omits_cited_keep_line_under_stack_gc() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+        let mut config = config(provider.clone());
+        config.gc = GcMode::Stack(crate::gc::StackFrameGc {
+            preserve_prefix: true,
+        });
+        run_ir_sequential(&config, guidance_probe_machine()).await?;
+
+        let system = provider.prompts()[0][0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        assert!(system.contains(crate::guidance::GC_BLOCK_WITHOUT_MEMORY));
+        assert!(!system.contains("marks that result as load-bearing"));
+        Ok(())
+    }
+
+    /// Opt-out is explicit and total: no fragment in any prompt, no
+    /// `prompt_ir` trace event.
+    #[tokio::test]
+    async fn runtime_guidance_opt_out_removes_fragment_and_trace_event() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = config_with_trace(provider.clone(), trace);
+        config.guidance = crate::guidance::RuntimeGuidance::disabled();
+        run_ir_sequential(&config, guidance_probe_machine()).await?;
+
+        for prompt in provider.prompts() {
+            for message in prompt {
+                assert!(!message
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("runtime-guidance"));
+            }
+        }
+        let events = TraceLogger::read_events(&trace_path).await?;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Custom { name, .. } if name == "prompt_ir")));
+        Ok(())
+    }
+
+    /// The fragment's section summary — origin `Static {
+    /// "runtime-guidance" }`, content hash — rides a `prompt_ir` Custom
+    /// event per delivering InferCall, so any trace proves which guidance
+    /// version the model saw (docs/GUIDANCE.md §4).
+    #[tokio::test]
+    async fn runtime_guidance_section_hash_rides_the_trace() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = config_with_trace(provider, trace);
+        run_ir_sequential(&config, guidance_probe_machine()).await?;
+
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let sections: Vec<Value> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "prompt_ir" => {
+                    Some(data["sections"].as_array().cloned().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // Exactly one delivering Infer (the turn call; the bare child gets
+        // none), carrying exactly the runtime-guidance section.
+        assert_eq!(sections.len(), 1, "{sections:?}");
+        assert_eq!(
+            sections[0]["source"]["origin"]["Static"]["name"],
+            Value::String("runtime-guidance".into())
+        );
+        assert!(sections[0]["hash"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"));
+        assert_eq!(sections[0]["role"], Value::String("Developer".into()));
+        Ok(())
+    }
+
+    /// Recorded Infer results replay by effect id regardless of prompt
+    /// bytes: a trace recorded WITH guidance replays cleanly with guidance
+    /// disabled (and would the other way around) — guidance wording is
+    /// tunable without breaking replay of old traces.
+    #[tokio::test]
+    async fn replay_reproduces_results_regardless_of_guidance_setting() -> Result<()> {
+        // One machine value, cloned per run: Inline prompts carry fresh
+        // ChatMessage ids per construction, which land in the serialized
+        // program (and so its hash) — reusing the value keeps the program
+        // identity fixed while the guidance setting varies.
+        let machine = guidance_probe_machine();
+        let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config_on = config_with_trace(provider, trace);
+        let (recorded_value, _machine) = run_ir_sequential(&config_on, machine.clone()).await?;
+
+        let events = TraceLogger::read_events(&trace_path).await?;
+        let replay = IrReplayTrace::from_events(&events)?;
+        let mut config_off = config(Arc::new(crate::provider::ReplayOnlyProvider));
+        config_off.guidance = crate::guidance::RuntimeGuidance::disabled();
+        let mut store = InMemoryStore::new();
+        let (replayed_value, _machine) = run_ir_sequential_with_store_and_replay(
+            &config_off,
+            machine,
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+
+        assert_eq!(replayed_value, recorded_value);
         Ok(())
     }
 

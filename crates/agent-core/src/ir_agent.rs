@@ -1812,6 +1812,7 @@ mod tests {
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
             approvals: Default::default(),
+            guidance: Default::default(),
             tools: Default::default(),
             provider,
             hydration: SourceRegistry::new(),
@@ -3256,9 +3257,14 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![response("plain text", vec![])]));
         let (value, _machine, events) = run_contract_loop(provider, None, 4).await?;
         assert_eq!(value["content"], Value::String("plain text".into()));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, Event::Custom { .. })));
+        // No contract machinery ran: no contract-named Custom events. (The
+        // runtime-guidance `prompt_ir` Custom event is unrelated default
+        // loop behavior, t-1359.)
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::Custom { name, .. }
+                if name == OUTPUT_CONTRACT_EVENT || name == OUTPUT_VALIDATION_FAILED_EVENT
+        )));
         Ok(())
     }
 
