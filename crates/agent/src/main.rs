@@ -125,8 +125,10 @@ struct Args {
     /// everything, credentials included; `clean` passes nothing.
     #[arg(long, value_enum, default_value_t = EvalEnvMode::Inherit)]
     eval_env: EvalEnvMode,
-    /// Context GC strategy.
-    #[arg(long, value_enum, default_value_t = GcArg::Ring)]
+    /// Context GC strategy. `stack` is the default per the t-1339 strategy
+    /// matrix: best replay-completion on tool chains, degrades to ring on
+    /// chat-heavy windows (see docs/GC.md "Choosing a strategy").
+    #[arg(long, value_enum, default_value_t = GcArg::Stack)]
     gc: GcArg,
     /// Trigger GC at this fraction of the model context budget.
     #[arg(long, default_value_t = 0.85)]
@@ -581,7 +583,7 @@ async fn main() -> Result<()> {
     };
     if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
         return Err(anyhow!(
-            "--gc-timing {} requires a GC strategy; pass --gc ring or --gc mark-sweep",
+            "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, or --gc mark-sweep",
             args.gc_timing.name()
         ));
     }
@@ -1536,7 +1538,9 @@ async fn resume_run(
         replay: None,
         trace_full_prompt_ir: false,
         trace_full_payloads: false,
-        gc: GcMode::Ring(RingGc {
+        // Mirrors the CLI defaults (--gc stack, --gc-cache preserve): the
+        // resumed run should collect the way a fresh run would.
+        gc: GcMode::Stack(StackFrameGc {
             preserve_prefix: true,
         }),
         gc_threshold: 0.85,

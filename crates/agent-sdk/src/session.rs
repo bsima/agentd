@@ -17,7 +17,10 @@
 //!   in a spawned `agent` child; turns are NUL-framed v1 turn envelopes on
 //!   the child's stdin, correlated by `turn_id` on the `--json` machine
 //!   events (never by order). Checkpoints land under the session home after
-//!   every turn; `kill -9` loses nothing that was checkpointed.
+//!   every turn; `kill -9` loses nothing that was checkpointed. The child
+//!   applies the CLI's context-GC defaults (`--gc stack`,
+//!   `--gc-cache preserve` — see docs/GC.md), unlike in-process
+//!   [`crate::Runner`] runs, which run no GC (`GcMode::None`).
 //! - **Replay** ([`crate::Runner::replay`], or a session with
 //!   [`SessionOptions::replay_trace`]) — deterministic re-execution from a
 //!   recorded trace; no provider, no credentials.
