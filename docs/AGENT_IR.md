@@ -15,7 +15,7 @@ whether reality has caught up.
 | CLI switched to AgentIR | Implemented; the CLI is IR-only (`--runtime` removed; the Op layer remains a library builder/test API) |
 | In-memory **STM** store with transactional Get/Put | Removed (t-1182): Get/Put deleted in favor of the Retrieve/Store hydration effects; `InMemoryStore` now only backs instruction-limit checkpoints. See docs/MEMORY.md |
 | Normalization pass for canonical hashing | Implemented (`ir_normalize`): programs normalize to strict SSA (existing params/args preserved, implicit dominator-scoped uses become params) and `program_hash` hashes the canonical form, so alpha-equivalent programs share identity |
-| `Par` semantics | Not implemented — the IR runtime rejects `Par` until the open questions below are settled |
+| `Par` semantics | Implemented (t-1358): dynamic-width map-Par (`Par { over, body, body_args, join, join_args }`), concurrent branches, join-all in declaration order, errors-as-values per branch, ids forked per the scheme below, pre-split step budgets. v1 constraints: no Store and no approval gates inside bodies (validation-rejected), no cancellation, no mid-Par checkpoints. See "`Par` semantics" below |
 
 AgentIR is the serializable core representation for `agentd` programs.
 
@@ -78,7 +78,7 @@ pub enum Terminator {
     If { cond: Expr, then_block: BlockId, else_block: BlockId },
     Match { value: Expr, arms: Vec<MatchArm> },
     Return { value: Expr },
-    Par { branches: Vec<BlockId>, join: BlockId },
+    Par { over: Expr, body: BlockId, body_args: Vec<Expr>, join: BlockId, join_args: Vec<Expr> },
 }
 ```
 
@@ -139,7 +139,9 @@ The store backend is not part of AgentIR. The same program should be able to run
 
 `Retrieve` reads from registered hydration sources; `Store` writes to registered hydration sinks (docs/MEMORY.md). The runtime attaches provenance and decides persistence, checkpoint cadence, and replay semantics (replay never mutates a sink).
 
-A serialized `Machine` checkpoint contains enough local execution state to resume the program. It may also contain or reference a store snapshot, depending on the backend.
+`Par` branches fork `env` as a read-only snapshot: each branch machine starts from the parent env at the fork (plus its element binding), branch-local mutations die at the join, and only the branch's `Return` value crosses back (in the join's results list). Branches cannot `Store` (validation-rejected, see "`Par` semantics"), so there is no branch write to merge or roll back.
+
+A serialized `Machine` checkpoint contains enough local execution state to resume the program. It may also contain or reference a store snapshot, depending on the backend. Checkpoints never capture a Par mid-flight: suspension takes effect before the fork or from the join onward.
 
 ## Effect IDs and replay
 
@@ -158,7 +160,9 @@ The dynamic path is explicit enough to distinguish repeated visits to the same e
 - **`transitions`** is how many transitions were folded into `path`: a human-readable depth for divergence errors, where the digest itself is opaque.
 - **`visit`** is the per-site execution ordinal (0-based). Within one machine run it is redundant with `path`; it exists because per-site visit counts are carried across session turns (each turn runs a fresh machine whose path restarts at the root), so turn N's entry effect is `(path = root, visit = N-1)` — distinguishable from turn 1's and computable without simulating the machine (`agent ir-effect --visit N-1`, `DynamicPath::at_entry`). It also names loop iterations legibly in errors.
 
-**Par (planned).** The scheme extends to parallel branches without new machinery: branch `b` of a `Par` at block `P` forks the parent path by folding `(P, arm = b, branch_entry)`, so sibling branches derive distinct, deterministic digests from the same parent, independent of scheduling order; the continuation after the join folds `(P, arm = branch_count, join)` onto the parent path. Nested forks compose the same way, since each branch's digest is a prefix-chained value — the parent-frame prefix comes for free. A scaffold test (`par_branches_fork_the_control_path`) documents this.
+**Par (implemented, t-1358).** The scheme extends to parallel branches without new machinery: branch `b` of a `Par` at block `P` forks the parent path by folding `(P, arm = b, body)` — for map-Par, `b` is the element index — so sibling branches derive distinct, deterministic digests from the same parent, independent of scheduling order; the continuation after the join folds `(P, arm = width, join)` onto the parent path. Branch machines are forked (path, env snapshot, per-site visit counters) BEFORE any branch is scheduled, so every id derives from the fork point, never from completion order. Nested forks compose the same way, since each branch's digest is a prefix-chained value — the parent-frame prefix comes for free. Pinned by `par_branches_fork_the_control_path` (the realized t-1058 scaffold) and `par_effect_ids_are_deterministic_across_runs_and_schedules`.
+
+Sibling trace events go through the one shared appender: they may interleave in file order (each event is atomic), and consumers must not infer causality from cross-branch adjacency — the effect id, not position, is the join key. Replay lookup is id-keyed, so a Par recording replays independent of its interleaving order (`par_replay_is_order_independent` pins this with a deliberately re-interleaved recording).
 
 Replay feeds recorded `Infer`/`Eval`/`Retrieve`/`Store` results back at matching effect IDs and never executes the underlying effect. A divergence fails with an error naming the effect id, its site, its visit, and its control path — and states the id scheme, since a "missing call" is usually an edited program or a different branch/loop path.
 
@@ -194,20 +198,21 @@ The agent loop exposes an `infer` tool so the model can dispatch a nested `Infer
 
 ## `Par` semantics
 
-`Par` should have deterministic semantics before it becomes a core runtime feature.
+Implemented (t-1358) as the minimal dynamic-width **map-Par** derived demand-first in [GUIDANCE.md §3](GUIDANCE.md) (t-1356). The open questions above the t-1356 pass are settled as follows; everything favors replayability over cleverness.
 
-Open questions to settle before enabling it:
+**Shape.** `Par { over, body, body_args, join, join_args }`: `over` must evaluate to a list at runtime (a clear error otherwise); one branch runs the `body` block per element, concurrently (the interpreter drives all branch futures together, so provider calls and Evals overlap). `body`'s first param receives the element; its remaining params bind positionally from `body_args`, evaluated once in the parent env at fork. A branch runs its body subgraph to a `Return`, whose value is the branch result. Fixed-width Par is the degenerate case (`over` = literal array). Validation checks body/join existence and param arities (implicit first param plus one per arg).
 
-- whether branches get isolated store transactions or shared store access
-- how branch writes are merged at the join
-- what happens when one branch fails or is canceled
-- how branch effects are ordered in the trace
-- ~~how stable effect IDs include branch identity~~ — settled: each branch forks the parent control path with its branch index (see "Effect IDs and replay" above), so branch effect ids are deterministic and independent of scheduling order
-- whether join result order follows branch declaration order
+**Join: all-of, declaration order.** The join block runs once, after ALL branches settle; its first param receives the results list in element order — never completion order (remaining params bind from `join_args` in the parent env). Width 0 joins immediately with `[]`. `any`/`first-success` racing is deferred (no demand); the id scheme does not preclude it.
 
-The default should favor replayability over cleverness. Parallel branches should use isolated transactions unless a specific interpreter provides stronger shared-state semantics.
+**Failure: errors-as-values, no cancellation.** A branch effect failing under `on_error: Bind` puts its error value in that branch's slot and the join still runs. An `Abort`-polarity failure lets every sibling run to completion, then propagates after all branches settle, with the first failure by declaration order as the reported error — deterministic under any scheduling. Nothing is ever canceled in v1 (cancellation would leave partially-issued effects ill-defined in the trace and under replay).
 
-A demand-first pass over these questions — concrete fan-out patterns, derived requirements (join-all in declaration order, errors-as-values propagation, id assignment at fork, pre-split budgets, Store rejected in branches), and a minimal-Par recommendation — is in [GUIDANCE.md §3](GUIDANCE.md) (t-1356).
+**State: fork-snapshot env, isolated branches, no writes.** Branches see the parent env as of the fork (a snapshot); branch env mutations stay branch-local and die at the join — only the `Return` value survives, in the results list. `Store` instructions and approval-gated `Eval`s are rejected by `validate_program` in every block reachable from a Par body (v1: no demand pattern writes or pauses inside a branch — this dissolves the isolated-vs-shared-transaction and merge-at-join questions instead of answering them speculatively). `Retrieve` is read-only and allowed. An approval gate a branch could only reach dynamically fails that branch at runtime with a clear error rather than pausing: a mid-Par pause would have to checkpoint sibling in-flight state.
+
+**Checkpoints.** Mid-Par checkpoints are out of scope in v1: an instruction-limit reached while branches run takes effect at (or after) the join, never inside it. If the remaining budget cannot even give each branch one instruction, the machine suspends AT the Par terminator (before forking), so a resume with a fresh budget re-forks; a width larger than the entire budget is a deterministic error.
+
+**Budgets: pre-split, returned at join.** At the fork each branch gets `floor(remaining / width)` instructions, remainder to earlier branches — deterministic, so "which branch hit the limit" never depends on scheduling. A branch exhausting its allocation fails as that branch's error value (bind semantics; the join still runs). Only what a branch actually executed counts against the parent — unused allocation returns at the join. Token/cost accounting (`RunUsage`) is an additive rollup over trace events, order-independent, unchanged. Parallel branches never consume parent turns: the whole Par happens inside one turn.
+
+**Trace + replay.** See "Effect IDs and replay" above: ids fork at dispatch, appends are serialized through the shared logger, replay is id-keyed and order-independent, and divergence detection is per-branch.
 
 ## Runtime policy and sandbox boundary
 
