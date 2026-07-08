@@ -155,6 +155,16 @@ struct Args {
     /// invalidate the provider prompt cache on every collection.
     #[arg(long, value_enum, default_value_t = GcCacheArg::Preserve)]
     gc_cache: GcCacheArg,
+    /// Recent-window size for `--gc semantic`: the last N messages define
+    /// the "current topic" centroid and are immune from eviction (the
+    /// recency floor).
+    #[arg(long, default_value_t = agent_core::gc::DEFAULT_SEMANTIC_RECENT_WINDOW)]
+    gc_semantic_window: usize,
+    /// Similarity floor for `--gc semantic`: messages scoring at or above
+    /// this cosine similarity to the recent-window centroid are only
+    /// dropped once every below-floor candidate is gone.
+    #[arg(long, default_value_t = agent_core::gc::DEFAULT_SEMANTIC_SIMILARITY_FLOOR)]
+    gc_semantic_floor: f32,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -177,6 +187,11 @@ enum GcArg {
     Ring,
     MarkSweep,
     Stack,
+    /// Drop messages semantically distant from the recent conversation
+    /// (abandoned tangents). Embeddings come from the model registry's
+    /// `embeddings` entry — the same config memory retrieval uses; without
+    /// one, scoring degrades to a deterministic recency heuristic.
+    Semantic,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -575,6 +590,24 @@ async fn main() -> Result<()> {
                 GcArg::Ring => GcMode::Ring(RingGc { preserve_prefix }),
                 GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc { preserve_prefix }),
                 GcArg::Stack => GcMode::Stack(StackFrameGc { preserve_prefix }),
+                GcArg::Semantic => {
+                    // Same embedder the memory backend resolves from the
+                    // registry's `embeddings` entry (t-1340). None =
+                    // heuristic-only mode (documented in docs/GC.md), worth
+                    // a warning since semantic scoring is the point.
+                    if embedder.is_none() {
+                        eprintln!(
+                            "warning: --gc semantic without a models.yaml `embeddings` entry \
+                             scores by recency only (heuristic mode; see docs/GC.md)"
+                        );
+                    }
+                    GcMode::Semantic(agent_core::gc::SemanticGc {
+                        preserve_prefix,
+                        recent_window: args.gc_semantic_window,
+                        similarity_floor: args.gc_semantic_floor,
+                        embedder: embedder.clone(),
+                    })
+                }
             }
         },
         gc_threshold: args.gc_threshold,
@@ -585,7 +618,7 @@ async fn main() -> Result<()> {
     };
     if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
         return Err(anyhow!(
-            "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, or --gc mark-sweep",
+            "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, --gc mark-sweep, or --gc semantic",
             args.gc_timing.name()
         ));
     }

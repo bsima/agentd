@@ -651,6 +651,37 @@ async fn collect_prompt(
             })
             .await?;
     }
+    // Semantic embedding pre-pass (t-1350): SemanticGc::collect() consumes
+    // only the GcState.embeddings cache, so the async provider call happens
+    // here — the layer with async + config access (the same layer the
+    // t-1343 backstop landed in, and the shape the t-1166 design note
+    // sanctioned). Runs after the truncate pre-pass because the cache keys
+    // on message content. Best-effort: a failed embed leaves the cache
+    // unchanged and collect() degrades to its deterministic recency
+    // heuristic — an embedding outage can never fail a turn. Replay runs
+    // are offline by contract and skip the embedder entirely (the same
+    // heuristic path as "no embedder configured").
+    if let GcMode::Semantic(semantic) = &config.gc {
+        if config.replay.is_none() {
+            let report = semantic.prime_cache(&prompt, gc_state).await;
+            if config.gc_log && (report.embedded > 0 || report.failed) {
+                config
+                    .trace
+                    .emit(&Event::Custom {
+                        run_id: config.trace.run_id().into(),
+                        name: "gc_semantic_embed".into(),
+                        data: serde_json::json!({
+                            "type": "gc_semantic_embed",
+                            "embedded": report.embedded,
+                            "cached": report.cached,
+                            "failed": report.failed,
+                        }),
+                        timestamp: Utc::now(),
+                    })
+                    .await?;
+            }
+        }
+    }
     let before_ids: BTreeSet<_> = prompt.iter().map(|message| message.id).collect();
     let collected = config.gc.collect(prompt, target_budget, gc_state);
     let after_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
@@ -1170,6 +1201,125 @@ mod tests {
             )),
             "the collection event must still fire"
         );
+        Ok(())
+    }
+
+    /// Deterministic test embedder for the semantic pre-pass; flippable to
+    /// failure to exercise the degrade path.
+    struct StubEmbedder {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embedding::Embedder for StubEmbedder {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if self.fail {
+                anyhow::bail!("embeddings endpoint down");
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn model_id(&self) -> &str {
+            "stub-embedder"
+        }
+    }
+
+    fn semantic_config(trace: TraceLogger, fail: bool) -> SeqConfig {
+        SeqConfig {
+            approvals: Default::default(),
+            tools: Default::default(),
+            provider: Arc::new(MockProvider::new(vec![])),
+            hydration: SourceRegistry::new(),
+            passive_hydration: PassiveHydrationConfig::default(),
+            trace,
+            eval: EvalConfig::default(),
+            replay: None,
+            trace_full_prompt_ir: false,
+            trace_full_payloads: false,
+            gc: crate::gc::GcMode::Semantic(crate::gc::SemanticGc {
+                preserve_prefix: false,
+                recent_window: 2,
+                embedder: Some(Arc::new(StubEmbedder { fail })),
+                ..Default::default()
+            }),
+            gc_threshold: 0.5,
+            gc_log: true,
+            gc_timing: GcTiming::Threshold,
+            context_budget: 200,
+            pricing: Default::default(),
+        }
+    }
+
+    fn semantic_test_prompt() -> Prompt {
+        vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(90)),
+            ChatMessage::user("y".repeat(90)),
+            ChatMessage::user("z".repeat(90)),
+        ]
+    }
+
+    /// The semantic pre-pass primes GcState.embeddings before collect()
+    /// runs, emits the gc_semantic_embed event under --gc-log, and the
+    /// collection converges (t-1350).
+    #[tokio::test]
+    async fn semantic_gc_pre_pass_primes_cache_and_collects() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = semantic_config(trace, false);
+        let prompt = semantic_test_prompt();
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(
+            estimate_tokens(&collected) <= 100,
+            "collected={collected:?}"
+        );
+        assert!(
+            !state.embeddings.is_empty(),
+            "the pre-pass must populate the cache before collect() consumes it"
+        );
+        let events = TraceLogger::read_events(trace_path).await?;
+        let embed_event = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_semantic_embed" => Some(data),
+                _ => None,
+            })
+            .expect("gc_semantic_embed event under --gc-log");
+        assert_eq!(embed_event["failed"], false);
+        assert!(embed_event["embedded"].as_u64().unwrap_or(0) > 0);
+        Ok(())
+    }
+
+    /// Embedding failure is a degrade, never an error: the turn proceeds,
+    /// collect() uses the recency heuristic, and the failure is visible on
+    /// the gc_semantic_embed event.
+    #[tokio::test]
+    async fn semantic_gc_pre_pass_failure_degrades_to_heuristic() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let config = semantic_config(trace, true);
+        let prompt = semantic_test_prompt();
+
+        let mut state = crate::gc::GcState::default();
+        let collected = maybe_collect_prompt(&config, prompt, &mut state).await?;
+
+        assert!(
+            estimate_tokens(&collected) <= 100,
+            "collected={collected:?}"
+        );
+        assert!(state.embeddings.is_empty());
+        let events = TraceLogger::read_events(trace_path).await?;
+        let embed_event = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "gc_semantic_embed" => Some(data),
+                _ => None,
+            })
+            .expect("the failure must be observable under --gc-log");
+        assert_eq!(embed_event["failed"], true);
         Ok(())
     }
 

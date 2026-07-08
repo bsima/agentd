@@ -1,6 +1,8 @@
+use crate::embedding::{content_hash, cosine, Embedder};
 use crate::op::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub trait ContextGc: Send + Sync {
@@ -57,6 +59,17 @@ pub struct GcState {
     /// estimate — is the ceiling; later calls in the same loop collect to
     /// this proactively instead of paying a failed request per turn.
     pub discovered_budget: Option<usize>,
+    /// Semantic-GC embedding cache (t-1350), keyed by message content hash
+    /// ([`semantic_cache_key`]). Written ONLY by the interpreter's async
+    /// pre-pass ([`SemanticGc::prime_cache`], called from
+    /// `maybe_collect_prompt`); [`SemanticGc::collect`] consumes it
+    /// read-only, so collect() stays a pure function of
+    /// (messages, budget, state). Runtime-only: `GcState` never serializes
+    /// into checkpoints, so vectors are re-embedded (or the recency
+    /// heuristic applies) after a resume, and the pre-pass prunes entries
+    /// whose content left the window, bounding the cache to the live
+    /// window.
+    pub embeddings: HashMap<String, Vec<f32>>,
 }
 
 /// When GC runs, independent of which strategy reclaims tokens (t-1151).
@@ -208,12 +221,382 @@ impl Default for StackFrameGc {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Default recent-window size for [`SemanticGc`]: the last 8 messages are
+/// roughly the last 3-4 user/assistant exchanges — enough to define the
+/// conversation's current topic, small enough that a tangent abandoned a
+/// couple of turns ago has already left the window (and so scores as
+/// distant instead of anchoring the centroid to itself).
+pub const DEFAULT_SEMANTIC_RECENT_WINDOW: usize = 8;
+
+/// Default similarity floor for [`SemanticGc`]: below ~0.25 cosine on
+/// typical text-embedding models two passages share almost no topic, so
+/// dropping them first is safe; messages at or above the floor are only
+/// dropped in the second pass, once dropping the clearly-unrelated ones
+/// did not reach the budget.
+pub const DEFAULT_SEMANTIC_SIMILARITY_FLOOR: f32 = 0.25;
+
+/// Strategy 4 (docs/GC.md, t-1350): drop messages semantically distant from
+/// the recent conversation — conversational dead ends and abandoned
+/// tangents — lowest-similarity first, until under budget.
+///
+/// Each candidate is scored by cosine similarity between its cached
+/// embedding and the *centroid* of the last [`Self::recent_window`]
+/// messages' embeddings. Centroid over max-similarity-to-any-recent
+/// because it scores against the topic of the recent thread as a whole
+/// instead of rewarding lexical echo of any single recent message.
+///
+/// The GC invariant holds: `collect()` is stateless, deterministic, and
+/// LLM-free. Embeddings are computed by an async pre-pass in the
+/// interpreter ([`Self::prime_cache`], called from `maybe_collect_prompt`
+/// — the layer with async + config access, the same shape the t-1166
+/// design note sanctioned for memory retrieval); `collect()` consumes only
+/// `GcState.embeddings`. A message with no cached vector — embedder not
+/// configured, endpoint failed, resumed session — falls back to a
+/// deterministic recency score, never an error and never a provider call.
+#[derive(Clone)]
+pub struct SemanticGc {
+    /// Preserve the cached prefix: candidates must live entirely after the
+    /// pinned prefix region (same boundary semantics as the other
+    /// strategies).
+    pub preserve_prefix: bool,
+    /// The last N messages define "recent": they form the centroid AND are
+    /// immune from eviction (the recency floor).
+    pub recent_window: usize,
+    /// Messages scoring at or above this cosine similarity are only
+    /// dropped once every below-floor candidate is gone.
+    pub similarity_floor: f32,
+    /// Carried for the interpreter's async pre-pass ONLY
+    /// ([`Self::prime_cache`]); `collect()` never touches it, which is
+    /// what keeps collect() synchronous, deterministic, and offline.
+    pub embedder: Option<Arc<dyn Embedder>>,
+}
+
+impl Default for SemanticGc {
+    fn default() -> Self {
+        Self {
+            preserve_prefix: true,
+            recent_window: DEFAULT_SEMANTIC_RECENT_WINDOW,
+            similarity_floor: DEFAULT_SEMANTIC_SIMILARITY_FLOOR,
+            embedder: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for SemanticGc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SemanticGc")
+            .field("preserve_prefix", &self.preserve_prefix)
+            .field("recent_window", &self.recent_window)
+            .field("similarity_floor", &self.similarity_floor)
+            .field(
+                "embedder",
+                &self.embedder.as_ref().map(|embedder| embedder.model_id()),
+            )
+            .finish()
+    }
+}
+
+/// The text a message is embedded as: role, content, and tool-call
+/// name/arguments. Excludes the message UUID and tool-call ids so identical
+/// content shares one cache entry and the key survives replay/rebuild.
+pub fn message_embedding_text(message: &ChatMessage) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "{}: {}",
+        message.role,
+        message.content.as_deref().unwrap_or("")
+    );
+    for call in message.tool_calls.as_deref().unwrap_or_default() {
+        let _ = write!(text, "\n[call {} {}]", call.name, call.arguments);
+    }
+    text
+}
+
+/// Key into `GcState.embeddings`: content hash of the embedded text.
+pub fn semantic_cache_key(message: &ChatMessage) -> String {
+    content_hash(&message_embedding_text(message))
+}
+
+/// What one pre-pass did, for the optional `gc_semantic_embed` trace event.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SemanticPrimeReport {
+    /// Vectors newly embedded this pass.
+    pub embedded: usize,
+    /// Cache entries already present (after pruning to the live window).
+    pub cached: usize,
+    /// The embed call failed; the cache is unchanged and collect() will
+    /// score uncached messages with the recency heuristic.
+    pub failed: bool,
+}
+
+impl SemanticGc {
+    /// The async pre-pass (t-1350): embed every window message whose
+    /// content hash is not yet cached, pruning entries whose content left
+    /// the window (bounding the cache to the live window). Best-effort by
+    /// contract — any failure leaves the cache as-is and is reported, never
+    /// returned as an error, so an embedding outage can never fail a turn.
+    ///
+    /// Called from `interpreter::collect_prompt` after the truncate
+    /// pre-pass (truncation rewrites content, and the cache keys on
+    /// content). Never called by `collect()`.
+    pub async fn prime_cache(
+        &self,
+        messages: &[ChatMessage],
+        state: &mut GcState,
+    ) -> SemanticPrimeReport {
+        let live: BTreeSet<String> = messages.iter().map(semantic_cache_key).collect();
+        state.embeddings.retain(|key, _| live.contains(key));
+
+        let mut report = SemanticPrimeReport {
+            cached: state.embeddings.len(),
+            ..Default::default()
+        };
+        let Some(embedder) = &self.embedder else {
+            return report;
+        };
+        let mut missing: Vec<(String, String)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for message in messages {
+            let text = message_embedding_text(message);
+            let key = content_hash(&text);
+            if state.embeddings.contains_key(&key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            missing.push((key, text));
+        }
+        if missing.is_empty() {
+            return report;
+        }
+        let texts: Vec<String> = missing.iter().map(|(_, text)| text.clone()).collect();
+        match embedder.embed(&texts).await {
+            Ok(vectors) if vectors.len() == missing.len() => {
+                for ((key, _), vector) in missing.into_iter().zip(vectors) {
+                    state.embeddings.insert(key, vector);
+                    report.embedded += 1;
+                }
+            }
+            // Failure = heuristic path: cache unchanged, no error.
+            _ => report.failed = true,
+        }
+        report
+    }
+
+    /// Centroid of the cached vectors of the last `recent_window` messages.
+    /// `None` when none of them have a vector (heuristic-only mode).
+    /// Vectors with a mismatched dimension (an embedding-model switch
+    /// mid-run) are skipped rather than mixed.
+    fn recent_centroid(&self, messages: &[ChatMessage], state: &GcState) -> Option<Vec<f32>> {
+        let start = messages.len().saturating_sub(self.recent_window.max(1));
+        let mut sum: Option<Vec<f32>> = None;
+        let mut count = 0usize;
+        for message in &messages[start..] {
+            let Some(vector) = state.embeddings.get(&semantic_cache_key(message)) else {
+                continue;
+            };
+            match &mut sum {
+                None => {
+                    sum = Some(vector.clone());
+                    count = 1;
+                }
+                Some(acc) if acc.len() == vector.len() => {
+                    for (slot, value) in acc.iter_mut().zip(vector) {
+                        *slot += value;
+                    }
+                    count += 1;
+                }
+                Some(_) => {}
+            }
+        }
+        sum.map(|mut acc| {
+            for slot in &mut acc {
+                *slot /= count as f32;
+            }
+            acc
+        })
+    }
+
+    /// Score every message: cosine to the recent centroid when both the
+    /// centroid and the message's vector are cached; otherwise a
+    /// deterministic recency score mapped into cosine's [-1, 1] range
+    /// (older = lower), so an unvouched-for message degrades to
+    /// oldest-first — ring's ordering — instead of erroring.
+    fn scores(&self, messages: &[ChatMessage], state: &GcState) -> Vec<f32> {
+        let centroid = self.recent_centroid(messages, state);
+        let len = messages.len();
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                if let Some(centroid) = &centroid {
+                    if let Some(vector) = state.embeddings.get(&semantic_cache_key(message)) {
+                        return cosine(vector, centroid);
+                    }
+                }
+                if len <= 1 {
+                    1.0
+                } else {
+                    -1.0 + 2.0 * (index as f32) / ((len - 1) as f32)
+                }
+            })
+            .collect()
+    }
+
+    /// The hard guards plus the recency floor: system messages, the last
+    /// user message, everything inside the pinned prefix (preserve mode),
+    /// and the last `recent_window` messages are immune from eviction.
+    fn protected_mask(&self, messages: &[ChatMessage], boundary: usize) -> Vec<bool> {
+        let len = messages.len();
+        let floor_start = len.saturating_sub(self.recent_window);
+        let last_user = messages.iter().rposition(|message| message.role == "user");
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                message.role == "system"
+                    || index < boundary
+                    || index >= floor_start
+                    || Some(index) == last_user
+            })
+            .collect()
+    }
+}
+
+/// The guards that survive even the degrade pass: the system message and
+/// the last user message (the statement of the current task) are never
+/// dropped, no matter the pressure.
+fn semantic_hard_protected_mask(messages: &[ChatMessage]) -> Vec<bool> {
+    let last_user = messages.iter().rposition(|message| message.role == "user");
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| message.role == "system" || Some(index) == last_user)
+        .collect()
+}
+
+/// Drop unprotected candidates most-distant-first until under budget.
+/// `floor = Some(f)` restricts the pass to candidates scoring below `f`.
+/// Tool-call pairs travel atomically; a group that would pull a protected
+/// message out is skipped entirely.
+fn sweep_semantic(
+    messages: &[ChatMessage],
+    keep: &mut [bool],
+    budget: usize,
+    protected: &[bool],
+    scores: &[f32],
+    floor: Option<f32>,
+) {
+    if estimate_tokens(&kept_messages(messages, keep)) <= budget {
+        return;
+    }
+    let mut order: Vec<usize> = (0..messages.len())
+        .filter(|&index| !protected[index] && messages[index].role != "system")
+        .collect();
+    // Ascending score (most distant first); index ascending (older first)
+    // breaks ties deterministically. total_cmp: no NaN surprises.
+    order.sort_by(|a, b| scores[*a].total_cmp(&scores[*b]).then(a.cmp(b)));
+    for index in order {
+        if estimate_tokens(&kept_messages(messages, keep)) <= budget {
+            break;
+        }
+        if !keep[index] {
+            continue;
+        }
+        if floor.is_some_and(|floor| scores[index] >= floor) {
+            continue;
+        }
+        if !atomic_group_avoids_protected(messages, keep, index, protected) {
+            continue;
+        }
+        drop_atomic_group(messages, keep, index);
+    }
+}
+
+/// Would dropping `index`'s atomic group (tool-call pairs travel together)
+/// remove any protected message? Generalizes [`atomic_group_stays_past`]
+/// from a prefix boundary to an arbitrary protection mask.
+fn atomic_group_avoids_protected(
+    messages: &[ChatMessage],
+    keep: &[bool],
+    index: usize,
+    protected: &[bool],
+) -> bool {
+    let mut scratch = keep.to_vec();
+    drop_atomic_group(messages, &mut scratch, index);
+    keep.iter()
+        .zip(&scratch)
+        .enumerate()
+        .all(|(position, (before, after))| !protected[position] || before == after)
+}
+
+impl ContextGc for SemanticGc {
+    fn collect(
+        &self,
+        messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
+        let full_boundary = cache_prefix_boundary(&messages, budget).min(messages.len());
+        let prefix_snapshot = messages[..full_boundary].to_vec();
+        let boundary = if self.preserve_prefix {
+            full_boundary
+        } else {
+            0
+        };
+
+        let mut keep = vec![true; messages.len()];
+        if estimate_tokens(&messages) > budget {
+            let protected = self.protected_mask(&messages, boundary);
+            let scores = self.scores(&messages, state);
+            // Phase 1: clearly-unrelated candidates (below the floor),
+            // most distant first.
+            sweep_semantic(
+                &messages,
+                &mut keep,
+                budget,
+                &protected,
+                &scores,
+                Some(self.similarity_floor),
+            );
+            // Phase 2: any candidate, most distant first.
+            sweep_semantic(&messages, &mut keep, budget, &protected, &scores, None);
+            // Phase 3 (degrade): the protected set alone exceeds the
+            // budget. Relax the recency floor and the prefix pin —
+            // overflowing the model is worse than a cache miss (same
+            // stance as ring's front-drop fallback; the invalidation is
+            // reported via prefix_invalidated) — but the system message
+            // and the last user message stay hard-protected.
+            if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+                let hard = semantic_hard_protected_mask(&messages);
+                sweep_semantic(&messages, &mut keep, budget, &hard, &scores, None);
+            }
+        }
+
+        let collected: Vec<ChatMessage> = messages
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(message, _)| message)
+            .collect();
+        state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
+        collected
+    }
+
+    fn name(&self) -> &'static str {
+        "semantic"
+    }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum GcMode {
     None,
     Ring(RingGc),
     MarkSweep(MarkSweepGc),
     Stack(StackFrameGc),
+    Semantic(SemanticGc),
 }
 
 impl GcMode {
@@ -228,6 +611,7 @@ impl GcMode {
             Self::Ring(gc) => gc.collect(messages, budget, state),
             Self::MarkSweep(gc) => gc.collect(messages, budget, state),
             Self::Stack(gc) => gc.collect(messages, budget, state),
+            Self::Semantic(gc) => gc.collect(messages, budget, state),
         }
     }
 
@@ -237,6 +621,7 @@ impl GcMode {
             Self::Ring(gc) => gc.name(),
             Self::MarkSweep(gc) => gc.name(),
             Self::Stack(gc) => gc.name(),
+            Self::Semantic(gc) => gc.name(),
         }
     }
 
@@ -246,6 +631,7 @@ impl GcMode {
             Self::Ring(gc) => gc.cache_preserving(),
             Self::MarkSweep(gc) => gc.cache_preserving(),
             Self::Stack(gc) => gc.cache_preserving(),
+            Self::Semantic(gc) => gc.cache_preserving(),
         }
     }
 
@@ -1370,6 +1756,335 @@ mod tests {
             "interior completed pair should be evicted under pressure"
         );
         assert!(!state.prefix_invalidated);
+    }
+
+    // ---- SemanticGc (t-1350) ------------------------------------------------
+
+    /// Cache a unit-basis vector for `message`: `axis` 0/1/2 give three
+    /// mutually-orthogonal topics, so cosine to a recent centroid on axis 0
+    /// is 1.0 for on-topic messages and 0.0 for tangents.
+    fn cache_axis(state: &mut GcState, message: &ChatMessage, axis: usize) {
+        let mut vector = vec![0.0f32; 3];
+        vector[axis] = 1.0;
+        state.embeddings.insert(semantic_cache_key(message), vector);
+    }
+
+    /// system + task + old on-topic exchange + tangent exchange + recent
+    /// on-topic tail. The tangent is NEWER than the on-topic history: a
+    /// recency-only strategy drops the wrong messages, semantic must not.
+    fn semantic_fixture(state: &mut GcState) -> Vec<ChatMessage> {
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user(format!("fix the query planner {}", "p".repeat(120))),
+            ChatMessage::assistant(Some(format!("old on-topic {}", "q".repeat(200))), vec![]),
+            ChatMessage::assistant(
+                Some(format!("tangent cache idea {}", "r".repeat(200))),
+                vec![],
+            ),
+            ChatMessage::assistant(Some(format!("more tangent {}", "s".repeat(200))), vec![]),
+            ChatMessage::user("back to the planner"),
+            ChatMessage::assistant(Some("statistics refreshed".into()), vec![]),
+        ];
+        for (index, message) in messages.iter().enumerate() {
+            let axis = usize::from(matches!(index, 3 | 4));
+            cache_axis(state, message, axis);
+        }
+        messages
+    }
+
+    fn semantic_gc() -> SemanticGc {
+        SemanticGc {
+            preserve_prefix: false,
+            recent_window: 2,
+            similarity_floor: 0.25,
+            embedder: None,
+        }
+    }
+
+    #[test]
+    fn semantic_drops_the_distant_tangent_before_older_on_topic_history() {
+        let mut state = GcState::default();
+        let messages = semantic_fixture(&mut state);
+        let tangent_ids = [messages[3].id, messages[4].id];
+        let on_topic_id = messages[2].id;
+        let budget = estimate_tokens(&messages) - 100;
+
+        let collected = semantic_gc().collect(messages, budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(
+            !collected
+                .iter()
+                .any(|message| tangent_ids.contains(&message.id)),
+            "the semantically distant tangent goes first: {collected:?}"
+        );
+        assert!(
+            collected.iter().any(|message| message.id == on_topic_id),
+            "older but on-topic history outlives the newer tangent"
+        );
+    }
+
+    #[test]
+    fn semantic_never_drops_system_last_user_or_recency_floor() {
+        let mut state = GcState::default();
+        let messages = semantic_fixture(&mut state);
+        let last_user = messages[5].id;
+        let tail = messages[6].id;
+        // Heavy pressure: everything unprotected must go.
+        let budget = estimate_tokens(&messages[..1]) + 60;
+
+        let collected = semantic_gc().collect(messages, budget, &mut state);
+
+        assert!(collected.iter().any(|message| message.role == "system"));
+        assert!(
+            collected.iter().any(|message| message.id == last_user),
+            "the last user message is hard-protected: {collected:?}"
+        );
+        assert!(
+            collected.iter().any(|message| message.id == tail),
+            "the recency floor keeps the live tail: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_without_cached_vectors_degrades_to_oldest_first() {
+        // No embeddings cached at all (no embedder configured): the
+        // deterministic recency heuristic drops oldest-first, like ring.
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("a".repeat(400)),
+            ChatMessage::user("b".repeat(400)),
+            ChatMessage::user("c".repeat(400)),
+        ];
+        let mut state = GcState::default();
+        let budget = 300;
+
+        let collected = semantic_gc().collect(messages, budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(collected.iter().any(|message| message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.starts_with('c'))));
+        assert!(!collected.iter().any(|message| message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.starts_with('a'))));
+    }
+
+    #[test]
+    fn semantic_keeps_tool_call_pairs_atomic() {
+        let mut state = GcState::default();
+        let call = ChatMessage::assistant(
+            Some("tangent tool step".into()),
+            vec![tool_call("call-tangent")],
+        );
+        let result = ChatMessage::tool("call-tangent", "tangent output ".repeat(40));
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("fix the planner"),
+            call,
+            result,
+            ChatMessage::user("back to the planner"),
+            ChatMessage::assistant(Some("on it".into()), vec![]),
+        ];
+        for (index, message) in messages.iter().enumerate() {
+            cache_axis(&mut state, message, usize::from(matches!(index, 2 | 3)));
+        }
+        let budget = estimate_tokens(&messages) - 50;
+
+        let collected = semantic_gc().collect(messages, budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget);
+        assert!(
+            !collected.iter().any(|message| {
+                message.tool_call_id.as_deref() == Some("call-tangent")
+                    || message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| calls.iter().any(|call| call.id == "call-tangent"))
+            }),
+            "the tangent frame drops call and result together: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_is_deterministic_with_full_partial_and_empty_caches() {
+        let build = |fill: fn(usize) -> bool| {
+            let mut state = GcState::default();
+            let messages = semantic_fixture(&mut GcState::default());
+            for (index, message) in messages.iter().enumerate() {
+                if fill(index) {
+                    cache_axis(&mut state, message, usize::from(matches!(index, 3 | 4)));
+                }
+            }
+            (messages, state)
+        };
+        for fill in [
+            (|_| true) as fn(usize) -> bool,
+            |index| index % 2 == 0,
+            |_| false,
+        ] {
+            let (messages, mut state_a) = build(fill);
+            let budget = estimate_tokens(&messages) - 100;
+            let first = semantic_gc().collect(messages.clone(), budget, &mut state_a);
+            let mut state_b = GcState {
+                embeddings: state_a.embeddings.clone(),
+                ..Default::default()
+            };
+            let replayed = semantic_gc().collect(messages, budget, &mut state_b);
+            assert_eq!(
+                first, replayed,
+                "same window + same cached vectors = identical collection"
+            );
+            let again = semantic_gc().collect(first.clone(), budget, &mut state_a);
+            assert_eq!(first, again, "collecting collected output is a no-op");
+        }
+    }
+
+    #[test]
+    fn semantic_under_budget_is_untouched() {
+        let mut state = GcState::default();
+        let messages = semantic_fixture(&mut state);
+
+        let collected = semantic_gc().collect(messages.clone(), 100_000, &mut state);
+
+        assert_eq!(collected, messages);
+        assert!(!state.prefix_invalidated);
+    }
+
+    #[test]
+    fn semantic_preserve_mode_pins_the_prefix() {
+        let mut state = GcState::default();
+        let messages = semantic_fixture(&mut state);
+        let budget = estimate_tokens(&messages) - 100;
+
+        let gc = SemanticGc {
+            preserve_prefix: true,
+            ..semantic_gc()
+        };
+        let collected = gc.collect(messages.clone(), budget, &mut state);
+
+        assert!(estimate_tokens(&collected) <= budget);
+        let boundary = cache_prefix_boundary(&messages, budget);
+        assert_eq!(
+            &collected[..boundary],
+            &messages[..boundary],
+            "the cached prefix must stay byte-identical"
+        );
+        assert!(!state.prefix_invalidated);
+    }
+
+    /// Deterministic mock embedder for the pre-pass tests: axis by keyword,
+    /// flippable to failure.
+    struct AxisEmbedder {
+        fail: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AxisEmbedder {
+        fn new() -> Self {
+            Self {
+                fail: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for AxisEmbedder {
+        async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("embedding endpoint down");
+            }
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains("tangent") {
+                        vec![0.0, 1.0, 0.0]
+                    } else {
+                        vec![1.0, 0.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+
+        fn model_id(&self) -> &str {
+            "axis-embedder"
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_prime_cache_embeds_missing_prunes_stale_and_reuses() {
+        let embedder = Arc::new(AxisEmbedder::new());
+        let gc = SemanticGc {
+            embedder: Some(embedder.clone()),
+            ..semantic_gc()
+        };
+        let mut state = GcState::default();
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("fix the planner"),
+        ];
+
+        let report = gc.prime_cache(&messages, &mut state).await;
+        assert_eq!(report.embedded, 2);
+        assert!(!report.failed);
+        assert_eq!(state.embeddings.len(), 2);
+
+        // Second pass: everything cached, no embed call.
+        let calls_before = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let report = gc.prime_cache(&messages, &mut state).await;
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.cached, 2);
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before,
+            "fully-cached windows must not call the embedder"
+        );
+
+        // A message that left the window is pruned from the cache.
+        let report = gc.prime_cache(&messages[..1], &mut state).await;
+        assert_eq!(state.embeddings.len(), 1);
+        assert_eq!(report.cached, 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_prime_cache_failure_is_reported_not_raised() {
+        let embedder = Arc::new(AxisEmbedder::new());
+        embedder
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let gc = SemanticGc {
+            embedder: Some(embedder),
+            ..semantic_gc()
+        };
+        let mut state = GcState::default();
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("a".repeat(400)),
+            ChatMessage::user("b".repeat(400)),
+        ];
+
+        let report = gc.prime_cache(&messages, &mut state).await;
+        assert!(report.failed);
+        assert!(state.embeddings.is_empty(), "failed embed caches nothing");
+
+        // collect() still works — heuristic path, no provider call possible.
+        let collected = gc.collect(messages, 250, &mut state);
+        assert!(estimate_tokens(&collected) <= 250);
+    }
+
+    #[tokio::test]
+    async fn semantic_prime_cache_without_embedder_is_heuristic_only() {
+        let gc = semantic_gc();
+        let mut state = GcState::default();
+        let messages = vec![ChatMessage::user("hello")];
+        let report = gc.prime_cache(&messages, &mut state).await;
+        assert_eq!(report.embedded, 0);
+        assert!(!report.failed);
+        assert!(state.embeddings.is_empty());
     }
 
     #[test]
