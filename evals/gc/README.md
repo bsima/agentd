@@ -35,6 +35,23 @@ Shapes worth recording (gaps in the current set):
   `synthetic:tool-heavy-long` stands in until a real one is recorded
 - a chat-heavy session with little tool use
 - a hydration-heavy session (large Get/temporal context blocks)
+- a session with an abandoned tangent (several turns down a wrong approach,
+  then back on track) — `synthetic:tangent-abandoned` stands in; it is the
+  fixture class the `semantic` strategy exists for (t-1350)
+
+## Semantic strategy cells (offline embeddings)
+
+`semantic` cells score against `GcState.embeddings`, which the runtime
+fills via an async embedding pre-pass. The harness mirrors that pre-pass
+with a deterministic mock embedder (bag-of-tokens vectors, 64 FNV-hashed
+buckets — cosine similarity is vocabulary overlap), the same
+recorded-replay stance as the judge column: offline runs never touch a
+provider and produce identical collections every run. The promotion gates
+(`gc_semantic_drops_the_tangent_and_keeps_the_relevant_thread`,
+`gc_semantic_no_regression_vs_stack_on_replay_completion`) assert semantic
+drops more of the abandoned tangent than stack while retaining at least as
+much of the relevant thread, and never loses the last user message where
+stack keeps it.
 
 ## Hygiene
 

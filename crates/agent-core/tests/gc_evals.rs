@@ -34,9 +34,11 @@
 //! ONLINE-GATED behind `RUN_AGENT_ONLINE_EVAL=1` with recorded-judge replay
 //! by default — see the judge section at the bottom of this file.
 
+use agent_core::gc::{message_embedding_text, SemanticGc};
 use agent_core::{
-    estimate_tokens, truncate_oversized_message, ChatMessage, ChatProvider, ContextGc, GcState,
-    MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc, StackFrameGc, ToolCall,
+    content_hash, estimate_tokens, truncate_oversized_message, ChatMessage, ChatProvider,
+    ContextGc, GcState, MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc, StackFrameGc,
+    ToolCall,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -100,6 +102,7 @@ enum Strategy {
     Ring,
     MarkSweep,
     Stack,
+    Semantic,
 }
 
 impl Strategy {
@@ -108,11 +111,59 @@ impl Strategy {
             Self::Ring => Box::new(RingGc { preserve_prefix }),
             Self::MarkSweep => Box::new(MarkSweepGc { preserve_prefix }),
             Self::Stack => Box::new(StackFrameGc { preserve_prefix }),
+            Self::Semantic => Box::new(SemanticGc {
+                preserve_prefix,
+                ..Default::default()
+            }),
         }
     }
 }
 
-const STRATEGIES: [Strategy; 3] = [Strategy::Ring, Strategy::MarkSweep, Strategy::Stack];
+const STRATEGIES: [Strategy; 4] = [
+    Strategy::Ring,
+    Strategy::MarkSweep,
+    Strategy::Stack,
+    Strategy::Semantic,
+];
+
+// --- deterministic offline embedder (t-1350) ---------------------------------
+//
+// Semantic cells score against GcState.embeddings, which the runtime's async
+// pre-pass fills from a real embeddings endpoint. The harness mirrors that
+// pre-pass with a deterministic mock — the same recorded-replay stance as the
+// judge column: offline runs never touch a provider and produce identical
+// vectors (and therefore identical collections) every run.
+
+/// Bag-of-tokens vector: each token FNV-hashes into one of 64 buckets, so
+/// cosine similarity reflects vocabulary overlap. Deterministic, no RNG.
+fn mock_vector(text: &str) -> Vec<f32> {
+    const DIMS: u64 = 64;
+    let mut vector = vec![0.0f32; DIMS as usize];
+    for token in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in token.to_ascii_lowercase().bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        vector[(hash % DIMS) as usize] += 1.0;
+    }
+    vector
+}
+
+/// Mirror of `SemanticGc::prime_cache` (interpreter pre-pass): cache a vector
+/// for every window message, keyed exactly as the runtime keys them.
+fn prime_semantic_cache(window: &[ChatMessage], state: &mut GcState) {
+    for message in window {
+        let text = message_embedding_text(message);
+        state
+            .embeddings
+            .entry(content_hash(&text))
+            .or_insert_with(|| mock_vector(&text));
+    }
+}
 
 /// When GC runs over the simulated session (see module docs). `Final`
 /// approximates catch-overflow's first cycle; the rest mirror `--gc-timing`.
@@ -209,6 +260,136 @@ fn gc_challengers_improve_over_ring_on_tool_chains() -> Result<()> {
                 challenger.messages_after,
                 challenger.tool_results_after
             );
+        }
+    }
+    Ok(())
+}
+
+/// How a strategy handled the tangent fixture: what fraction of the tangent
+/// it dropped, and what fraction of the relevant (non-system, non-tangent)
+/// messages it retained. "Retained" counts a message as surviving even if
+/// rewritten in place (stack's frame annotations keep the stable id) —
+/// generous to stack, so the comparison is honest.
+#[derive(Debug, Clone, Copy)]
+struct TangentMetrics {
+    tangent_dropped: f64,
+    relevant_retained: f64,
+}
+
+fn tangent_metrics(
+    original: &[ChatMessage],
+    collected: &[ChatMessage],
+    tangent: &[usize],
+) -> TangentMetrics {
+    let survived = |index: &usize| {
+        collected
+            .iter()
+            .any(|message| message.id == original[*index].id)
+    };
+    let tangent_kept = tangent.iter().filter(|index| survived(index)).count();
+    let relevant: Vec<usize> = (0..original.len())
+        .filter(|index| !tangent.contains(index) && original[*index].role != "system")
+        .collect();
+    let relevant_kept = relevant.iter().filter(|index| survived(index)).count();
+    TangentMetrics {
+        tangent_dropped: 1.0 - (tangent_kept as f64) / (tangent.len() as f64),
+        relevant_retained: (relevant_kept as f64) / (relevant.len() as f64),
+    }
+}
+
+/// The t-1350 promotion bar, half one: on the conversational-dead-end
+/// fixture, semantic must drop more of the abandoned tangent than stack
+/// while retaining at least as much of the relevant thread. Stack pops
+/// frames oldest-first, so under pressure it evicts the EARLY on-topic
+/// work and keeps the newer tangent; semantic scores the tangent as
+/// distant from the recent thread and drops it first.
+#[test]
+fn gc_semantic_drops_the_tangent_and_keeps_the_relevant_thread() -> Result<()> {
+    let (prompt, tangent) = tangent_abandoned_case();
+    for preserve in [true, false] {
+        let budget = ((estimate_tokens(&prompt) as f64) * GATE_PRESSURE).floor() as usize;
+        let mut per_strategy = Vec::new();
+        for strategy in &STRATEGIES {
+            let gc = strategy.build(preserve);
+            let run = run_timed(&prompt, budget, gc.as_ref(), Timing::Final);
+            let metrics = tangent_metrics(&prompt, &run.collected, &tangent);
+            println!(
+                "tangent_eval strategy={} cache={} tangent_dropped={:.2} relevant_retained={:.2}",
+                gc.name(),
+                if preserve { "preserve" } else { "ignore" },
+                metrics.tangent_dropped,
+                metrics.relevant_retained,
+            );
+            per_strategy.push((gc.name(), metrics));
+        }
+        let find = |name: &str| {
+            per_strategy
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, metrics)| *metrics)
+                .expect("strategy evaluated")
+        };
+        let semantic = find("semantic");
+        let stack = find("stack");
+        assert!(
+            semantic.tangent_dropped > stack.tangent_dropped,
+            "semantic must drop more of the tangent than stack (preserve={preserve}): \
+             semantic={:.2}, stack={:.2}",
+            semantic.tangent_dropped,
+            stack.tangent_dropped
+        );
+        assert!(
+            semantic.relevant_retained >= stack.relevant_retained,
+            "semantic must retain at least as much of the relevant thread as stack \
+             (preserve={preserve}): semantic={:.2}, stack={:.2}",
+            semantic.relevant_retained,
+            stack.relevant_retained
+        );
+        assert!(
+            semantic.tangent_dropped >= 0.75,
+            "semantic should evict most of the tangent (preserve={preserve}): {:.2}",
+            semantic.tangent_dropped
+        );
+    }
+    Ok(())
+}
+
+/// The t-1350 promotion bar, half two: winning on tangents must not cost
+/// the existing fixture classes. Replay-completion proxy: wherever stack
+/// retains the last user message (the statement of the current task),
+/// semantic must too — at every pressure, on every case, under both cache
+/// policies. Convergence and determinism are asserted inside evaluate()
+/// for every cell.
+#[test]
+fn gc_semantic_no_regression_vs_stack_on_replay_completion() -> Result<()> {
+    for case in &all_cases()? {
+        for pressure in PRESSURES {
+            for preserve in [true, false] {
+                let stack = evaluate(
+                    case,
+                    pressure,
+                    Timing::Final,
+                    &Strategy::Stack,
+                    preserve,
+                    None,
+                )?;
+                let semantic = evaluate(
+                    case,
+                    pressure,
+                    Timing::Final,
+                    &Strategy::Semantic,
+                    preserve,
+                    None,
+                )?;
+                if stack.last_user_retained {
+                    assert!(
+                        semantic.last_user_retained,
+                        "semantic dropped the last user message where stack kept it: \
+                         case={} pressure={pressure} preserve={preserve}",
+                        case.name
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -340,6 +521,11 @@ fn run_timed(
     if timing == Timing::Final {
         let mut window = prompt.to_vec();
         truncate_oversized_message(&mut window, budget);
+        // Semantic pre-pass mirror (after truncation: the cache keys on
+        // content, exactly as interpreter::collect_prompt orders it).
+        if gc.name() == "semantic" {
+            prime_semantic_cache(&window, &mut state);
+        }
         run.collected = gc.collect(window, budget, &mut state);
         run.collections = 1;
         run.invalidations = usize::from(state.prefix_invalidated);
@@ -386,6 +572,9 @@ fn infer_point(
         return;
     }
     truncate_oversized_message(window, budget);
+    if gc.name() == "semantic" {
+        prime_semantic_cache(window, state);
+    }
     *window = gc.collect(std::mem::take(window), budget, state);
     run.collections += 1;
     run.invalidations += usize::from(state.prefix_invalidated);
@@ -529,7 +718,170 @@ fn synthetic_cases() -> Vec<TraceCase> {
             prompt: tool_heavy_long_prompt(),
             tool_chain: true,
         },
+        TraceCase {
+            name: "synthetic:tangent-abandoned".into(),
+            prompt: tangent_abandoned_case().0,
+            tool_chain: true,
+        },
     ]
+}
+
+/// Vocabulary pools for the tangent fixture: the mock embedder scores by
+/// token overlap, so distinct pools = semantically distant, exactly like
+/// distinct topics under a real embedding model.
+const PLANNER_WORDS: [&str; 12] = [
+    "planner",
+    "join",
+    "index",
+    "statistics",
+    "selectivity",
+    "postgres",
+    "analyze",
+    "btree",
+    "rows",
+    "estimate",
+    "scan",
+    "vacuum",
+];
+
+const CACHE_WORDS: [&str; 12] = [
+    "redis",
+    "cache",
+    "invalidation",
+    "websocket",
+    "dashboard",
+    "frontend",
+    "javascript",
+    "payload",
+    "subscription",
+    "broker",
+    "eviction",
+    "socket",
+];
+
+/// Deterministic topical filler: repeatable pseudo-prose drawn from one
+/// vocabulary pool, no RNG (the topic-specific sibling of `lorem`).
+fn topical_filler(words: &[&str], seed: usize, chars: usize) -> String {
+    let mut out = String::new();
+    let mut cursor = seed;
+    while out.len() < chars {
+        out.push_str(words[cursor % words.len()]);
+        out.push(' ');
+        cursor = cursor.wrapping_mul(31).wrapping_add(7);
+    }
+    out.truncate(chars);
+    out
+}
+
+/// One completed frame on a given topic vocabulary.
+fn push_topical_frame(
+    prompt: &mut Vec<ChatMessage>,
+    words: &[&str],
+    call_id: &str,
+    command: &str,
+    narration: &str,
+    seed: usize,
+    result_chars: usize,
+) {
+    prompt.push(ChatMessage::assistant(
+        Some(narration.into()),
+        vec![ToolCall::new(
+            call_id,
+            "shell",
+            serde_json::json!({ "command": command }),
+        )],
+    ));
+    prompt.push(ChatMessage::tool(
+        call_id.to_string(),
+        topical_filler(words, seed, result_chars),
+    ));
+}
+
+/// The conversational-dead-end fixture class (t-1350): a session explores a
+/// wrong approach for several turns (rewriting the reporting layer around a
+/// cache service), abandons it, and continues correctly on the original
+/// problem (the query planner). The tangent sits in the MIDDLE of the
+/// window — newer than the early on-topic work — so position-based
+/// strategies (ring's front-drop, stack's oldest-frame-first) evict the
+/// wrong messages first, while the tangent is semantically distant from the
+/// recent thread. Returns the prompt and the indices of the tangent
+/// messages.
+fn tangent_abandoned_case() -> (Vec<ChatMessage>, Vec<usize>) {
+    let mut prompt = vec![
+        ChatMessage::system("You are a database engineering agent."),
+        ChatMessage::user(
+            "The orders report query is slow: the planner picks a bad join order. Fix the query plan.",
+        ),
+    ];
+    // On-topic exploration: plans, statistics, index selectivity.
+    for step in 0..4 {
+        push_topical_frame(
+            &mut prompt,
+            &PLANNER_WORDS,
+            &format!("call-plan-{step}"),
+            &format!("psql -c 'EXPLAIN ANALYZE SELECT ...' # step {step}"),
+            &format!("Inspecting the query plan: join order and index selectivity, step {step}."),
+            step,
+            500,
+        );
+    }
+
+    // The tangent: rewrite the dashboard around a cache service instead.
+    let tangent_start = prompt.len();
+    prompt.push(ChatMessage::assistant(
+        Some(
+            "Different idea: skip the planner entirely and build a redis cache service \
+             with websocket push to the dashboard frontend."
+                .into(),
+        ),
+        vec![],
+    ));
+    for step in 0..3 {
+        push_topical_frame(
+            &mut prompt,
+            &CACHE_WORDS,
+            &format!("call-cache-{step}"),
+            &format!("redis-cli --scan # cache layer step {step}"),
+            &format!(
+                "Sketching the cache invalidation and websocket subscription flow, step {step}."
+            ),
+            step + 40,
+            800,
+        );
+    }
+    prompt.push(ChatMessage::assistant(
+        Some("Cache service and dashboard websocket push sketched out.".into()),
+        vec![],
+    ));
+    let tangent: Vec<usize> = (tangent_start..prompt.len()).collect();
+
+    // Abandonment + correct continuation.
+    prompt.push(ChatMessage::user(
+        "Stop — the cache rewrite is out of scope. Go back to fixing the query planner.",
+    ));
+    for step in 0..3 {
+        push_topical_frame(
+            &mut prompt,
+            &PLANNER_WORDS,
+            &format!("call-fix-{step}"),
+            &format!("psql -c 'ALTER TABLE orders ...; ANALYZE orders' # fix step {step}"),
+            &format!("Raising the statistics target and adding the composite index, step {step}."),
+            step + 80,
+            500,
+        );
+    }
+    prompt.push(ChatMessage::assistant(
+        Some(
+            "Composite index created and statistics refreshed: the planner now picks the \
+             index scan and the query runs in 40ms."
+                .into(),
+        ),
+        vec![],
+    ));
+    prompt.push(ChatMessage::user(
+        "Great — verify the weekly report query also uses the new index.",
+    ));
+    (prompt, tangent)
 }
 
 /// Pure conversation, no tool structure: mark-sweep has nothing to evict and

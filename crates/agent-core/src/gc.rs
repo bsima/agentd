@@ -559,12 +559,24 @@ impl ContextGc for SemanticGc {
             );
             // Phase 2: any candidate, most distant first.
             sweep_semantic(&messages, &mut keep, budget, &protected, &scores, None);
-            // Phase 3 (degrade): the protected set alone exceeds the
-            // budget. Relax the recency floor and the prefix pin —
-            // overflowing the model is worse than a cache miss (same
-            // stance as ring's front-drop fallback; the invalidation is
-            // reported via prefix_invalidated) — but the system message
-            // and the last user message stay hard-protected.
+            // Phase 3 (degrade, floor first): the protected set alone
+            // exceeds the budget. Relax the recency floor but keep the
+            // prefix pin — the floor is a heuristic guard while preserve
+            // mode's stable prefix is a billing contract (the
+            // gc_cache_preserve gate holds every strategy to it) — with
+            // system + last user still hard-protected.
+            if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+                let mut floor_relaxed = semantic_hard_protected_mask(&messages);
+                for slot in floor_relaxed.iter_mut().take(boundary) {
+                    *slot = true;
+                }
+                sweep_semantic(&messages, &mut keep, budget, &floor_relaxed, &scores, None);
+            }
+            // Phase 4 (degrade, prefix last): even the pinned prefix plus
+            // system + last user exceed the budget. Overflowing the model
+            // is worse than a cache miss (ring's front-drop stance; the
+            // invalidation is reported via prefix_invalidated); system and
+            // the last user message are never dropped.
             if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
                 let hard = semantic_hard_protected_mask(&messages);
                 sweep_semantic(&messages, &mut keep, budget, &hard, &scores, None);
