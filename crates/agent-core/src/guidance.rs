@@ -106,11 +106,17 @@ call `infer` with `context_refs` naming that shell call's id and ask for \
 the distilled answer. You can issue the fetch and the delegation in the \
 same turn.";
 
-/// §2.2 store/retrieve discipline block. Delivered only when the memory
-/// tools are in the call's tool offer. The drafted "retained
-/// preferentially" sentence is intentionally absent until a GC strategy
-/// consumes `recall_hot` (t-1167) — guidance must never claim retention
-/// the active strategy does not implement.
+/// §2.2 store/retrieve discipline block — **DRAFT, not shipped** (demoted
+/// t-1368). Shipped default-on with t-1359; the t-1364 A/B failed the
+/// promotion gate's "target behavior moved" requirement: zero proactive
+/// saves (rem=0, prem=0, rec=0) in all 12 guided cells outside the
+/// scripted memory fixture, and no improvement on the memory fixture
+/// itself. The remember/recall TOOL descriptions (step 1) remain shipped;
+/// it is this fragment block that failed. The constant stays as the draft
+/// text (docs/GUIDANCE.md §2.2) pending a rework + re-record. The drafted
+/// "retained preferentially" sentence is additionally absent until a GC
+/// strategy consumes `recall_hot` (t-1167) — guidance must never claim
+/// retention the active strategy does not implement.
 pub const MEMORY_BLOCK: &str = "\
 You have persistent memory via `remember` and `recall`.
 
@@ -172,6 +178,120 @@ pending action.
 If an action is denied, you will see a denial result. Respect it: do not \
 re-attempt that action or an equivalent of it. Pursue an alternative, or \
 report clearly what you could not do and why.";
+
+// --- budget-aware delivery (t-1368) ----------------------------------------
+//
+// t-1364's load-bearing caveat: at 1600-2000-token context budgets the
+// ~700-token fragment was 33-44% of the WHOLE budget — eviction-protected
+// meta-text crowding out the task, a priority inversion. It fattened the
+// system message, tripped the GC threshold on turn 1-2, and (before
+// t-1367) evicted the live task; the strategies that kept the task
+// thrashed instead (16-26 collections/cell). Delivery is therefore gated
+// on headroom: the full fragment only when it costs at most
+// [`FULL_FRAGMENT_BUDGET_SHARE`] of `context_budget`, the minimal variant
+// (the do-not-guess + remember-distilled core) up to
+// [`MINIMAL_FRAGMENT_BUDGET_SHARE`], and nothing above that — a budget
+// that small has no room for operations prose; the task must win. Real
+// deployments (100k+ windows, fragment <1%) always get the full fragment.
+
+/// Full-fragment ceiling: 5% of the context budget. At the shipped
+/// fragment's ~700 tokens this delivers full guidance on budgets >=
+/// ~14k tokens — an order of magnitude above the t-1364 failure regime,
+/// an order of magnitude below real deployment windows.
+pub const FULL_FRAGMENT_BUDGET_SHARE: f32 = 0.05;
+
+/// Minimal-variant ceiling: 15% of the context budget. Between the two
+/// thresholds the fragment is replaced by the 2-4 sentence core; above
+/// it nothing ships.
+pub const MINIMAL_FRAGMENT_BUDGET_SHARE: f32 = 0.15;
+
+/// Minimal-variant GC core (§2.4 distilled; ships when a GC strategy is
+/// active and the full fragment does not fit the budget).
+pub const MINIMAL_GC_CORE: &str = "\
+Your context window is managed: old tool results are collapsed or dropped \
+under pressure. Extract what matters from a result when you see it; if a \
+result you need is gone, re-run the command — do not guess at what it \
+contained.";
+
+/// Minimal-variant memory core (ships when the memory tools are offered
+/// and the full fragment does not fit the budget). One sentence — this is
+/// NOT the demoted §2.2 block; it is the remember-distilled core the
+/// t-1368 minimal variant carries, unvalidated pending its own A/B.
+pub const MINIMAL_MEMORY_CORE: &str = "\
+Save load-bearing values with `remember` as you produce them — the \
+distilled fact, not raw output — and `recall` them instead of re-running \
+commands or guessing.";
+
+/// Which guidance rendering one Infer call's budget allows. Trace-visible:
+/// the delivered section's content hash differs per variant, and the
+/// variant name rides the `prompt_ir` event (`guidance_variant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidanceVariant {
+    /// The whole capability-keyed fragment.
+    Full,
+    /// The 2-4 sentence do-not-guess + remember-distilled core.
+    Minimal,
+    /// Nothing: the budget is too small for meta-text.
+    Suppressed,
+}
+
+impl GuidanceVariant {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+            Self::Suppressed => "suppressed",
+        }
+    }
+}
+
+/// Pick the variant for one call: the FULL fragment's estimated tokens
+/// against the run's context budget (the same conservative estimator GC
+/// budgets use).
+pub fn variant_for_budget(full_fragment_tokens: usize, context_budget: usize) -> GuidanceVariant {
+    let share = |ratio: f32| ((context_budget as f32) * ratio) as usize;
+    if full_fragment_tokens <= share(FULL_FRAGMENT_BUDGET_SHARE) {
+        GuidanceVariant::Full
+    } else if full_fragment_tokens <= share(MINIMAL_FRAGMENT_BUDGET_SHARE) {
+        GuidanceVariant::Minimal
+    } else {
+        GuidanceVariant::Suppressed
+    }
+}
+
+/// The minimal variant's text for one call's capabilities: GC core and/or
+/// memory core. Empty when neither applies (no GC, no memory tools) —
+/// the caller ships nothing rather than padding.
+pub fn minimal_runtime_guidance_fragment(caps: &GuidanceCapabilities) -> String {
+    let mut blocks: Vec<&str> = Vec::new();
+    if caps.gc {
+        blocks.push(MINIMAL_GC_CORE);
+    }
+    if caps.memory {
+        blocks.push(MINIMAL_MEMORY_CORE);
+    }
+    blocks.join("\n\n")
+}
+
+/// Assemble the fragment a call's budget allows: the full capability-keyed
+/// fragment, the minimal core, or `None` (suppressed, or the selected
+/// variant renders empty for these capabilities).
+pub fn budgeted_runtime_guidance_fragment(
+    caps: &GuidanceCapabilities,
+    context_budget: usize,
+) -> Option<(String, GuidanceVariant)> {
+    let full = runtime_guidance_fragment(caps);
+    let variant = variant_for_budget(crate::gc::estimate_text_tokens(&full), context_budget);
+    let fragment = match variant {
+        GuidanceVariant::Full => full,
+        GuidanceVariant::Minimal => minimal_runtime_guidance_fragment(caps),
+        GuidanceVariant::Suppressed => return None,
+    };
+    if fragment.is_empty() {
+        return None;
+    }
+    Some((fragment, variant))
+}
 
 /// §2.5 cost-awareness block. Unconditional within the fragment (no
 /// capability gate); the fragment itself is delivered only on tool-bearing
@@ -263,9 +383,11 @@ pub fn runtime_guidance_fragment(caps: &GuidanceCapabilities) -> String {
         }
         blocks.push(block);
     }
-    if caps.memory {
-        blocks.push(MEMORY_BLOCK.into());
-    }
+    // The §2.2 memory-discipline block is deliberately absent: demoted to
+    // draft by t-1368 after its t-1364 A/B moved nothing (see MEMORY_BLOCK).
+    // The §2.4 GC block below keeps its memory-keyed variant — that block's
+    // remember/recall cross-references are recovery instructions, not the
+    // failed save-discipline prose.
     if caps.gc {
         let mut block = if caps.memory {
             GC_BLOCK_WITH_MEMORY.to_string()
@@ -365,11 +487,16 @@ mod tests {
         assert!(!infer.contains("human approval"));
         assert!(infer.contains(COST_BLOCK));
 
+        // The §2.2 memory-discipline block is demoted to draft (t-1368):
+        // memory capability alone adds NOTHING to the full fragment (the
+        // tool descriptions carry the discipline; the block failed its
+        // t-1364 A/B).
         let memory = runtime_guidance_fragment(&GuidanceCapabilities {
             memory: true,
             ..Default::default()
         });
-        assert!(memory.contains(MEMORY_BLOCK));
+        assert!(!memory.contains(MEMORY_BLOCK));
+        assert_eq!(memory, COST_BLOCK);
         assert!(!memory.contains(DELEGATION_BLOCK));
 
         let approvals = runtime_guidance_fragment(&GuidanceCapabilities {
@@ -430,11 +557,114 @@ mod tests {
     }
 
     /// The §2.2 "retained preferentially" claim ships only when a GC
-    /// strategy consumes `recall_hot` (t-1167) — until then the memory
-    /// block must not promise preferential retention.
+    /// strategy consumes `recall_hot` (t-1167) — until then neither the
+    /// draft memory block nor the shipped minimal core may promise
+    /// preferential retention.
     #[test]
     fn memory_block_does_not_promise_preferential_retention_yet() {
         assert!(!MEMORY_BLOCK.contains("retained preferentially"));
+        assert!(!MINIMAL_MEMORY_CORE.contains("retained preferentially"));
+    }
+
+    // --- budget-aware delivery (t-1368) -----------------------------------
+
+    /// Variant selection at the three budget regimes, measured against the
+    /// real shipped fragment size: a t-1364-sized budget (2k) suppresses,
+    /// a mid budget delivers the minimal core, a deployment-sized budget
+    /// delivers the full fragment.
+    #[test]
+    fn variant_tracks_budget_headroom() {
+        let caps = GuidanceCapabilities {
+            infer: true,
+            memory: true,
+            gc: true,
+            ..Default::default()
+        };
+        let full_tokens = crate::gc::estimate_text_tokens(&runtime_guidance_fragment(&caps));
+        assert_eq!(
+            variant_for_budget(full_tokens, 2_000),
+            GuidanceVariant::Suppressed,
+            "the t-1364 failure regime must suppress the fragment \
+             (fragment = {full_tokens} tokens)"
+        );
+        assert_eq!(
+            variant_for_budget(full_tokens, 8_000),
+            GuidanceVariant::Minimal
+        );
+        assert_eq!(
+            variant_for_budget(full_tokens, 200_000),
+            GuidanceVariant::Full,
+            "deployment-sized budgets always get the full fragment"
+        );
+
+        // The boundaries are shares of the budget, exact at the estimator.
+        assert_eq!(variant_for_budget(100, 2_000), GuidanceVariant::Full);
+        assert_eq!(variant_for_budget(101, 2_000), GuidanceVariant::Minimal);
+        assert_eq!(variant_for_budget(300, 2_000), GuidanceVariant::Minimal);
+        assert_eq!(variant_for_budget(301, 2_000), GuidanceVariant::Suppressed);
+    }
+
+    /// The minimal variant is capability-keyed like the full fragment: GC
+    /// core under GC, memory core when the tools are offered, empty (=
+    /// nothing delivered) when neither applies.
+    #[test]
+    fn minimal_fragment_is_capability_keyed() {
+        let both = minimal_runtime_guidance_fragment(&GuidanceCapabilities {
+            gc: true,
+            memory: true,
+            ..Default::default()
+        });
+        assert!(both.contains(MINIMAL_GC_CORE));
+        assert!(both.contains(MINIMAL_MEMORY_CORE));
+
+        let gc_only = minimal_runtime_guidance_fragment(&GuidanceCapabilities {
+            gc: true,
+            ..Default::default()
+        });
+        assert!(gc_only.contains(MINIMAL_GC_CORE));
+        assert!(!gc_only.contains("`remember`"));
+
+        let neither = minimal_runtime_guidance_fragment(&GuidanceCapabilities::default());
+        assert!(neither.is_empty());
+        // A budget in the minimal regime for the cost-block-only fragment
+        // (~120 tokens: 5% < 120/1000 <= 15%): the minimal variant renders
+        // empty for these capabilities, so nothing is delivered.
+        assert_eq!(
+            variant_for_budget(
+                crate::gc::estimate_text_tokens(&runtime_guidance_fragment(
+                    &GuidanceCapabilities::default()
+                )),
+                1_000
+            ),
+            GuidanceVariant::Minimal
+        );
+        assert_eq!(
+            budgeted_runtime_guidance_fragment(&GuidanceCapabilities::default(), 1_000),
+            None,
+            "an empty minimal variant delivers nothing, not padding"
+        );
+    }
+
+    /// Which variant was delivered is trace-visible through the section
+    /// content hash alone: full and minimal hash differently on the same
+    /// capabilities.
+    #[test]
+    fn variant_changes_the_section_hash() {
+        let caps = GuidanceCapabilities {
+            infer: true,
+            memory: true,
+            gc: true,
+            ..Default::default()
+        };
+        let (full, full_variant) = budgeted_runtime_guidance_fragment(&caps, 200_000).unwrap();
+        let (minimal, minimal_variant) = budgeted_runtime_guidance_fragment(&caps, 8_000).unwrap();
+        assert_eq!(full_variant, GuidanceVariant::Full);
+        assert_eq!(minimal_variant, GuidanceVariant::Minimal);
+        assert_ne!(
+            runtime_guidance_section(full).hash,
+            runtime_guidance_section(minimal).hash
+        );
+        assert_eq!(budgeted_runtime_guidance_fragment(&caps, 2_000), None);
     }
 
     /// The interim delegate catalog (§2.1, pending t-1345): rendered only

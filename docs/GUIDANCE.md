@@ -157,7 +157,8 @@ an *intra-session* intermediate, which is precisely what GC destroys.
 Symptoms to score for: re-running commands whose output was evicted;
 final answers contradicting evicted intermediates.
 
-**Drafted guidance** (ships when a memory backend is registered):
+**Drafted guidance** (**DRAFT — demoted from the shipped fragment,
+t-1368; see the status note below**):
 
 > You have persistent memory via `remember` and `recall`.
 >
@@ -177,6 +178,23 @@ retained preferentially." That sentence ships only when a GC strategy
 actually consumes `recall_hot` — t-1167, the first mechanism gap below —
 per the strategy-honesty rule of §2.4: guidance must never claim retention
 the active strategy does not implement.)
+
+**Status: demoted to draft (t-1368) — the A/B failed.** The block shipped
+default-on with t-1359 (ahead of its A/B, per the §5 note) and the t-1364
+guided-vs-strategy run measured it: **zero behavior movement**. rem=0,
+prem=0 (proactive saves before the first collection), rec=0 in every one
+of the 12 guided cells outside the scripted memory fixture — no proactive
+saves, no recall-instead-of-refetch, identical to unguided and to t-1349;
+on `memory-discipline` itself the guided cells did the scripted
+remember/recall no better than unguided (and lost the WARN count or the
+task). That fails promotion-gate condition (a) — the target behavior did
+not move — so the block is out of the shipped fragment
+(`guidance.rs::runtime_guidance_fragment` no longer assembles it). What
+remains shipped from §2.2: the `remember`/`recall` TOOL descriptions
+(step 1, uncontroversial), the §2.4 GC block's recall-as-recovery
+cross-references, and a one-sentence remember-distilled core inside the
+t-1368 minimal fragment variant (see §4) — that core is new, minimal-only,
+and unvalidated pending its own A/B; it is not this block.
 
 **Validation.** New behavioral eval (t-1354 methodology): long-horizon
 fixtures where a fact computed early is needed after GC has run (`--gc
@@ -407,9 +425,9 @@ needles.
 | pattern | one-line guidance | validation status |
 |---|---|---|
 | Delegation | Delegate generation-heavy/bulky-digest subtasks via `infer` + `context_refs`; never direct questions; costs latency | **Validated with shipped text** (t-1354: 2.26x; t-1359 re-record: 1.41x, zero over-delegation, replay asserted) |
-| Store/Retrieve discipline | Save distilled load-bearing intermediates via `remember` as produced; `recall` instead of re-deriving | Not yet evaluated; new behavioral eval specified above |
+| Store/Retrieve discipline | Save distilled load-bearing intermediates via `remember` as produced; `recall` instead of re-deriving | **A/B failed — demoted to draft** (t-1364: zero movement in 12 guided cells; t-1368). Tool descriptions remain shipped |
 | Eval→Infer chaining | Digest bulky command output by reference (`context_refs`), never by re-reading into your own tokens | Mechanics validated (t-1342, 1.6x); behavioral arm pending |
-| GC awareness | Context is a managed window; extract-or-`remember` on sight; `[frame: ...]` = body gone | Not yet evaluated; arms belong to the GC behavioral eval |
+| GC awareness | Context is a managed window; extract-or-`remember` on sight; `[frame: ...]` = body gone | Evaluated at extreme pressure only (t-1364: did not stop confabulation there); still shipped, full-variant only, budget-gated per §4 |
 | Cost awareness | Fewest steps; cheapest correct path; batch independent tool calls in one turn | Partially evidenced (t-1354 restraint generalization); explicit A/B pending |
 | Approval awareness | Gated effects pause durably; denial is an answer, not an error — never re-attempt | Not yet evaluated; offline-scriptable via SDK `on_approval` |
 
@@ -704,27 +722,64 @@ proves which guidance version the model saw. Opt-out is
 `.runtime_guidance(false)` (SDK builder, honored by both in-process runs
 and spawned sessions).
 
-Delivery keying (the §2 conditionality invariant, plus one delivery-level
-gate):
+Delivery keying (the §2 conditionality invariant, plus two delivery-level
+gates):
 
 | block | renders when |
 |---|---|
-| fragment as a whole | guidance enabled AND the call offers ≥1 tool (a bare sub-infer child is not operating the runtime) |
+| fragment as a whole | guidance enabled AND the call offers ≥1 tool (a bare sub-infer child is not operating the runtime) AND the budget gate below allows it |
 | delegation (§2.1 + §2.3 bullet) | `infer` in the call's tool offer |
 | delegate-catalog line (§2.1, interim pending t-1345) | delegation block on AND the deployment supplied `RuntimeGuidance.delegate_models` (the runtime cannot yet promise which ids the run's provider resolves, so the CLI default is empty) |
-| memory discipline (§2.2, minus the t-1167 retention sentence) | `remember`/`recall` in the call's tool offer |
+| memory discipline (§2.2) | **never — demoted to draft (t-1368)** after its t-1364 A/B moved nothing; the remember/recall tool descriptions remain shipped |
 | GC awareness (§2.4; with/without-memory variant) | a GC strategy is active |
 | cited-keep line (§2.4) | strategy is `semantic` with `cited-keep` on — strategy-honest per gap 6 |
 | approval awareness (§2.6) | any effect in the run's config is gated (an Eval site with `require_approval`, or a sink whose writes require approval) |
 | cost awareness (§2.5) | unconditional within a delivered fragment |
+
+**Budget gate (t-1368).** t-1364's load-bearing caveat became a mechanism:
+at 1600-2000-token context budgets the ~700-token fragment was 33-44% of
+the whole budget — eviction-protected meta-text crowding out the task (a
+priority inversion; it fattened the system message, tripped the GC
+threshold by turn 1-2, and either evicted the live task — pre-t-1367
+ring/stack — or induced a per-turn thrash loop). Delivery now compares the
+FULL fragment's estimated tokens (the conservative GC estimator) against
+`context_budget`:
+
+| regime | condition (`guidance.rs::variant_for_budget`) | delivered |
+|---|---|---|
+| full | fragment ≤ 5% of budget (`FULL_FRAGMENT_BUDGET_SHARE`) | the whole capability-keyed fragment |
+| minimal | fragment ≤ 15% of budget (`MINIMAL_FRAGMENT_BUDGET_SHARE`) | the 2-4 sentence core below |
+| suppressed | above 15% | nothing — no section, no `prompt_ir` event; the task must win |
+
+At the shipped fragment's size, full delivery starts around 14k-token
+budgets; deployment-sized windows (100k+) are always full; the t-1364
+failure regime (≤2k) is always suppressed. Which variant was delivered is
+trace-visible twice over: the section content hash differs per variant,
+and the `prompt_ir` event carries a `guidance_variant` attribute.
+
+The minimal variant, shipped text (constants `MINIMAL_GC_CORE` /
+`MINIMAL_MEMORY_CORE`, capability-keyed like the full fragment — GC core
+under an active strategy, memory core when the tools are offered, nothing
+when neither applies):
+
+> Your context window is managed: old tool results are collapsed or
+> dropped under pressure. Extract what matters from a result when you see
+> it; if a result you need is gone, re-run the command — do not guess at
+> what it contained.
+>
+> Save load-bearing values with `remember` as you produce them — the
+> distilled fact, not raw output — and `recall` them instead of re-running
+> commands or guessing.
 
 Prompt bytes never affect effect identity or replay (recorded Infer
 results match by effect id) — pinned by
 `replay_reproduces_results_regardless_of_guidance_setting`
 (ir_interpreter.rs). One recording-validity consequence: GC *behavioral*
 replays re-run the live token-sensitive collector, so `evals/gc/`
-recordings made without the fragment replay with guidance off until that
-harness records guidance arms of its own.
+recordings must replay under the guidance bytes they were recorded with —
+which is why the t-1368 delivery change invalidated the t-1364 guided
+recordings (their cells' budgets now suppress the fragment the recordings
+ran under; see evals/gc/README.md, t-1367 follow-up).
 
 ## 5. Eval plan
 
@@ -793,6 +848,17 @@ each block's wording stays frozen-with-recording, and the re-run filed as
 **t-1364 validates the shipped fragment immediately after this ships** —
 its recordings become the citations this section requires. Blocks whose
 A/Bs later fail the gate get demoted to the flag, not reworded in place.
+
+**t-1364 outcome (see evals/gc/README.md for the full table).** The gate
+discipline was applied: the §2.2 memory-discipline block **failed** (zero
+proactive saves in 12 guided cells) and was demoted back to draft
+(t-1368, see §2.2's status note); fragment delivery as a whole gained the
+§4 budget gate after the run showed that delivering ~700 tokens of
+operations prose into a ≤2k-token window converts guidance into GC
+pressure and destroys the task. The remaining shipped blocks
+(delegation, GC awareness, cost, approval) were only observed at that
+extreme-pressure regime, where they now no longer deliver; their
+steady-state A/Bs at realistic budgets remain open.
 
 ## 6. Comparative grounding: how mature harnesses do this
 

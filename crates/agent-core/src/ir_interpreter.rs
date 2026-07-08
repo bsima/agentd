@@ -2074,6 +2074,15 @@ async fn goto_block(
 /// no fragment. Within a delivered fragment each block is keyed to its
 /// capability; the §2.5 cost block is unconditional.
 ///
+/// Budget-aware delivery (t-1368): the fragment is additionally gated on
+/// context-budget headroom — full fragment, the 2-4 sentence minimal
+/// core, or nothing, per `guidance::variant_for_budget` (t-1364 showed a
+/// ~700-token eviction-protected fragment at 33-44% of a small budget is
+/// a priority inversion that destroys the task). Which variant was
+/// delivered is trace-visible: the section content hash differs per
+/// variant, and the `prompt_ir` event carries `guidance_variant`; a
+/// suppressed fragment emits no section and no event, same as opt-out.
+///
 /// Prompt bytes never affect effect identity or replay (recorded Infer
 /// results are matched by effect id), so guidance can be tuned, toggled,
 /// or re-keyed without breaking replay of old traces — pinned by
@@ -2098,15 +2107,21 @@ async fn apply_runtime_guidance(
         approvals: run_has_gated_effects(config, program),
         delegate_models: config.guidance.delegate_models.clone(),
     };
-    let fragment = crate::guidance::runtime_guidance_fragment(&caps);
+    let Some((fragment, variant)) =
+        crate::guidance::budgeted_runtime_guidance_fragment(&caps, config.context_budget)
+    else {
+        return Ok(prompt);
+    };
     let section = crate::guidance::runtime_guidance_section(fragment);
     let prompt_ir = PromptIR::new(prompt, vec![section])?;
+    let mut data = serde_json::to_value(prompt_ir.trace(config.trace_full_prompt_ir))?;
+    data["guidance_variant"] = variant.name().into();
     config
         .trace
         .emit(&Event::Custom {
             run_id: config.trace.run_id().into(),
             name: "prompt_ir".into(),
-            data: serde_json::to_value(prompt_ir.trace(config.trace_full_prompt_ir))?,
+            data,
             timestamp: Utc::now(),
         })
         .await?;
@@ -3426,10 +3441,70 @@ mod tests {
 
         let prompts = provider.prompts();
         let system = prompts[0][0].content.as_deref().unwrap_or_default();
-        assert!(system.contains(crate::guidance::MEMORY_BLOCK));
+        // The §2.2 memory-discipline block is demoted to draft (t-1368,
+        // failed its t-1364 A/B): memory capability no longer adds it. The
+        // §2.4 GC block keeps its memory-keyed variant.
+        assert!(!system.contains(crate::guidance::MEMORY_BLOCK));
         assert!(system.contains(crate::guidance::GC_BLOCK_WITH_MEMORY));
         assert!(system.contains(crate::guidance::GC_CITED_KEEP_LINE));
         assert!(system.contains(crate::guidance::APPROVAL_BLOCK));
+        Ok(())
+    }
+
+    /// Budget-aware delivery end to end (t-1368): the same config at the
+    /// three budget regimes ships the full fragment, the minimal core
+    /// (with `guidance_variant` on the prompt_ir event), or nothing (no
+    /// section, no event — the t-1364 failure regime).
+    #[tokio::test]
+    async fn runtime_guidance_variant_tracks_budget_headroom() -> Result<()> {
+        async fn run_at(budget: usize) -> Result<(String, Vec<Event>)> {
+            let provider = Arc::new(MockProvider::new(vec![response("a"), response("b")]));
+            let trace = test_trace();
+            let trace_path = trace.path().clone();
+            let mut config = config_with_trace(provider.clone(), trace);
+            config.gc = GcMode::Stack(crate::gc::StackFrameGc {
+                preserve_prefix: true,
+            });
+            config.context_budget = budget;
+            run_ir_sequential(&config, guidance_probe_machine()).await?;
+            let system = provider.prompts()[0][0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            Ok((system, TraceLogger::read_events(&trace_path).await?))
+        }
+        let variant_attr = |events: &[Event]| -> Option<String> {
+            events.iter().find_map(|event| match event {
+                Event::Custom { name, data, .. } if name == "prompt_ir" => {
+                    data["guidance_variant"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+        };
+
+        // Deployment-sized budget: the full fragment.
+        let (system, events) = run_at(200_000).await?;
+        assert!(system.contains(crate::guidance::DELEGATION_BLOCK));
+        assert!(system.contains(crate::guidance::GC_BLOCK_WITHOUT_MEMORY));
+        assert_eq!(variant_attr(&events).as_deref(), Some("full"));
+
+        // Mid budget: the minimal core replaces the fragment.
+        let (system, events) = run_at(8_000).await?;
+        assert!(system.contains(crate::guidance::MINIMAL_GC_CORE));
+        assert!(!system.contains(crate::guidance::DELEGATION_BLOCK));
+        assert!(!system.contains(crate::guidance::COST_BLOCK));
+        assert_eq!(variant_attr(&events).as_deref(), Some("minimal"));
+
+        // The t-1364 failure regime: nothing — no section, no event.
+        let (system, events) = run_at(2_000).await?;
+        assert!(!system.contains("runtime-guidance"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Custom { name, .. } if name == "prompt_ir")),
+            "a suppressed fragment must emit no prompt_ir event"
+        );
         Ok(())
     }
 
