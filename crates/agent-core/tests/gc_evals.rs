@@ -34,7 +34,7 @@
 //! ONLINE-GATED behind `RUN_AGENT_ONLINE_EVAL=1` with recorded-judge replay
 //! by default — see the judge section at the bottom of this file.
 
-use agent_core::gc::{message_embedding_text, SemanticGc};
+use agent_core::gc::{message_embedding_text, CitationGraph, SemanticGc};
 use agent_core::{
     content_hash, estimate_tokens, truncate_oversized_message, ChatMessage, ChatProvider,
     ContextGc, GcState, MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc, StackFrameGc,
@@ -395,6 +395,128 @@ fn gc_semantic_no_regression_vs_stack_on_replay_completion() -> Result<()> {
     Ok(())
 }
 
+/// The t-1351 matrix row (docs/GC.md "Citation signals", the cited+distant
+/// cell of the 2x2): on the cited-distant fixture, SemanticGc WITHOUT
+/// citations drops the old, semantically distant, explicitly cited tool
+/// result — that deficiency is pinned here as the baseline — while
+/// SemanticGc with `cited-keep` (the default) retains it and pays with the
+/// uncited noise frames instead. Both must converge, under both cache
+/// policies.
+#[test]
+fn gc_semantic_cited_keep_retains_the_cited_distant_result() -> Result<()> {
+    let (prompt, cited, noise) = cited_distant_case();
+    // Fixture honesty: the frame that must survive is cited; the noise
+    // frames — same topic, same size, same age class — are not. The
+    // citation is the only distinguishing signal.
+    let citations = CitationGraph::extract(&prompt);
+    let cited_result = cited
+        .iter()
+        .copied()
+        .find(|index| prompt[*index].role == "tool")
+        .expect("the cited frame has a tool result");
+    assert!(
+        citations.is_cited(&prompt[cited_result].id),
+        "fixture honesty: the audit result must be cited"
+    );
+    for index in &noise {
+        assert!(
+            !citations.is_cited(&prompt[*index].id),
+            "fixture honesty: noise frame at {index} must be uncited"
+        );
+    }
+
+    for preserve in [true, false] {
+        let budget = ((estimate_tokens(&prompt) as f64) * GATE_PRESSURE).floor() as usize;
+        let survived = |collected: &[ChatMessage], index: usize| {
+            collected
+                .iter()
+                .any(|message| message.id == prompt[index].id)
+        };
+
+        let baseline = SemanticGc {
+            preserve_prefix: preserve,
+            cited_keep: false,
+            ..Default::default()
+        };
+        let baseline_run = run_timed(&prompt, budget, &baseline, Timing::Final);
+        let cited_keep = SemanticGc {
+            preserve_prefix: preserve,
+            ..Default::default()
+        };
+        let cited_run = run_timed(&prompt, budget, &cited_keep, Timing::Final);
+
+        let noise_retained = noise
+            .iter()
+            .filter(|index| survived(&cited_run.collected, **index))
+            .count();
+        println!(
+            "cited_eval cache={} budget={budget} \
+             baseline(no citations): cited_retained={} tokens={} | \
+             cited-keep: cited_retained={} noise_retained={}/{} tokens={}",
+            if preserve { "preserve" } else { "ignore" },
+            survived(&baseline_run.collected, cited_result),
+            estimate_tokens(&baseline_run.collected),
+            survived(&cited_run.collected, cited_result),
+            noise_retained,
+            noise.len(),
+            estimate_tokens(&cited_run.collected),
+        );
+
+        assert!(estimate_tokens(&baseline_run.collected) <= budget);
+        assert!(
+            estimate_tokens(&cited_run.collected) <= budget,
+            "cited-keep must still converge (preserve={preserve})"
+        );
+        // The baseline deficiency, pinned: pure similarity cannot tell the
+        // load-bearing frame from the noise around it.
+        assert!(
+            !survived(&baseline_run.collected, cited_result),
+            "semantic-without-citations must drop the cited-but-distant \
+             result (preserve={preserve}) — if this starts passing, the \
+             fixture no longer isolates the citation signal"
+        );
+        // The fix: the citation keeps it.
+        assert!(
+            survived(&cited_run.collected, cited_result),
+            "semantic+cited-keep must retain the cited result (preserve={preserve})"
+        );
+    }
+    Ok(())
+}
+
+/// No regression on the tangent fixture class: the tangent is uncited by
+/// construction (asserted — fixture honesty), so cited-keep must be exactly
+/// inert there: identical collections with the modifier on and off.
+#[test]
+fn gc_cited_keep_is_inert_on_the_uncited_tangent_fixture() -> Result<()> {
+    let (prompt, tangent) = tangent_abandoned_case();
+    let citations = CitationGraph::extract(&prompt);
+    for index in &tangent {
+        assert!(
+            !citations.is_cited(&prompt[*index].id),
+            "fixture honesty: the tangent at {index} must be uncited"
+        );
+    }
+    for preserve in [true, false] {
+        let budget = ((estimate_tokens(&prompt) as f64) * GATE_PRESSURE).floor() as usize;
+        let off = SemanticGc {
+            preserve_prefix: preserve,
+            cited_keep: false,
+            ..Default::default()
+        };
+        let on = SemanticGc {
+            preserve_prefix: preserve,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_timed(&prompt, budget, &off, Timing::Final).collected,
+            run_timed(&prompt, budget, &on, Timing::Final).collected,
+            "cited-keep must be a no-op on an uncited window (preserve={preserve})"
+        );
+    }
+    Ok(())
+}
+
 fn evaluate(
     case: &TraceCase,
     pressure: f64,
@@ -723,6 +845,11 @@ fn synthetic_cases() -> Vec<TraceCase> {
             prompt: tangent_abandoned_case().0,
             tool_chain: true,
         },
+        TraceCase {
+            name: "synthetic:cited-distant".into(),
+            prompt: cited_distant_case().0,
+            tool_chain: true,
+        },
     ]
 }
 
@@ -882,6 +1009,111 @@ fn tangent_abandoned_case() -> (Vec<ChatMessage>, Vec<usize>) {
         "Great — verify the weekly report query also uses the new index.",
     ));
     (prompt, tangent)
+}
+
+/// Third vocabulary pool for the cited-distant fixture (t-1351): a security
+/// audit — semantically distant from the planner thread under the mock
+/// embedder, exactly like a distinct topic under a real one.
+const AUDIT_WORDS: [&str; 12] = [
+    "audit",
+    "vulnerability",
+    "dependency",
+    "advisory",
+    "libfoo",
+    "cve",
+    "signature",
+    "checksum",
+    "pinning",
+    "sbom",
+    "license",
+    "transitive",
+];
+
+/// The cited-distant fixture class (t-1351, docs/GC.md "Citation signals"
+/// 2x2, the cited+distant cell): an OLD tool result that is semantically
+/// distant from the recent thread — a dependency-audit lookup in the middle
+/// of query-planner work — but explicitly cited by a recent message ("Per
+/// the output of call-audit-0, ..."). Pure similarity scoring drops it with
+/// the uncited audit noise around it; cited-keep must not. The noise frames
+/// share the audit vocabulary and are UNcited by construction, so the
+/// citation — not the topic — is the only thing distinguishing the frame
+/// that must survive. Returns the prompt, the indices of the cited frame
+/// (call + result), and the indices of the uncited noise frames.
+fn cited_distant_case() -> (Vec<ChatMessage>, Vec<usize>, Vec<usize>) {
+    let mut prompt = vec![
+        ChatMessage::system("You are a database engineering agent."),
+        ChatMessage::user(
+            "The orders report query is slow: the planner picks a bad join order. Fix the query plan.",
+        ),
+    ];
+    // Early on-topic work: fills the preserve-mode prefix allowance so the
+    // audit frames below sit in the evictable interior.
+    for step in 0..2 {
+        push_topical_frame(
+            &mut prompt,
+            &PLANNER_WORDS,
+            &format!("call-plan-{step}"),
+            &format!("psql -c 'EXPLAIN ANALYZE SELECT ...' # step {step}"),
+            &format!("Inspecting the query plan, step {step}."),
+            step,
+            500,
+        );
+    }
+    // The audit sidebar: one frame a later message will cite...
+    // All four audit results share one seed so their embedding texts — and
+    // therefore their similarity scores — tie exactly; the sweep's
+    // oldest-first tie-break then makes the CITED frame (deliberately the
+    // oldest) the first thing pure similarity kills. The citation is the
+    // only signal distinguishing it from the noise.
+    push_topical_frame(
+        &mut prompt,
+        &AUDIT_WORDS,
+        "call-audit-0",
+        "cargo audit --json # dependency check",
+        "Side check: auditing the dependency tree before touching the schema.",
+        7,
+        800,
+    );
+    let cited: Vec<usize> = vec![prompt.len() - 2, prompt.len() - 1];
+    // ...and noise frames on the same distant topic that nothing ever cites.
+    let noise_start = prompt.len();
+    for step in 0..3 {
+        push_topical_frame(
+            &mut prompt,
+            &AUDIT_WORDS,
+            &format!("call-noise-{step}"),
+            "cargo audit --json # dependency check",
+            "Side check: auditing the dependency tree before touching the schema.",
+            7,
+            800,
+        );
+    }
+    let noise: Vec<usize> = (noise_start..prompt.len()).collect();
+    // Recent on-topic work + the citation: the model builds on the audit
+    // output while doing planner work.
+    for step in 0..3 {
+        push_topical_frame(
+            &mut prompt,
+            &PLANNER_WORDS,
+            &format!("call-fix-{step}"),
+            &format!("psql -c 'ALTER TABLE orders ...; ANALYZE orders' # fix step {step}"),
+            &format!("Raising the statistics target and adding the index, step {step}."),
+            step + 80,
+            500,
+        );
+    }
+    prompt.push(ChatMessage::assistant(
+        Some(
+            "Per the output of call-audit-0, the slow join comes through the unpatched \
+             libfoo dependency — applying the planner fix with that version pinned."
+                .into(),
+        ),
+        vec![],
+    ));
+    prompt.push(ChatMessage::user(
+        "Good — apply it that way and rerun the orders report.",
+    ));
+    (prompt, cited, noise)
 }
 
 /// Pure conversation, no tool structure: mark-sweep has nothing to evict and
