@@ -182,6 +182,11 @@ The meta-finding: this parent model's delegation behavior tracked the
 place delegation pays and nowhere else, but only once told how. The
 mechanism's bottleneck is discoverability, not model judgment.
 
+This finding is the founding evidence for the runtime operations guidance
+design (t-1356): what guidance should ship, where it lives, and how each
+piece gets A/B'd with this eval's arms methodology —
+[../../docs/GUIDANCE.md](../../docs/GUIDANCE.md).
+
 ## Candidate tasks (mechanism gaps surfaced)
 
 - **Delegate catalog in the infer schema.** Unprompted delegation is ~0 and

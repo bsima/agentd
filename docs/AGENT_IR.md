@@ -207,6 +207,8 @@ Open questions to settle before enabling it:
 
 The default should favor replayability over cleverness. Parallel branches should use isolated transactions unless a specific interpreter provides stronger shared-state semantics.
 
+A demand-first pass over these questions — concrete fan-out patterns, derived requirements (join-all in declaration order, errors-as-values propagation, id assignment at fork, pre-split budgets, Store rejected in branches), and a minimal-Par recommendation — is in [GUIDANCE.md §3](GUIDANCE.md) (t-1356).
+
 ## Runtime policy and sandbox boundary
 
 AgentIR does not ask the model to govern itself.
