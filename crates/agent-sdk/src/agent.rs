@@ -4,6 +4,7 @@
 
 use crate::error::SdkError;
 use agent_core::approval::{ApprovalDecision, ApprovalHookFn, ApprovalRequest};
+use agent_core::hydration::HydrationSource;
 use agent_core::tool::{NativeTool, ToolHandler, ToolRegistry};
 use agent_core::{ChatProvider, EnvPolicy, OutputContract};
 use serde_json::Value;
@@ -91,6 +92,7 @@ pub struct Agent {
     pub(crate) eval_env: EnvPolicy,
     pub(crate) eval_cwd: Option<PathBuf>,
     pub(crate) memory_dir: Option<PathBuf>,
+    pub(crate) hydration_sources: Vec<Arc<dyn HydrationSource>>,
     pub(crate) trace_dir: Option<PathBuf>,
     pub(crate) provider: Option<Arc<dyn ChatProvider>>,
     pub(crate) require_shell_approval: bool,
@@ -114,6 +116,7 @@ impl Agent {
             eval_env: EnvPolicy::Inherit,
             eval_cwd: None,
             memory_dir: None,
+            hydration_sources: Vec::new(),
             trace_dir: None,
             provider: None,
             require_shell_approval: false,
@@ -151,6 +154,7 @@ pub struct AgentBuilder {
     eval_env: EnvPolicy,
     eval_cwd: Option<PathBuf>,
     memory_dir: Option<PathBuf>,
+    hydration_sources: Vec<Arc<dyn HydrationSource>>,
     trace_dir: Option<PathBuf>,
     provider: Option<Arc<dyn ChatProvider>>,
     require_shell_approval: bool,
@@ -228,6 +232,31 @@ impl AgentBuilder {
         self
     }
 
+    /// Register a custom read-only hydration source
+    /// ([`agent_core::HydrationSource`], docs/PROVIDERS.md) alongside the
+    /// built-ins. Sources with the QUERY capability answer `Retrieve`
+    /// effects; a Semantic + QUERY source additionally exposes the
+    /// model-initiated `recall` tool, exactly as [`AgentBuilder::memory_dir`]
+    /// does (docs/MEMORY.md settled question 6: an unreachable backend is a
+    /// trap). Note the SESSION_CONTEXT capability is inert for in-process
+    /// runs — the [`crate::Runner`] does no passive prompt-assembly
+    /// hydration by design.
+    ///
+    /// Write halves ([`agent_core::hydration::HydrationSink`]) are
+    /// deliberately not registrable here: the built-in loop's only write
+    /// path is the `remember` tool, which targets the sink named `memory`
+    /// that [`AgentBuilder::memory_dir`] registers — a custom sink would be
+    /// unreachable. Embedders driving `agent_core::run_agent_loop` directly
+    /// can register full backends via
+    /// `agent_core::SourceRegistry::register_backend`.
+    pub fn hydration_source<T>(mut self, source: T) -> Self
+    where
+        T: HydrationSource + 'static,
+    {
+        self.hydration_sources.push(Arc::new(source));
+        self
+    }
+
     /// Where run traces are written (default: `~/.local/share/agent/traces`,
     /// the CLI's convention).
     pub fn trace_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -299,6 +328,7 @@ impl AgentBuilder {
             eval_env: self.eval_env,
             eval_cwd: self.eval_cwd,
             memory_dir: self.memory_dir,
+            hydration_sources: self.hydration_sources,
             trace_dir: self.trace_dir,
             provider: self.provider,
             require_shell_approval: self.require_shell_approval,

@@ -127,6 +127,17 @@ pub use agent_core::public_trace::{
 pub use agent_core::tool::{ToolHandler, RESERVED_TOOL_NAMES};
 pub use agent_core::{ChatProvider, EnvPolicy, OutputContract};
 
+// The hydration-provider authoring surface (docs/PROVIDERS.md): implement
+// [`HydrationSource`] and register it with
+// [`AgentBuilder::hydration_source`]. See
+// `examples/custom_source.rs` for a complete out-of-tree provider. The
+// write-side trait (`HydrationSink`) is intentionally not re-exported —
+// custom sinks are unreachable from the built-in loop; see the builder
+// docs.
+pub use agent_core::hydration::{
+    HydrationSource, SourceCapability, SourceKind, SourceParams, SourceResult,
+};
+
 // The approval/pause protocol (t-1308.10, DR-7): the hook types for
 // AgentBuilder::on_approval and the on-disk record shape surfaced by
 // Session::next_approval.

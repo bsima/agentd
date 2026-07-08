@@ -13,7 +13,8 @@ use agent_core::{
     AnthropicConfig, AnthropicProvider, ApprovalConfig, ChatMessage, ChatProvider, Embedder,
     EmbeddingClient, EvalConfig, Event, GcMode, GcState, GcTiming, IrReplayTrace, JsonlTraceSink,
     MemorySource, Model, ModelRegistry, PassiveHydrationConfig, ProviderClient, ProviderConfig,
-    ReplayOnlyProvider, Response, SeqConfig, SourceRegistry, TraceLogger,
+    ReplayOnlyProvider, Response, SeqConfig, SourceCapability, SourceKind, SourceRegistry,
+    TraceLogger,
 };
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
@@ -349,6 +350,13 @@ async fn execute(
         };
 
     let mut hydration = SourceRegistry::new();
+    // Custom sources (docs/PROVIDERS.md) register ahead of the built-in
+    // memory backend; retrieval consults every QUERY-capable source, so
+    // order only affects result ordering. They stay registered under
+    // replay — harmless, since a replayed Retrieve never touches a source.
+    for source in &agent.hydration_sources {
+        hydration = hydration.register_arc(source.clone());
+    }
     if let Some(dir) = &agent.memory_dir {
         // Semantic memory retrieval (t-1340): consult the default registry's
         // optional `embeddings` section. Replay never retrieves (recorded
@@ -361,7 +369,16 @@ async fn execute(
         hydration =
             hydration.register_backend(MemorySource::new(dir.clone()).with_embedder(embedder));
     }
-    let memory_tools = agent.memory_dir.is_some();
+    // remember/recall ride whenever a backend makes them reachable
+    // (docs/MEMORY.md settled question 6): the memory backend, or any
+    // custom source that answers the recall tool's Semantic queries. The
+    // flag shapes the loop program (and so its hash) — it is derived from
+    // the agent definition alone, so record and replay agree.
+    let memory_tools = agent.memory_dir.is_some()
+        || agent.hydration_sources.iter().any(|source| {
+            source.kind() == SourceKind::Semantic
+                && source.capabilities().contains(SourceCapability::QUERY)
+        });
 
     let config = SeqConfig {
         provider,
