@@ -124,6 +124,16 @@ fn infer_call(id: &str, model: &str, prompt: String) -> ToolCall {
     )
 }
 
+/// A by-reference delegation (t-1344): the material is named by the ids of
+/// prior tool calls, never copied into the arguments.
+fn infer_ref_call(id: &str, model: &str, prompt: &str, context_refs: &[&str]) -> ToolCall {
+    ToolCall::new(
+        id,
+        "infer",
+        serde_json::json!({ "model": model, "prompt": prompt, "context_refs": context_refs }),
+    )
+}
+
 fn shell_call(id: &str, command: &str) -> ToolCall {
     ToolCall::new(id, "shell", serde_json::json!({ "command": command }))
 }
@@ -212,6 +222,18 @@ impl ChatProvider for MeteredProvider {
 
 // --- fixtures ----------------------------------------------------------------
 
+/// The structural cost expectation a fixture pins.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Expected {
+    /// The sub-infer arm must come out cheaper.
+    SubWins,
+    /// The single arm must come out cheaper.
+    SingleWins,
+    /// The single arm still wins, but the sub arm must land within this
+    /// ratio of it — delegation as a rounding error, not a structural tax.
+    SingleWinsWithin(f64),
+}
+
 struct Fixture {
     name: &'static str,
     single_prompt: Vec<ChatMessage>,
@@ -222,9 +244,8 @@ struct Fixture {
     /// success; offline this validates the wiring, online it scores the
     /// real model).
     success_needles: Vec<&'static str>,
-    /// The structural expectation this fixture pins: true = the sub-infer
-    /// arm must come out cheaper, false = the single arm must.
-    expect_sub_wins: bool,
+    /// The structural expectation this fixture pins.
+    expected: Expected,
     /// How many sub-infer calls are expected to FAIL in the sub arm
     /// (error-binding fixtures).
     expected_sub_infer_errors: usize,
@@ -256,15 +277,25 @@ fn quarterly_report(index: usize, fact: &str) -> String {
     )
 }
 
-fn migration_dump() -> String {
-    let mut out = String::new();
-    for line in 0..160 {
-        out.push_str(&format!(
-            "ERROR[{line:03}]: frobnicator stage {line} panicked: widget overflow (retrying)\n"
-        ));
-    }
-    out.push_str("RESULT: step7=ok\n");
-    out
+/// Shell command producing quarterly report `index` on stdout (~3KB of
+/// deterministic filler around one KEY FACT line). By-reference fixtures
+/// fetch material through the shell tool so it enters the conversation as a
+/// tool result with a model-minted id — the thing `context_refs` can name.
+/// The command is short; its OUTPUT is the fat object.
+fn report_command(index: usize, fact: &str) -> String {
+    format!(
+        "seq -f \"report {index} filler paragraph %g alpha bravo charlie delta echo foxtrot\" 1 30 \
+         && echo \"KEY FACT: {fact}\" \
+         && seq -f \"report {index} appendix filler %g golf hotel india juliet kilo lima\" 1 30"
+    )
+}
+
+/// Shell command standing in for migration step 7: ~11KB of repeated noise
+/// followed by the one RESULT line that matters.
+fn migration_step7_command() -> String {
+    "seq -f \"ERROR[%03g]: frobnicator stage %g panicked: widget overflow (retrying)\" 0 159 \
+     && echo \"RESULT: step7=ok\""
+        .into()
 }
 
 fn brainstorm_evaluation() -> String {
@@ -316,15 +347,15 @@ fn fixtures(child_model: &str) -> Vec<Fixture> {
                 (PARENT_MODEL.into(), text("Lisbon")),
             ],
             success_needles: vec!["Lisbon"],
-            expect_sub_wins: false,
+            expected: Expected::SingleWins,
             expected_sub_infer_errors: 0,
             rationale: "delegation round-trip (args out + extra turn) on a one-shot answer",
         });
     }
 
-    // (a) synthesis over 3 long documents: sub-infers summarize each doc
-    // with the cheap model, the parent synthesizes — vs the parent reading
-    // everything itself.
+    // (a) synthesis over 3 long documents, BY COPY — the pre-t-1344 path,
+    // kept on purpose: passing material through the prompt still works and
+    // still costs. The by-reference variant below is the comparison.
     {
         let docs = [
             quarterly_report(1, "revenue grew 12%"),
@@ -342,7 +373,7 @@ fn fixtures(child_model: &str) -> Vec<Fixture> {
             format!("Summarize this report in one sentence, preserving its key fact.\n\n{doc}")
         };
         fixtures.push(Fixture {
-            name: "doc-synthesis",
+            name: "doc-synthesis-by-copy",
             single_prompt: vec![
                 ChatMessage::system("You are a research assistant."),
                 ChatMessage::user(task.clone()),
@@ -380,23 +411,109 @@ fn fixtures(child_model: &str) -> Vec<Fixture> {
                 (PARENT_MODEL.into(), text(synthesis)),
             ],
             success_needles: vec!["12%", "3%", "84"],
-            expect_sub_wins: false,
+            expected: Expected::SingleWins,
             expected_sub_infer_errors: 0,
-            rationale: "the child has no context of its own: each doc is COPIED into the \
-                        tool-call arguments (billed as parent output at 5x input rate) \
-                        and then rides in parent history every later turn",
+            rationale: "BY COPY, the old path: each doc is copied into the tool-call \
+                        arguments (billed as parent output at 5x input rate) and then \
+                        rides in parent history every later turn",
         });
     }
 
-    // (c) multi-step task with a noisy middle step: does sub-infer
-    // isolation contain the poison? (Structurally it cannot: the parent
-    // must splice the noisy material into the tool-call arguments, which
-    // live in parent history from then on.)
+    // (a') the same synthesis BY REFERENCE (t-1344): the reports are fetched
+    // through the shell tool (fat tool results with model-minted ids) and
+    // delegated via context_refs in the same assistant turn — refs resolve
+    // against results appended earlier in the batch. The material never
+    // transits parent output and never rides twice in parent history, so
+    // delegating the reading costs a rounding error instead of 7.7x.
     {
-        let dump = migration_dump();
+        let fetches = [
+            report_command(1, "revenue grew 12%"),
+            report_command(2, "churn fell to 3%"),
+            report_command(3, "headcount stayed at 84"),
+        ];
         let task = format!(
-            "Here is the raw migration log for step 7:\n\n{dump}\n\
-             Determine step 7's status from the log, then run step 8 \
+            "Fetch the three quarterly reports by running each of these shell \
+             commands as its own shell tool call:\n1. {}\n2. {}\n3. {}\n\
+             Then synthesize the reports into a short paragraph covering each \
+             report's key fact.",
+            fetches[0], fetches[1], fetches[2]
+        );
+        let synthesis = "Synthesis: revenue grew 12%, churn fell to 3%, and headcount \
+                         stayed at 84. The quarter improved on both growth and retention.";
+        let child_prompt = "Summarize the referenced report in one sentence, preserving \
+                            its KEY FACT line.";
+        let batch = |with_infers: bool| {
+            let mut batch = vec![
+                shell_call("call-ds-r1", &fetches[0]),
+                shell_call("call-ds-r2", &fetches[1]),
+                shell_call("call-ds-r3", &fetches[2]),
+            ];
+            if with_infers {
+                batch.extend([
+                    infer_ref_call("call-ds-i1", child_model, child_prompt, &["call-ds-r1"]),
+                    infer_ref_call("call-ds-i2", child_model, child_prompt, &["call-ds-r2"]),
+                    infer_ref_call("call-ds-i3", child_model, child_prompt, &["call-ds-r3"]),
+                ]);
+            }
+            batch
+        };
+        fixtures.push(Fixture {
+            name: "doc-synthesis",
+            single_prompt: vec![
+                ChatMessage::system("You are a research assistant."),
+                ChatMessage::user(task.clone()),
+            ],
+            sub_prompt: vec![
+                ChatMessage::system("You are a research assistant."),
+                ChatMessage::user(format!(
+                    "{task}\n\nDelegate each report's summary to the cheaper model \
+                     \"{child_model}\" in the same turn as the fetches: call the infer \
+                     tool once per report with context_refs naming the shell call id \
+                     that fetched it. Never paste report text into the prompt. Then \
+                     synthesize the summaries."
+                )),
+            ],
+            single_script: vec![
+                (PARENT_MODEL.into(), calls(batch(false))),
+                (PARENT_MODEL.into(), text(synthesis)),
+            ],
+            sub_script: vec![
+                (PARENT_MODEL.into(), calls(batch(true))),
+                (
+                    child_model.into(),
+                    text("Report 1 key point: revenue grew 12%."),
+                ),
+                (
+                    child_model.into(),
+                    text("Report 2 key point: churn fell to 3%."),
+                ),
+                (
+                    child_model.into(),
+                    text("Report 3 key point: headcount stayed at 84."),
+                ),
+                (PARENT_MODEL.into(), text(synthesis)),
+            ],
+            success_needles: vec!["12%", "3%", "84"],
+            expected: Expected::SingleWinsWithin(1.3),
+            expected_sub_infer_errors: 0,
+            rationale: "BY REFERENCE: the corpus enters history once as tool results \
+                        (parent input rate, both arms) and reaches the children without \
+                        transiting parent output — the remaining sub overhead is the \
+                        cheap child reads, not a structural copy tax",
+        });
+    }
+
+    // (c) multi-step task with a noisy middle step, BY REFERENCE (t-1344):
+    // the noisy dump is a shell tool result; the sub arm hands it to a
+    // cheap child via context_refs instead of the parent analyzing it
+    // inline. Containment is real now — the dump never transits parent
+    // output, and the parent's context gains a one-line status instead of
+    // a verbose inline digest.
+    {
+        let step7 = migration_step7_command();
+        let task = format!(
+            "Run migration step 7 via the shell tool: {step7}\n\
+             Determine step 7's status from its output, then run step 8 \
              (`echo step8-done`) and step 9 (`echo step9-done`) via the shell \
              tool, then report the status of steps 7, 8, and 9."
         );
@@ -416,50 +533,61 @@ fn fixtures(child_model: &str) -> Vec<Fixture> {
             sub_prompt: vec![
                 ChatMessage::system("You are an operations agent."),
                 ChatMessage::user(format!(
-                    "{task} Use the infer tool with model \"{child_model}\" to digest \
-                     the log instead of analyzing it inline."
+                    "{task} Delegate the log analysis to the cheaper model \
+                     \"{child_model}\" with the infer tool, passing the log by \
+                     reference: context_refs naming the step-7 shell call id, never \
+                     the log text itself. Dispatch the delegation and steps 8 and 9 \
+                     in the same turn."
                 )),
             ],
             single_script: vec![
                 (
                     PARENT_MODEL.into(),
-                    text_and_calls(digest, vec![shell_call("call-nm-s8", "echo step8-done")]),
+                    calls(vec![shell_call("call-nm-s7", &step7)]),
                 ),
+                // The parent analyzes 160 noise lines inline: a verbose
+                // digest at parent OUTPUT rates, which then rides history.
                 (
                     PARENT_MODEL.into(),
-                    calls(vec![shell_call("call-nm-s9", "echo step9-done")]),
+                    text_and_calls(
+                        digest,
+                        vec![
+                            shell_call("call-nm-s8", "echo step8-done"),
+                            shell_call("call-nm-s9", "echo step9-done"),
+                        ],
+                    ),
                 ),
                 (PARENT_MODEL.into(), text(final_report)),
             ],
             sub_script: vec![
                 (
                     PARENT_MODEL.into(),
-                    calls(vec![infer_call(
-                        "call-nm-digest",
-                        child_model,
-                        format!(
-                            "Report only the final RESULT line status from this \
-                             migration log:\n\n{dump}"
+                    calls(vec![shell_call("call-nm-s7", &step7)]),
+                ),
+                (
+                    PARENT_MODEL.into(),
+                    calls(vec![
+                        infer_ref_call(
+                            "call-nm-digest",
+                            child_model,
+                            "Report only the final RESULT line status from the \
+                             referenced migration log.",
+                            &["call-nm-s7"],
                         ),
-                    )]),
+                        shell_call("call-nm-s8", "echo step8-done"),
+                        shell_call("call-nm-s9", "echo step9-done"),
+                    ]),
                 ),
                 (child_model.into(), text("step7=ok")),
-                (
-                    PARENT_MODEL.into(),
-                    calls(vec![shell_call("call-nm-s8", "echo step8-done")]),
-                ),
-                (
-                    PARENT_MODEL.into(),
-                    calls(vec![shell_call("call-nm-s9", "echo step9-done")]),
-                ),
                 (PARENT_MODEL.into(), text(final_report)),
             ],
             success_needles: vec!["step7=ok", "step8", "step9"],
-            expect_sub_wins: false,
+            expected: Expected::SubWins,
             expected_sub_infer_errors: 0,
-            rationale: "containment is illusory: the dump must be spliced into the infer \
-                        arguments, so the sub arm re-sends it in history on every later \
-                        turn AND paid parent output rates to copy it once",
+            rationale: "BY REFERENCE the containment is real: the dump stays a tool \
+                        result (input rate, both arms), the child digests it at cheap \
+                        rates, and the parent trades a verbose inline digest (output \
+                        rate + history residue) for a one-line status",
         });
     }
 
@@ -505,7 +633,7 @@ fn fixtures(child_model: &str) -> Vec<Fixture> {
                 ),
             ],
             success_needles: vec!["zephyr"],
-            expect_sub_wins: true,
+            expected: Expected::SubWins,
             expected_sub_infer_errors: 0,
             rationale: "output-rate arbitrage: the long text is generated at cheap output \
                         rates and only READ back at parent input rates; the delegation \
@@ -551,7 +679,7 @@ fn fixtures(child_model: &str) -> Vec<Fixture> {
                 (PARENT_MODEL.into(), text("Lisbon")),
             ],
             success_needles: vec!["Lisbon"],
-            expect_sub_wins: false,
+            expected: Expected::SingleWins,
             expected_sub_infer_errors: 1,
             rationale: "a hallucinated model id costs a full delegation round-trip (args \
                         out, error tool result, retry turn) before the recovery",
@@ -881,22 +1009,37 @@ async fn infer_infer_cost_matrix() -> Result<()> {
 
         let single_cost = single.usage.cost_micro_usd.unwrap();
         let sub_cost = sub.usage.cost_micro_usd.unwrap();
-        if fixture.expect_sub_wins {
-            assert!(
+        match fixture.expected {
+            Expected::SubWins => assert!(
                 sub_cost < single_cost,
                 "{}: expected the sub-infer arm to win on cost ({} vs {})",
                 fixture.name,
                 sub_cost,
                 single_cost
-            );
-        } else {
-            assert!(
+            ),
+            Expected::SingleWins => assert!(
                 sub_cost > single_cost,
                 "{}: expected the single arm to win on cost ({} vs {})",
                 fixture.name,
                 single_cost,
                 sub_cost
-            );
+            ),
+            Expected::SingleWinsWithin(ratio) => {
+                assert!(
+                    sub_cost > single_cost,
+                    "{}: expected the single arm to win on cost ({} vs {})",
+                    fixture.name,
+                    single_cost,
+                    sub_cost
+                );
+                let actual = sub_cost as f64 / single_cost as f64;
+                assert!(
+                    actual <= ratio,
+                    "{}: expected the sub-infer arm within {ratio}x of single, got {actual:.2}x \
+                     ({sub_cost} vs {single_cost})",
+                    fixture.name
+                );
+            }
         }
     }
     Ok(())
@@ -909,13 +1052,12 @@ async fn infer_infer_cost_matrix() -> Result<()> {
 // behavior on purpose: fixing the mechanism should flip the probe, and the
 // probe failing is the signal to update the eval alongside the fix.
 
-/// The child's context is exactly one bare user message: no system prompt,
-/// no parent history, nothing but the text the parent typed into the
-/// tool-call arguments (ir_agent.rs `infer_eval` builds
-/// `[{role:"user",content:prompt}]`). This is why "delegating a document"
-/// means copying it out through parent output tokens.
+/// Without `context_refs` the child's context is still exactly one bare
+/// user message built from the arguments — the by-copy path is unchanged
+/// (and still costs; see the doc-synthesis-by-copy fixture). Parent history
+/// never leaks into the child implicitly.
 #[tokio::test]
-async fn probe_child_context_is_one_bare_user_message() -> Result<()> {
+async fn probe_child_context_without_refs_is_one_bare_user_message() -> Result<()> {
     let script = vec![
         (
             PARENT_MODEL.to_string(),
@@ -958,6 +1100,101 @@ async fn probe_child_context_is_one_bare_user_message() -> Result<()> {
             .iter()
             .any(|message| message.role == "system"),
         "no system prompt travels to the child"
+    );
+    Ok(())
+}
+
+/// Fix pin (t-1344, findings 1+2): with `context_refs` the referenced tool
+/// result is assembled into the child's messages at dispatch — the material
+/// reaches the child WITHOUT transiting parent output tokens, and the infer
+/// arguments retained in parent history stay small (refs + prompt), so the
+/// material lives in parent history exactly once (the original tool
+/// result).
+#[tokio::test]
+async fn probe_context_refs_deliver_material_without_argument_copies() -> Result<()> {
+    let material_command = "seq -f \"needle-material line %g\" 1 40";
+    let script = vec![
+        (
+            PARENT_MODEL.to_string(),
+            calls(vec![shell_call("call-sh", material_command)]),
+        ),
+        (
+            PARENT_MODEL.to_string(),
+            calls(vec![infer_ref_call(
+                "call-inf",
+                CHILD_MODEL,
+                "summarize the referenced output",
+                &["call-sh"],
+            )]),
+        ),
+        (CHILD_MODEL.to_string(), text("digest")),
+        (PARENT_MODEL.to_string(), text("done")),
+    ];
+    let provider = Arc::new(MeteredProvider::new(&script));
+    let prompt = vec![ChatMessage::system("system"), ChatMessage::user("go")];
+    let (content, _events) =
+        run_arm(provider.clone(), PARENT_MODEL, prompt, pricing_table()).await?;
+    assert_eq!(content, "done");
+
+    let calls = provider.recorded_calls();
+    let child_call = calls
+        .iter()
+        .find(|call| call.model == CHILD_MODEL)
+        .expect("child call recorded");
+    // The child gets a proper message structure: referenced material first,
+    // instruction last.
+    assert_eq!(
+        child_call.messages.len(),
+        2,
+        "referenced material + instruction: {:?}",
+        child_call.messages
+    );
+    let referenced = child_call.messages[0].content.as_deref().unwrap_or("");
+    assert!(
+        referenced.starts_with("Referenced result of tool call call-sh (shell):")
+            && referenced.contains("needle-material line 40"),
+        "the material travels to the child by reference: {referenced}"
+    );
+    assert_eq!(
+        child_call.messages[1].content.as_deref(),
+        Some("summarize the referenced output")
+    );
+
+    // Parent history hygiene: in the FINAL parent prompt the material
+    // appears exactly once — in the shell tool result — and the infer
+    // tool-call arguments retained by prepare_tools contain the ref id,
+    // never the material.
+    let final_parent = calls
+        .iter()
+        .rfind(|call| call.model == PARENT_MODEL)
+        .expect("final parent call recorded");
+    let carriers = final_parent
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("needle-material"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        carriers.len(),
+        1,
+        "material lives in parent history exactly once"
+    );
+    assert_eq!(carriers[0].role, "tool");
+    assert_eq!(carriers[0].tool_call_id.as_deref(), Some("call-sh"));
+    let infer_args = final_parent
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls.as_deref().unwrap_or_default())
+        .find(|call| call.name == "infer")
+        .map(|call| call.arguments.to_string())
+        .expect("infer tool call retained in history");
+    assert!(
+        infer_args.contains("call-sh") && !infer_args.contains("needle-material"),
+        "retained infer arguments are refs, not copies: {infer_args}"
     );
     Ok(())
 }
@@ -1024,6 +1261,18 @@ async fn probe_child_toolset_and_infer_schema_guidance() -> Result<()> {
             .get("max_tokens")
             .is_none(),
         "the infer schema has no budget knob today"
+    );
+    // Fix pin (t-1344): the schema advertises pass-by-reference, and it is
+    // optional — by-copy calls stay valid.
+    let refs_property = &infer_spec.function.parameters["properties"]["context_refs"];
+    assert_eq!(refs_property["type"], "array", "{refs_property}");
+    let required = infer_spec.function.parameters["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !required.iter().any(|name| name == "context_refs"),
+        "context_refs must stay optional: {required:?}"
     );
     Ok(())
 }

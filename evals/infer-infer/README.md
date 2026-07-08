@@ -24,8 +24,9 @@ parent-loop events carry none.
 | fixture | shape | expected winner |
 |---|---|---|
 | `simple-question` | one-shot answer, delegation is pure indirection | single |
-| `doc-synthesis` | summarize 3 long docs via cheap children, parent synthesizes | single |
-| `noisy-middle-step` | error-prone middle step produces a large dump; child digests it | single |
+| `doc-synthesis-by-copy` | 3 long docs pasted into infer prompts (pre-t-1344 path, kept) | single, big |
+| `doc-synthesis` | 3 docs fetched via shell, delegated **by reference** (`context_refs`) | single, within 1.3x |
+| `noisy-middle-step` | noisy shell dump digested by a child **by reference** | **sub-infer** |
 | `generation-offload` | long boilerplate generation delegated, short verdict kept | **sub-infer** |
 | `child-error-recovery` | delegate to a hallucinated model id, bind the error, retry | single |
 
@@ -74,22 +75,44 @@ the ratio, and the structural reason.
 
 ## Findings (offline matrix, mechanism probes)
 
-The headline: **the sub-infer mechanism only pays for generation-heavy,
-short-prompt delegation** (`generation-offload`, ~2.7x cheaper via
-output-rate arbitrage). Everywhere else it loses — not because of model
-quality, but because of mechanism structure:
+The headline: **the sub-infer mechanism pays wherever the parent's own
+token flow is what delegation removes** — generation-heavy work
+(`generation-offload`, ~2.7x via output-rate arbitrage) and, since
+t-1344, reading/digesting work passed **by reference**
+(`noisy-middle-step`, ~1.6x). By-copy delegation of material remains a
+structural tax (`doc-synthesis-by-copy`, 7.7x — kept as the
+comparison).
 
-1. **The child has no context of its own** — its prompt is exactly one
-   bare user message built from the tool-call arguments
-   (`ir_agent.rs` `infer_eval`), so delegating over material means
-   *copying it out through parent output tokens* (5x the input rate) and
-   that copy then rides in parent history every later turn
-   (`ir_agent.rs` `prepare_tools` pushes the full `tool_calls` into
-   history). `doc-synthesis`: sub-infer 7.7x more expensive.
-2. **Containment is illusory** — everything the child sees passes through
-   the parent's history via arguments, and the child (a single Infer, no
-   tool dispatch) cannot fetch anything itself. `noisy-middle-step`:
-   sub-infer 3.3x more expensive.
+1. **Fixed (t-1344).** The child used to have no context of its own —
+   one bare user message built from the tool-call arguments — so
+   delegating material meant *copying it out through parent output
+   tokens* (5x the input rate), with the copy then riding parent history
+   every later turn (`prepare_tools` retains the full `tool_calls`).
+   Now the `infer` tool takes `context_refs`: ids of prior tool calls
+   (the ids the model itself minted — `tool_calls[].id` /
+   `tool_call_id`, already model-visible), resolved against history at
+   dispatch (`ir_agent.rs` `infer_resolve`/`infer_eval`,
+   `Expr::SelectToolResults`) and assembled into the child's messages
+   server-side. The child gets a proper message structure: an optional
+   system slot (`AgentLoopOptions.infer_system_prompt`, owned by the
+   dispatch site), referenced material as user messages, instruction
+   last. Refs resolve within the same assistant turn too (results
+   append as the tool loop walks the batch), so fetch + delegate can be
+   one turn. An unresolved ref binds as a readable tool result naming
+   the missing ids (t-1222). `doc-synthesis` by reference: single wins
+   by 1.2x (delegation as rounding error — the cheap child reads),
+   down from 7.7x; the retained arguments are refs + prompt, so parent
+   history carries the material exactly once. The by-copy path is
+   unchanged and still costs: `doc-synthesis-by-copy` pins 7.7x.
+2. **Fixed (t-1344).** Containment is real for referenced material —
+   the dump stays a tool result (input rate, both arms, exactly once),
+   the child digests it at cheap rates, and the parent trades a verbose
+   inline digest (output rate + history residue) for a one-line status.
+   `noisy-middle-step` by reference: sub-infer **wins 1.6x** (was 3.3x
+   more expensive by copy). What remains structural: material already
+   in parent history is paid at parent input rates per turn in *both*
+   arms — references remove the copy tax, not the carry tax (that is
+   GC's territory).
 3. **The `infer` schema gives no delegation guidance** — `model` is a bare
    string (no catalog/enum/pricing), and there is no budget knob
    (`ir_interpreter.rs` `base_ir_tool_specs`; `InferPolicy` carries no
