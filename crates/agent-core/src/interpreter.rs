@@ -749,35 +749,19 @@ async fn collect_prompt(
             }
         }
     }
-    // Recall-overlap write-barrier pre-pass (t-1351): a recall result that
-    // re-injects content already in (or previously collected from) the
-    // window marks that content HOT in GcState.recall_hot. Pure and
-    // synchronous, but it lives here rather than inside collect() because
-    // "previously collected" needs cross-collection state. Signal-only:
-    // no strategy consumes it yet (t-1167 generational input); it is
-    // observable on the gc_collect event below.
-    let recall_report = crate::gc::record_recall_overlaps(&prompt, gc_state);
-    // Snapshot (id, content-key) pairs so the contents of whatever this
-    // collection drops can join GcState.collected_hashes afterwards.
-    let before_contents: Vec<(uuid::Uuid, String)> = prompt
-        .iter()
-        .filter_map(|message| {
-            message
-                .content
-                .as_deref()
-                .filter(|content| !content.trim().is_empty())
-                .map(|content| (message.id, crate::gc::recall_content_key(content)))
-        })
-        .collect();
+    // Re-injection write-barrier pre-pass (t-1351, chunk-normalized in
+    // t-1362): a tool result that re-injects content previously collected
+    // from the window (or, for recall results, content still in it) marks
+    // those chunks HOT in GcState.recall_hot. Pure and synchronous; it
+    // lives here rather than inside collect() so the hot set is fresh
+    // before the strategy's hot-keep guard consults it. The corpus side
+    // (GcState.collected_hashes) is maintained by collect()'s own marker
+    // wrapper since t-1362, so every GcState-threading caller gets it.
+    let recall_report = crate::gc::record_reinjection_overlaps(&prompt, gc_state);
     let before_ids: BTreeSet<_> = prompt.iter().map(|message| message.id).collect();
     let collected = config.gc.collect(prompt, target_budget, gc_state);
     let after_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
     let dropped_count = before_ids.difference(&after_ids).count();
-    for (id, key) in before_contents {
-        if !after_ids.contains(&id) {
-            gc_state.collected_hashes.insert(key);
-        }
-    }
     let after_tokens = estimate_tokens(&collected);
     if config.gc_log {
         // Eviction-marker summary (t-1360): what this collection left
@@ -797,6 +781,11 @@ async fn collect_prompt(
             "dropped_count": dropped_count,
             "recall_overlap_events": recall_report.overlap_events,
             "recall_hot": recall_report.hot_total,
+            // hot-keep consumer (t-1362): messages the returned window
+            // retains because their content is write-barrier hot. Also the
+            // recording-era detector — replays of recordings made before
+            // this field compare gc-derived metrics leniently.
+            "hot_kept": gc_state.hot_report.hot_kept,
             "markers": markers.markers,
             "marker_kinds": {
                 "tool_result": markers.evicted_tool_results,
@@ -1437,10 +1426,11 @@ mod tests {
         Ok(())
     }
 
-    /// The recall-overlap write-barrier (t-1351) is recorded by the pre-pass
-    /// and observable on the gc_collect event, so the behavioral eval
-    /// (t-1349) can watch it fire. Ring is the strategy here on purpose:
-    /// the signal is strategy-independent and consumed by none yet.
+    /// The re-injection write-barrier (t-1351/t-1362) is recorded by the
+    /// pre-pass and observable on the gc_collect event (including the
+    /// hot-keep consumer's `hot_kept`), so the behavioral eval (t-1349)
+    /// can watch it fire. Ring is the strategy here on purpose: the
+    /// signal is strategy-independent.
     #[tokio::test]
     async fn gc_collect_reports_recall_overlap_signal() -> Result<()> {
         let trace = test_trace();
@@ -1488,9 +1478,7 @@ mod tests {
         let _ = maybe_collect_prompt(&config, prompt, &mut state).await?;
 
         assert!(
-            state
-                .recall_hot
-                .contains(&crate::gc::recall_content_key(note)),
+            !crate::gc::reinjection_chunk_keys(note).is_disjoint(&state.recall_hot),
             "the pre-pass must mark the re-injected content hot"
         );
         let events = TraceLogger::read_events(trace_path).await?;
@@ -1503,11 +1491,16 @@ mod tests {
             .expect("gc_collect event under --gc-log");
         assert_eq!(collect_event["recall_overlap_events"], 1);
         assert_eq!(collect_event["recall_hot"], 1);
+        assert!(
+            collect_event.get("hot_kept").is_some(),
+            "gc_collect must report the hot-keep consumer (t-1362)"
+        );
         Ok(())
     }
 
-    /// Dropped message contents join GcState.collected_hashes so a later
-    /// recall re-injecting them still registers as a write-barrier event.
+    /// Dropped message chunks join GcState.collected_hashes (via the
+    /// collect() marker wrapper, t-1362) so a later result re-injecting
+    /// them registers as a write-barrier event.
     #[tokio::test]
     async fn gc_collect_records_dropped_contents_for_the_write_barrier() -> Result<()> {
         let config = SeqConfig {
@@ -1524,6 +1517,7 @@ mod tests {
             trace_full_payloads: false,
             gc: crate::gc::GcMode::Ring(crate::gc::RingGc {
                 preserve_prefix: false,
+                ..Default::default()
             }),
             gc_threshold: 0.5,
             gc_log: false,
@@ -1545,10 +1539,8 @@ mod tests {
             .iter()
             .all(|message| message.content.as_deref() != Some(doomed.as_str())));
         assert!(
-            state
-                .collected_hashes
-                .contains(&crate::gc::recall_content_key(&doomed)),
-            "dropped content must be remembered for later recall overlap"
+            crate::gc::reinjection_chunk_keys(&doomed).is_subset(&state.collected_hashes),
+            "dropped content chunks must be remembered for later re-injection overlap"
         );
         Ok(())
     }

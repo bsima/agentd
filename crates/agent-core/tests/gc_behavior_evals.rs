@@ -242,12 +242,15 @@ impl Arm {
         match self {
             Self::NoGc => GcMode::None,
             Self::Ring => GcMode::Ring(RingGc {
+                hot_keep: true,
                 preserve_prefix: true,
             }),
             Self::MarkSweep => GcMode::MarkSweep(MarkSweepGc {
+                hot_keep: true,
                 preserve_prefix: true,
             }),
             Self::Stack => GcMode::Stack(StackFrameGc {
+                hot_keep: true,
                 preserve_prefix: true,
             }),
             Self::Semantic => GcMode::Semantic(SemanticGc {
@@ -856,6 +859,11 @@ struct CellMetrics {
     overlap_total: u64,
     /// Max gc_collect recall_hot: hot-set size high-water mark.
     recall_hot_max: u64,
+    /// Max gc_collect hot_kept: messages the hot-keep consumer (t-1362)
+    /// was protecting in a collected window. 0 on recordings made before
+    /// hot-keep (the field is absent there — replayed leniently, like the
+    /// pre-marker era).
+    hot_kept_max: u64,
     /// Max gc_collect markers: in-window eviction-marker high-water mark
     /// (t-1360). 0 on recordings made before the marker mechanism (the
     /// field is absent there — see the pre-marker replay note in
@@ -897,6 +905,7 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         dropped_total: 0,
         overlap_total: 0,
         recall_hot_max: 0,
+        hot_kept_max: 0,
         markers_max: 0,
         markers_suppressed: 0,
         marker_mentions: 0,
@@ -951,6 +960,9 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                 metrics.recall_hot_max = metrics
                     .recall_hot_max
                     .max(data["recall_hot"].as_u64().unwrap_or(0));
+                metrics.hot_kept_max = metrics
+                    .hot_kept_max
+                    .max(data["hot_kept"].as_u64().unwrap_or(0));
                 // Eviction-marker needles (t-1360): in-window marker
                 // high-water mark and suppression count, for scoring
                 // marker-driven recovery vs re-derivation vs fabrication.
@@ -1480,7 +1492,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1496,6 +1508,7 @@ fn print_header() {
         "reasons",
         "drop",
         "ovl",
+        "hot",
         "mkr",
         "mkref",
         "in_tok",
@@ -1523,7 +1536,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1539,6 +1552,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         reasons_label(&metrics.reasons),
         metrics.dropped_total,
         metrics.overlap_total,
+        metrics.hot_kept_max,
         metrics.markers_max,
         metrics.marker_mentions,
         metrics.usage.input_tokens,
@@ -1817,13 +1831,25 @@ async fn replay_cell(
         matches!(event, Event::Custom { name, data, .. }
             if name == "gc_collect" && data.get("markers").is_none())
     });
+    // Pre-hot-keep recordings (before t-1362's chunk-normalized write
+    // barrier + hot-keep consumer): the replayed collector now protects
+    // re-acquired content and reports `hot_kept`, so the gc stream cannot
+    // reproduce a recording made without it — the same lenient stance as
+    // the pre-marker era, detected by the absent `hot_kept` field.
+    // Everything effect-replayed (answers, turns, tool counts, usage)
+    // still reproduces exactly.
+    let pre_hotkeep_recording = recorded_events.iter().any(|event| {
+        matches!(event, Event::Custom { name, data, .. }
+            if name == "gc_collect" && data.get("hot_kept").is_none())
+    });
     let mut replayed_cmp = replayed.clone();
-    if bound_errors || pre_marker_recording {
+    if bound_errors || pre_marker_recording || pre_hotkeep_recording {
         replayed_cmp.collections = recorded.collections;
         replayed_cmp.reasons = recorded.reasons.clone();
         replayed_cmp.dropped_total = recorded.dropped_total;
         replayed_cmp.overlap_total = recorded.overlap_total;
         replayed_cmp.recall_hot_max = recorded.recall_hot_max;
+        replayed_cmp.hot_kept_max = recorded.hot_kept_max;
         replayed_cmp.markers_max = recorded.markers_max;
         replayed_cmp.markers_suppressed = recorded.markers_suppressed;
         assert!(
@@ -1838,6 +1864,21 @@ async fn replay_cell(
         "{}: replayed metrics (incl. the gc_collect stream) must reproduce the recording",
         path.display()
     );
+    // t-1362 promotion assertion: on the recordings whose traces show
+    // re-injection (a recovery action — the t-1369 re-fetch/recall cells,
+    // where t-1351's exact-hash barrier fired 0/15), the chunk-normalized
+    // barrier must fire during replay. GC re-runs live under replay, so
+    // this drives the new matcher over the REAL recorded sessions.
+    // (Observed on the full recording set: every GC cell fires — 3..6336
+    // overlap events — and every control cell stays at 0.)
+    if pre_hotkeep_recording && recorded.collections > 0 && recorded.recovered {
+        assert!(
+            replayed.overlap_total > 0,
+            "{}: recorded session re-injects evicted content but the \
+             write-barrier did not fire on replay (t-1362 matcher regression)",
+            path.display()
+        );
+    }
     Ok((meta, recorded, recorded_events))
 }
 

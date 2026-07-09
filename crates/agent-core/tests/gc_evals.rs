@@ -34,7 +34,9 @@
 //! ONLINE-GATED behind `RUN_AGENT_ONLINE_EVAL=1` with recorded-judge replay
 //! by default — see the judge section at the bottom of this file.
 
-use agent_core::gc::{message_embedding_text, CitationGraph, SemanticGc};
+use agent_core::gc::{
+    message_embedding_text, record_reinjection_overlaps, CitationGraph, SemanticGc,
+};
 use agent_core::{
     content_hash, estimate_tokens, is_eviction_marker, truncate_oversized_message, ChatMessage,
     ChatProvider, ContextGc, GcState, MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc,
@@ -112,9 +114,18 @@ enum Strategy {
 impl Strategy {
     fn build(&self, preserve_prefix: bool) -> Box<dyn ContextGc> {
         match self {
-            Self::Ring => Box::new(RingGc { preserve_prefix }),
-            Self::MarkSweep => Box::new(MarkSweepGc { preserve_prefix }),
-            Self::Stack => Box::new(StackFrameGc { preserve_prefix }),
+            Self::Ring => Box::new(RingGc {
+                hot_keep: true,
+                preserve_prefix,
+            }),
+            Self::MarkSweep => Box::new(MarkSweepGc {
+                hot_keep: true,
+                preserve_prefix,
+            }),
+            Self::Stack => Box::new(StackFrameGc {
+                hot_keep: true,
+                preserve_prefix,
+            }),
             Self::Semantic => Box::new(SemanticGc {
                 preserve_prefix,
                 ..Default::default()
@@ -723,6 +734,10 @@ fn run_timed(
         if gc.name() == "semantic" {
             prime_semantic_cache(&window, &mut state);
         }
+        // Re-injection write-barrier pre-pass mirror (t-1362), same
+        // ordering as interpreter::collect_prompt: the hot set is fresh
+        // before the strategy's hot-keep guard consults it.
+        record_reinjection_overlaps(&window, &mut state);
         run.collected = gc.collect(window, budget, &mut state);
         run.collections = 1;
         run.invalidations = usize::from(state.prefix_invalidated);
@@ -773,6 +788,10 @@ fn infer_point(
     if gc.name() == "semantic" {
         prime_semantic_cache(window, state);
     }
+    // Re-injection write-barrier pre-pass mirror (t-1362): incremental
+    // timings thread one GcState, so the collect() wrapper's corpus from
+    // earlier collections is live here exactly as in the runtime loop.
+    record_reinjection_overlaps(window, state);
     *window = gc.collect(std::mem::take(window), budget, state);
     run.collections += 1;
     run.invalidations += usize::from(state.prefix_invalidated);

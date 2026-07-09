@@ -70,23 +70,32 @@ pub struct GcState {
     /// whose content left the window, bounding the cache to the live
     /// window.
     pub embeddings: HashMap<String, Vec<f32>>,
-    /// Recall-overlap write-barrier signal (t-1351): content hashes
-    /// ([`recall_content_key`]) marked HOT because a `recall` tool result
-    /// re-injected content already present in — or previously collected
-    /// from — the window. Written by [`record_recall_overlaps`] in the
-    /// interpreter pre-pass; consumed by NO strategy yet, by design — it is
-    /// the promotion signal generational GC (t-1167) is specified against,
-    /// and it is observable today via `recall_overlap_events`/`recall_hot`
-    /// on the gc_collect event. Runtime-only like `embeddings`: never
+    /// Re-injection write-barrier signal (t-1351, chunk-normalized in
+    /// t-1362): normalized chunk keys ([`reinjection_chunk_keys`]) marked
+    /// HOT because a tool result re-injected content previously collected
+    /// from the window (a re-run call returning the payload an evicted
+    /// call returned, or a `recall` hit re-rendering evicted material —
+    /// or, for recalls, content still in the window). Written by
+    /// [`record_reinjection_overlaps`] in the interpreter pre-pass;
+    /// consumed by every strategy's `hot-keep` sweep guard (t-1362) and
+    /// observable via `recall_overlap_events`/`recall_hot`/`hot_kept` on
+    /// the gc_collect event. Runtime-only like `embeddings`: never
     /// serialized into checkpoints.
     pub recall_hot: BTreeSet<String>,
-    /// Content hashes of messages dropped by earlier collections this run
-    /// (written by `interpreter::collect_prompt` after each collect), so a
-    /// recall that re-injects *collected* content still registers as a
-    /// write-barrier event — the "evict, recall, re-inject" thrash loop is
-    /// exactly what the hot signal exists to expose. Bounded by the run's
-    /// own drop history; runtime-only, never serialized.
+    /// Normalized chunk keys of content removed by earlier collections
+    /// this run — dropped messages and in-place rewrites (mark-sweep
+    /// elision, stack frame pops) alike. Written by the eviction-marker
+    /// wrapper inside `collect()` itself (t-1362; every caller that
+    /// threads a GcState gets the corpus for free), so a later result that
+    /// re-injects *collected* content registers as a write-barrier event —
+    /// the "evict, re-fetch, re-evict" loop is exactly what the hot signal
+    /// exists to expose. Bounded by the run's own drop history;
+    /// runtime-only, never serialized.
     pub collected_hashes: BTreeSet<String>,
+    /// What the most recent collect() did for the hot set (t-1362). Set by
+    /// the eviction-marker wrapper on every collection, like
+    /// `marker_summary`; read for gc_collect trace events.
+    pub hot_report: HotKeepReport,
     /// What the most recent collect() left behind as eviction markers
     /// (t-1360). Set by every strategy on every collection, like
     /// `prefix_invalidated`; read for gc_collect trace events.
@@ -196,12 +205,20 @@ pub struct RingGc {
     /// the system message and the last user message survive every phase
     /// (t-1367, docs/GC.md invariants).
     pub preserve_prefix: bool,
+    /// Hot-keep (t-1362): messages carrying write-barrier-hot content
+    /// ([`hot_mask`]) join the protected set during the normal sweep
+    /// phase — a value the model re-fetched or recalled after eviction
+    /// stops being evictable. Heuristic guard with cited-keep strength:
+    /// relaxes in the degrade phases, below the preserve-prefix billing
+    /// contract and the hard guards.
+    pub hot_keep: bool,
 }
 
 impl Default for RingGc {
     fn default() -> Self {
         Self {
             preserve_prefix: true,
+            hot_keep: true,
         }
     }
 }
@@ -211,12 +228,17 @@ pub struct MarkSweepGc {
     /// Preserve the cached prefix: only annotate/evict messages after the
     /// pinned prefix region.
     pub preserve_prefix: bool,
+    /// Hot-keep (t-1362): hot messages are neither elided in place nor
+    /// swept during the normal lifecycle passes; relaxes when the passes
+    /// alone cannot reach the budget (see [`RingGc::hot_keep`]).
+    pub hot_keep: bool,
 }
 
 impl Default for MarkSweepGc {
     fn default() -> Self {
         Self {
             preserve_prefix: true,
+            hot_keep: true,
         }
     }
 }
@@ -237,12 +259,19 @@ pub struct StackFrameGc {
     /// Preserve the cached prefix: only pop frames living entirely after
     /// the pinned prefix region.
     pub preserve_prefix: bool,
+    /// Hot-keep (t-1362): frames whose members carry write-barrier-hot
+    /// content resist popping, and hot messages join the interior sweep's
+    /// protected set; relaxes in the degrade phases (see
+    /// [`RingGc::hot_keep`]). Popping destroys the result body — exactly
+    /// the loss a re-fetched value must not suffer twice.
+    pub hot_keep: bool,
 }
 
 impl Default for StackFrameGc {
     fn default() -> Self {
         Self {
             preserve_prefix: true,
+            hot_keep: true,
         }
     }
 }
@@ -304,6 +333,10 @@ pub struct SemanticGc {
     /// system/last-user hard guards. Extraction is pure text analysis and
     /// runs inside collect() (unlike embeddings — no cache, no pre-pass).
     pub cited_keep: bool,
+    /// Hot-keep (t-1362): hot messages join the protected set alongside
+    /// cited ones during the normal sweep phases, with the same strength
+    /// (relaxed in the degrade phases; see [`RingGc::hot_keep`]).
+    pub hot_keep: bool,
 }
 
 impl Default for SemanticGc {
@@ -314,6 +347,7 @@ impl Default for SemanticGc {
             similarity_floor: DEFAULT_SEMANTIC_SIMILARITY_FLOOR,
             embedder: None,
             cited_keep: true,
+            hot_keep: true,
         }
     }
 }
@@ -329,6 +363,7 @@ impl std::fmt::Debug for SemanticGc {
                 &self.embedder.as_ref().map(|embedder| embedder.model_id()),
             )
             .field("cited_keep", &self.cited_keep)
+            .field("hot_keep", &self.hot_keep)
             .finish()
     }
 }
@@ -632,6 +667,14 @@ impl SemanticGc {
                     *slot = *slot || cited;
                 }
             }
+            // hot-keep (t-1362): write-barrier-hot messages join the
+            // protected set with cited-keep's strength — protected through
+            // the normal sweep phases, relaxed in phases 3/4.
+            if self.hot_keep {
+                for (slot, hot) in protected.iter_mut().zip(hot_mask(&messages, state)) {
+                    *slot = *slot || hot;
+                }
+            }
             let scores = self.scores(&messages, state);
             // Phase 1: clearly-unrelated candidates (below the floor),
             // most distant first.
@@ -842,43 +885,170 @@ fn mentions_id(text: &str, id: &str) -> bool {
     false
 }
 
-/// What one recall-overlap pre-pass observed, reported on the gc_collect
+/// What one re-injection pre-pass observed, reported on the gc_collect
 /// event (`recall_overlap_events` / `recall_hot`) so the behavioral eval
 /// (t-1349) can watch the write-barrier fire.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecallOverlapReport {
-    /// Overlapping recall hits found in this window (a hit counts every
-    /// pass it stays in the window: re-observation is the signal).
+    /// Overlapping re-injection chunks found in this window (a chunk counts
+    /// every pass it stays in the window: re-observation is the signal).
     pub overlap_events: usize,
     /// Cumulative size of `GcState.recall_hot` after this pass.
     pub hot_total: usize,
+}
+
+/// What the most recent collect() did for the hot set (t-1362), reported on
+/// the gc_collect event as `hot_kept`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotKeepReport {
+    /// Messages in the returned window carrying hot content — what
+    /// hot-keep is currently protecting.
+    pub hot_kept: usize,
 }
 
 /// Tool names whose results re-inject memory content — the write-barrier
 /// sources. Today just the agent loop's `recall` tool (ir_agent.rs).
 const RECALL_TOOL_NAMES: [&str; 1] = ["recall"];
 
-/// The hash key for recall-overlap membership: content hash of the trimmed
-/// text. Trimming forgives leading/trailing whitespace differences between
-/// the stored note and the window message; anything fuzzier is future work
-/// (and must stay out of collect() regardless — docs/GC.md).
-pub fn recall_content_key(text: &str) -> String {
-    content_hash(text.trim())
+// --- Re-injection chunk matching (t-1362) -----------------------------------
+//
+// t-1351's write-barrier matched by exact content hash and fired 0/15 in
+// three generations of the behavioral eval (evals/gc/README.md): a recall
+// hit is a memory RENDER and a re-run tool call is a fresh JSON ENVELOPE
+// (differing in `duration_ms` alone), so neither ever hash-equals the
+// window/collected content it re-injects. The replacement matches
+// normalized content CHUNKS instead:
+//
+// 1. Extract payload strings: JSON content (tool-result envelopes, recall
+//    hit arrays) contributes its string leaves — which drops the volatile
+//    non-string envelope fields (`duration_ms`, `status`, `ok`,
+//    `*_truncated`) by construction, the exact t-1369 re-fetch delta
+//    (precedent: a5da89d normalizes wall-clock as metering noise).
+//    Non-JSON content is one opaque payload.
+// 2. Split payloads into lines, whitespace-fold each line, and key lines
+//    of >= MIN_CHUNK_CHARS chars by content hash.
+//
+// Deterministic (pure text analysis), cheap (one linear pass per message,
+// keys stored — never a full-window scan), and it catches both observed
+// directions: (a) a recall result re-injecting content whose earlier
+// render was collected, and (b) a re-run tool call returning the same
+// payload an earlier evicted call returned.
+
+/// Minimum chars a whitespace-folded line needs to become a chunk key.
+/// Shorter lines ("ok", "STATUS: OK", bare counts) carry too little
+/// entropy: exact-matching them would mark unrelated content hot.
+const MIN_CHUNK_CHARS: usize = 12;
+
+/// Is this line GC's own annotation output (`[gc: ...]` markers,
+/// `[frame ...]` summaries)? Annotation lines never become chunk keys: a
+/// marker *describing* an eviction must not vouch for evicted content.
+fn is_gc_annotation_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with(EVICTION_MARKER_PREFIX) || trimmed.starts_with("[frame ")
 }
 
-/// The recall-overlap write-barrier pre-pass (t-1351, docs/GC.md): for each
-/// `recall` tool result in the window, hash its hit contents and check them
-/// against (a) every other window message's content and (b) contents
-/// previously collected from the window (`GcState.collected_hashes`).
-/// Matches mark the content HOT in `GcState.recall_hot` — a re-reference
-/// event: the model pulled back something it already had (or something GC
-/// took away), so dropping it again would thrash.
+fn collect_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if !text.trim().is_empty() {
+                out.push(text.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_string_leaves(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_string_leaves(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The payload strings inside one message content: JSON string leaves when
+/// the content parses as JSON (numbers/booleans — the volatile envelope
+/// fields — vanish by construction), else the raw text as one payload.
+fn payload_strings(content: &str) -> Vec<String> {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            let mut out = Vec::new();
+            collect_string_leaves(&value, &mut out);
+            out
+        }
+        _ => vec![content.to_string()],
+    }
+}
+
+/// Normalized chunk keys for write-barrier matching (t-1362): payload
+/// strings split into lines, each line whitespace-folded (interior runs
+/// collapse to one space), lines of >= [`MIN_CHUNK_CHARS`] chars hashed.
+/// The same stdout re-fetched under a different `duration_ms`, or
+/// re-injected as a memory render, yields overlapping keys.
+pub fn reinjection_chunk_keys(content: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for payload in payload_strings(content) {
+        for line in payload.lines() {
+            if is_gc_annotation_line(line) {
+                continue;
+            }
+            let folded = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if folded.chars().count() >= MIN_CHUNK_CHARS {
+                keys.insert(content_hash(&folded));
+            }
+        }
+    }
+    keys
+}
+
+/// Per-index hot mask over a window: a message is hot when any of its
+/// chunk keys is in `GcState.recall_hot` — content the model demonstrably
+/// re-acquired after eviction. This is what the `hot-keep` guard (t-1362)
+/// unions into a strategy's protected set: a value the model went and got
+/// AGAIN stops being evictable under normal pressure. Same strength as
+/// cited-keep — weaker than the preserve-prefix billing contract and the
+/// system/last-user hard guards, relaxed in the degrade phases.
+pub fn hot_mask(messages: &[ChatMessage], state: &GcState) -> Vec<bool> {
+    if state.recall_hot.is_empty() {
+        return vec![false; messages.len()];
+    }
+    messages
+        .iter()
+        .map(|message| {
+            message.content.as_deref().is_some_and(|content| {
+                reinjection_chunk_keys(content)
+                    .iter()
+                    .any(|key| state.recall_hot.contains(key))
+            })
+        })
+        .collect()
+}
+
+fn union_masks(base: &[bool], extra: &[bool]) -> Vec<bool> {
+    base.iter()
+        .zip(extra)
+        .map(|(left, right)| *left || *right)
+        .collect()
+}
+
+/// The re-injection write-barrier pre-pass (t-1351/t-1362, docs/GC.md):
+/// for each tool result in the window, chunk its content
+/// ([`reinjection_chunk_keys`]) and match against content previously
+/// collected from the window (`GcState.collected_hashes`); `recall`
+/// results additionally match against every other window message (a
+/// memory hit re-injecting live content is a re-reference even before
+/// anything was evicted). Matches mark the chunks HOT in
+/// `GcState.recall_hot` — the model pulled back something GC took away
+/// (or already had), so dropping it again would thrash.
 ///
 /// Pure, synchronous, and total, but it lives in the pre-pass rather than
-/// inside collect() because "previously collected" requires cross-collection
-/// state that no pure function of the current window has. NOT consumed by
-/// any strategy yet — it is t-1167 generational input, signal-only.
-pub fn record_recall_overlaps(
+/// inside collect() so the hot set is fresh before the strategy consults
+/// it, and because "previously collected" is cross-collection state.
+/// Consumed by every strategy's hot-keep guard (t-1362); it remains the
+/// promotion signal generational GC (t-1167) is specified against.
+pub fn record_reinjection_overlaps(
     messages: &[ChatMessage],
     state: &mut GcState,
 ) -> RecallOverlapReport {
@@ -888,8 +1058,9 @@ pub fn record_recall_overlaps(
             call_names.entry(call.id.as_str()).or_insert(&call.name);
         }
     }
+    let is_tool_result = |message: &ChatMessage| message.role == "tool";
     let is_recall_result = |message: &ChatMessage| {
-        message.role == "tool"
+        is_tool_result(message)
             && message.tool_call_id.as_deref().is_some_and(|id| {
                 call_names
                     .get(id)
@@ -897,28 +1068,31 @@ pub fn record_recall_overlaps(
             })
     };
 
-    // What the recall could be re-injecting: every OTHER window message's
-    // content (recall results themselves are excluded so two identical
-    // recalls do not vouch for each other).
-    let window_keys: BTreeSet<String> = messages
-        .iter()
-        .filter(|message| !is_recall_result(message))
-        .filter_map(|message| message.content.as_deref())
-        .filter(|content| !content.trim().is_empty())
-        .map(recall_content_key)
-        .collect();
+    // What a recall could be re-injecting from the LIVE window: every
+    // other (non-recall) message's chunks. Recall results are excluded so
+    // two identical recalls do not vouch for each other; built only when
+    // the window has recall traffic.
+    let window_keys: BTreeSet<String> = if messages.iter().any(&is_recall_result) {
+        messages
+            .iter()
+            .filter(|message| !is_recall_result(message))
+            .filter_map(|message| message.content.as_deref())
+            .flat_map(reinjection_chunk_keys)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
 
     let mut report = RecallOverlapReport::default();
-    for message in messages.iter().filter(|message| is_recall_result(message)) {
+    for message in messages.iter().filter(|message| is_tool_result(message)) {
         let Some(content) = message.content.as_deref() else {
             continue;
         };
-        for chunk in recall_hit_contents(content) {
-            if chunk.trim().is_empty() {
-                continue;
-            }
-            let key = recall_content_key(&chunk);
-            if window_keys.contains(&key) || state.collected_hashes.contains(&key) {
+        let recall = is_recall_result(message);
+        for key in reinjection_chunk_keys(content) {
+            let collected = state.collected_hashes.contains(&key);
+            let live = recall && window_keys.contains(&key);
+            if collected || live {
                 state.recall_hot.insert(key);
                 report.overlap_events += 1;
             }
@@ -926,24 +1100,6 @@ pub fn record_recall_overlaps(
     }
     report.hot_total = state.recall_hot.len();
     report
-}
-
-/// The hit contents inside one recall result. The recall tool renders a
-/// Retrieve result as a JSON array of `SourceResult`s, each with a `content`
-/// string; anything that does not parse that way is treated as one opaque
-/// chunk. Total: never an error.
-fn recall_hit_contents(content: &str) -> Vec<String> {
-    if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(content) {
-        let hits: Vec<String> = items
-            .iter()
-            .filter_map(|item| item.get("content").and_then(serde_json::Value::as_str))
-            .map(str::to_string)
-            .collect();
-        if !hits.is_empty() {
-            return hits;
-        }
-    }
-    vec![content.to_string()]
 }
 
 // --- Eviction markers (t-1360) ----------------------------------------------
@@ -1448,6 +1604,37 @@ where
      -> Vec<ChatMessage> {
         summary.markers = count_markers(&window);
         state.marker_summary = summary;
+        // Write-barrier corpus (t-1362): the normalized chunks of whatever
+        // this collection removed — dropped messages AND in-place rewrites
+        // (mark-sweep elision, stack frame pops) — join collected_hashes,
+        // so the pre-pass can recognize this content when a re-run call or
+        // a recall injects it back. GC annotation lines contribute nothing
+        // (reinjection_chunk_keys filters them), so dropped markers never
+        // vouch for content.
+        let survivors: HashMap<MsgId, Option<&str>> = window
+            .iter()
+            .map(|message| (message.id, message.content.as_deref()))
+            .collect();
+        for message in &original {
+            let Some(content) = message.content.as_deref() else {
+                continue;
+            };
+            let removed = match survivors.get(&message.id) {
+                None => true,
+                Some(now) => *now != Some(content),
+            };
+            if removed {
+                state
+                    .collected_hashes
+                    .extend(reinjection_chunk_keys(content));
+            }
+        }
+        state.hot_report = HotKeepReport {
+            hot_kept: hot_mask(&window, state)
+                .into_iter()
+                .filter(|hot| *hot)
+                .count(),
+        };
         window
     };
     if build.markers.is_empty() {
@@ -1622,8 +1809,18 @@ impl MarkSweepGc {
         // interior; in ignore mode the whole window is fair game.
         let restrict = if self.preserve_prefix { boundary } else { 0 };
 
+        let hot = if self.hot_keep {
+            hot_mask(&messages, state)
+        } else {
+            vec![false; messages.len()]
+        };
+        let hot_any = hot.iter().any(|hot| *hot);
+
         tag_lifecycles(&messages, state);
-        annotate_evictable_tool_results(&mut messages, state, restrict);
+        // Hot results keep their full body (hot-keep, t-1362): elision is
+        // in-place content destruction, exactly the loss a re-fetched
+        // value must not suffer twice.
+        annotate_evictable_tool_results(&mut messages, state, restrict, &hot);
 
         let mut keep = vec![true; messages.len()];
         sweep_by_lifecycle(
@@ -1633,6 +1830,7 @@ impl MarkSweepGc {
             budget,
             restrict,
             LifecycleState::Evictable,
+            &hot,
         );
         sweep_by_lifecycle(
             &messages,
@@ -1641,7 +1839,33 @@ impl MarkSweepGc {
             budget,
             restrict,
             LifecycleState::Complete,
+            &hot,
         );
+        // Hot relax: when the lifecycle passes cannot reach the budget
+        // with hot messages protected, run them again without hot-keep so
+        // mark-sweep reclaims exactly what it could before t-1362 (its
+        // convergence remains best-effort either way).
+        if hot_any && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            let unrestricted = vec![false; messages.len()];
+            sweep_by_lifecycle(
+                &messages,
+                &mut keep,
+                state,
+                budget,
+                restrict,
+                LifecycleState::Evictable,
+                &unrestricted,
+            );
+            sweep_by_lifecycle(
+                &messages,
+                &mut keep,
+                state,
+                budget,
+                restrict,
+                LifecycleState::Complete,
+                &unrestricted,
+            );
+        }
 
         let collected: Vec<ChatMessage> = messages
             .into_iter()
@@ -1720,10 +1944,15 @@ fn is_large_tool_result(message: &ChatMessage) -> bool {
             .is_some_and(|content| content.len() > 512)
 }
 
-fn annotate_evictable_tool_results(messages: &mut [ChatMessage], state: &GcState, boundary: usize) {
+fn annotate_evictable_tool_results(
+    messages: &mut [ChatMessage],
+    state: &GcState,
+    boundary: usize,
+    avoid: &[bool],
+) {
     let call_summaries = tool_call_summaries(messages);
-    for message in messages.iter_mut().skip(boundary) {
-        if message.role != "tool" {
+    for (index, message) in messages.iter_mut().enumerate().skip(boundary) {
+        if message.role != "tool" || avoid[index] {
             continue;
         }
         if state.lifecycle.get(&message.id) != Some(&LifecycleState::Evictable) {
@@ -1784,14 +2013,17 @@ fn sweep_by_lifecycle(
     budget: usize,
     boundary: usize,
     target: LifecycleState,
+    avoid: &[bool],
 ) {
     while estimate_tokens(&kept_messages(messages, keep)) > budget {
         let Some(index) = messages.iter().enumerate().position(|(idx, message)| {
             idx >= boundary
                 && keep[idx]
+                && !avoid[idx]
                 && message.role != "system"
                 && state.lifecycle.get(&message.id).copied() == Some(target)
                 && atomic_group_stays_past(messages, keep, idx, boundary)
+                && atomic_group_avoids_protected(messages, keep, idx, avoid)
         }) else {
             break;
         };
@@ -1856,14 +2088,23 @@ impl RingGc {
             messages[..cache_prefix_boundary(&messages, budget).min(messages.len())].to_vec();
 
         let mut keep = vec![true; messages.len()];
+        let protected = protected_with_prefix(&messages, boundary);
+        let hot = if self.hot_keep {
+            hot_mask(&messages, state)
+        } else {
+            vec![false; messages.len()]
+        };
+        let hot_any = hot.iter().any(|hot| *hot);
         // Phase 1: drop oldest-first from the interior (boundary 0 in ignore
-        // mode makes this the classic front-drop, minus the hard guards).
-        sweep_ring(
-            &messages,
-            &mut keep,
-            budget,
-            &protected_with_prefix(&messages, boundary),
-        );
+        // mode makes this the classic front-drop, minus the hard guards),
+        // skipping write-barrier-hot messages (hot-keep, t-1362).
+        sweep_ring(&messages, &mut keep, budget, &union_masks(&protected, &hot));
+        // Phase 1b (hot relax): hot-keep is a heuristic guard with
+        // cited-keep strength — it relaxes before the prefix pin (a
+        // billing contract) and the hard guards do.
+        if hot_any && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            sweep_ring(&messages, &mut keep, budget, &protected);
+        }
         // Phase 2 (preserve fallback): the pinned prefix plus the live tail
         // alone exceed the budget. Overflowing the model is worse than a
         // cache miss, so degrade to front-drop — with system + last user
@@ -1928,22 +2169,44 @@ impl StackFrameGc {
         record_frame_statuses(&messages, state);
 
         let mut keep = vec![true; messages.len()];
-        // Phase 1: pop completed frames oldest-first until under budget.
+        let hot = if self.hot_keep {
+            hot_mask(&messages, state)
+        } else {
+            vec![false; messages.len()]
+        };
+        let hot_any = hot.iter().any(|hot| *hot);
+        let protected = protected_with_prefix(&messages, boundary);
+        // Phase 1: pop completed frames oldest-first until under budget,
+        // skipping frames with write-barrier-hot members (hot-keep,
+        // t-1362: popping destroys the result body — the loss a
+        // re-fetched value must not suffer twice).
         while estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-            let Some(frame) = oldest_completed_frame(&messages, &keep, boundary) else {
+            let Some(frame) = oldest_completed_frame(&messages, &keep, boundary, &hot) else {
                 break;
             };
             pop_frame(&mut messages, &mut keep, &frame, state);
         }
         // Phase 2: frames alone were not enough (open frames, chat-heavy
-        // windows); drop oldest-first from the interior like ring.
+        // windows); drop oldest-first from the interior like ring, still
+        // skipping hot messages.
         if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
-            sweep_ring(
-                &messages,
-                &mut keep,
-                budget,
-                &protected_with_prefix(&messages, boundary),
-            );
+            sweep_ring(&messages, &mut keep, budget, &union_masks(&protected, &hot));
+        }
+        // Phase 2b (hot relax): hot-keep is a heuristic guard with
+        // cited-keep strength — pop and sweep again without it before the
+        // prefix pin or the hard guards are touched.
+        if hot_any && estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+            let unrestricted = vec![false; messages.len()];
+            while estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+                let Some(frame) = oldest_completed_frame(&messages, &keep, boundary, &unrestricted)
+                else {
+                    break;
+                };
+                pop_frame(&mut messages, &mut keep, &frame, state);
+            }
+            if estimate_tokens(&kept_messages(&messages, &keep)) > budget {
+                sweep_ring(&messages, &mut keep, budget, &protected);
+            }
         }
         // Phase 3 (preserve fallback): the pinned prefix plus the live tail
         // alone exceed the budget. Overflowing the model is worse than a
@@ -2000,18 +2263,21 @@ fn record_frame_statuses(messages: &[ChatMessage], state: &mut GcState) {
     }
 }
 
-/// The oldest kept frame whose every member sits at or past `boundary`.
-/// Frames with any unanswered call are open — never popped, never split.
-/// A frame is only poppable once a later assistant message exists past its
-/// last result: until the model has spoken again, the result is the live
-/// working set, not history (same incorporation rule as mark-sweep).
+/// The oldest kept frame whose every member sits at or past `boundary`
+/// and none of whose members is marked in `avoid` (the hot-keep guard —
+/// pass an all-false mask to lift the restriction). Frames with any
+/// unanswered call are open — never popped, never split. A frame is only
+/// poppable once a later assistant message exists past its last result:
+/// until the model has spoken again, the result is the live working set,
+/// not history (same incorporation rule as mark-sweep).
 fn oldest_completed_frame(
     messages: &[ChatMessage],
     keep: &[bool],
     boundary: usize,
+    avoid: &[bool],
 ) -> Option<Frame> {
     for (index, message) in messages.iter().enumerate().skip(boundary) {
-        if !keep[index] || message.role != "assistant" {
+        if !keep[index] || message.role != "assistant" || avoid[index] {
             continue;
         }
         let calls = message.tool_calls.as_deref().unwrap_or_default();
@@ -2034,7 +2300,7 @@ fn oldest_completed_frame(
                 .any(|(idx, later)| keep[idx] && later.role == "assistant")
         });
         if results.len() == calls.len()
-            && results.iter().all(|idx| *idx >= boundary)
+            && results.iter().all(|idx| *idx >= boundary && !avoid[*idx])
             && incorporated
         {
             return Some(Frame {
@@ -2703,6 +2969,7 @@ mod tests {
 
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: true,
         }
         .collect(messages.clone(), budget, &mut state);
@@ -2747,6 +3014,7 @@ mod tests {
 
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, budget, &mut state);
@@ -2779,6 +3047,7 @@ mod tests {
 
         let mut state = GcState::default();
         let collected = MarkSweepGc {
+            hot_keep: true,
             preserve_prefix: true,
         }
         .collect(messages, budget, &mut state);
@@ -2837,6 +3106,7 @@ mod tests {
 
     fn semantic_gc() -> SemanticGc {
         SemanticGc {
+            hot_keep: true,
             preserve_prefix: false,
             recent_window: 2,
             similarity_floor: 0.25,
@@ -3004,6 +3274,7 @@ mod tests {
         let budget = estimate_tokens(&messages) - 100;
 
         let gc = SemanticGc {
+            hot_keep: true,
             preserve_prefix: true,
             ..semantic_gc()
         };
@@ -3063,6 +3334,7 @@ mod tests {
     async fn semantic_prime_cache_embeds_missing_prunes_stale_and_reuses() {
         let embedder = Arc::new(AxisEmbedder::new());
         let gc = SemanticGc {
+            hot_keep: true,
             embedder: Some(embedder.clone()),
             ..semantic_gc()
         };
@@ -3101,6 +3373,7 @@ mod tests {
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let gc = SemanticGc {
+            hot_keep: true,
             embedder: Some(embedder),
             ..semantic_gc()
         };
@@ -3267,6 +3540,7 @@ mod tests {
         // Baseline deficiency (cited_keep off): the cited frame is the
         // oldest most-distant candidate, so pure similarity drops it first.
         let baseline = SemanticGc {
+            hot_keep: true,
             cited_keep: false,
             ..semantic_gc()
         };
@@ -3316,7 +3590,7 @@ mod tests {
         assert!(collected.iter().any(|message| message.id == last_user));
     }
 
-    // ---- recall-overlap write-barrier (t-1351) -------------------------------
+    // ---- re-injection write-barrier (t-1351, chunk-normalized t-1362) --------
 
     fn recall_frame(id: &str, hits: serde_json::Value) -> [ChatMessage; 2] {
         [
@@ -3332,6 +3606,67 @@ mod tests {
         ]
     }
 
+    /// The tool-result envelope shape ir_agent's shell tool renders — the
+    /// content real windows carry. `duration_ms` is the volatile field the
+    /// t-1369 re-fetch loop differed by.
+    fn shell_envelope(stdout: &str, duration_ms: u64) -> String {
+        serde_json::json!({
+            "duration_ms": duration_ms,
+            "ok": true,
+            "status": 0,
+            "stderr": "",
+            "stderr_truncated": false,
+            "stdout": stdout,
+            "stdout_truncated": false,
+            "timed_out": false,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn chunk_keys_normalize_the_envelope_and_volatile_fields() {
+        // Direction (b)'s prerequisite (t-1369 re-fetch loop): the same
+        // stdout under a different duration_ms must key identically, and
+        // the bare payload must overlap the enveloped one.
+        let first = reinjection_chunk_keys(&shell_envelope("MX-7749-KESTREL\n", 9));
+        let second = reinjection_chunk_keys(&shell_envelope("MX-7749-KESTREL\n", 4711));
+        assert_eq!(first, second, "wall-clock noise must normalize away");
+        assert!(!first.is_empty());
+        let bare = reinjection_chunk_keys("MX-7749-KESTREL");
+        assert_eq!(
+            first, bare,
+            "envelope and bare payload must share chunk keys"
+        );
+    }
+
+    #[test]
+    fn chunk_keys_fold_whitespace_and_skip_low_entropy_lines() {
+        assert_eq!(
+            reinjection_chunk_keys("the  planner fix\tis here"),
+            reinjection_chunk_keys("the planner fix is here"),
+        );
+        // Short lines ("ok", counts, STATUS: OK) carry too little entropy
+        // to key; GC's own annotation lines never key at all.
+        assert!(reinjection_chunk_keys("ok\n42\nSTATUS: OK").is_empty());
+        assert!(reinjection_chunk_keys(
+            "[gc: 3 evicted — shell call-2; recover: re-run the call — do not guess]"
+        )
+        .is_empty());
+        assert!(reinjection_chunk_keys(
+            "[frame call-1: shell(cat a.txt) -> stuff — evicted; re-run to recover]"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn chunk_keys_are_deterministic() {
+        let envelope = shell_envelope("line one of the payload\nline two of the payload\n", 3);
+        assert_eq!(
+            reinjection_chunk_keys(&envelope),
+            reinjection_chunk_keys(&envelope)
+        );
+    }
+
     #[test]
     fn recall_overlap_marks_reinjected_window_content_hot() {
         let note = "the planner fix is raising the statistics target";
@@ -3340,41 +3675,80 @@ mod tests {
             "call-recall",
             serde_json::json!([
                 { "source": "memory", "kind": "Semantic", "content": note },
-                { "source": "memory", "kind": "Semantic", "content": "unrelated note" },
+                { "source": "memory", "kind": "Semantic", "content": "an unrelated note body" },
             ]),
         ));
         let mut state = GcState::default();
 
-        let report = record_recall_overlaps(&messages, &mut state);
+        let report = record_reinjection_overlaps(&messages, &mut state);
 
         assert_eq!(report.overlap_events, 1, "only the matching hit fires");
         assert_eq!(report.hot_total, 1);
-        assert!(state.recall_hot.contains(&recall_content_key(note)));
+        assert!(!reinjection_chunk_keys(note).is_disjoint(&state.recall_hot));
     }
 
+    /// Direction (a) as observed in vivo (t-1369 finding 5): the collected
+    /// content was a shell-result JSON envelope, the recall hit is a memory
+    /// RENDER of the same value — exact-hash matching never fired on this;
+    /// chunk matching must.
     #[test]
-    fn recall_overlap_matches_previously_collected_content() {
-        // The thrash loop the signal exists to expose: GC dropped it, the
-        // model recalled it right back.
-        let dropped = "the audit finding GC evicted two turns ago";
+    fn recall_overlap_matches_previously_collected_content_across_renders() {
+        let token = "TOKEN-9QX-RAVEN-7734";
         let mut state = GcState::default();
-        state.collected_hashes.insert(recall_content_key(dropped));
+        state
+            .collected_hashes
+            .extend(reinjection_chunk_keys(&shell_envelope(
+                &format!("{token}\n"),
+                9,
+            )));
         let mut messages = vec![ChatMessage::system("system")];
         messages.extend(recall_frame(
             "call-recall",
-            serde_json::json!([{ "source": "memory", "kind": "Semantic", "content": dropped }]),
+            serde_json::json!([{
+                "source": "memory",
+                "kind": "Semantic",
+                "content": format!("### deploy-token\n{token}"),
+            }]),
         ));
 
-        let report = record_recall_overlaps(&messages, &mut state);
+        let report = record_reinjection_overlaps(&messages, &mut state);
 
         assert_eq!(report.overlap_events, 1);
-        assert!(state.recall_hot.contains(&recall_content_key(dropped)));
+        assert!(!reinjection_chunk_keys(token).is_disjoint(&state.recall_hot));
+    }
+
+    /// Direction (b), the t-1369 ring re-fetch loop: a re-run tool call
+    /// returns the same payload an earlier evicted call returned (envelope
+    /// differing only in duration_ms). The re-fetched result must go hot.
+    #[test]
+    fn refetched_tool_result_matching_collected_content_goes_hot() {
+        let stdout = "MX-7749-KESTREL\n";
+        let mut state = GcState::default();
+        state
+            .collected_hashes
+            .extend(reinjection_chunk_keys(&shell_envelope(stdout, 9)));
+        let refetched = shell_envelope(stdout, 231);
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant(None, vec![tool_call("call-9")]),
+            ChatMessage::tool("call-9", refetched.clone()),
+            ChatMessage::user("finish the task"),
+        ];
+
+        let report = record_reinjection_overlaps(&messages, &mut state);
+
+        assert_eq!(report.overlap_events, 1);
+        assert!(!reinjection_chunk_keys(&refetched).is_disjoint(&state.recall_hot));
+        // And the hot mask marks exactly the re-fetched result (hot-keep's
+        // read side).
+        let hot = hot_mask(&messages, &state);
+        assert_eq!(hot, vec![false, false, true, false]);
     }
 
     #[test]
     fn recall_overlap_unparseable_result_falls_back_to_whole_content() {
-        // A recall result that is not a JSON hit array is treated as one
-        // opaque chunk; exact (trimmed) window membership still fires.
+        // A recall result that is not JSON is treated as one opaque
+        // payload; window membership still fires.
         let note = "plain text recall payload";
         let messages = vec![
             ChatMessage::system("system"),
@@ -3390,18 +3764,19 @@ mod tests {
             ChatMessage::tool("call-recall", note),
         ];
         let mut state = GcState::default();
-        let report = record_recall_overlaps(&messages, &mut state);
+        let report = record_reinjection_overlaps(&messages, &mut state);
         assert_eq!(report.overlap_events, 1);
     }
 
     #[test]
-    fn recall_overlap_ignores_other_tools_and_non_overlapping_hits() {
+    fn reinjection_overlap_ignores_live_echo_and_non_overlapping_hits() {
         let note = "content that also appears in a shell result";
         let messages = vec![
             ChatMessage::system("system"),
             ChatMessage::user(note),
-            // A shell result echoing window content is not a memory
-            // re-injection: no write barrier.
+            // A shell result echoing LIVE window content is not a
+            // re-injection — nothing was evicted (tool results match only
+            // the collected corpus; the live-window check is recall-only).
             ChatMessage::assistant(None, vec![tool_call("call-shell")]),
             ChatMessage::tool("call-shell", note),
             // A recall whose hits overlap nothing stays cold.
@@ -3415,13 +3790,168 @@ mod tests {
             ),
             ChatMessage::tool(
                 "call-recall",
-                serde_json::json!([{ "content": "a note nobody has seen" }]).to_string(),
+                serde_json::json!([{ "content": "a note nobody has seen before" }]).to_string(),
             ),
         ];
         let mut state = GcState::default();
-        let report = record_recall_overlaps(&messages, &mut state);
+        let report = record_reinjection_overlaps(&messages, &mut state);
         assert_eq!(report.overlap_events, 0);
         assert!(state.recall_hot.is_empty());
+    }
+
+    // ---- hot-keep consumer (t-1362) -------------------------------------------
+
+    /// A window under pressure with one hot tool pair among cold ones: the
+    /// normal sweep must evict around the hot pair, whatever the strategy.
+    fn hot_keep_fixture(state: &mut GcState) -> Vec<ChatMessage> {
+        let hot_payload = shell_envelope("MX-7749-KESTREL\n", 17);
+        state
+            .collected_hashes
+            .extend(reinjection_chunk_keys(&shell_envelope(
+                "MX-7749-KESTREL\n",
+                9,
+            )));
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("count the OK lines and report the access code"),
+            ChatMessage::assistant(None, vec![tool_call("call-hot")]),
+            ChatMessage::tool("call-hot", hot_payload),
+            ChatMessage::assistant(Some("noted the code".into()), vec![]),
+            ChatMessage::assistant(None, vec![tool_call("call-cold-1")]),
+            ChatMessage::tool("call-cold-1", format!("cold {}", "x".repeat(400))),
+            ChatMessage::assistant(Some("step done".into()), vec![]),
+            ChatMessage::assistant(None, vec![tool_call("call-cold-2")]),
+            ChatMessage::tool("call-cold-2", format!("cold {}", "y".repeat(400))),
+            ChatMessage::assistant(Some("another step done".into()), vec![]),
+            ChatMessage::user("now finish"),
+        ];
+        record_reinjection_overlaps(&messages, state);
+        assert!(!state.recall_hot.is_empty(), "fixture must prime a hot set");
+        messages
+    }
+
+    /// Every strategy protects the hot pair through its normal phases: at
+    /// a budget reachable by evicting cold content, the hot result — an
+    /// OLDER message than its cold peers — survives with its body intact,
+    /// and hot_kept reports the protection.
+    #[test]
+    fn hot_keep_protects_reacquired_content_in_every_strategy() {
+        let strategies: Vec<(&str, Box<dyn ContextGc>)> = vec![
+            ("ring", Box::new(RingGc::default())),
+            ("mark-sweep", Box::new(MarkSweepGc::default())),
+            ("stack", Box::new(StackFrameGc::default())),
+            ("semantic", Box::new(semantic_gc())),
+        ];
+        for (name, gc) in strategies {
+            let mut state = GcState::default();
+            let messages = hot_keep_fixture(&mut state);
+            let hot_id = messages[3].id;
+            let budget = estimate_tokens(&messages) - 150;
+
+            let collected = gc.collect(messages, budget, &mut state);
+
+            assert!(
+                collected.iter().any(|message| message.id == hot_id
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains("MX-7749-KESTREL"))),
+                "{name}: the hot result (body intact) must survive the normal sweep"
+            );
+            assert!(
+                state.hot_report.hot_kept > 0,
+                "{name}: hot_kept must report the protection"
+            );
+        }
+    }
+
+    /// Hot-keep is a heuristic guard, not a hard one: under degrade
+    /// pressure the hot pair drops while system + last user survive, and
+    /// the window still reaches the budget (convergence unchanged).
+    #[test]
+    fn hot_keep_relaxes_under_degrade_pressure() {
+        let strategies: Vec<(&str, Box<dyn ContextGc>)> = vec![
+            ("ring", Box::new(RingGc::default())),
+            ("stack", Box::new(StackFrameGc::default())),
+            ("semantic", Box::new(semantic_gc())),
+        ];
+        for (name, gc) in strategies {
+            let mut state = GcState::default();
+            let messages = hot_keep_fixture(&mut state);
+            let hot_id = messages[3].id;
+            let last_user = messages[messages.len() - 1].id;
+            let budget = estimate_tokens(&messages[..1]) + 60;
+
+            let collected = gc.collect(messages, budget, &mut state);
+
+            assert!(
+                !collected.iter().any(|message| {
+                    message.id == hot_id
+                        && message
+                            .content
+                            .as_deref()
+                            .is_some_and(|content| content.contains("MX-7749-KESTREL"))
+                }),
+                "{name}: degrade pressure overrides hot-keep"
+            );
+            assert!(collected.iter().any(|message| message.role == "system"));
+            assert!(
+                collected.iter().any(|message| message.id == last_user),
+                "{name}: hard guards outrank hot-keep"
+            );
+            assert!(
+                estimate_tokens(&collected) <= budget,
+                "{name}: hot-keep must not break convergence"
+            );
+        }
+    }
+
+    /// The corpus side (t-1362): whatever collect() removes — dropped
+    /// messages and in-place rewrites alike — joins collected_hashes via
+    /// the marker wrapper, so every GcState-threading caller feeds the
+    /// write-barrier without interpreter help.
+    #[test]
+    fn collect_feeds_the_written_corpus_including_rewrites() {
+        // Ring: whole-message drops.
+        let doomed = format!("doomed payload {}", "z".repeat(200));
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(doomed.clone()),
+            ChatMessage::user("live tail"),
+        ];
+        let mut state = GcState::default();
+        let budget = estimate_tokens(&messages) - 40;
+        let collected = RingGc {
+            preserve_prefix: false,
+            hot_keep: true,
+        }
+        .collect(messages, budget, &mut state);
+        assert!(collected
+            .iter()
+            .all(|m| m.content.as_deref() != Some(&*doomed)));
+        assert!(
+            reinjection_chunk_keys(&doomed).is_subset(&state.collected_hashes),
+            "dropped content chunks must join the corpus"
+        );
+
+        // Stack: a frame pop rewrites the assistant message and drops the
+        // result — the result body must still reach the corpus.
+        let fat_result = format!("frame result body {}", "w".repeat(300));
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("task"),
+            ChatMessage::assistant(None, vec![tool_call("call-1")]),
+            ChatMessage::tool("call-1", fat_result.clone()),
+            ChatMessage::assistant(Some("done".into()), vec![]),
+            ChatMessage::user("go on"),
+        ];
+        let mut state = GcState::default();
+        let budget = estimate_tokens(&messages) - 60;
+        let _ = StackFrameGc::default().collect(messages, budget, &mut state);
+        assert!(
+            reinjection_chunk_keys(&fat_result).is_subset(&state.collected_hashes),
+            "popped frame result chunks must join the corpus"
+        );
     }
 
     // ---- hard protection: system + last user survive any pressure (t-1367) ----
@@ -3494,6 +4024,7 @@ mod tests {
             for preserve in [true, false] {
                 assert_system_and_last_user_survive(
                     &RingGc {
+                        hot_keep: true,
                         preserve_prefix: preserve,
                     },
                     budget,
@@ -3508,6 +4039,7 @@ mod tests {
             for preserve in [true, false] {
                 assert_system_and_last_user_survive(
                     &StackFrameGc {
+                        hot_keep: true,
                         preserve_prefix: preserve,
                     },
                     budget,
@@ -3525,6 +4057,7 @@ mod tests {
             for preserve in [true, false] {
                 assert_system_and_last_user_survive(
                     &MarkSweepGc {
+                        hot_keep: true,
                         preserve_prefix: preserve,
                     },
                     budget,
@@ -3541,6 +4074,7 @@ mod tests {
             for preserve in [true, false] {
                 assert_system_and_last_user_survive(
                     &SemanticGc {
+                        hot_keep: true,
                         preserve_prefix: preserve,
                         ..semantic_gc()
                     },
@@ -3560,6 +4094,7 @@ mod tests {
         let budget = protected_tokens + 20;
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: true,
         }
         .collect(messages, budget, &mut state);
@@ -3582,6 +4117,7 @@ mod tests {
         ];
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, 45, &mut state);
@@ -3637,6 +4173,7 @@ mod tests {
         let mut state = GcState::default();
         let budget = 220;
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, budget, &mut state);
@@ -3675,6 +4212,7 @@ mod tests {
         messages.push(ChatMessage::user("final question"));
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, 250, &mut state);
@@ -3715,6 +4253,7 @@ mod tests {
         ];
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, 200, &mut state);
@@ -3742,10 +4281,12 @@ mod tests {
         let mut state_a = GcState::default();
         let mut state_b = GcState::default();
         let a = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages.clone(), 200, &mut state_a);
         let b = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, 200, &mut state_b);
@@ -3766,6 +4307,7 @@ mod tests {
         let original_ids: BTreeSet<_> = messages.iter().map(|message| message.id).collect();
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, 200, &mut state);
@@ -3798,6 +4340,7 @@ mod tests {
         }
         messages.push(ChatMessage::user("wrap up"));
         let ring = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         };
         let mut state = GcState::default();
@@ -3840,6 +4383,7 @@ mod tests {
         let budget = protected_tokens + 5;
         let mut state = GcState::default();
         let collected = RingGc {
+            hot_keep: true,
             preserve_prefix: false,
         }
         .collect(messages, budget, &mut state);

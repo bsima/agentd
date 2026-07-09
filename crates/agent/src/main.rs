@@ -172,6 +172,14 @@ struct Args {
     /// pure similarity scoring.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     gc_cited_keep: bool,
+    /// Hot-keep for every GC strategy (t-1362): content the model
+    /// re-fetched or recalled after eviction (the re-injection
+    /// write-barrier's hot set) joins the protected set during the normal
+    /// sweep phases, so a just-recovered value stops being evictable — the
+    /// re-fetch-loss loop breaker. Relaxes in the degrade phases like
+    /// cited-keep. Pass `false` for pre-t-1362 sweep behavior.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gc_hot_keep: bool,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -618,9 +626,18 @@ async fn main() -> Result<()> {
             let preserve_prefix = matches!(args.gc_cache, GcCacheArg::Preserve);
             match args.gc {
                 GcArg::None => GcMode::None,
-                GcArg::Ring => GcMode::Ring(RingGc { preserve_prefix }),
-                GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc { preserve_prefix }),
-                GcArg::Stack => GcMode::Stack(StackFrameGc { preserve_prefix }),
+                GcArg::Ring => GcMode::Ring(RingGc {
+                    preserve_prefix,
+                    hot_keep: args.gc_hot_keep,
+                }),
+                GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc {
+                    preserve_prefix,
+                    hot_keep: args.gc_hot_keep,
+                }),
+                GcArg::Stack => GcMode::Stack(StackFrameGc {
+                    preserve_prefix,
+                    hot_keep: args.gc_hot_keep,
+                }),
                 GcArg::Semantic => {
                     // Same embedder the memory backend resolves from the
                     // registry's `embeddings` entry (t-1340). None =
@@ -638,6 +655,7 @@ async fn main() -> Result<()> {
                         similarity_floor: args.gc_semantic_floor,
                         embedder: embedder.clone(),
                         cited_keep: args.gc_cited_keep,
+                        hot_keep: args.gc_hot_keep,
                     })
                 }
             }
@@ -1617,6 +1635,7 @@ async fn resume_run(
         // Mirrors the CLI defaults (--gc stack, --gc-cache preserve): the
         // resumed run should collect the way a fresh run would.
         gc: GcMode::Stack(StackFrameGc {
+            hot_keep: true,
             preserve_prefix: true,
         }),
         gc_threshold: 0.85,

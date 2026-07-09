@@ -28,6 +28,7 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 | `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
 | `semantic` | Drops messages semantically distant from the recent thread (abandoned tangents first) | Long meandering sessions with dead ends; needs a registry `embeddings` entry | `--gc semantic` |
 | `cited-keep` (default on, semantic only) | Messages cited by later ones (id mentions, `context_refs`) join the protected set | A recent turn builds on an old, off-topic tool result | `--gc-cited-keep false` to disable |
+| `hot-keep` (default on, every strategy) | Content the model re-fetched or recalled after eviction (write-barrier hot set, t-1362) joins the protected set | Breaks the evict → re-fetch → re-evict loss loop (t-1369 finding 3) | `--gc-hot-keep false` to disable |
 | `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
 | cache `preserve` (default) | Pins system prompt + oldest ~25% of budget; evicts interior | Cached providers: zero prefix invalidations | `--gc-cache preserve` |
 | cache `ignore` | Front-drop allowed; maximal reclaim | No prompt caching in use | `--gc-cache ignore` |
@@ -200,6 +201,7 @@ Cross-strategy modifier:
 | Name         | Description                                                    | Status      |
 |--------------|----------------------------------------------------------------|-------------|
 | `cited-keep` | Messages cited by later ones join the protected set (t-1351)   | implemented for `semantic` (`--gc-cited-keep`, default on) |
+| `hot-keep`   | Re-acquired-after-eviction content joins the protected set (t-1362) | implemented for every strategy (`--gc-hot-keep`, default on) |
 
 ---
 
@@ -408,7 +410,7 @@ cited message** and come in three kinds, ordered by precision:
 |---|---|---|
 | `context_refs` | An `infer` tool call whose arguments carry `context_refs: [ids]` (t-1344) | Explicit citation **by construction**: the model asked for that tool result to be re-materialized into a child's context. Highest precision. |
 | id-mention | A message's *text content* contains a tool-call id minted earlier in the window, at token boundaries (`call-1` does not match inside `call-10`) | The model referred to the call/result by name ("per the output of call-X, proceed with…"). The structural pair members — the assistant message that *issued* the call and the tool message that *answers* it — carry the id by construction and are excluded; only third-party mentions are citations. |
-| recall-overlap | A `recall` tool result re-injects content whose hash matches content already in (or previously collected from) the window | Not a static edge but a temporal **re-reference event** — see the write-barrier section below. It lives in `GcState`, not in the per-window graph, because it needs cross-collection memory. |
+| re-injection overlap | A tool result re-injects content previously collected from the window — a re-run call returning an evicted payload, or a `recall` hit re-rendering it (recalls also match live window content) | Not a static edge but a temporal **re-reference event** — see the write-barrier section below. It lives in `GcState`, not in the per-window graph, because it needs cross-collection memory. Matching is chunk-normalized since t-1362. |
 
 The citation target is the tool-*result* message when it exists in the window
 (that is where the tokens are), else the dispatching call message. Protecting
@@ -449,12 +451,16 @@ computation. Embeddings need an async provider → pre-pass + `GcState` cache
 `collect()` stays a pure function of `(messages, budget, state)` with the
 graph derived on the fly.
 
-The recall-overlap signal is the exception that proves the rule: deciding
-"this recall re-injected something we *previously collected*" requires
+The re-injection signal is the exception that proves the rule: deciding
+"this result re-injected something we *previously collected*" requires
 memory of past collections, which no pure function of the current window
-has. So it lives in `GcState` (`recall_hot`, `collected_hashes`), written by
-the interpreter pre-pass — the same home and the same write-side/read-side
-split as the t-1350 embedding cache.
+has. So it lives in `GcState`: `collected_hashes` (the corpus) is written
+by `collect()`'s own eviction-marker wrapper — every dropped message and
+in-place rewrite contributes its chunks, so any caller threading a
+`GcState` feeds it — and `recall_hot` (the matches) is written by the
+interpreter pre-pass (`gc::record_reinjection_overlaps`) right before the
+strategy runs, so the hot-keep guard reads a fresh hot set. The same
+write-side/read-side split as the t-1350 embedding cache.
 
 ### `cited-keep`: the modifier, and what each strategy can do with the graph
 
@@ -472,7 +478,10 @@ before the window overflows the model.
 - **`ring`/`stack`/`mark-sweep` + `cited-keep` (future).** Same shape: skip
   cited atomic groups in the primary sweep, take them only in the degrade
   pass. For `stack`, a cited frame should also resist *popping* (the
-  citation refers to the result body, which popping destroys).
+  citation refers to the result body, which popping destroys). This shape
+  shipped for the *hot* signal as `hot-keep` (t-1362, all strategies —
+  including frame-pop resistance and elision-skip); the citation edge is
+  still semantic-only.
 - **`refcount` (future).** The graph is the strategy: roots = system + last
   user + recency floor; keep what is reachable over citation edges, evict
   unreachable-first in topological age order.
@@ -485,36 +494,67 @@ starts from observed re-reference behavior instead of speculation:
 - **Citation in-degree → warm.** A result cited once is demonstrably
   load-bearing: promote out of the nursery ("young, evict cheaply") into
   warm ("referenced; compact, don't drop").
-- **Recall-overlap → hot.** A recall hit that re-injects content already
-  seen — especially content *previously collected* — is a write barrier
-  firing in the JVM sense: a mutation (the recall) just created a reference
-  from the live working set to old-generation data. That content is hot;
-  re-evicting or re-dropping it thrashes (evict → recall → re-inject →
-  evict). `GcState.recall_hot` is exactly the hot-set membership,
-  `collected_hashes` the old-generation extent.
+- **Re-injection overlap → hot.** A tool result that re-injects content
+  already seen — especially content *previously collected* — is a write
+  barrier firing in the JVM sense: a mutation (the recall or re-run) just
+  created a reference from the live working set to old-generation data.
+  That content is hot; re-evicting or re-dropping it thrashes (evict →
+  re-fetch/recall → re-inject → evict — observed live as t-1369's ring
+  re-fetch-loss loop). `GcState.recall_hot` is exactly the hot-set
+  membership, `collected_hashes` the old-generation extent, and since
+  t-1362 the `hot-keep` guard is the first consumer: hot content is
+  protected through every strategy's normal sweep phases.
 - **Neither signal + semantically distant → cold.** The 2x2's bottom-right
   cell, already handled by semantic today.
 
-### The recall-overlap write-barrier (v1 mechanics)
+### The re-injection write-barrier (v2 mechanics, t-1362) and `hot-keep`
 
-Recorded by `gc::record_recall_overlaps`, called from the interpreter
-pre-pass (`interpreter::collect_prompt`) before the strategy runs:
+v1 (t-1351) matched by exact content hash and fired 0/15 across three
+generations of the behavioral eval: a recall hit is a memory RENDER and a
+re-run tool call is a fresh JSON ENVELOPE (differing only in
+`duration_ms`), so neither ever hash-equals what it re-injects. v2 matches
+**normalized content chunks** instead. Recorded by
+`gc::record_reinjection_overlaps`, called from the interpreter pre-pass
+(`interpreter::collect_prompt`) before the strategy runs:
 
-- A window message is a *recall result* when its `tool_call_id` resolves to
-  a tool call named `recall` (the agent loop's memory tool).
-- Its hit contents (the JSON array of `SourceResult`s; the whole text as one
-  chunk when it does not parse) are content-hashed (trimmed) and
-  membership-checked against (a) the hashes of every other window message's
-  content and (b) `GcState.collected_hashes` — contents of messages dropped
-  by earlier collections this run. v1 is exact-hash membership; fuzzy
-  overlap is future work and must stay out of `collect()` regardless.
-- Matches land in `GcState.recall_hot` and are reported on the `gc_collect`
-  event as `recall_overlap_events` (this collection) and `recall_hot`
-  (cumulative set size), so the t-1349 behavioral eval can observe the
-  signal. Both sets are runtime-only — `GcState` never serializes into
-  checkpoints — and are bounded by the run's own history.
-- **No strategy consumes it yet.** It is deliberately signal-only: t-1167's
-  generational design is its first customer.
+- **Chunking** (`gc::reinjection_chunk_keys`): JSON content contributes
+  its string leaves — dropping the volatile non-string envelope fields
+  (`duration_ms`, `status`, `ok`, `*_truncated`) by construction — and
+  non-JSON content is one payload; payloads split into lines, each line
+  whitespace-folds, and lines of >= 12 chars are content-hashed into keys.
+  Shorter lines carry too little entropy to match on, and GC's own
+  `[gc: ...]`/`[frame ...]` annotation lines never key at all. Chunking is
+  deterministic pure text analysis, one linear pass per message.
+- **Corpus**: `GcState.collected_hashes` holds the chunk keys of
+  everything collections removed this run — whole-message drops and
+  in-place rewrites (mark-sweep elision, stack frame pops) alike — written
+  by `collect()`'s eviction-marker wrapper itself.
+- **Matching, both observed directions**: every tool result's chunks are
+  checked against the corpus (a re-run call returning an evicted payload —
+  t-1369's re-fetch loop); `recall` results additionally match every other
+  window message's chunks (a memory hit re-injecting live content).
+  Matches land in `GcState.recall_hot`, reported on the `gc_collect`
+  event as `recall_overlap_events` (this pass) and `recall_hot`
+  (cumulative set size). Both sets are runtime-only — `GcState` never
+  serializes into checkpoints — and are bounded by the run's own history.
+- **`hot-keep`, the consumer** (`--gc-hot-keep`, default on, every
+  strategy): messages whose chunks intersect the hot set join the
+  protected set during the normal sweep phases — ring/stack/semantic skip
+  them in the primary sweeps, stack frames with hot members resist
+  popping, and mark-sweep neither elides nor sweeps them. The guard has
+  cited-keep strength: it relaxes in a dedicated degrade step *before*
+  the preserve-prefix billing contract or the system/last-user hard
+  guards are touched, so every strategy's convergence contract is
+  unchanged. What the returned window retains because it is hot is
+  reported as `hot_kept` on the gc_collect event. Rationale (t-1369
+  finding 3): recovery attempts were real but recovered values were
+  re-evicted 2-3x per session and the model eventually guessed — a value
+  the model went and got AGAIN must stop being evictable.
+- Scope note: hot-keep ships for ALL strategies, not just the default
+  candidates — the re-fetch-loss loop was observed on ring, the residual
+  fabrication on mark-sweep, and recall re-injection on stack/semantic;
+  the mechanic is a strategy-agnostic protected-mask union, so a partial
+  scope would leave known failure modes in specific collectors.
 
 ---
 

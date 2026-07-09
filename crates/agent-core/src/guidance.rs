@@ -114,9 +114,10 @@ same turn.";
 /// itself. The remember/recall TOOL descriptions (step 1) remain shipped;
 /// it is this fragment block that failed. The constant stays as the draft
 /// text (docs/GUIDANCE.md §2.2) pending a rework + re-record. The drafted
-/// "retained preferentially" sentence is additionally absent until a GC
-/// strategy consumes `recall_hot` (t-1167) — guidance must never claim
-/// retention the active strategy does not implement.
+/// "retained preferentially" sentence is no longer mechanism-blocked —
+/// hot-keep (t-1362) consumes `recall_hot` in every strategy — but stays
+/// out with the rest of the draft block until the rework's re-record
+/// passes the promotion gate.
 pub const MEMORY_BLOCK: &str = "\
 You have persistent memory via `remember` and `recall`.
 
@@ -566,10 +567,11 @@ mod tests {
         assert!(!no_gc.contains("marks that result as load-bearing"));
     }
 
-    /// The §2.2 "retained preferentially" claim ships only when a GC
-    /// strategy consumes `recall_hot` (t-1167) — until then neither the
-    /// draft memory block nor the shipped minimal core may promise
-    /// preferential retention.
+    /// The §2.2 "retained preferentially" claim stays out of both the
+    /// draft memory block and the shipped minimal core: the mechanism now
+    /// exists (hot-keep, t-1362, consumes `recall_hot` in every strategy),
+    /// but the sentence ships only with the §2.2 rework once its re-record
+    /// passes the promotion gate — text follows validated mechanism.
     #[test]
     fn memory_block_does_not_promise_preferential_retention_yet() {
         assert!(!MEMORY_BLOCK.contains("retained preferentially"));

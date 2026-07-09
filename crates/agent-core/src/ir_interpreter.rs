@@ -3446,6 +3446,7 @@ mod tests {
             similarity_floor: 0.35,
             embedder: None,
             cited_keep: true,
+            hot_keep: true,
         });
         let mut machine = guidance_probe_machine();
         machine.program.blocks.insert(
@@ -3494,6 +3495,7 @@ mod tests {
             let mut config = config_with_trace(provider.clone(), trace);
             config.gc = GcMode::Stack(crate::gc::StackFrameGc {
                 preserve_prefix: true,
+                hot_keep: true,
             });
             config.context_budget = budget;
             run_ir_sequential(&config, guidance_probe_machine()).await?;
@@ -3547,6 +3549,7 @@ mod tests {
         let mut config = config(provider.clone());
         config.gc = GcMode::Stack(crate::gc::StackFrameGc {
             preserve_prefix: true,
+            hot_keep: true,
         });
         run_ir_sequential(&config, guidance_probe_machine()).await?;
 
