@@ -28,10 +28,40 @@ pub fn normalize_program(program: &Program) -> Result<Program> {
 
 /// Hash the canonical normalized program form.
 pub fn canonical_program_hash(program: &Program) -> Result<ProgramHash> {
-    let normalized = normalize_program(program)?;
+    let mut normalized = normalize_program(program)?;
+    canonicalize_inline_prompt_ids(&mut normalized);
     let bytes = serde_json::to_vec(&HashProgram::from(&normalized))?;
     let digest = Sha256::digest(bytes);
     Ok(ProgramHash(format!("sha256:{digest:x}")))
+}
+
+/// Hash-canonicalization for Inline prompts (t-1366). `ChatMessage`'s serde
+/// carries its `id: Uuid` — traces and checkpoints depend on that, so the
+/// general serialization must keep it — but the id is minted per
+/// construction and is not identity (ChatMessage's PartialEq already
+/// ignores it). Left alone it leaks into the canonical serialization,
+/// making structurally-equal Inline-carrying programs hash apart. Pin the
+/// ids to nil in the hashed form so alpha-equivalent programs hash equal.
+///
+/// Scope: this touches only `PromptRef::Inline` messages inside `Infer`
+/// instructions. Programs without Inline prompts (the agent-loop programs,
+/// whose Infers take `PromptRef::Var`) serialize byte-identically to
+/// before, so their hashes — and the effect ids derived from them — do not
+/// move (pinned by `agent_loop_program_hash_is_pinned_across_the_inline_id_scrub`).
+fn canonicalize_inline_prompt_ids(program: &mut Program) {
+    for block in program.blocks.values_mut() {
+        for instr in &mut block.instructions {
+            if let Instr::Infer {
+                prompt: PromptRef::Inline(messages),
+                ..
+            } = instr
+            {
+                for message in messages {
+                    message.id = uuid::Uuid::nil();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1286,6 +1316,75 @@ mod tests {
         assert_ne!(
             canonical_program_hash(&p).unwrap(),
             canonical_program_hash(&different).unwrap()
+        );
+    }
+
+    fn single_inline_infer_program(message: crate::op::ChatMessage) -> Program {
+        Program {
+            id: ProgramId("inline".into()),
+            entry: BlockId(0),
+            blocks: BTreeMap::from([(
+                BlockId(0),
+                Block {
+                    params: vec![],
+                    instructions: vec![Instr::Infer {
+                        out: Var("response".into()),
+                        model: Expr::Value(json!("mock")),
+                        prompt: PromptRef::Inline(vec![message]),
+                        policy: Default::default(),
+                    }],
+                    terminator: Terminator::Return {
+                        value: Expr::Var(Var("response".into())),
+                    },
+                },
+            )]),
+        }
+    }
+
+    /// t-1366: `PromptRef::Inline` embeds ChatMessages whose freshly-minted
+    /// uuid serializes, so two structurally-equal user programs hashed
+    /// apart. The canonical form pins those ids to nil: identical content
+    /// hashes equal regardless of minted ids, and content still decides.
+    #[test]
+    fn inline_prompt_message_ids_do_not_change_the_hash() {
+        let first = crate::op::ChatMessage::user("hello");
+        let second = crate::op::ChatMessage::user("hello");
+        assert_ne!(first.id, second.id, "distinct minted uuids");
+        assert_eq!(
+            canonical_program_hash(&single_inline_infer_program(first)).unwrap(),
+            canonical_program_hash(&single_inline_infer_program(second)).unwrap(),
+            "structurally-equal Inline programs must hash equal"
+        );
+        assert_ne!(
+            canonical_program_hash(&single_inline_infer_program(crate::op::ChatMessage::user(
+                "hello"
+            )))
+            .unwrap(),
+            canonical_program_hash(&single_inline_infer_program(crate::op::ChatMessage::user(
+                "different content"
+            )))
+            .unwrap(),
+            "different content must still hash apart"
+        );
+    }
+
+    /// The agent-loop program carries no Inline prompts (its Infers take
+    /// `PromptRef::Var`), so the t-1366 inline-id scrub must not move its
+    /// hash: effect-id derivation flows from program_hash, and moving it
+    /// would orphan every existing loop recording. The literal is the hash
+    /// measured immediately before the scrub landed; it moves only when the
+    /// loop program itself intentionally changes (a replay-identity clean
+    /// break that must be its own decision).
+    #[test]
+    fn agent_loop_program_hash_is_pinned_across_the_inline_id_scrub() {
+        let machine = crate::ir_agent::agent_loop_ir(
+            crate::op::Model("mock".into()),
+            vec![crate::op::ChatMessage::user("hello")],
+            4,
+        );
+        assert_eq!(
+            canonical_program_hash(&machine.program).unwrap().0,
+            "sha256:c815b28c0616bc63c4598f757d016528050eb9edf83c96681257f8ff174b2e47"
         );
     }
 
