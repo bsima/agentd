@@ -2589,6 +2589,115 @@ mod tests {
         Ok(())
     }
 
+    /// t-1363: a bound effect error must replay byte-identically. Record a
+    /// run whose infer sub-tool fails (the t-1222 error-as-value envelope
+    /// feeds the failure back into the model-visible history), replay it,
+    /// and compare the reconstructed history turn by turn: whatever the
+    /// model saw live must come back verbatim from the recording — replay
+    /// never re-derives or decorates model-visible text.
+    #[tokio::test]
+    async fn agent_loop_ir_bound_infer_error_replays_byte_identical_history() -> Result<()> {
+        let machine = || {
+            agent_loop_ir(
+                Model("mock-main".into()),
+                vec![ChatMessage::user("use infer, then answer")],
+                6,
+            )
+        };
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let recorded_value = {
+            let mut queued = vec![
+                response(
+                    "",
+                    vec![ToolCall::new(
+                        "call-1",
+                        "infer",
+                        serde_json::json!({
+                            "model": "claude-sonnet-4-20250514",
+                            "prompt": "sub-question",
+                        }),
+                    )],
+                ),
+                response("recovered from the bad infer", vec![]),
+            ];
+            queued.reverse();
+            let provider = Arc::new(DeadModelProvider {
+                dead_model: "claude-sonnet-4-20250514".into(),
+                responses: Mutex::new(queued),
+                prompts: Mutex::new(Vec::new()),
+            });
+            let mut config = config_with_trace(provider, record_trace);
+            config.trace_full_payloads = true;
+            let (value, _machine) =
+                crate::ir_interpreter::run_ir_sequential(&config, machine()).await?;
+            value
+        };
+
+        let recorded_events = TraceLogger::read_events(&record_path).await?;
+        let replay = IrReplayTrace::from_events(&recorded_events)?;
+        let replay_trace = test_trace();
+        let replay_path = replay_trace.path().clone();
+        // Exhausted provider: replay must never reach it.
+        let mut config = config_with_trace(Arc::new(MockProvider::new(vec![])), replay_trace);
+        config.trace_full_payloads = true;
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let (replayed_value, _machine) =
+            crate::ir_interpreter::run_ir_sequential_with_store_and_replay(
+                &config,
+                machine(),
+                &mut store,
+                Some(&replay),
+            )
+            .await?;
+        assert_eq!(replayed_value, recorded_value);
+
+        let replayed_events = TraceLogger::read_events(&replay_path).await?;
+        let prompts = |events: &[Event]| -> Vec<Prompt> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::InferCall {
+                        prompt: Some(prompt),
+                        ..
+                    } => Some(prompt.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let recorded_prompts = prompts(&recorded_events);
+        let replayed_prompts = prompts(&replayed_events);
+        assert!(
+            recorded_prompts.len() >= 2,
+            "the recording has the turn prompts: {}",
+            recorded_prompts.len()
+        );
+        // ChatMessage equality covers every model-visible byte (role,
+        // content, tool metadata); only the volatile message uuids — which
+        // the model never sees — are excluded, by ChatMessage's PartialEq.
+        assert_eq!(
+            replayed_prompts, recorded_prompts,
+            "replayed model-visible history must be byte-identical to the recording"
+        );
+        let errors = |events: &[Event]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::InferError { error, .. } => Some(error.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            errors(&replayed_events),
+            errors(&recorded_events),
+            "replayed InferError text must match the recording verbatim"
+        );
+        let _ = std::fs::remove_file(&record_path);
+        let _ = std::fs::remove_file(&replay_path);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn agent_loop_ir_remember_store_failure_becomes_a_recoverable_tool_result() -> Result<()>
     {

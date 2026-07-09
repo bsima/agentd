@@ -117,6 +117,63 @@ impl Default for EvalConfig {
     }
 }
 
+/// A recorded effect failure being replayed (t-1363). `Display` renders the
+/// recorded error string *verbatim* — that string is exactly what the live
+/// run's error-as-value envelope embedded and fed back to the model
+/// (t-1222), so replay must reproduce it byte-for-byte, never re-derive or
+/// decorate model-visible text. The operator-facing replay note (`context`)
+/// is attached only when the failure propagates as an abort, via
+/// [`annotate_replayed_failure`], where nothing model-visible is at stake.
+///
+/// The type also distinguishes a *recorded* failure from replay-machinery
+/// errors (missing calls, identity divergence): under replay, only a
+/// recorded failure may bind as an error value — anything else must abort
+/// instead of fabricating text the model never saw.
+#[derive(Debug)]
+pub(crate) struct ReplayedEffectFailure {
+    /// Operator-facing note naming the replayed effect, e.g. "AgentIR
+    /// replaying recorded Infer failure at effect sha256:…".
+    context: String,
+    /// The recorded error string, byte-for-byte.
+    error: String,
+}
+
+impl ReplayedEffectFailure {
+    pub(crate) fn recorded(context: String, error: String) -> anyhow::Error {
+        anyhow::Error::new(Self { context, error })
+    }
+}
+
+impl std::fmt::Display for ReplayedEffectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for ReplayedEffectFailure {}
+
+/// Attach the operator-facing replay note to a recorded failure that is
+/// about to abort the run. A recorded failure that *binds* (errors-as-values)
+/// must stay byte-identical to what the model saw live, so the note is never
+/// applied on that path; non-recorded errors pass through untouched.
+pub(crate) fn annotate_replayed_failure(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast_ref::<ReplayedEffectFailure>() {
+        Some(failure) => {
+            let context = failure.context.clone();
+            err.context(context)
+        }
+        None => err,
+    }
+}
+
+/// Whether a failed effect with `on_error: Bind` may bind this error as a
+/// value (t-1363). Live, every failure binds. Under replay, only a recorded
+/// failure does — its `Display` is the recorded text verbatim — while
+/// replay-machinery errors (missing calls, divergence) abort loudly.
+pub(crate) fn bindable_effect_error(live: bool, err: &anyhow::Error) -> bool {
+    live || err.downcast_ref::<ReplayedEffectFailure>().is_some()
+}
+
 /// The Eval identity recorded for op-layer replay-divergence detection: the
 /// display command plus, for direct-exec Evals, the exact argv. Both are
 /// compared, so a shell command whose rendering happens to match an argv
@@ -196,8 +253,11 @@ impl ReplayTrace {
             }
         }
         if let Some(error) = self.infer_errors.get(&op_id) {
-            return Err(anyhow!(
-                "replaying recorded Infer failure at op {op_id}: {error}"
+            // Verbatim (t-1363): the recorded string is what the live run's
+            // consumers saw; the replay note rides as abort-only context.
+            return Err(ReplayedEffectFailure::recorded(
+                format!("replaying recorded Infer failure at op {op_id}"),
+                error.clone(),
             ));
         }
         self.infer_results
@@ -222,8 +282,9 @@ impl ReplayTrace {
             }
         }
         if let Some(error) = self.eval_errors.get(&op_id) {
-            return Err(anyhow!(
-                "replaying recorded Eval failure at op {op_id}: {error}"
+            return Err(ReplayedEffectFailure::recorded(
+                format!("replaying recorded Eval failure at op {op_id}"),
+                error.clone(),
             ));
         }
         self.eval_results
@@ -386,7 +447,7 @@ where
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             // Live responses get cost stamped from the registry pricing;
@@ -460,7 +521,7 @@ where
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             let truncated_stdout = result
@@ -2774,10 +2835,14 @@ mod tests {
             pricing: Default::default(),
         };
         let program = infer(Model("mock".into()), vec![ChatMessage::user("hello")]);
-        let err = run_sequential(&replay_config, (), program)
-            .await
-            .unwrap_err()
-            .to_string();
+        // `{:#}` renders the whole chain: the abort-only replay note plus
+        // the recorded error text, which is kept verbatim (t-1363).
+        let err = format!(
+            "{:#}",
+            run_sequential(&replay_config, (), program)
+                .await
+                .unwrap_err()
+        );
 
         assert!(err.contains("replaying recorded Infer failure"), "{err}");
         assert!(err.contains("mock provider exhausted"), "{err}");

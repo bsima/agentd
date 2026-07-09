@@ -1,8 +1,9 @@
 use crate::gc::GcState;
 use crate::interpreter::{
-    annotate_overflow_failure, catch_overflow_active, collect_for_overflow, hydrate_infer_prompt,
-    maybe_collect_prompt, millis_u64, prompt_preview, response_preview, run_eval_argv_with_env,
-    run_eval_with_env, SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
+    annotate_overflow_failure, annotate_replayed_failure, bindable_effect_error,
+    catch_overflow_active, collect_for_overflow, hydrate_infer_prompt, maybe_collect_prompt,
+    millis_u64, prompt_preview, response_preview, run_eval_argv_with_env, run_eval_with_env,
+    ReplayedEffectFailure, SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectErrorMode,
@@ -375,8 +376,13 @@ impl IrReplayTrace {
             ));
         }
         if let Some(error) = self.infer_errors.get(effect_id) {
-            return Err(anyhow!(
-                "AgentIR replaying recorded Infer failure at effect {effect_id}: {error}"
+            // Verbatim (t-1363): the recorded string is exactly what the
+            // live run's bound-error envelope embedded in the model-visible
+            // history, so replay must reproduce it byte-for-byte. The
+            // replay note rides as abort-only context.
+            return Err(ReplayedEffectFailure::recorded(
+                format!("AgentIR replaying recorded Infer failure at effect {effect_id}"),
+                error.clone(),
             ));
         }
         self.infer_results
@@ -411,8 +417,9 @@ impl IrReplayTrace {
             ));
         }
         if let Some(error) = self.eval_errors.get(effect_id) {
-            return Err(anyhow!(
-                "AgentIR replaying recorded Eval failure at effect {effect_id}: {error}"
+            return Err(ReplayedEffectFailure::recorded(
+                format!("AgentIR replaying recorded Eval failure at effect {effect_id}"),
+                error.clone(),
             ));
         }
         self.eval_results
@@ -436,8 +443,9 @@ impl IrReplayTrace {
             ));
         }
         if let Some(error) = self.retrieve_errors.get(effect_id) {
-            return Err(anyhow!(
-                "AgentIR replaying recorded Retrieve failure at effect {effect_id}: {error}"
+            return Err(ReplayedEffectFailure::recorded(
+                format!("AgentIR replaying recorded Retrieve failure at effect {effect_id}"),
+                error.clone(),
             ));
         }
         self.retrieve_results
@@ -465,8 +473,9 @@ impl IrReplayTrace {
             ));
         }
         if let Some(error) = self.store_errors.get(effect_id) {
-            return Err(anyhow!(
-                "AgentIR replaying recorded Store failure at effect {effect_id}: {error}"
+            return Err(ReplayedEffectFailure::recorded(
+                format!("AgentIR replaying recorded Store failure at effect {effect_id}"),
+                error.clone(),
             ));
         }
         self.store_results
@@ -504,8 +513,9 @@ impl IrReplayTrace {
             ));
         }
         if let Some(error) = self.tool_errors.get(effect_id) {
-            return Err(anyhow!(
-                "AgentIR replaying recorded Tool failure at effect {effect_id}: {error}"
+            return Err(ReplayedEffectFailure::recorded(
+                format!("AgentIR replaying recorded Tool failure at effect {effect_id}"),
+                error.clone(),
             ));
         }
         self.tool_results
@@ -1305,12 +1315,17 @@ async fn execute_instr(
                         .await?;
                     // Errors-as-values (t-1222): a Bind site converts the
                     // failure into a tool-visible value instead of unwinding
-                    // the turn. Abort (default) propagates.
-                    if policy.on_error == EffectErrorMode::Bind {
+                    // the turn. Abort (default) propagates. Under replay
+                    // only a *recorded* failure may bind — reproducing the
+                    // live envelope byte-for-byte (t-1363) — while replay
+                    // machinery errors (missing calls, divergence) abort
+                    // instead of fabricating text the model never saw.
+                    if policy.on_error == EffectErrorMode::Bind && bindable_effect_error(live, &err)
+                    {
                         machine.env.insert(out, effect_error_value(&err));
                         return Ok(None);
                     }
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             // Live responses get cost stamped from the registry pricing;
@@ -1448,7 +1463,7 @@ async fn execute_instr(
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             let truncated_stdout = result
@@ -1547,11 +1562,15 @@ async fn execute_instr(
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    if policy.on_error == EffectErrorMode::Bind {
+                    // Bind only live failures or recorded ones (t-1363);
+                    // replay-machinery errors abort, never bind.
+                    if policy.on_error == EffectErrorMode::Bind
+                        && bindable_effect_error(ir_replay.is_none(), &err)
+                    {
                         machine.env.insert(out, effect_error_value(&err));
                         return Ok(None);
                     }
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             let rendered = results.to_string();
@@ -1679,11 +1698,15 @@ async fn execute_instr(
                             timestamp: Utc::now(),
                         })
                         .await?;
-                    if policy.on_error == EffectErrorMode::Bind {
+                    // Bind only live failures or recorded ones (t-1363);
+                    // replay-machinery errors abort, never bind.
+                    if policy.on_error == EffectErrorMode::Bind
+                        && bindable_effect_error(ir_replay.is_none(), &err)
+                    {
                         machine.env.insert(out, effect_error_value(&err));
                         return Ok(None);
                     }
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             config
@@ -1760,12 +1783,19 @@ async fn execute_instr(
                         .await?;
                     // Errors-as-values (t-1222): the loop's dispatch arms use
                     // Bind so a failed handler becomes a tool result the
-                    // model can recover from.
-                    if policy.on_error == EffectErrorMode::Bind {
+                    // model can recover from. Under replay only a recorded
+                    // failure binds (t-1363): machinery errors — including
+                    // the op-layer-trace case above — abort loudly.
+                    if policy.on_error == EffectErrorMode::Bind
+                        && bindable_effect_error(
+                            ir_replay.is_none() && config.replay.is_none(),
+                            &err,
+                        )
+                    {
                         machine.env.insert(out, effect_error_value(&err));
                         return Ok(None);
                     }
-                    return Err(err);
+                    return Err(annotate_replayed_failure(err));
                 }
             };
             config
@@ -4773,6 +4803,126 @@ mod tests {
 
         assert!(err.contains("AgentIR replay missing InferCall"));
         assert!(err.contains("block BlockId(0) instruction 0"));
+        Ok(())
+    }
+
+    fn single_bind_infer_machine(model: &str) -> Machine {
+        let mut machine = single_infer_machine(model);
+        let block = machine.program.blocks.get_mut(&BlockId(0)).unwrap();
+        let Instr::Infer { policy, .. } = &mut block.instructions[0] else {
+            unreachable!("single_infer_machine starts with an Infer");
+        };
+        policy.on_error = EffectErrorMode::Bind;
+        machine
+    }
+
+    /// t-1363: a bound effect error must replay byte-identically. The value
+    /// a Bind site binds live embeds the raw error text — the model-visible
+    /// history is built from it — so replaying the recorded failure must
+    /// reconstruct that exact value, never a wrapper-decorated variant.
+    #[tokio::test]
+    async fn bound_infer_error_replays_byte_identically() -> Result<()> {
+        // An exhausted MockProvider fails the live chat call.
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let machine = single_bind_infer_machine("mock");
+        let (recorded, _) = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), record_trace),
+            machine.clone(),
+        )
+        .await?;
+        assert_eq!(recorded["ok"], Value::Bool(false));
+        let recorded_error = recorded["error"].as_str().unwrap().to_owned();
+        assert!(recorded_error.contains("mock provider exhausted"));
+
+        let events = crate::trace::TraceLogger::read_events(&record_path).await?;
+        let replay = IrReplayTrace::from_events(&events)?;
+        let replay_provider = Arc::new(MockProvider::new(vec![]));
+        let replay_trace = test_trace();
+        let replay_path = replay_trace.path().clone();
+        let mut store = InMemoryStore::new();
+        let (replayed, _) = run_ir_sequential_with_store_and_replay(
+            &config_with_trace(replay_provider.clone(), replay_trace),
+            machine,
+            &mut store,
+            Some(&replay),
+        )
+        .await?;
+
+        assert_eq!(
+            replayed, recorded,
+            "the bound error envelope must replay byte-identically"
+        );
+        assert_eq!(replay_provider.prompt_count(), 0);
+        // The replayed run's own InferError event also carries the recorded
+        // text verbatim, so a re-recorded trace matches the original.
+        let error_of = |events: &[Event]| -> Option<String> {
+            events.iter().find_map(|event| match event {
+                Event::InferError { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+        };
+        let replayed_events = crate::trace::TraceLogger::read_events(&replay_path).await?;
+        assert_eq!(error_of(&replayed_events), error_of(&events));
+        let _ = std::fs::remove_file(&record_path);
+        let _ = std::fs::remove_file(&replay_path);
+        Ok(())
+    }
+
+    /// t-1363: under replay, Bind polarity applies only to *recorded*
+    /// failures. A replay-machinery error — here a missing recording — must
+    /// abort instead of binding fabricated text the model never saw.
+    #[tokio::test]
+    async fn replay_machinery_errors_abort_even_under_bind_polarity() -> Result<()> {
+        let replay = IrReplayTrace::from_events(&[])?;
+        let mut store = InMemoryStore::new();
+        let err = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            single_bind_infer_machine("mock"),
+            &mut store,
+            Some(&replay),
+        )
+        .await
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("AgentIR replay missing InferCall"), "{err}");
+        Ok(())
+    }
+
+    /// t-1363: when a recorded failure aborts (default polarity), the
+    /// operator-facing replay note still rides the error chain — it is only
+    /// the model-visible bound value that must stay verbatim.
+    #[tokio::test]
+    async fn replayed_abort_failure_keeps_the_operator_note() -> Result<()> {
+        let record_trace = test_trace();
+        let record_path = record_trace.path().clone();
+        let machine = single_infer_machine("mock");
+        let live_err = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), record_trace),
+            machine.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{live_err:#}").contains("mock provider exhausted"));
+
+        let events = crate::trace::TraceLogger::read_events(&record_path).await?;
+        let replay = IrReplayTrace::from_events(&events)?;
+        let mut store = InMemoryStore::new();
+        let err = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            machine,
+            &mut store,
+            Some(&replay),
+        )
+        .await
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("AgentIR replaying recorded Infer failure"),
+            "{err}"
+        );
+        assert!(err.contains("mock provider exhausted"), "{err}");
+        let _ = std::fs::remove_file(&record_path);
         Ok(())
     }
 
