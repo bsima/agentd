@@ -1115,3 +1115,161 @@ exhausted mid-run (auth/402-style failures after earlier success):
 STOP, keep valid recordings, report exactly which pre-registered cells
 are unfunded — no retries into the wall, no fakes. Offline replay
 asserted per recorded cell, as every round.
+
+## GC as curation (t-1371): RESULTS — the hypothesis is refuted, with the opposite sign
+
+Recorded 2026-07-08, same model/provider/defaults as every round
+(`anthropic/claude-haiku-4.5` via OpenRouter). The per-cell estimate
+was wrong in one direction: GC cells thrashed to the 26-turn cap
+(~$0.15 each instead of ~$0.07), so the cap bound earlier than planned.
+Spend: **$1.168 matrix (9 of 13 cells) + $0.030 judge + <= ~$0.01 for
+a partial cell at the manual stop ≈ $1.21** of the $1.25 hard cap. The
+run was stopped by hand after the 9th cell: the harness cap check is
+per-cell-pre-flight and the 10th cell would have overshot the hard
+cap. **Unfunded pre-registered cells (4):** `distractor-update`
+mark-sweep s1, `clean-long` stack s1, `clean-long` mark-sweep s1, and
+the class-3 `tangent-return` semantic guided s1. Priority order
+protected the deciding cells as designed; the casualty ordering is
+uncomfortable in hindsight — mark-sweep, the strategy with the best
+behavioral record, went entirely unfunded. Offline replay reproduces
+every recorded cell strictly (asserted per cell, re-verified from a
+cold offline run); the `minimal` guidance variant was confirmed
+delivered on every turn of every cell from the recorded prompt_ir
+events, as pre-registered.
+
+### Results (the 9 recorded cells + unfunded markers)
+
+```
+fixture            arm        guid s turns evals  rpt refx rem prem rec coll reasons     drop ovl hot reev esc mkr mkref   in_tok  out_tok       cost wall_s  ok cfab rot rcov admt judge
+distractor-update  none       on   1    11     8    0    0   2    2   0    0 -              0   0   0    0   0   0     0    93090      861  $0.097395   19.6 yes    -   -    -    -   3/3
+distractor-update  none       on   2    11     8    0    0   2    2   0    0 -              0   0   0    0   0   0     0    93388      926  $0.098018   20.1 yes    -   -    -    -   3/3
+distractor-update  stack      on   1    27    25   17    7   1    0   0   24 s:24         487 3890   2  298  16  32     6   140401     2657  $0.153686   51.6  NO    -   -  yes    -   2/3
+distractor-update  mark-sweep on   1 skipped: planned cell not recorded (UNFUNDED)
+distractor-update  semantic   on   1    27    22   16    7   4    0   0   24 s:24         610 3579   2  298  17  34     7   133369     3702  $0.151879   54.7  NO    -   -  yes    -   0/3
+distractor-update  semantic   on   2    27    20   17    6   4    0   2   24 s:24         612 3724   1  299  25  50     8   134369     2966  $0.149199   54.5  NO    -   -  yes    -   0/3
+clean-long         none       on   1    13     8    0    0   4    4   0    0 -              0   0   0    0   0   0     0   114738     1049  $0.119983   24.8 yes    -   -    -    -   3/3
+clean-long         none       on   2    11     8    0    0   2    2   0    0 -              0   0   0    0   0   0     0    91401      814  $0.095471   17.7 yes    -   -    -    -   3/3
+clean-long         stack      on   1 skipped: planned cell not recorded (UNFUNDED)
+clean-long         mark-sweep on   1 skipped: planned cell not recorded (UNFUNDED)
+clean-long         semantic   on   1    27    18   15    7   8    1   0   23 s:23         568 2836   5  276  23  46     8   132357     3016  $0.147437   52.6  NO    -   -  yes    -   0/3
+clean-long         semantic   on   2    27    14   11    6  12    1   0   23 s:23         558 2369  12  269  25  50     9   138713     3233  $0.154878   50.1  NO    -   -  yes  yes   0/3
+```
+
+The control's final answers, verbatim, all four cells: `QUOTE UNIT 57
+TOTAL 570` (x2) and `REGION NORTH-7 SHIPPED 8 AUDIT AUD-4413` (x2) —
+exact, rot-free, 3/3 judge, in exactly the scripted 8 eval steps. No
+GC cell produced a final line at all: all five ran to the 26-turn cap
+mid-task. Flag honesty: the `admt yes` on clean-long semantic s2 is an
+artifact — its last text QUOTES a `[gc: ...]` marker containing the
+word "evicted", which trips the admission phrase check; it is not an
+admission. The stack cell's 2/3 judge verdict wrapped its JSON in
+echoed prose (the usual least-reliable-row caveat).
+
+### Verdicts against the pre-registered predictions
+
+- **P1 (class-1 accuracy): REFUTED, in both directions.** The control
+  never rotted — 2/2 exact answers, rot 0, despite the stale price,
+  the dead approach, and ~16 KB of poem tangent all sitting in its
+  window (93k cumulative input tokens). And semantic never answered —
+  0/2, both samples turn-capped in a restart loop. The predicted gap
+  appeared with the opposite sign: control 2/2, tuned curator 0/2.
+- **P2 (class-1 mechanism): REFUTED.** Semantic collected on
+  effectively every turn (23-24 of 27), evicted its own progress
+  narration, and cycled: s1 ran `cat plans/approach-a.txt` TEN times
+  and `cat pricing-v1.txt` seven times, never reaching steps 8-9. refx
+  6-7 (predicted ~0), cost 1.5x control (predicted <= 1.5x only
+  alongside success), rpt 11-17. The t-1349 restart loop, at 4x the
+  budget it was discovered at.
+- **P3 (class-2 refutation control): REFUTED on its matching half.**
+  Semantic did not match the control on clean content — 0/2 vs 2/2.
+  The artifact half held trivially (no GC arm beat the control; none
+  finished). Stack and mark-sweep halves UNFUNDED.
+- **P4 (cost at equal accuracy): REFUTED on the funded cells.** GC
+  arms cost 1.2-1.6x the control at zero success. (The pre-existing
+  weak-form evidence — mark-sweep completing tangent-return under
+  starvation cheaper than control, four straight generations — is
+  untouched by this round; the arm that carried it went unfunded.)
+- **P5 (regime contrast): UNFUNDED.** No new pressure-regime cell was
+  recorded. What can be said without it: the regime distinction the
+  contrast was meant to sharpen partially dissolved — see below.
+- **P6 (validity): SUPPORTED.** Every GC cell fired 23-24 threshold
+  collections (asserted per cell); no cell "matched control by never
+  collecting".
+
+**Overall: the strong form (well-tuned GC improves accuracy through
+curation) is REFUTED at these budgets on this model — not
+underpowered: the deciding cells discriminated sharply, with the
+opposite sign.** The weak form (equal accuracy at lower cost) is also
+refuted in this regime on the funded cells; its starvation-regime
+evidence stands but got no new test. The distractor premise itself
+found no victim: two blatant-distractor samples never moved the
+control, so "curation as attention hygiene" had nothing to hygiene at
+this window scale (~14k content tokens) — while the curator itself
+destroyed five out of five sessions it touched.
+
+### Why — and what the design got wrong
+
+The pre-registered regime conflated "generous budget" with "budget the
+session fits in". 8k tokens is 4-5x the starvation rounds, and no
+single item came close to filling it — but the SESSION is ~14k
+estimated content tokens, so from mid-session on the window cannot
+hold the transcript and threshold GC must evict something live every
+turn (23-24 collections). The restart dynamics are set by the
+content-to-budget ratio (~1.8x here, same as the starvation rounds'
+2-3x), not by absolute budget. In principle a perfect curator had
+room: the distractor mass is ~60% of the fixture, and the relevant
+remainder (~5.3k est. tokens) fits under the 6.8k collection target.
+The tuned stack is not that curator: it dropped step-completion
+narration and needed tool results alongside the poems (drop 487-612,
+reev 269-299 — content evicted, re-fetched, re-evicted, ~300 times per
+cell), so the model kept concluding it was on step 2. Hot-keep kept
+1-12 messages per collection and the write-barrier fired constantly
+(ovl 2.4-3.9k) — mechanism working as built, drowned by cadence. The
+in-window marker population reached 32-50 (vs 1-7 under starvation)
+with 16-25 escalations, and the models demonstrably read them (mkref
+6-9, the highest quoting rate of any round) — and still looped:
+markers name what is gone but cannot substitute for the narrative of
+what is DONE. This is t-1349 finding 2 (progress-narration eviction),
+five generations old, now demonstrated to be budget-independent and
+the single dominant failure of the whole stack.
+
+Two genuine firsts, both from the minimal guidance fragment (this is
+the first round where any variant renders): unprompted `remember`
+calls in every cell INCLUDING the controls (rem 2-4 proactive on
+`none` cells; 4-12 on semantic cells — though the GC-arm remembers
+happened mid-thrash and rescued nothing), where five starvation-regime
+generations of tool-description-only cells produced zero. The §2.2
+memory-discipline claim that failed its t-1364 A/B at suppressed
+budgets looks alive when the text actually ships — worth a controlled
+A/B before believing (the fragment is not the only delta vs those
+rounds).
+
+### What a fully-funded follow-up needs
+
+1. **The 4 unfunded cells** (~$0.55 at observed rates) — mark-sweep on
+   both new fixtures matters most: the strategy least prone to the
+   restart loop (it refuses incomplete lifecycles) is the one this
+   round never got to test, and on four generations of starvation
+   evidence it is the likeliest to have matched the control.
+2. **A true curation regime**, which this design failed to build:
+   budget sized so the RELEVANT content plus working margin fits
+   comfortably (e.g. 12-14k for this session shape, or shorter
+   sessions at 8k), with the distractor mass alone pushing past the
+   threshold. The tension to solve: at threshold timing, a budget the
+   whole session fits in never collects (P6 fails); the distractor
+   share must therefore carry the overflow — 3-4x bulkier tangents,
+   or eager timing declared up front.
+3. **A progress-narration guard before any re-test**: this round makes
+   the case that no curation result is interpretable while every
+   strategy evicts the agent's own step-completion record — protect
+   recent assistant narration (or leave a "steps 1-N done" digest) and
+   THEN ask whether curation beats control.
+4. **n>=4 on the control** if context rot is still the target: rot
+   0/4 control samples here says blatant distractors do not move this
+   model at ~14k-token windows; either the windows must be much
+   longer, the distractors subtler, or the claim dropped.
+5. **A second model class** (the standing caveat, unchanged): every
+   generation of this eval is one cheap model family;
+   nothing here is evidence about how other models respond to
+   curation, markers, or the restart trap. Estimated ~$3-5 for 1+2+4
+   on the same model; a second model class roughly doubles it.

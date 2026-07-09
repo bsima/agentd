@@ -101,6 +101,25 @@
 //! fixture's scripted count), and `admt` (the final answer admits the
 //! value is unavailable instead of asserting one — admission-phrase
 //! check on failed cells, a lower bound).
+//!
+//! Curation axis (t-1371): every round above ran the STARVATION regime
+//! (1.6-2k-token budgets, GC forced). The pre-registered hypothesis
+//! (evals/gc/README.md "GC as curation — PRE-REGISTRATION", committed
+//! before any recording) is that well-tuned GC IMPROVES accuracy in the
+//! CURATION regime: generous budgets (8k tokens — nothing forced, the
+//! t-1368 gate delivers the MINIMAL guidance variant), threshold-triggered
+//! collections, and sessions long enough to curate. Two new fixture
+//! classes with OPPOSITE predictions: `distractor-update` (an early value
+//! superseded later + an abandoned approach + an irrelevant tangent;
+//! prediction: semantic beats the control by evicting the stale/dead
+//! content, the control risks context rot) and `clean-long` (same length
+//! and structure, everything relevant and consistent, broad recall needed;
+//! prediction: GC arms MATCH the control and never beat it — a GC win here
+//! is a fixture artifact that discounts the class-1 win). New metric:
+//! `rot` — the final answer asserts the claim with the STALE needle while
+//! the updated one is absent (context-rot failure made programmatic; the
+//! success needles score the updated value, the rot needles the stale
+//! one, so every cell is scoreable both ways).
 
 use agent_core::gc::SemanticGc;
 use agent_core::{
@@ -291,6 +310,12 @@ struct Fixture {
     /// Ordered needles that must appear in this order after the final
     /// answer marker (F2's category ranking); empty = no order check.
     ordered_needles: Vec<&'static str>,
+    /// Context-rot needles (t-1371): STALE values a distractor fixture
+    /// plants and later supersedes. The `rot` flag fires when the final
+    /// answer asserts the claim marker with a rot needle while the updated
+    /// value (`needles[0]`) is absent — the context-rot failure made
+    /// programmatic. Empty on fixtures with nothing stale to quote.
+    rot_needles: Vec<&'static str>,
     /// Substring identifying shell commands that touch the needle's source
     /// (e.g. the access-code file). Occurrences beyond `probe_allowance`
     /// count as re-fetches — the model re-acquiring something it had been
@@ -394,8 +419,41 @@ const BUILD_WORDS: [&str; 12] = [
     "incremental",
 ];
 
+const CATALOG_WORDS: [&str; 12] = [
+    "catalog",
+    "listing",
+    "wholesale",
+    "invoice",
+    "quotation",
+    "discount",
+    "surcharge",
+    "freight",
+    "tariff",
+    "bundle",
+    "voucher",
+    "ledger",
+];
+
+const DEPOT_WORDS: [&str; 12] = [
+    "depot",
+    "pallet",
+    "dockside",
+    "forklift",
+    "manifest",
+    "carton",
+    "staging",
+    "inbound",
+    "outbound",
+    "bay",
+    "consignment",
+    "waybill",
+];
+
 const ACCESS_CODE: &str = "MX-7749-KESTREL";
 const DEPLOY_TOKEN: &str = "TOKEN-9QX-RAVEN-7734";
+/// t-1371 distractor-update values: the stale price and the update.
+const STALE_UNIT_PRICE: &str = "42";
+const CURRENT_UNIT_PRICE: &str = "57";
 
 /// Batch log `index` with exactly `ok_lines` lines reading exactly
 /// "STATUS: OK" amid bulky deterministic filler. The OK line is the WHOLE
@@ -432,6 +490,34 @@ fn build_log(index: usize, warn_lines: usize) -> String {
         }
     }
     out
+}
+
+/// Shipment day-log `index` with exactly `ok_lines` lines reading exactly
+/// `SHIPPED: OK` amid `bulk_lines` of deterministic filler (the batch_log
+/// whole-line lesson: one right answer under every plausible reading).
+fn shipment_log(index: usize, ok_lines: usize, bulk_lines: usize) -> String {
+    let mut out = String::new();
+    for line in 0..bulk_lines {
+        out.push_str(&format!(
+            "day-{index} {}\n",
+            filler(&DEPOT_WORDS, index * 100 + line * 7, 64)
+        ));
+        if line < ok_lines {
+            out.push_str("SHIPPED: OK\n");
+        }
+    }
+    out
+}
+
+/// A bulky prose file with one load-bearing `value_line` embedded mid-file
+/// (t-1371): filler above and below, so the value sits inside ordinary
+/// content rather than alone at a file boundary.
+fn value_file(words: &[&str], seed: usize, lines: usize, prefix: &str, value_line: &str) -> String {
+    format!(
+        "{}\n{value_line}\n{}\n",
+        filler_lines(words, seed, lines / 2, prefix),
+        filler_lines(words, seed + 1000, lines - lines / 2, prefix),
+    )
 }
 
 /// app.log: ERROR lines in three categories (timeout 7, checksum 4,
@@ -491,6 +577,7 @@ fn fixtures() -> Vec<Fixture> {
             context_budget: 2000,
             needles: vec![ACCESS_CODE, "21"],
             ordered_needles: vec![],
+            rot_needles: vec![],
             claim_marker: "ACCESS",
             probe: "access-code",
             probe_allowance: 1,
@@ -530,6 +617,7 @@ fn fixtures() -> Vec<Fixture> {
             context_budget: 1600,
             needles: vec!["CATEGORIES", "timeout", "checksum", "quota"],
             ordered_needles: vec!["timeout", "checksum", "quota"],
+            rot_needles: vec![],
             claim_marker: "CATEGORIES",
             probe: "app.log",
             probe_allowance: 2,
@@ -572,6 +660,7 @@ fn fixtures() -> Vec<Fixture> {
             context_budget: 1700,
             needles: vec![DEPLOY_TOKEN, "6"],
             ordered_needles: vec![],
+            rot_needles: vec![],
             claim_marker: "DEPLOY",
             probe: "deploy-token",
             probe_allowance: 1,
@@ -589,6 +678,181 @@ fn fixtures() -> Vec<Fixture> {
             ],
         },
     ]
+}
+
+/// The t-1371 curation-regime fixtures (pre-registered in
+/// evals/gc/README.md BEFORE recording). Budget 8000 tokens — generous:
+/// the largest single tool result is well under budget, so nothing is
+/// forced; the ~40 KB sessions overflow it ~2x, so threshold collections
+/// fire mid-session with real material to curate. Both fixtures share
+/// length and structure (8 cat steps + a final line); they differ only in
+/// whether the content contains distractors — that is the experiment.
+fn curation_fixtures() -> Vec<Fixture> {
+    vec![
+        // Class 1 — distractor-update (hypothesis home turf): a stale
+        // value superseded later, an explicitly abandoned approach, and an
+        // irrelevant tangent. Scoreable both ways: success needles score
+        // the updated price, rot needles the stale one.
+        Fixture {
+            name: "distractor-update",
+            task: "Complete these steps strictly in order, one shell command per step, \
+                   with at most one short sentence of commentary each:\n\
+                   1. Run `cat briefing/notes.txt` (the ops briefing; no action needed).\n\
+                   2. Run `cat catalog/pricing-v1.txt` — the price list.\n\
+                   3. Run `cat plans/approach-a.txt` — a draft quoting procedure.\n\
+                   4. Run `cat plans/approach-a-review.txt` — the review of that draft.\n\
+                   5. Run `cat archive/clippings-1.txt` and summarize it in one sentence.\n\
+                   6. Run `cat archive/clippings-2.txt` and summarize it in one sentence.\n\
+                   7. Run `cat catalog/pricing-v2.txt` — the price list again.\n\
+                   8. Run `cat orders/current.txt` — the confirmed order count.\n\
+                   9. Finish with one line exactly of the form: \
+                   `QUOTE UNIT <price> TOTAL <total>` — the current unit price in \
+                   whole dollars (digits only, no symbols or decimals) and that \
+                   price times the number of units ordered."
+                .into(),
+            context_budget: 8000,
+            needles: vec![CURRENT_UNIT_PRICE, "570"],
+            ordered_needles: vec![],
+            rot_needles: vec![STALE_UNIT_PRICE, "420"],
+            claim_marker: "QUOTE",
+            probe: "pricing",
+            probe_allowance: 2,
+            scripted_recalls: 0,
+            files: vec![
+                (
+                    "briefing/notes.txt",
+                    filler_lines(&MANUAL_WORDS, 11, 120, "briefing: "),
+                ),
+                (
+                    "catalog/pricing-v1.txt",
+                    format!(
+                        "PRICE LIST v1\n{}",
+                        value_file(
+                            &CATALOG_WORDS,
+                            21,
+                            56,
+                            "item: ",
+                            &format!("unit price: ${STALE_UNIT_PRICE}"),
+                        )
+                    ),
+                ),
+                (
+                    "plans/approach-a.txt",
+                    format!(
+                        "DRAFT quoting procedure (approach A)\n{}",
+                        value_file(
+                            &BUILD_WORDS,
+                            31,
+                            118,
+                            "draft: ",
+                            "step: multiply the legacy base rate $38 by the seasonal \
+                             factor 1.2, then add the handling surcharge",
+                        )
+                    ),
+                ),
+                (
+                    "plans/approach-a-review.txt",
+                    "REVIEW: Approach A is REJECTED. The draft procedure and every \
+                     number in it (base rate, seasonal factor, surcharge) are \
+                     obsolete — do not use them. Produce the quote from the current \
+                     price list instead.\n"
+                        .into(),
+                ),
+                (
+                    "archive/clippings-1.txt",
+                    filler_lines(&POEM_WORDS, 7, 110, ""),
+                ),
+                (
+                    "archive/clippings-2.txt",
+                    filler_lines(&POEM_WORDS, 401, 110, ""),
+                ),
+                (
+                    "catalog/pricing-v2.txt",
+                    format!(
+                        "PRICE LIST v2 (CURRENT — supersedes v1; v1 prices are obsolete)\n{}",
+                        value_file(
+                            &CATALOG_WORDS,
+                            61,
+                            56,
+                            "item: ",
+                            &format!("unit price: ${CURRENT_UNIT_PRICE}"),
+                        )
+                    ),
+                ),
+                (
+                    "orders/current.txt",
+                    "confirmed orders this cycle: 10 units\n".into(),
+                ),
+            ],
+        },
+        // Class 2 — clean-long (refutation control): same length and
+        // structure, every byte relevant and consistent, and the final
+        // answer needs broad recall (early + middle + late values). No rot
+        // needles: there is nothing stale to quote. Predicted: GC arms
+        // match the control, never beat it — a GC win here is a fixture
+        // artifact that discounts the class-1 result.
+        Fixture {
+            name: "clean-long",
+            task: "Complete these steps strictly in order, one shell command per step, \
+                   with at most one short sentence of commentary each:\n\
+                   1. Run `cat briefing/overview.txt` (the depot background; no action \
+                   needed).\n\
+                   2. Run `cat depot/region.txt` — it states the depot's region code.\n\
+                   3. Run `cat procedures/receiving.txt` (the receiving procedure).\n\
+                   4. Run `cat procedures/receiving-checklist.txt`.\n\
+                   5-7. For each of shipments/day-1.log through shipments/day-3.log in \
+                   order, run `cat <file>` and count the lines that read exactly \
+                   `SHIPPED: OK`.\n\
+                   8. Run `cat depot/audit.txt` — it states the audit id.\n\
+                   9. Finish with one line exactly of the form: \
+                   `REGION <code> SHIPPED <total> AUDIT <id>` — the region code from \
+                   step 2, the sum of the three SHIPPED-line counts, and the audit id \
+                   from step 8."
+                .into(),
+            context_budget: 8000,
+            needles: vec!["NORTH-7", "8", "AUD-4413"],
+            ordered_needles: vec![],
+            rot_needles: vec![],
+            claim_marker: "REGION",
+            probe: "region",
+            probe_allowance: 1,
+            scripted_recalls: 0,
+            files: vec![
+                (
+                    "briefing/overview.txt",
+                    filler_lines(&MANUAL_WORDS, 17, 120, "overview: "),
+                ),
+                (
+                    "depot/region.txt",
+                    value_file(&DEPOT_WORDS, 23, 56, "site: ", "region code: NORTH-7"),
+                ),
+                (
+                    "procedures/receiving.txt",
+                    filler_lines(&BUILD_WORDS, 37, 118, "procedure: "),
+                ),
+                (
+                    "procedures/receiving-checklist.txt",
+                    "CHECKLIST: the deliverable is the day-log shipment count — for \
+                     each shipments/day-N.log, count the lines that read exactly \
+                     `SHIPPED: OK`, and report the region code and audit id with the \
+                     total.\n"
+                        .into(),
+                ),
+                ("shipments/day-1.log", shipment_log(1, 3, 110)),
+                ("shipments/day-2.log", shipment_log(2, 1, 110)),
+                ("shipments/day-3.log", shipment_log(3, 4, 56)),
+                ("depot/audit.txt", "audit id: AUD-4413\n".into()),
+            ],
+        },
+    ]
+}
+
+/// Every fixture the harness knows: the starvation-regime set plus the
+/// t-1371 curation-regime set (recording lookup + honesty checks).
+fn all_fixtures() -> Vec<Fixture> {
+    let mut all = fixtures();
+    all.extend(curation_fixtures());
+    all
 }
 
 fn system_prompt() -> &'static str {
@@ -677,6 +941,28 @@ fn confabulated(fixture: &Fixture, content: &str) -> bool {
         ordered_needles_present(content, &fixture.ordered_needles)
     };
     !claim_ok
+}
+
+/// The context-rot flag (t-1371): the final answer asserts the fixture's
+/// claim marker, the updated value (`needles[0]`) is absent, and a STALE
+/// needle is present — the model quoted the superseded value the session
+/// later corrected. A prose mention of the old value alongside a correct
+/// claim does NOT flag (the updated value being present clears it), and a
+/// cell that never answers cannot rot. Always false on fixtures with no
+/// rot needles.
+fn context_rot(fixture: &Fixture, content: &str) -> bool {
+    if fixture.rot_needles.is_empty()
+        || !content
+            .to_lowercase()
+            .contains(&fixture.claim_marker.to_lowercase())
+        || needle_present(content, fixture.needles[0])
+    {
+        return false;
+    }
+    fixture
+        .rot_needles
+        .iter()
+        .any(|needle| needle_present(content, needle))
 }
 
 /// Marker-reaction needle (t-1369): does an assistant text quote eviction-
@@ -896,6 +1182,9 @@ struct CellMetrics {
     /// The final answer asserts the claim marker with a wrong claim value
     /// (see [`confabulated`]) — fabricated content for evicted material.
     confabulated: bool,
+    /// The final answer asserts the claim with a STALE needle while the
+    /// updated value is absent (see [`context_rot`], t-1371).
+    context_rot: bool,
 }
 
 fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Result<CellMetrics> {
@@ -923,6 +1212,7 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         usage: RunUsage::default(),
         success: fixture_success(fixture, content),
         confabulated: confabulated(fixture, content),
+        context_rot: context_rot(fixture, content),
     };
     let mut seen_commands: BTreeSet<String> = BTreeSet::new();
     let mut probe_hits = 0usize;
@@ -1068,7 +1358,26 @@ struct CellId {
     sample: u32,
 }
 
-/// The recording plan, in SPEND-PRIORITY order. Three generations:
+/// The recording plan, in SPEND-PRIORITY order. Four generations:
+///
+/// t-1371 curation-regime cells (first: the pre-registered plan order —
+/// evals/gc/README.md "GC as curation — PRE-REGISTRATION" — puts the
+/// hypothesis-deciding cells ahead of everything, so the spend cap can
+/// never cut them):
+///
+/// 1. class-1 deciding cells — `distractor-update` semantic + control,
+///    n=2 (the strong form's accuracy comparison);
+/// 2. class-2 control pair — `clean-long` semantic + control, n=2 (the
+///    refutation control that makes a class-1 win believable);
+/// 3. remaining arms n=1 — stack and mark-sweep on both new fixtures;
+/// 4. class-3 regime contrast — `tangent-return` semantic guided s1 at
+///    the starvation budget (the tuned curator in the regime where its
+///    arm has thrash-looped every generation).
+///
+/// All guided (the shipped default; at budget 8000 the t-1368 gate
+/// delivers the MINIMAL fragment variant — verified before
+/// pre-registration and part of the tested configuration). Earlier
+/// generations:
 ///
 /// t-1369 marker-era re-record (first, so the spend cap can never cut it):
 /// t-1360 gave every strategy eviction markers, which invalidated the
@@ -1115,6 +1424,35 @@ struct CellId {
 /// Then the t-1364 unguided coverage and `none` baselines, all recorded.
 fn planned_cells() -> Vec<CellId> {
     let mut cells = Vec::new();
+    // t-1371 curation-regime cells, in pre-registered priority order.
+    for fixture in ["distractor-update", "clean-long"] {
+        for sample in [1, 2] {
+            for arm in [Arm::Semantic, Arm::NoGc] {
+                cells.push(CellId {
+                    fixture,
+                    arm,
+                    guided: true,
+                    sample,
+                });
+            }
+        }
+    }
+    for fixture in ["distractor-update", "clean-long"] {
+        for arm in [Arm::Stack, Arm::MarkSweep] {
+            cells.push(CellId {
+                fixture,
+                arm,
+                guided: true,
+                sample: 1,
+            });
+        }
+    }
+    cells.push(CellId {
+        fixture: "tangent-return",
+        arm: Arm::Semantic,
+        guided: true,
+        sample: 1,
+    });
     // t-1369 marker-era cells, in deciding-question-first order.
     for arm in [Arm::Ring, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
         for sample in [1, 2] {
@@ -1505,7 +1843,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1532,6 +1870,7 @@ fn print_header() {
         "wall_s",
         "ok",
         "cfab",
+        "rot",
         "rcov",
         "admt",
         "judge",
@@ -1551,7 +1890,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1581,6 +1920,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         meta.wall_ms as f64 / 1000.0,
         if metrics.success { "yes" } else { "NO" },
         if metrics.confabulated { "YES" } else { "-" },
+        if metrics.context_rot { "YES" } else { "-" },
         if metrics.recovered { "yes" } else { "-" },
         if metrics.admitted { "yes" } else { "-" },
         judge,
@@ -1704,6 +2044,40 @@ async fn gc_behavior_matrix() -> Result<()> {
                     }
                     replay_and_print(&path, fixture, arm, guided, &mut judge).await?;
                 }
+            }
+        }
+    }
+
+    // Section 3 — the t-1371 curation-regime matrix (pre-registered; see
+    // evals/gc/README.md). All cells guided (the shipped default; the
+    // MINIMAL fragment variant renders at budget 8000). Ring is not an
+    // arm here — the pre-registration tests the tuned stack (stack,
+    // semantic+cited-keep+hot-keep, mark-sweep) against the control.
+    println!();
+    println!("== t-1371 curation regime (budget 8000, guided/minimal fragment) ==");
+    print_header();
+    for fixture in &curation_fixtures() {
+        for arm in [Arm::NoGc, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
+            for sample in [1, 2] {
+                let path = cell_path(&dir, fixture.name, arm, true, sample);
+                if !path.exists() {
+                    let cell = CellId {
+                        fixture: fixture.name,
+                        arm,
+                        guided: true,
+                        sample,
+                    };
+                    if planned.contains(&cell) {
+                        println!(
+                            "{:<18} {:<10} on   {} skipped: planned cell not recorded (UNFUNDED)",
+                            fixture.name,
+                            arm.label(),
+                            sample,
+                        );
+                    }
+                    continue;
+                }
+                replay_and_print(&path, fixture, arm, true, &mut judge).await?;
             }
         }
     }
@@ -1920,7 +2294,7 @@ async fn record_missing_cells(dir: &Path) -> Result<()> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_SPEND_CAP_USD);
     let mut spent_micro: u64 = 0;
-    let fixtures = fixtures();
+    let fixtures = all_fixtures();
 
     for cell in planned_cells() {
         let path = cell_path(dir, cell.fixture, cell.arm, cell.guided, cell.sample);
@@ -2079,6 +2453,7 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         context_budget: 400,
         needles: vec!["391"],
         ordered_needles: vec![],
+        rot_needles: vec![],
         claim_marker: "RESULT",
         probe: "fat.txt",
         probe_allowance: 1,
@@ -2189,6 +2564,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
         context_budget: 400,
         needles: vec![],
         ordered_needles: vec![],
+        rot_needles: vec![],
         claim_marker: "RESULT",
         probe: "fat.txt",
         probe_allowance: 1,
@@ -2301,6 +2677,56 @@ fn confabulation_flag_detects_fabricated_claims() {
         .unwrap();
     assert!(confabulated(memory, "DEPLOY TOKEN-1234-FAKE WARNS 6"));
     assert!(!confabulated(memory, "DEPLOY TOKEN-9QX-RAVEN-7734 WARNS 6"));
+}
+
+/// The context-rot flag (t-1371): fires exactly when the claim is asserted
+/// with the stale value and without the updated one; correct answers,
+/// non-answers, prose mentions of the old value alongside a correct claim,
+/// and non-stale wrong answers (plain confabulation) do not flag.
+#[test]
+fn context_rot_flag_detects_stale_claims() {
+    let fixtures = curation_fixtures();
+    let distractor = fixtures
+        .iter()
+        .find(|f| f.name == "distractor-update")
+        .unwrap();
+    // The context-rot failure: the stale price used in the claim.
+    assert!(context_rot(distractor, "QUOTE UNIT 42 TOTAL 420"));
+    assert!(confabulated(distractor, "QUOTE UNIT 42 TOTAL 420"));
+    // Correct answer: no rot, no confabulation.
+    assert!(!context_rot(distractor, "QUOTE UNIT 57 TOTAL 570"));
+    assert!(!confabulated(distractor, "QUOTE UNIT 57 TOTAL 570"));
+    // Prose mention of the superseded value next to a correct claim: clean.
+    assert!(!context_rot(
+        distractor,
+        "The v1 price ($42) was superseded. QUOTE UNIT 57 TOTAL 570"
+    ));
+    // Wrong but not stale: confabulation without rot (the flags separate
+    // "invented" from "quoted the superseded value").
+    assert!(!context_rot(distractor, "QUOTE UNIT 99 TOTAL 990"));
+    assert!(confabulated(distractor, "QUOTE UNIT 99 TOTAL 990"));
+    // A non-answer cannot rot.
+    assert!(!context_rot(distractor, ""));
+    assert!(!context_rot(distractor, "I could not finish the steps."));
+    // The dead approach's numbers in the claim: confabulation, and not
+    // counted as rot (the rot needles are the superseded price only).
+    assert!(!context_rot(distractor, "QUOTE UNIT 38 TOTAL 380"));
+    assert!(confabulated(distractor, "QUOTE UNIT 38 TOTAL 380"));
+
+    let clean = fixtures.iter().find(|f| f.name == "clean-long").unwrap();
+    // No rot needles: the flag can never fire, even on wrong answers.
+    assert!(!context_rot(
+        clean,
+        "REGION SOUTH-2 SHIPPED 9 AUDIT AUD-0000"
+    ));
+    assert!(confabulated(
+        clean,
+        "REGION SOUTH-2 SHIPPED 9 AUDIT AUD-0000"
+    ));
+    assert!(!confabulated(
+        clean,
+        "REGION NORTH-7 SHIPPED 8 AUDIT AUD-4413"
+    ));
 }
 
 /// Marker-reaction needles (t-1369): syntax quotes count, prose does not
@@ -2450,7 +2876,7 @@ fn needle_and_order_matching() {
 /// counts add up, and the needle values sit in exactly one source file.
 #[test]
 fn fixture_arithmetic_is_honest() {
-    for fixture in fixtures() {
+    for fixture in all_fixtures() {
         match fixture.name {
             "early-needle" => {
                 let total: usize = fixture
@@ -2491,6 +2917,53 @@ fn fixture_arithmetic_is_honest() {
                     .find(|(name, _)| *name == "secrets/deploy-token.txt")
                     .expect("token file");
                 assert!(token.1.contains(DEPLOY_TOKEN));
+            }
+            "distractor-update" => {
+                let find = |name: &str| {
+                    fixture
+                        .files
+                        .iter()
+                        .find(|(file, _)| *file == name)
+                        .unwrap_or_else(|| panic!("missing {name}"))
+                        .1
+                        .as_str()
+                };
+                let v1 = find("catalog/pricing-v1.txt");
+                let v2 = find("catalog/pricing-v2.txt");
+                assert!(v1.contains("unit price: $42"), "stale value in v1");
+                assert!(!v1.contains("57"), "v1 must not leak the updated price");
+                assert!(v2.contains("unit price: $57"), "updated value in v2");
+                assert!(v2.contains("supersedes v1"), "v2 must declare supersession");
+                assert!(!v2.contains("42"), "v2 must not repeat the stale price");
+                assert!(find("orders/current.txt").contains("10 units"));
+                // Scoreable both ways: the success and rot needle sets are
+                // non-empty and disjoint.
+                assert!(!fixture.rot_needles.is_empty());
+                for rot in &fixture.rot_needles {
+                    assert!(!fixture.needles.contains(rot));
+                }
+            }
+            "clean-long" => {
+                let total: usize = fixture
+                    .files
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("shipments/"))
+                    .map(|(_, content)| content.matches("SHIPPED: OK").count())
+                    .sum();
+                assert_eq!(total, 8);
+                let region = fixture
+                    .files
+                    .iter()
+                    .find(|(name, _)| *name == "depot/region.txt")
+                    .expect("region file");
+                assert!(region.1.contains("region code: NORTH-7"));
+                let audit = fixture
+                    .files
+                    .iter()
+                    .find(|(name, _)| *name == "depot/audit.txt")
+                    .expect("audit file");
+                assert!(audit.1.contains("AUD-4413"));
+                assert!(fixture.rot_needles.is_empty(), "nothing stale to quote");
             }
             other => panic!("unknown fixture {other}"),
         }
