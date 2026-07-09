@@ -787,3 +787,117 @@ judge verdicts (early-needle stack unguided s2, tangent stack guided
 s1) again wrapped their JSON in prose and remain the least reliable
 rows; and no early-needle GC cell has ever passed both needles —
 the honest ceiling at these budgets is "right code, wrong sum".
+## The closing round (t-1362 + t-1370, online): does hot-keep end the loss loop?
+
+t-1369 ended with recovery attempts that did not survive to answers: the
+write-barrier that should have seen the evict → re-fetch → re-evict loop
+fired 0/15 (exact-hash matching, finding 5), so recovered values were
+re-evicted 2-3x and the model eventually guessed. Two mechanism commits
+close the arc:
+
+- **t-1362** — the barrier matches normalized content chunks (JSON string
+  leaves, whitespace-folded lines >= 12 chars; `duration_ms` and friends
+  vanish by construction), the corpus is maintained by `collect()` itself,
+  and the new `hot-keep` guard (all strategies, `--gc-hot-keep`, default
+  on) protects re-acquired content through the normal sweep phases,
+  relaxing only in degrade. On the pre-existing recordings the new
+  matcher fires on **all 44 GC cells** during replay (0 before; controls
+  stay 0), asserted per cell for every recording whose trace shows
+  re-injection.
+- **t-1370** — per-content eviction counts escalate the marker at 3
+  evictions of the same content (fingerprints are envelope- and
+  call-id-insensitive): `[gc: 'call-7' evicted 3 times — this content
+  cannot stay in context: summarize what you need into memory (remember)
+  or ask the user — do not re-fetch again]`. New gc_collect fields:
+  `hot_kept`, `reevictions`, `markers_escalated` (table columns `hot`,
+  `reev`, `esc`).
+
+**Recording validity:** hot-keep changes what the replayed collector
+evicts, so recordings made before it (detected by the absent `hot_kept`
+field) replay with gc-derived fields lenient — the pre-marker-era stance;
+answers, turns, tool counts and usage still reproduce exactly. The 10
+deciding cells were deleted and re-recorded 2026-07-08 on the
+hot-keep + escalation runtime (`anthropic/claude-haiku-4.5` via
+OpenRouter, same defaults as every prior round): early-needle x all four
+strategies x guided n=2, plus tangent-return stack + mark-sweep guided
+n=1. Spend: **$0.57 matrix + $0.04 judge = $0.61** (cap $1.00; estimate
+was ~$0.75). Offline replay reproduces every re-recorded cell strictly —
+gc stream, hot/reev/esc fields included — re-verified from a cold run.
+
+### Results (the 10 re-recorded cells)
+
+```
+fixture            arm        guid s turns evals  rpt refx rem prem rec coll reasons     drop ovl hot reev esc mkr mkref   in_tok  out_tok       cost wall_s  ok cfab rcov admt judge
+early-needle       ring       on   1    27    25   17    5   1    0   0   22 s:22         584 456   3  283   3   7     0    61837     2320  $0.073437   45.2  NO    -  yes    -   0/3
+early-needle       ring       on   2    27    23   14    5   3    0   0   22 s:22         588 502   2  281   3   7     1    61928     2457  $0.074213   45.8  NO    -  yes    -   0/3
+early-needle       mark-sweep on   1    16    14    0    0   0    0   1   12 s:12         156  11   1   65   0   1     0    37539     1430  $0.044689   27.0 yes    -  yes    -   0/3
+early-needle       mark-sweep on   2    10     9    1    1   0    0   0    7 s:7           54 187   2   20   0   1     0    23702      765  $0.027527   15.4  NO    -  yes    -   0/3
+early-needle       stack      on   1    27    29   19    1   2    0   0   24 s:24         625 361   1  354   2   5     1    64730     2554  $0.077500   47.4  NO    -  yes    -   0/3
+early-needle       stack      on   2    27    25   17    3   1    0   0   22 s:22         568 502   1  288   2   5     1    63582     2462  $0.075892   55.5  NO  YES  yes    -   0/3
+early-needle       semantic   on   1    16    14    4    0   0    0   1   13 s:13         158 154   0   70   1   2     0    37342     1454  $0.044612   28.0  NO  YES  yes    -   0/3
+early-needle       semantic   on   2    27    29   20   10   0    0   3   24 s:24         638 360   0  329   3   7     1    61564     2542  $0.074274   45.3  NO  YES  yes    -   0/3
+tangent-return     stack      on   1    27    23   21    9   2    0   2   25 s:25         657 5403  1  353   7  15     1    51860     2400  $0.063860   48.3  NO    -  yes    -   0/3
+tangent-return     mark-sweep on   1     6     5    0    0   0    0   0    4 s:4           20 120   0    7   3   7     0    12314      463  $0.014629   12.0  NO  YES    -    -   1/3
+```
+
+The early-needle final answers, verbatim (true code `MX-7749-KESTREL`,
+true total 21): mark-sweep s1 `... 3 + 2 + 6 + 5 + 4 + 1 = 21 /
+ACCESS MX-7749-KESTREL TOTAL 21` — **the first early-needle GC cell in
+four generations to pass BOTH needles**; mark-sweep s2
+`ACCESS MX-7749-KESTREL TOTAL 17` (right code, wrong sum — the honest
+slip); semantic s1 `ACCESS 67mK9xL2 TOTAL 17` (fabricated); ring s1/s2
+and stack s1/s2 and semantic s2 hit the turn cap with no final line —
+and ring's last texts carry the REAL code ("Access code is
+`MX-7749-KESTREL`"), not a guess. Flag honesty: stack s2 and semantic
+s2 read `cfab YES` from commentary like "Step 2: Reading the access
+code." at the cap — the claim-marker substring check fires on the word
+"access" without an asserted value; the only *fabricated code* in this
+round is semantic s1's.
+
+### Deltas vs t-1369 (the deciding early-needle cells)
+
+| metric | t-1369 | this round |
+|---|---|---|
+| fabricated codes in final answers | 4/6 answering cells (`7B2X9K`, `7K9X2M`, `sk-7d42c991`, `7K9mR2`) | **1/3** answering cells (`67mK9xL2`) |
+| both-needles success | 0/8 (never in any generation) | **1/8** (mark-sweep s1) |
+| ring's failure shape | re-fetch 2-3x, lose it, fabricate at answer time (cfab 2/2) | re-fetch, KEEP the real code in live narration to the cap, never fabricate (cfab 0/2) |
+| recovery actions | 9/10 cells | 8/8 deciding cells (`rcov` yes on every early-needle GC cell) |
+| unprompted recall | 6/10 | 5/10 (rec 1-3 in half the cells) |
+| write-barrier | ovl 0/15, hot set empty | fires in every cell (ovl 11-5403); hot-keep retains 1-3 hot messages per collection |
+| re-evictions | invisible (no metric) | visible and LARGE at these budgets: reev 20-354 |
+| escalation | n/a | esc 1-7 in 8/10 cells — markers escalate, models do not yet obey "do not re-fetch again" before the turn cap |
+
+### Where the confabulation arc ends
+
+**Closed:** the failure this arc was opened on — t-1349 finding 3,
+"models fabricate evicted content instead of recovering it" — is no
+longer the dominant failure mode. Across four generations the deciding
+fixture went: fabrication with zero recovery (t-1349/t-1364, cfab 7/9,
+recovery 4/9) → recovery attempts that lost their values and fabricated
+anyway (t-1369, cfab 4/10, re-fetch-loss loop) → recovery that mostly
+holds (this round: one fabricated code in ten cells, the first-ever
+full completion, and the ex-fabricators either answering with the real
+code or persisting honestly to the cap with the real value in hand).
+The mechanism chain — markers name the loss (t-1360), hot-keep makes
+recovery stick (t-1362), escalation names the exit (t-1370) — is
+validated end to end offline and each link moved the online metric it
+targeted.
+
+**Residual (not confabulation):** the surviving failures are loop
+termination, not fabrication. At these extreme budgets (1.6-2k tokens,
+25x below real deployments) degrade pressure dominates, so hot-keep
+relaxes most collections (reev stayed in the hundreds, not ~0 — the
+"re-evictions drop to ~0" prediction holds only above degrade pressure)
+and 6/10 cells still burned to the turn cap re-reading files (`rpt`
+14-21) despite in-window escalation markers saying "do not re-fetch
+again" — the progress-narration gap (t-1349 finding 2) again, now the
+whole residual. Nobody admits loss (admt 0/10, five generations
+running). tangent-return is unchanged in kind: stack loops, mark-sweep
+finishes cheaply but mis-ordered the categories this sample (its first
+tangent miss in five generations, n=1). Follow-ups that would carry
+this forward live outside the confabulation arc: a loop-termination
+affordance (the model must be able to STOP at the cap and answer with
+what it has), an admission affordance ("if recovery fails, say so" —
+still only in suppressed §2.4 text), and steady-state evidence at
+realistic budgets where hot-keep's normal-phase protection actually
+binds.
