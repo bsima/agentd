@@ -292,6 +292,9 @@ default; the SDK's in-process `Runner` runs no GC and gets no block):
 >   marker names what was evicted and how to recover it: re-run the named
 >   tool call, `recall` the named memory, or ask the user again — do not
 >   guess at what it contained.
+> - A marker saying content "cannot stay in context" means re-fetching
+>   will not help: summarize what you need into memory with `remember` or
+>   ask the user, then move on.
 
 And, **only** when `semantic` + `cited-keep` is the active strategy:
 
@@ -302,11 +305,23 @@ And, **only** when `semantic` + `cited-keep` is the active strategy:
 (Shipped variant, t-1359: when GC is active but the memory tools are
 *not* offered, the `remember`/`recall` cross-references drop out — "into
 your reply, or into memory with `remember`" becomes "into your reply",
-and "re-run the named tool call, `recall` the named memory, or ask the
-user again" becomes "re-run the named tool call or ask the user again".
-Guidance naming tools the model does not have is noise; both variants
-live in `guidance.rs` as `GC_BLOCK_WITH_MEMORY` /
+"re-run the named tool call, `recall` the named memory, or ask the
+user again" becomes "re-run the named tool call or ask the user again",
+and the escalation bullet's "summarize what you need into memory with
+`remember` or ask the user, then move on" becomes "ask the user for what
+you need, then move on". Guidance naming tools the model does not have
+is noise; both variants live in `guidance.rs` as `GC_BLOCK_WITH_MEMORY` /
 `GC_BLOCK_WITHOUT_MEMORY`.)
+
+The escalation bullet (t-1370) describes the escalated marker mechanism:
+when the same content is evicted `EVICTION_ESCALATION_AFTER` (3) times in
+one run, the `[gc: ...]` marker stops offering a recovery affordance and
+names the honest exit — `[gc: 'call-7' evicted 3 times — this content
+cannot stay in context: summarize what you need into memory (remember) or
+ask the user — do not re-fetch again]`. With hot-keep (t-1362) protecting
+re-acquired content, escalation is rare by design: it fires only for
+content that genuinely cannot fit, terminating the re-fetch loop t-1369
+finding 4 documented instead of feeding it.
 
 **Validation.** Arms inside the GC behavioral eval (guidance
 present/absent under forced pressure); metrics: confabulation needles

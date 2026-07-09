@@ -149,7 +149,10 @@ verbatim later.
 - A `[frame ...]` or `[gc: ...]` line means that content is gone. The \
 marker names what was evicted and how to recover it: re-run the named \
 tool call, `recall` the named memory, or ask the user again — do not \
-guess at what it contained.";
+guess at what it contained.
+- A marker saying content \"cannot stay in context\" means re-fetching \
+will not help: summarize what you need into memory with `remember` or \
+ask the user, then move on.";
 
 /// §2.4 GC-awareness block, no-memory variant: the same text with the
 /// `remember`/`recall` cross-references removed (recorded as the shipped
@@ -163,7 +166,9 @@ eviction markers.
 Do not plan to re-read old output verbatim later.
 - A `[frame ...]` or `[gc: ...]` line means that content is gone. The \
 marker names what was evicted and how to recover it: re-run the named \
-tool call or ask the user again — do not guess at what it contained.";
+tool call or ask the user again — do not guess at what it contained.
+- A marker saying content \"cannot stay in context\" means re-fetching \
+will not help: ask the user for what you need, then move on.";
 
 /// §2.4 citation-protection line. Strategy-conditional (GUIDANCE.md gap
 /// 6): cited-keep is implemented for the `semantic` strategy only, so this

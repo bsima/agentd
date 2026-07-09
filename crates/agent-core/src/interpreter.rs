@@ -786,6 +786,10 @@ async fn collect_prompt(
             // recording-era detector — replays of recordings made before
             // this field compare gc-derived metrics leniently.
             "hot_kept": gc_state.hot_report.hot_kept,
+            // Re-evictions (t-1370): evicted tool results whose content
+            // had been evicted before — the loss loop hot-keep exists to
+            // drive to zero; escalation is its honest exit.
+            "reevictions": gc_state.hot_report.reevictions,
             "markers": markers.markers,
             "marker_kinds": {
                 "tool_result": markers.evicted_tool_results,
@@ -795,6 +799,9 @@ async fn collect_prompt(
             },
             "markers_coalesced": markers.coalesced,
             "markers_suppressed": markers.suppressed,
+            // Escalated markers in-window (t-1370): honest-exit lines for
+            // content evicted EVICTION_ESCALATION_AFTER+ times.
+            "markers_escalated": markers.escalated,
         });
         if let Some(cycle) = overflow_cycle {
             let object = data.as_object_mut().expect("gc_collect data is an object");

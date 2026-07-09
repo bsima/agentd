@@ -1,7 +1,7 @@
 use crate::embedding::{content_hash, cosine, Embedder};
 use crate::op::ChatMessage;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -96,6 +96,15 @@ pub struct GcState {
     /// the eviction-marker wrapper on every collection, like
     /// `marker_summary`; read for gc_collect trace events.
     pub hot_report: HotKeepReport,
+    /// Per-content eviction counts (t-1370), keyed by
+    /// [`content_fingerprint`] — how many times THIS content (under any
+    /// call id or envelope) has been evicted this run. Written by the
+    /// eviction-marker wrapper alongside `collected_hashes`; read by the
+    /// marker builder to escalate after
+    /// [`EVICTION_ESCALATION_AFTER`] evictions. Deterministic (pure
+    /// function of the collection sequence), runtime-only, never
+    /// serialized.
+    pub eviction_counts: BTreeMap<String, u32>,
     /// What the most recent collect() left behind as eviction markers
     /// (t-1360). Set by every strategy on every collection, like
     /// `prefix_invalidated`; read for gc_collect trace events.
@@ -904,6 +913,10 @@ pub struct HotKeepReport {
     /// Messages in the returned window carrying hot content — what
     /// hot-keep is currently protecting.
     pub hot_kept: usize,
+    /// Evicted tool results whose content had already been evicted
+    /// before (t-1370): the re-eviction count this collection — the loop
+    /// signal hot-keep exists to drive to zero.
+    pub reevictions: usize,
 }
 
 /// Tool names whose results re-inject memory content — the write-barrier
@@ -1001,6 +1014,20 @@ pub fn reinjection_chunk_keys(content: &str) -> BTreeSet<String> {
         }
     }
     keys
+}
+
+/// Stable identity for "the same content" across re-fetches (t-1370):
+/// the hash of a message's chunk-key set, so the same payload under a
+/// different call id or a different envelope (duration_ms) fingerprints
+/// identically. Chunk-less content (too short to key) falls back to the
+/// whitespace-folded text hash.
+pub fn content_fingerprint(content: &str) -> String {
+    let keys = reinjection_chunk_keys(content);
+    if keys.is_empty() {
+        content_hash(&content.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        content_hash(&keys.into_iter().collect::<Vec<_>>().join(","))
+    }
 }
 
 /// Per-index hot mask over a window: a message is hot when any of its
@@ -1143,6 +1170,40 @@ pub const EVICTION_MARKER_PREFIX: &str = "[gc:";
 /// folded into a `+N more` suffix so markers stay cheap under mass drops.
 const MAX_MARKER_ITEMS: usize = 4;
 
+/// Marker escalation threshold (t-1370): when the SAME content (by
+/// [`content_fingerprint`]) is evicted this many times in one run, its
+/// marker escalates from a recovery affordance to an honest exit — stop
+/// re-fetching, summarize into memory or ask the user. Three because the
+/// first eviction is normal pressure, a second tolerates one legitimate
+/// re-fetch losing a race with the next collection, and the third is the
+/// t-1369 loop signature (ring re-fetched the code 2-3x and then
+/// guessed). With hot-keep (t-1362) protecting re-acquired content, a
+/// third eviction can only mean degrade pressure — content that
+/// genuinely cannot stay in this window.
+pub const EVICTION_ESCALATION_AFTER: u32 = 3;
+
+/// The escalated marker line (t-1370): names the latest handle, the
+/// repeat count, and the honest exit. Recognized by
+/// [`is_escalation_marker`] via the "cannot stay in context" phrase.
+fn escalation_marker_content(handle: &str, evictions: u32) -> String {
+    format!(
+        "[gc: '{handle}' evicted {evictions} times — this content cannot \
+stay in context: summarize what you need into memory (remember) or ask \
+the user — do not re-fetch again]"
+    )
+}
+
+/// Is this an escalated eviction marker (t-1370)? Escalation markers are
+/// never fused with neighbors — fusion keeps the later text, which would
+/// silently delete the honest-exit instruction.
+pub fn is_escalation_marker(message: &ChatMessage) -> bool {
+    is_eviction_marker(message)
+        && message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("cannot stay in context"))
+}
+
 /// What one collection left behind as markers (t-1360). Reported on the
 /// gc_collect trace event so behavioral evals can tell marker-driven
 /// recovery from re-derivation and fabrication.
@@ -1167,6 +1228,11 @@ pub struct EvictionMarkerSummary {
     /// Terminal degrade: not even the coalesced line fit. This collection
     /// wrote no markers — the trace event still records what was dropped.
     pub suppressed: bool,
+    /// Escalated markers present in the collected window (t-1370):
+    /// `[gc: '<handle>' evicted N times — ... cannot stay in context ...]`
+    /// lines, from repeated-eviction drops and mark-sweep's escalated
+    /// elisions alike.
+    pub escalated: usize,
 }
 
 /// Is this message an eviction-marker line written by a previous collection?
@@ -1183,15 +1249,29 @@ pub fn is_eviction_marker(message: &ChatMessage) -> bool {
             .is_some_and(|content| content.starts_with(EVICTION_MARKER_PREFIX))
 }
 
-/// How many evictions a marker line stands for: its first integer. Defaults
-/// to 1 — a marker always represents at least one eviction.
+/// How many evictions a marker line stands for: its first integer
+/// OUTSIDE single quotes (an escalated marker's quoted handle may carry
+/// digits — `'call-7'` must not read as 7; its count is the "evicted N
+/// times" N). Defaults to 1 — a marker always represents at least one
+/// eviction.
 fn marker_evicted_count(message: &ChatMessage) -> usize {
     let content = message.content.as_deref().unwrap_or("");
-    let digits: String = content
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let mut digits = String::new();
+    let mut in_quote = false;
+    for c in content.chars() {
+        if c == '\'' {
+            if !digits.is_empty() {
+                break;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if !in_quote && c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
     digits.parse().unwrap_or(1).max(1)
 }
 
@@ -1268,9 +1348,16 @@ struct MarkerBuild {
 }
 
 /// Build the marker lines for one collection, from the pre-collection
-/// window and the collection's survivors. Pure text analysis over exactly
-/// the inputs collect() already has — stateless, deterministic, LLM-free.
-fn build_eviction_markers(original: &[ChatMessage], collected: &[ChatMessage]) -> MarkerBuild {
+/// window, the collection's survivors, and the run's per-content
+/// eviction counts (t-1370: prior counts decide escalation — this
+/// collection's own increments happen afterwards, in the wrapper's
+/// finish). Pure text analysis over exactly the inputs collect() already
+/// has — stateless, deterministic, LLM-free.
+fn build_eviction_markers(
+    original: &[ChatMessage],
+    collected: &[ChatMessage],
+    counts: &BTreeMap<String, u32>,
+) -> MarkerBuild {
     let kept: BTreeSet<MsgId> = collected.iter().map(|message| message.id).collect();
     // Every call id minted in the pre-collection window: tool name,
     // arguments, and the issuing assistant message (frame-covered check).
@@ -1391,18 +1478,68 @@ fn build_eviction_markers(original: &[ChatMessage], collected: &[ChatMessage]) -
                         .push(format!("tool {call_id}{}", cited_suffix(message)));
                     continue;
                 };
+                // Escalation (t-1370): this content's Nth eviction stops
+                // getting a recovery affordance — re-fetching demonstrably
+                // does not stick — and gets the honest exit instead.
+                let escalated = message.content.as_deref().and_then(|content| {
+                    if content.starts_with(EVICTION_MARKER_PREFIX) {
+                        return None;
+                    }
+                    let evictions = counts
+                        .get(&content_fingerprint(content))
+                        .copied()
+                        .unwrap_or(0)
+                        + 1;
+                    (evictions >= EVICTION_ESCALATION_AFTER).then_some(evictions)
+                });
                 if kept.contains(issuer) {
                     // Frame-covered (StackFrameGc pop): the surviving
                     // assistant message was rewritten to a `[frame ...]`
                     // annotation naming this call and its recovery
                     // affordance — that annotation IS the marker. Break
                     // the run so no duplicate `[gc: ...]` line appears.
+                    // Escalation outranks the dedup: a repeatedly-lost
+                    // result gets the honest-exit line even here (t-1369
+                    // finding 4 — stack's recovery loop needs a
+                    // termination affordance).
                     run.dropped -= 1;
                     run.ids.pop();
                     flush(&mut run, &mut build);
+                    if let Some(evictions) = escalated {
+                        if itemized_calls.insert(call_id.to_string()) {
+                            build.summary.escalated += 1;
+                            build.markers.push((
+                                index,
+                                marker_message(
+                                    marker_id(&[message.id]),
+                                    escalation_marker_content(call_id, evictions),
+                                ),
+                            ));
+                        }
+                    }
                     continue;
                 }
                 if !itemized_calls.insert(call_id.to_string()) {
+                    continue;
+                }
+                if let Some(evictions) = escalated {
+                    // Stand the escalation marker alone at this position:
+                    // pull the message out of the aggregate run (it still
+                    // counts as evicted) so the honest-exit line is not
+                    // buried in a listing.
+                    run.dropped -= 1;
+                    run.ids.pop();
+                    flush(&mut run, &mut build);
+                    build.total_evicted += 1;
+                    build.summary.evicted_tool_results += 1;
+                    build.summary.escalated += 1;
+                    build.markers.push((
+                        index,
+                        marker_message(
+                            marker_id(&[message.id]),
+                            escalation_marker_content(call_id, evictions),
+                        ),
+                    ));
                     continue;
                 }
                 if RECALL_TOOL_NAMES.contains(name) {
@@ -1509,9 +1646,9 @@ fn merge_eviction_markers(
 fn fuse_adjacent_markers(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for message in messages {
-        if is_eviction_marker(&message) {
+        if is_eviction_marker(&message) && !is_escalation_marker(&message) {
             if let Some(last) = out.last_mut() {
-                if is_eviction_marker(last) {
+                if is_eviction_marker(last) && !is_escalation_marker(last) {
                     let combined = marker_evicted_count(last) + marker_evicted_count(&message);
                     let content = replace_marker_count(
                         message.content.as_deref().unwrap_or(EVICTION_MARKER_PREFIX),
@@ -1595,7 +1732,7 @@ where
 {
     let original = messages.clone();
     let collected = core(messages, budget, state);
-    let build = build_eviction_markers(&original, &collected);
+    let build = build_eviction_markers(&original, &collected, &state.eviction_counts);
     let count_markers =
         |window: &[ChatMessage]| window.iter().filter(|m| is_eviction_marker(m)).count();
     let finish = |window: Vec<ChatMessage>,
@@ -1603,18 +1740,31 @@ where
                   state: &mut GcState|
      -> Vec<ChatMessage> {
         summary.markers = count_markers(&window);
-        state.marker_summary = summary;
+        // Escalated lines standing in the window (t-1370): standalone
+        // escalation markers plus mark-sweep's escalated elisions.
+        summary.escalated = window
+            .iter()
+            .filter(|message| {
+                message.content.as_deref().is_some_and(|content| {
+                    content.starts_with(EVICTION_MARKER_PREFIX)
+                        && content.contains("cannot stay in context")
+                })
+            })
+            .count();
         // Write-barrier corpus (t-1362): the normalized chunks of whatever
         // this collection removed — dropped messages AND in-place rewrites
         // (mark-sweep elision, stack frame pops) — join collected_hashes,
         // so the pre-pass can recognize this content when a re-run call or
         // a recall injects it back. GC annotation lines contribute nothing
         // (reinjection_chunk_keys filters them), so dropped markers never
-        // vouch for content.
+        // vouch for content. Tool-result removals also feed the per-content
+        // eviction counts (t-1370) — a fingerprint seen before is a
+        // re-eviction, the loop signal.
         let survivors: HashMap<MsgId, Option<&str>> = window
             .iter()
             .map(|message| (message.id, message.content.as_deref()))
             .collect();
+        let mut reevictions = 0usize;
         for message in &original {
             let Some(content) = message.content.as_deref() else {
                 continue;
@@ -1627,13 +1777,25 @@ where
                 state
                     .collected_hashes
                     .extend(reinjection_chunk_keys(content));
+                if message.role == "tool" && !content.starts_with(EVICTION_MARKER_PREFIX) {
+                    let count = state
+                        .eviction_counts
+                        .entry(content_fingerprint(content))
+                        .or_insert(0);
+                    if *count >= 1 {
+                        reevictions += 1;
+                    }
+                    *count += 1;
+                }
             }
         }
+        state.marker_summary = summary;
         state.hot_report = HotKeepReport {
             hot_kept: hot_mask(&window, state)
                 .into_iter()
                 .filter(|hot| *hot)
                 .count(),
+            reevictions,
         };
         window
     };
@@ -1667,7 +1829,7 @@ where
                 return None;
             }
             scratch.prefix_invalidated = prefix_changed(prefix_snapshot, &recollected);
-            let rebuild = build_eviction_markers(&original, &recollected);
+            let rebuild = build_eviction_markers(&original, &recollected, &scratch.eviction_counts);
             Some((recollected, rebuild))
         };
 
@@ -1965,6 +2127,26 @@ fn annotate_evictable_tool_results(
             .get(tool_call_id)
             .cloned()
             .unwrap_or_else(|| tool_call_id.to_string());
+        // Escalation (t-1370): content elided/evicted N times already
+        // gets the honest exit instead of another recovery affordance —
+        // mark-sweep's elision joins the same escalation ladder as
+        // whole-message drops.
+        let escalated = message.content.as_deref().and_then(|content| {
+            if content.starts_with(EVICTION_MARKER_PREFIX) {
+                return None;
+            }
+            let evictions = state
+                .eviction_counts
+                .get(&content_fingerprint(content))
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            (evictions >= EVICTION_ESCALATION_AFTER).then_some(evictions)
+        });
+        if let Some(evictions) = escalated {
+            message.content = Some(escalation_marker_content(tool_call_id, evictions));
+            continue;
+        }
         // The `[gc: ...]` marker family (t-1360): the old "result
         // incorporated" wording reported the call happened while silently
         // withholding its body — the confabulation-inviting shape. Name
@@ -3954,6 +4136,195 @@ mod tests {
         );
     }
 
+    // ---- marker escalation (t-1370) --------------------------------------------
+
+    /// One evict/re-fetch cycle: a window whose interior carries the
+    /// payload under a fresh call id (and fresh envelope wall-clock),
+    /// collected at a budget that forces the pair out. Returns the window
+    /// collect() produced.
+    fn escalation_cycle(
+        gc: &dyn ContextGc,
+        state: &mut GcState,
+        call_id: &str,
+        duration_ms: u64,
+    ) -> Vec<ChatMessage> {
+        let payload = shell_envelope("the batch access code is MX-7749-KESTREL\n", duration_ms);
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("count OK lines, then report the access code"),
+            ChatMessage::assistant(None, vec![tool_call(call_id)]),
+            ChatMessage::tool(call_id, payload),
+            ChatMessage::assistant(Some("noted; continuing with the batch logs".into()), vec![]),
+            ChatMessage::assistant(None, vec![tool_call(&format!("{call_id}-work"))]),
+            ChatMessage::tool(
+                format!("{call_id}-work"),
+                // Distinct per cycle: only the PAYLOAD's fingerprint may
+                // repeat across cycles.
+                format!("work {call_id} {}", "x".repeat(2000)),
+            ),
+            ChatMessage::assistant(Some("processed".into()), vec![]),
+            ChatMessage::user("keep going"),
+        ];
+        // Enough pressure that the payload pair (the oldest interior
+        // group) is evicted, at a window large enough that the marker
+        // ladder's re-collect rung can fund per-run markers — the
+        // escalation line must not be coalesced away.
+        let budget = estimate_tokens(&messages) - 100;
+        gc.collect(messages, budget, state)
+    }
+
+    /// The same content evicted for the third time escalates: the marker
+    /// stops offering a recovery affordance and names the honest exit,
+    /// carrying the LATEST handle and the count.
+    #[test]
+    fn escalation_marker_fires_on_the_third_eviction_of_the_same_content() {
+        let gc = RingGc {
+            preserve_prefix: false,
+            hot_keep: true,
+        };
+        let mut state = GcState::default();
+
+        let first = escalation_cycle(&gc, &mut state, "call-1", 9);
+        let second = escalation_cycle(&gc, &mut state, "call-2", 40);
+        assert!(
+            ![&first, &second]
+                .iter()
+                .any(|window| window.iter().any(|m| {
+                    m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("cannot stay in context"))
+                })),
+            "evictions one and two must not escalate"
+        );
+
+        let third = escalation_cycle(&gc, &mut state, "call-3", 77);
+        let escalated: Vec<&ChatMessage> =
+            third.iter().filter(|m| is_escalation_marker(m)).collect();
+        assert_eq!(escalated.len(), 1, "third eviction escalates: {third:?}");
+        let text = escalated[0].content.as_deref().unwrap();
+        assert!(
+            text.contains("'call-3' evicted 3 times"),
+            "latest handle + count: {text}"
+        );
+        assert!(text.contains("do not re-fetch again"), "{text}");
+        assert!(
+            state.marker_summary.escalated >= 1,
+            "summary must report the in-window escalation"
+        );
+    }
+
+    /// Eviction counts — and the escalated marker bytes and ids — are a
+    /// pure function of the collection sequence: two identical runs
+    /// produce identical state and windows (replay stability).
+    #[test]
+    fn escalation_counts_and_markers_are_deterministic() {
+        let run = || {
+            let gc = RingGc {
+                preserve_prefix: false,
+                hot_keep: true,
+            };
+            let mut state = GcState::default();
+            // Stable ids so the windows are byte-comparable across runs.
+            let mut windows = Vec::new();
+            for (call, duration) in [("call-1", 9u64), ("call-2", 40), ("call-3", 77)] {
+                let payload =
+                    shell_envelope("the batch access code is MX-7749-KESTREL\n", duration);
+                let mut messages = vec![
+                    ChatMessage::system("system"),
+                    ChatMessage::user("count OK lines, then report the access code"),
+                    ChatMessage::assistant(None, vec![tool_call(call)]),
+                    ChatMessage::tool(call, payload),
+                    ChatMessage::assistant(Some("noted".into()), vec![]),
+                    ChatMessage::user("keep going"),
+                ];
+                for (index, message) in messages.iter_mut().enumerate() {
+                    message.id = Uuid::from_u128(0x5eed_0000 + index as u128);
+                }
+                let budget = estimate_tokens(&messages[..2]) + 70;
+                windows.push(gc.collect(messages, budget, &mut state));
+            }
+            (state.eviction_counts.clone(), windows)
+        };
+        let (counts_a, windows_a) = run();
+        let (counts_b, windows_b) = run();
+        assert_eq!(counts_a, counts_b, "counts must be deterministic");
+        assert_eq!(
+            windows_a, windows_b,
+            "windows (ids included) must be deterministic"
+        );
+        // The payload fingerprint reached 3 despite three different call
+        // ids and three different duration_ms values.
+        assert!(counts_a.values().any(|count| *count == 3), "{counts_a:?}");
+    }
+
+    /// The quoted handle's digits never read as the marker's count: an
+    /// escalated marker for 'call-7' counts its "evicted 3 times", not 7.
+    #[test]
+    fn escalated_marker_count_ignores_quoted_handle_digits() {
+        let escalated = marker_message(Uuid::from_u128(1), escalation_marker_content("call-7", 3));
+        assert_eq!(marker_evicted_count(&escalated), 3);
+        // Normal markers still read their leading count.
+        let normal = marker_message(
+            Uuid::from_u128(2),
+            "[gc: 5 evicted — shell call-2; recover: re-run the call — do not guess]".into(),
+        );
+        assert_eq!(marker_evicted_count(&normal), 5);
+    }
+
+    /// Escalation markers never fuse: fusion keeps the later text, which
+    /// would silently delete the honest-exit instruction.
+    #[test]
+    fn escalation_markers_do_not_fuse_with_neighbors() {
+        let escalated = marker_message(Uuid::from_u128(1), escalation_marker_content("call-7", 3));
+        let normal = marker_message(
+            Uuid::from_u128(2),
+            "[gc: 2 evicted — shell call-9; recover: re-run the call — do not guess]".into(),
+        );
+        let fused = fuse_adjacent_markers(vec![escalated.clone(), normal.clone()]);
+        assert_eq!(fused.len(), 2, "escalation marker must survive: {fused:?}");
+        let fused = fuse_adjacent_markers(vec![normal, escalated]);
+        assert_eq!(fused.len(), 2);
+    }
+
+    /// Mark-sweep's in-place elision joins the escalation ladder: content
+    /// already evicted twice gets the honest-exit annotation instead of
+    /// another "re-run the call".
+    #[test]
+    fn mark_sweep_elision_escalates_after_repeated_evictions() {
+        let payload = format!("bulky incorporated result {}", "q".repeat(600));
+        let mut state = GcState::default();
+        state
+            .eviction_counts
+            .insert(content_fingerprint(&payload), 2);
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("task"),
+            ChatMessage::assistant(None, vec![tool_call("call-el")]),
+            ChatMessage::tool("call-el", payload),
+            ChatMessage::assistant(Some("incorporated".into()), vec![]),
+            ChatMessage::user("go on"),
+        ];
+        let budget = estimate_tokens(&messages) + 50; // under budget: elision only
+        let collected = MarkSweepGc {
+            preserve_prefix: false,
+            hot_keep: true,
+        }
+        .collect(messages, budget, &mut state);
+        let elided = collected
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-el"))
+            .expect("elided result message survives in place");
+        let text = elided.content.as_deref().unwrap();
+        assert!(
+            text.contains("'call-el' evicted 3 times") && text.contains("cannot stay in context"),
+            "elision must escalate: {text}"
+        );
+        assert!(
+            state.marker_summary.escalated >= 1,
+            "escalated elision must be reported on the summary"
+        );
+    }
+
     // ---- hard protection: system + last user survive any pressure (t-1367) ----
     //
     // t-1364's failure mode, pinned per strategy: a fat system message (the
@@ -4437,7 +4808,11 @@ mod tests {
             ChatMessage::assistant(Some("per the output of call-7, proceed".into()), vec![]),
             ChatMessage::user("finish"),
         ];
-        let build = build_eviction_markers(&messages, &[messages[0].clone(), messages[4].clone()]);
+        let build = build_eviction_markers(
+            &messages,
+            &[messages[0].clone(), messages[4].clone()],
+            &BTreeMap::new(),
+        );
         let text: String = build
             .markers
             .iter()

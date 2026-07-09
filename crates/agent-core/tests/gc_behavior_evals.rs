@@ -864,6 +864,13 @@ struct CellMetrics {
     /// hot-keep (the field is absent there — replayed leniently, like the
     /// pre-marker era).
     hot_kept_max: u64,
+    /// Sum of gc_collect reevictions (t-1370): evictions of content
+    /// already evicted before — the re-fetch-loss loop signal hot-keep
+    /// should drive to ~0. Absent (0) on pre-t-1370 recordings.
+    reevictions_total: u64,
+    /// Max gc_collect markers_escalated (t-1370): in-window escalated
+    /// honest-exit markers. Absent (0) on pre-t-1370 recordings.
+    escalated_max: u64,
     /// Max gc_collect markers: in-window eviction-marker high-water mark
     /// (t-1360). 0 on recordings made before the marker mechanism (the
     /// field is absent there — see the pre-marker replay note in
@@ -906,6 +913,8 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         overlap_total: 0,
         recall_hot_max: 0,
         hot_kept_max: 0,
+        reevictions_total: 0,
+        escalated_max: 0,
         markers_max: 0,
         markers_suppressed: 0,
         marker_mentions: 0,
@@ -963,6 +972,10 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                 metrics.hot_kept_max = metrics
                     .hot_kept_max
                     .max(data["hot_kept"].as_u64().unwrap_or(0));
+                metrics.reevictions_total += data["reevictions"].as_u64().unwrap_or(0);
+                metrics.escalated_max = metrics
+                    .escalated_max
+                    .max(data["markers_escalated"].as_u64().unwrap_or(0));
                 // Eviction-marker needles (t-1360): in-window marker
                 // high-water mark and suppression count, for scoring
                 // marker-driven recovery vs re-derivation vs fabrication.
@@ -1492,7 +1505,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1509,6 +1522,8 @@ fn print_header() {
         "drop",
         "ovl",
         "hot",
+        "reev",
+        "esc",
         "mkr",
         "mkref",
         "in_tok",
@@ -1536,7 +1551,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1553,6 +1568,8 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         metrics.dropped_total,
         metrics.overlap_total,
         metrics.hot_kept_max,
+        metrics.reevictions_total,
+        metrics.escalated_max,
         metrics.markers_max,
         metrics.marker_mentions,
         metrics.usage.input_tokens,
@@ -1850,6 +1867,8 @@ async fn replay_cell(
         replayed_cmp.overlap_total = recorded.overlap_total;
         replayed_cmp.recall_hot_max = recorded.recall_hot_max;
         replayed_cmp.hot_kept_max = recorded.hot_kept_max;
+        replayed_cmp.reevictions_total = recorded.reevictions_total;
+        replayed_cmp.escalated_max = recorded.escalated_max;
         replayed_cmp.markers_max = recorded.markers_max;
         replayed_cmp.markers_suppressed = recorded.markers_suppressed;
         assert!(

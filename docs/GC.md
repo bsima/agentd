@@ -608,13 +608,49 @@ mark-sweep's in-place elision annotation is the same `[gc: ...]` family.
   same collection yields byte- and id-identical output — `collect()`
   stays pure.
 
+**Escalation (t-1370): the honest exit.** t-1369 showed markers flip
+fabrication into recovery *attempts*, and two failure shapes remained:
+recovered values re-evicted until the model guessed (ring), and
+non-terminating recovery loops (stack). Hot-keep (t-1362) is the
+mechanism fix for the first; escalation is the termination affordance
+for whatever still cannot fit. Per-content eviction counts
+(`GcState.eviction_counts`, keyed by `content_fingerprint` so re-fetches
+under new call ids and different envelopes count as the SAME content)
+are maintained by the marker wrapper; when content reaches
+`EVICTION_ESCALATION_AFTER` (3) evictions, its marker escalates to a
+standalone line:
+
+```
+[gc: 'call-7' evicted 3 times — this content cannot stay in context: summarize what you need into memory (remember) or ask the user — do not re-fetch again]
+```
+
+N=3 because the first eviction is normal pressure, the second tolerates
+one legitimate re-fetch losing a race with the next collection, and the
+third is the observed loop signature (t-1369: 2-3 re-fetch/loss cycles,
+then a guess). With hot-keep protecting re-acquired content through
+normal phases, a third eviction implies degrade pressure — content that
+genuinely cannot stay. Escalated lines are emitted for whole-message
+drops, for stack's frame-covered drops (escalation outranks the
+never-double-marked dedup — the loop needs terminating), and as
+mark-sweep's elision annotation. They never fuse with neighboring
+markers (fusion keeps the later text, which would delete the honest-exit
+instruction), and their quoted handle's digits are excluded from count
+absorption. Deterministic like everything else in `collect()`: counts
+are a pure function of the collection sequence, so replay reproduces
+them.
+
 **Observability:** gc_collect events carry `markers` (in-window count),
 `marker_kinds` (tool_result/recall/user/assistant), `markers_coalesced`,
-`markers_suppressed`. The behavioral harness surfaces the high-water
-count as the `mkr` column so marker-driven recovery, re-derivation, and
-fabrication are distinguishable. Guidance §2.4 (docs/GUIDANCE.md)
-describes the marker format to the model — mechanism first, text second.
-Online behavioral validation of the markers is t-1369.
+`markers_suppressed`, `markers_escalated` (in-window escalated lines,
+t-1370), `hot_kept` (t-1362), and `reevictions` (evictions of
+previously-evicted content — the loop signal, expected ~0 with hot-keep
+on). The behavioral harness surfaces the high-water counts as the `mkr`,
+`hot`, `esc` and `reev` columns so marker-driven recovery,
+re-derivation, and fabrication are distinguishable. Guidance §2.4
+(docs/GUIDANCE.md) describes the marker format — including the
+escalation line — to the model: mechanism first, text second. Online
+behavioral validation of the markers is t-1369; of hot-keep +
+escalation, the t-1362 closing round (evals/gc/README.md).
 
 ---
 
