@@ -901,3 +901,217 @@ what it has), an admission affordance ("if recovery fails, say so" —
 still only in suppressed §2.4 text), and steady-state evidence at
 realistic budgets where hot-keep's normal-phase protection actually
 binds.
+
+## GC as curation (t-1371, online): PRE-REGISTRATION
+
+Written and committed BEFORE any recording (the git history is the
+proof: this section's commit precedes the results commit). Every prior
+round ran the starvation regime — 1.6-2k-token budgets, 25x below real
+deployments, where GC is forced and the interesting behavior is failure
+containment. The pre-registered hypothesis (Ben's): **well-tuned GC
+IMPROVES accuracy on real evals** — curation as attention hygiene. Not
+merely "GC survives pressure at lower cost" (the weak form, for which
+mark-sweep's tangent-return record — beating the no-GC control on cost
+at equal success across two recording generations — is the existing
+evidence), but the strong form: evicting stale, dead, and irrelevant
+content makes the model MORE likely to answer correctly than a control
+that keeps everything, because distractors actively hurt (context rot).
+
+### Regime: curation, not starvation
+
+- **Budget 8000 tokens** for the two new fixtures (mid 6-10k band).
+  Generous: the largest single tool result is ~2.7k tokens, so nothing
+  is forced — no overflow, no degrade phases expected; hot-keep and
+  cited-keep operate in their normal (non-relaxed) sweep phases.
+- **Collections threshold-triggered** (the runtime default: threshold
+  0.85 => first collection when the window estimate crosses ~6.8k
+  tokens). Sessions total ~13-14k content tokens (~40 KB of fixture
+  files across 8 cat steps), overflowing the budget ~2x, so GC arms
+  should fire roughly 3-8 threshold collections mid-session — enough
+  material that a strategy has something to CURATE. Fired counts are
+  reported per cell (`coll`): in the curation regime a GC arm that
+  matched control but never collected proves nothing, and the firing
+  invariant is asserted per GC cell as always.
+- **Guidance: the shipped default (guided on).** Verified against the
+  t-1368 thresholds before recording: at budget 8000 the full fragment
+  (measured 753 est. tokens for GC arms + memory tools, 806 for
+  semantic with the cited-keep line, 512 for the no-GC control) exceeds
+  the 5% ceiling (400) but fits the 15% one (1200), so **the MINIMAL
+  variant renders in every cell**: GC core + memory core (~160 est.
+  tokens) on GC arms, memory core alone (~54) on the control. That
+  asymmetry is the shipped behavior and part of the tested
+  configuration: the GC arms' prompts carry ~106 extra tokens of
+  do-not-guess/extract-what-matters text the control's do not. This is
+  the first behavioral round where any guidance variant actually
+  renders (all prior rounds ran at budgets where the gate suppresses
+  it).
+- Everything else identical to every prior round: `anthropic/
+  claude-haiku-4.5` via OpenRouter, provider-default temperature,
+  MAX_TURNS 26, `--gc-cache preserve`, threshold timing, memory tools
+  offered, deterministic bag-of-tokens embedder on semantic cells,
+  record/replay per cell.
+
+### Arms
+
+| arm | configuration |
+|---|---|
+| `none` | no-GC control |
+| `stack` | the shipped default strategy, default config (hot-keep on, hard guards, markers, escalation) |
+| `semantic` | the tuned curator: semantic + cited-keep + hot-keep (all default-on for semantic) + markers + escalation |
+| `mark-sweep` | the behavioral incumbent from the starvation rounds (hot-keep on) |
+
+n=2 on the deciding cells (class-1 and class-2 semantic + control);
+n=1 elsewhere. All cells guided (the shipped default). Cited-keep
+activity has no per-collection gc_collect field (only `hot`/`reev`/
+`esc`/`mkr` are instrumented); it is reported indirectly via semantic's
+drop pattern and noted as an instrumentation gap.
+
+### Fixture class 1 — `distractor-update` (hypothesis home turf)
+
+A quoting task where an early value is UPDATED later, a costing
+approach is developed then explicitly abandoned, and a bulky irrelevant
+tangent intervenes. 8 cat steps + a final line, strictly ordered:
+
+1. `briefing/notes.txt` — ~8 KB relevant-ish ops briefing (ballast so
+   the stale value sits in the evictable interior, not the pinned
+   prefix).
+2. `catalog/pricing-v1.txt` — ~4 KB price list containing
+   `unit price: $42` — **the stale value**.
+3. `plans/approach-a.txt` — ~8 KB draft costing procedure with its own
+   dead-end numbers (legacy base rate $38, seasonal factor) — **the
+   abandoned wrong approach**.
+4. `plans/approach-a-review.txt` — small: Approach A is REJECTED, do
+   not use its numbers; quote from the current price list.
+5. `archive/clippings-1.txt` — ~8 KB poem-vocabulary filler — **the
+   irrelevant tangent**.
+6. `archive/clippings-2.txt` — ~8 KB more of the same.
+7. `catalog/pricing-v2.txt` — ~4 KB `PRICE LIST v2 (CURRENT —
+   supersedes v1)` containing `unit price: $57` — **the update**.
+8. `orders/current.txt` — small: confirmed orders this cycle: 10 units.
+9. Final line exactly `QUOTE UNIT <unit price> TOTAL <price x units>`
+   using the current price.
+
+Scoreable both ways, needle metrics for both: success needles `57` and
+`570` (updated); **context-rot needles `42` and `420` (stale)** — a new
+per-cell `rot` flag fires when the answer asserts the QUOTE claim, the
+updated value is absent, and a stale needle is present (the
+context-rot failure made programmatic; a prose mention of $42 alongside
+a correct quote does NOT flag). `rot` is the strong-form discriminator.
+
+### Fixture class 2 — `clean-long` (refutation control)
+
+Same length, same structure, same step count, same file sizes — but
+every byte is relevant and consistent, nothing is updated or abandoned,
+and the final question needs broad recall across the whole session:
+
+1. `briefing/overview.txt` — ~8 KB relevant depot background.
+2. `depot/region.txt` — ~4 KB containing `region code: NORTH-7` (early
+   value needed at the end).
+3. `procedures/receiving.txt` — ~8 KB relevant procedure.
+4. `procedures/receiving-checklist.txt` — small, consistent pointer to
+   the day-log counting deliverable.
+5. `shipments/day-1.log` — ~8 KB, 3 lines reading exactly `SHIPPED: OK`.
+6. `shipments/day-2.log` — ~8 KB, 1 such line.
+7. `shipments/day-3.log` — ~4 KB, 4 such lines.
+8. `depot/audit.txt` — small: `audit id: AUD-4413` (late value).
+9. Final line exactly `REGION <code> SHIPPED <total> AUDIT <id>`
+   (3+1+4 = 8).
+
+Success needles: `NORTH-7`, `8`, `AUD-4413` — early + middle + late,
+so the answer needs recall across the full session. No rot needles:
+there is nothing stale to quote. **This cell class existing is what
+makes a class-1 win believable**: on clean content, eviction can only
+remove signal, never noise.
+
+### Fixture class 3 — pressure-regime contrast
+
+One new cell on the EXISTING `tangent-return` fixture at its starvation
+budget (1600): `semantic` guided s1 — the tuned curator, current
+runtime, in the regime where ring/stack/semantic have thrash-looped in
+every generation. Contrasted against the existing hot-keep-era
+recordings (tangent-return stack + mark-sweep guided, t-1362 round) and
+the new curation-regime cells for the regime narrative: same strategies,
+two regimes.
+
+### Per-cell predictions (hypothesis-expected outcomes, written first)
+
+- **P1 (class 1, accuracy — the strong form's deciding cell):**
+  `distractor-update` semantic succeeds in both samples (answers
+  QUOTE UNIT 57 TOTAL 570, rot=0), and the control exhibits the
+  context-rot failure — stale `42`/`420` in the final answer (`rot`
+  flag) or another wrong quote — in **at least one of its two
+  samples**. Semantic accuracy > control accuracy on this fixture.
+- **P2 (class 1, mechanism):** semantic's collections evict the
+  distractor mass (poems, dead approach, stale v1) — coll >= 1 and a
+  visibly nonzero drop count — while the current price survives to the
+  answer without a recovery loop (refx ~0, no turn-cap thrash, cost
+  within ~1.5x control).
+- **P3 (class 2, refutation control):** on `clean-long`, every GC arm
+  MATCHES the control on success (all succeed; broad recall survives
+  curation because hot/cited/recency protection keeps the load-bearing
+  values), and **no GC arm beats the control on accuracy** — there is
+  nothing to curate away. If any GC arm beats control here, that is a
+  fixture artifact and will be said plainly; it would also discount a
+  class-1 win.
+- **P4 (class 2 + 1, cost — the weak form in the curation regime):**
+  GC arms complete at equal-or-lower cost than control on both new
+  fixtures (smaller windows at equal success).
+- **P5 (class 3, regime contrast):** the tuned semantic at the 1600
+  starvation budget still fails or thrashes on `tangent-return` (as
+  its arm has in every generation), while the same strategy in the
+  curation regime completes cleanly — the REGIME, not the strategy,
+  determines whether GC is safe; curation is where improvement (P1)
+  lives.
+- **P6 (validity):** every curation-regime GC cell fires >= 1
+  threshold collection (asserted; a non-firing arm proves nothing).
+
+### Refutation criteria (decided before recording)
+
+- **Strong form SUPPORTED** iff P1 holds (semantic 2/2, control <= 1/2
+  with at least one rot/wrong-quote failure) AND P3 holds (clean-long
+  shows no GC-beats-control artifact).
+- **Strong form REFUTED** if control succeeds 2/2 on
+  `distractor-update` while semantic <= control (the distractors did
+  not hurt, or curation did); or if semantic fails where control
+  succeeds; or if P3 fails in the direction of a GC arm beating
+  control on clean content (fixture artifact — class-1 wins do not
+  count).
+- **Strong form UNDERPOWERED** (neither) if control and semantic BOTH
+  go 2/2 clean on `distractor-update` (no discrimination at n=2 —
+  the fixture's distractors are too weak for this model at this
+  budget) — reported as such, with what a follow-up needs.
+- **Weak form** (cost at equal accuracy) supported per P4 from the
+  clean-long and distractor cells' cost columns at equal success;
+  refuted where a GC arm pays more at equal success or loses accuracy.
+- Arithmetic slips (right value, wrong product/sum) count against
+  `ok` but are reported distinctly (the honest-slip mode of every
+  prior round); rot/confab flags carry the hypothesis weight.
+
+### Analysis plan
+
+Columns as the marker-era table plus `rot` (stale-needle flag).
+Per-cell: success, rot, cfab, judge coherence (recorded verdicts),
+cost, tokens, collections fired + reasons, hot/marker activity
+(`hot`/`reev`/`esc`/`mkr`; cited-keep has no dedicated field — noted).
+Verdict per prediction: supported / refuted / unfunded. Overall
+statement: strong form supported/refuted/underpowered, weak form
+status, and what a fully-funded follow-up needs (cells + estimated
+spend + the second-model-class caveat: one cheap model family has
+carried every generation of this eval; nothing here is evidence about
+other model classes).
+
+### Recording plan (priority-ordered under a HARD $1.25 cap)
+
+1. Class-1 deciding cells: `distractor-update` semantic s1, none s1,
+   semantic s2, none s2.
+2. Class-2 control pair: `clean-long` semantic s1, none s1, semantic
+   s2, none s2.
+3. Remaining arms, n=1: `distractor-update` stack s1, mark-sweep s1;
+   `clean-long` stack s1, mark-sweep s1.
+4. Class-3: `tangent-return` semantic guided s1 (budget 1600).
+
+13 cells, estimated ~$0.95-1.10 matrix + ~$0.07 judge. If credit is
+exhausted mid-run (auth/402-style failures after earlier success):
+STOP, keep valid recordings, report exactly which pre-registered cells
+are unfunded — no retries into the wall, no fakes. Offline replay
+asserted per recorded cell, as every round.
