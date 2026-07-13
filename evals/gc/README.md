@@ -1273,3 +1273,81 @@ rounds).
    nothing here is evidence about how other models respond to
    curation, markers, or the restart trap. Estimated ~$3-5 for 1+2+4
    on the same model; a second model class roughly doubles it.
+
+## The progress ledger (t-1373): offline validation; the recording round is t-1374
+
+Every generation above ends at the same wall: the **restart loop**
+(t-1349 finding 2; t-1364 finding 5; t-1369 findings 4 and 7; t-1371's
+refutation, where the tuned curator re-ran `cat plans/approach-a.txt`
+ten times at 4x the budget the loop was discovered at). Markers name
+what was LOST and hot-keep makes recovery stick, but nothing restored
+the model's narrative position — what it already did, what worked,
+where it was. t-1373 is the designed fix: the **progress ledger**, a
+single deterministic `[gc-ledger]` assistant message — an ordered
+digest of the session's completed tool calls
+(`call-id: tool(args) -> outcome [evicted|in-window|hot]`, newest-N
+itemized + a coalesced older-work line, escalation state inline:
+"evicted 3x — do not re-fetch") — rebuilt (replaced, never appended) by
+every collection that has evicted anything. Maintained entirely by the
+GC layer (`with_window_bookkeeping`, né `with_eviction_markers`), no
+LLM anywhere, tail-placed (immediately before a trailing user turn),
+never inside the pinned prefix, counted against the window target with
+its own coalesce/suppress ladder (`ledger_suppressed`, recorded, never
+silent), and deliberately slack-funded — a ledger-sized re-collection
+reserve measurably pushed cores past their heuristic guards (cited-keep
+and preserve-prefix gates failed), and content decisions outrank
+bookkeeping. §2.4 guidance (both variants) describes the format:
+"consult it before re-running work". See docs/GC.md "The progress
+ledger".
+
+**Offline validation (this repo, asserted):**
+
+- **Matrix (gc_evals):** per cell — at most ONE ledger instance;
+  presence-or-recorded-suppression whenever a tool-bearing window
+  evicted anything; nothing on chat-only windows; determinism incl. the
+  derived message id (two-run byte+id equality); budget inclusion (the
+  ledger is an ordinary window message under the convergence asserts);
+  and the preserve gate still shows ZERO invalidations with the ledger
+  in-window, plus an explicit ledger-never-in-the-stable-prefix assert.
+  New `ldg` column (itemized entries in the final window).
+- **Behavioral (gc_behavior_evals):** the five-generation recordings are
+  the corpus — GC re-runs live during replay, so the ledger builder is
+  driven by the REAL recorded histories. Asserted per GC cell: the
+  replayed gc stream shows a ledger or a recorded suppression, entries
+  within the cap, controls show nothing. The deciding needle: on every
+  recording with the full restart-loop signature (>= 20 repeated
+  commands — the 25-collection turn-cap loops), the replayed ledger
+  NAMED at least one repeated call in its in-window digest at the
+  moment of repetition (`rptl` 11-22 of rpt ~24 on the tangent-return
+  loop cells; 10-16 on the t-1371 curation cells). The record was
+  there; whether models consult it is the online question.
+- **Honest ceiling:** mark-sweep's early-needle cells replay with the
+  ledger SUPPRESSED throughout (present=false, suppressed 6-12) — its
+  best-effort convergence ships over-target windows with no slack to
+  fund even the coalesced line. The strategy least prone to the loop is
+  also the one the slack-funded ledger reaches least; the t-1374 round
+  measures whether that matters in vivo.
+
+**Recording validity:** the ledger changes what the replayed collector
+produces, so recordings made before it (detected by the absent
+`ledger_present` field on gc_collect events) replay with gc-derived
+fields lenient — the established pre-marker/pre-hot-keep stance;
+answers, turns, tool counts, and usage still reproduce exactly
+(re-verified across all five generations). The hand-written offline-
+judge fixture keys were regenerated for ledger-era windows (replay-path
+plumbing only, still not real judgments); real judge recordings for
+GC-arm matrix cells miss their keys and print `-` until re-recorded.
+New columns for the next round, both from traces: `ldg` (in-window
+itemized-entry high-water from gc_collect) and `rptl` (repeats of a
+command whose earlier call id the then-current ledger itemized — a
+re-run issued AGAINST the model's own record; the loop-break
+discriminator).
+
+**The recording round is filed as t-1374** (fresh key required,
+~$1.50 est.): tangent-return x ring/stack/semantic guided (do the
+canonical loops break?), the 4 unfunded t-1371 cells (mark-sweep on
+both curation fixtures, clean-long stack, and the class-3 regime
+contrast), and early-needle stack guided (does "these steps are DONE"
+terminate the t-1369 recovery loop?). It also discharges the §2.4
+ledger-sentence re-record obligation, degenerately (the fragment is
+suppressed at these budgets — the t-1369 stance).
