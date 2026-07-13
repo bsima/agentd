@@ -38,9 +38,9 @@ use agent_core::gc::{
     message_embedding_text, record_reinjection_overlaps, CitationGraph, SemanticGc,
 };
 use agent_core::{
-    content_hash, estimate_tokens, is_eviction_marker, truncate_oversized_message, ChatMessage,
-    ChatProvider, ContextGc, GcState, MarkSweepGc, Model, ProviderClient, ProviderConfig, RingGc,
-    StackFrameGc, ToolCall,
+    content_hash, estimate_tokens, is_eviction_marker, is_gc_ledger, truncate_oversized_message,
+    ChatMessage, ChatProvider, ContextGc, GcState, MarkSweepGc, Model, ProviderClient,
+    ProviderConfig, RingGc, StackFrameGc, ToolCall, MAX_LEDGER_ENTRIES,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,10 @@ struct EvalMetrics {
     /// are recovery affordances, not retained structure — comparative
     /// gates subtract them from `messages_after`.
     markers: usize,
+    /// Itemized entry lines in the in-window progress ledger (t-1373);
+    /// 0 when no ledger is present (chat-only windows, or recorded
+    /// suppression under extreme pressure).
+    ledger_entries: usize,
     stable_prefix: usize,
     /// How many collections ran (1 for `final`; up to one per infer point
     /// for the incremental timings).
@@ -639,6 +643,63 @@ fn evaluate(
             case.name
         );
     }
+    // Progress-ledger invariants (t-1373), per cell:
+    // - at most ONE ledger instance (replaced, never appended);
+    // - a session with completed tool calls that evicted anything must end
+    //   with an in-window ledger or a recorded suppression — a session
+    //   with no tool history gets no ledger (nothing to digest);
+    // - determinism (incl. the derived ledger id) is covered by the
+    //   two-run equality asserts above; budget inclusion by the
+    //   convergence assert (the ledger is an ordinary window message).
+    let ledgers = collected
+        .iter()
+        .filter(|message| is_gc_ledger(message))
+        .count();
+    assert!(
+        ledgers <= 1,
+        "{} ({}) on {} carries {ledgers} ledger instances — must be replaced, not appended",
+        gc.name(),
+        timing.label(),
+        case.name
+    );
+    let had_completed_calls = case
+        .prompt
+        .iter()
+        .any(|message| message.role == "tool" && message.tool_call_id.is_some());
+    if had_completed_calls && dropped_any {
+        assert!(
+            ledgers == 1 || run.any_ledger_suppression,
+            "{} ({}) on {} evicted tool-bearing history with no in-window \
+             [gc-ledger] digest and no recorded suppression (t-1373)",
+            gc.name(),
+            timing.label(),
+            case.name
+        );
+    }
+    if !had_completed_calls {
+        assert_eq!(
+            ledgers,
+            0,
+            "{} ({}) on {}: no completed tool calls = nothing to digest",
+            gc.name(),
+            timing.label(),
+            case.name
+        );
+    }
+    if let Some(ledger) = collected.iter().find(|message| is_gc_ledger(message)) {
+        let content = ledger.content.as_deref().unwrap_or("");
+        assert!(
+            run.ledger_entries <= MAX_LEDGER_ENTRIES,
+            "{} ({}) on {}: itemized ledger entries exceed the cap",
+            gc.name(),
+            timing.label(),
+            case.name
+        );
+        assert!(
+            content.contains("consult it before re-running work"),
+            "the ledger must carry its consult-before-re-running affordance: {content}"
+        );
+    }
 
     let cache = if preserve_prefix {
         "preserve"
@@ -680,6 +741,11 @@ fn evaluate(
             .iter()
             .filter(|message| is_eviction_marker(message))
             .count(),
+        ledger_entries: if collected.iter().any(is_gc_ledger) {
+            run.ledger_entries
+        } else {
+            0
+        },
         stable_prefix: stable_prefix_len(&case.prompt, &collected),
         collections: run.collections,
         invalidations: run.invalidations,
@@ -705,6 +771,13 @@ struct TimedRun {
     /// for even the coalesced line at the budget) — the only sanctioned way
     /// for evictions to leave no in-window marker (t-1360).
     any_marker_suppression: bool,
+    /// Any collection in this run suppressed its progress ledger (t-1373)
+    /// — the only sanctioned way for a tool-bearing, evicting session to
+    /// end a collection without an in-window `[gc-ledger]` digest.
+    any_ledger_suppression: bool,
+    /// The final collection's ledger summary: itemized entries in the
+    /// in-window digest.
+    ledger_entries: usize,
 }
 
 /// Apply `gc` to the case window under the given timing. `Final` is the
@@ -725,6 +798,8 @@ fn run_timed(
         collections: 0,
         invalidations: 0,
         any_marker_suppression: false,
+        any_ledger_suppression: false,
+        ledger_entries: 0,
     };
     if timing == Timing::Final {
         let mut window = prompt.to_vec();
@@ -742,6 +817,8 @@ fn run_timed(
         run.collections = 1;
         run.invalidations = usize::from(state.prefix_invalidated);
         run.any_marker_suppression = state.marker_summary.suppressed;
+        run.any_ledger_suppression = state.ledger_summary.suppressed;
+        run.ledger_entries = state.ledger_summary.entries;
         return run;
     }
 
@@ -753,6 +830,7 @@ fn run_timed(
         window.push(message.clone());
     }
     infer_point(&mut window, budget, gc, timing, &mut state, &mut run);
+    run.ledger_entries = state.ledger_summary.entries;
     run.collected = window;
     run
 }
@@ -796,6 +874,7 @@ fn infer_point(
     run.collections += 1;
     run.invalidations += usize::from(state.prefix_invalidated);
     run.any_marker_suppression |= state.marker_summary.suppressed;
+    run.any_ledger_suppression |= state.ledger_summary.suppressed;
 }
 
 /// Invariants every strategy owes every window (docs/GC.md): system messages
@@ -1404,7 +1483,7 @@ fn stable_prefix_len(original: &[ChatMessage], collected: &[ChatMessage]) -> usi
 
 fn print_header() {
     println!(
-        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>3} {:>6} {:>4} {:>5} {:>4} {:>5}",
+        "{:<28} {:>5} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>5} {:>9} {:>6} {:>6} {:>3} {:>3} {:>6} {:>4} {:>5} {:>4} {:>5}",
         "case",
         "press",
         "timing",
@@ -1418,6 +1497,7 @@ fn print_header() {
         "tools",
         "frames",
         "mkr",
+        "ldg",
         "prefix",
         "coll",
         "inval",
@@ -1428,7 +1508,7 @@ fn print_header() {
 
 fn print_metrics(metrics: &EvalMetrics) {
     println!(
-        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>3} {:>6} {:>4} {:>5} {:>4} {:>5}{}",
+        "{:<28} {:>5.2} {:<9} {:<10} {:<8} {:>7} {:>7}->{:<7} {:>4.1}% {:>4}/{:<4} {:>3}/{:<3} {:>6} {:>3} {:>3} {:>6} {:>4} {:>5} {:>4} {:>5}{}",
         metrics.trace,
         metrics.pressure,
         metrics.timing.label(),
@@ -1444,6 +1524,7 @@ fn print_metrics(metrics: &EvalMetrics) {
         metrics.tool_results_before,
         metrics.frames_popped,
         metrics.markers,
+        metrics.ledger_entries,
         metrics.stable_prefix,
         metrics.collections,
         metrics.invalidations,
@@ -1502,6 +1583,18 @@ fn gc_cache_preserve_keeps_prefix_stable() -> Result<()> {
                 "{name} preserve on {} must not invalidate the cached prefix",
                 trace.name
             );
+            // t-1373 prefix-stability evidence: with the progress ledger
+            // in the window, preserve mode still reports zero
+            // invalidations (asserted above) and the ledger itself never
+            // sits inside the stable prefix region.
+            if let Some(index) = preserved.iter().position(is_gc_ledger) {
+                assert!(
+                    index >= preserve_prefix.min(preserved.len()),
+                    "{name} preserve on {}: the ledger sits inside the stable \
+                     prefix region (index {index}, prefix {preserve_prefix})",
+                    trace.name
+                );
+            }
             assert!(
                 preserve_prefix >= ignore_prefix,
                 "{name} preserve on {} must keep at least as long a stable prefix \

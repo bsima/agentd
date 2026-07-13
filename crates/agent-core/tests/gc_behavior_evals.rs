@@ -102,6 +102,25 @@
 //! value is unavailable instead of asserting one — admission-phrase
 //! check on failed cells, a lower bound).
 //!
+//! Ledger axis (t-1373): the restart loop — the dominant failure across
+//! all five recording generations (t-1349 finding 2 through t-1371's
+//! curation refutation) — got its designed fix: the progress ledger, a
+//! deterministic in-window `[gc-ledger]` digest of the session's
+//! completed tool calls, rebuilt by every collection (docs/GC.md "The
+//! progress ledger"). Offline, this harness validates it against the
+//! EXISTING five-generation corpus: GC re-runs live during replay, so
+//! the ledger builder is driven by the real recorded histories, and the
+//! replayed gc stream's ledger fields are sanity-asserted per cell
+//! (present-or-suppressed on evicting GC arms, entry counts within the
+//! cap, absent on controls). Recordings predate the ledger, so their
+//! gc-derived fields compare leniently (absent `ledger_present` field —
+//! the pre-marker pattern); everything effect-replayed reproduces
+//! exactly. New restart-loop needles for the FUTURE recording round:
+//! `ldg` (in-window itemized-entry high-water) and `rptl` (repeats of a
+//! command whose earlier call id the then-current ledger itemized — a
+//! re-run issued AGAINST the model's own progress record, the loop
+//! signature the ledger exists to break).
+//!
 //! Curation axis (t-1371): every round above ran the STARVATION regime
 //! (1.6-2k-token budgets, GC forced). The pre-registered hypothesis
 //! (evals/gc/README.md "GC as curation — PRE-REGISTRATION", committed
@@ -1032,6 +1051,11 @@ struct CellSpec {
     /// must use the recording's setting: guidance is prompt bytes, and the
     /// live collector re-run during replay is token-sensitive.
     guidance: RuntimeGuidance,
+    /// Record full prompts on InferCall events (plumbing-only, t-1373:
+    /// lets a test inspect the exact window a turn saw — e.g. that the
+    /// ledger named a call at the moment it was repeated). Recorded cells
+    /// keep this OFF (prompt payloads grow O(n^2)).
+    full_payloads: bool,
 }
 
 fn cell_guidance(guided: bool) -> RuntimeGuidance {
@@ -1084,7 +1108,7 @@ async fn run_cell(
         },
         replay: None,
         trace_full_prompt_ir: false,
-        trace_full_payloads: false,
+        trace_full_payloads: spec.full_payloads,
         gc: spec.gc,
         gc_threshold: GC_THRESHOLD,
         gc_log: true,
@@ -1177,6 +1201,20 @@ struct CellMetrics {
     /// Failed cell whose final answer admits the value is unavailable
     /// instead of asserting one (t-1369; see [`admits_loss`]).
     admitted: bool,
+    /// Max gc_collect ledger_entries (t-1373): itemized-entry high-water
+    /// of the in-window progress ledger. 0 on pre-ledger recordings (the
+    /// field is absent there — replayed leniently).
+    ledger_entries_max: u64,
+    /// Any gc_collect event reported an in-window ledger (t-1373).
+    ledger_present_any: bool,
+    /// gc_collect events whose ledger was suppressed (no room at this
+    /// budget; recorded, never silent).
+    ledger_suppressed_total: u64,
+    /// Repeated commands issued while the then-current ledger itemized an
+    /// earlier identical call (t-1373): the model re-ran work AGAINST its
+    /// own in-window progress record — the restart-loop needle for the
+    /// next recording round. Always <= repeat_evals.
+    rpt_ledger_named: usize,
     usage: RunUsage,
     success: bool,
     /// The final answer asserts the claim marker with a wrong claim value
@@ -1207,6 +1245,10 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         markers_max: 0,
         markers_suppressed: 0,
         marker_mentions: 0,
+        ledger_entries_max: 0,
+        ledger_present_any: false,
+        ledger_suppressed_total: 0,
+        rpt_ledger_named: 0,
         recovered: false,
         admitted: false,
         usage: RunUsage::default(),
@@ -1217,6 +1259,11 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
     let mut seen_commands: BTreeSet<String> = BTreeSet::new();
     let mut probe_hits = 0usize;
     let mut done_usage: Option<RunUsage> = None;
+    // t-1373 restart-loop needle state: which call ids the most recent
+    // collection's ledger itemized, and which call ids ran which command
+    // (from InferResult tool_calls — EvalCall events carry no call id).
+    let mut ledger_calls: BTreeSet<String> = BTreeSet::new();
+    let mut command_calls: HashMap<String, Vec<String>> = HashMap::new();
     for event in events {
         match event {
             Event::InferCall { parent_op_id, .. } => {
@@ -1233,11 +1280,41 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                 if mentions_marker(&response.content) {
                     metrics.marker_mentions += 1;
                 }
+                // t-1373: map shell commands to the call ids that ran
+                // them, so a later repeat can be checked against the
+                // ledger's itemized call ids.
+                for call in &response.tool_calls {
+                    if call.name != "shell" {
+                        continue;
+                    }
+                    if let Some(command) = call
+                        .arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        command_calls
+                            .entry(command.trim().to_string())
+                            .or_default()
+                            .push(call.id.clone());
+                    }
+                }
             }
             Event::EvalCall { command, .. } => {
                 metrics.eval_calls += 1;
-                if !seen_commands.insert(command.trim().to_string()) {
+                let trimmed = command.trim().to_string();
+                if !seen_commands.insert(trimmed.clone()) {
                     metrics.repeat_evals += 1;
+                    // t-1373: a repeat issued while the in-window ledger
+                    // itemized an earlier call running this exact command
+                    // — a re-run against the model's own progress record.
+                    let named = command_calls
+                        .get(&trimmed)
+                        .into_iter()
+                        .flatten()
+                        .any(|call_id| ledger_calls.contains(call_id));
+                    if named {
+                        metrics.rpt_ledger_named += 1;
+                    }
                 }
                 if command.contains(fixture.probe) {
                     probe_hits += 1;
@@ -1276,6 +1353,24 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                 if data["markers_suppressed"].as_bool().unwrap_or(false) {
                     metrics.markers_suppressed += 1;
                 }
+                // Progress-ledger needles (t-1373): presence, itemized
+                // entries, recorded suppression, and the itemized call ids
+                // (each collection REPLACES the ledger, so the latest
+                // event's list is exactly what the window holds). Absent
+                // on pre-ledger recordings (replayed leniently).
+                metrics.ledger_entries_max = metrics
+                    .ledger_entries_max
+                    .max(data["ledger_entries"].as_u64().unwrap_or(0));
+                metrics.ledger_present_any |= data["ledger_present"].as_bool().unwrap_or(false);
+                if data["ledger_suppressed"].as_bool().unwrap_or(false) {
+                    metrics.ledger_suppressed_total += 1;
+                }
+                ledger_calls = data["ledger_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect();
                 // Structural: the write-barrier fields must be present on
                 // every gc_collect event (t-1351) — absent fields would
                 // silently zero the behavioral signal.
@@ -1843,7 +1938,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1851,6 +1946,7 @@ fn print_header() {
         "turns",
         "evals",
         "rpt",
+        "rptl",
         "refx",
         "rem",
         "prem",
@@ -1864,6 +1960,7 @@ fn print_header() {
         "esc",
         "mkr",
         "mkref",
+        "ldg",
         "in_tok",
         "out_tok",
         "cost",
@@ -1890,7 +1987,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1898,6 +1995,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         metrics.turns,
         metrics.eval_calls,
         metrics.repeat_evals,
+        metrics.rpt_ledger_named,
         metrics.needle_refetches,
         metrics.remember_calls,
         metrics.proactive_remembers,
@@ -1911,6 +2009,7 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         metrics.escalated_max,
         metrics.markers_max,
         metrics.marker_mentions,
+        metrics.ledger_entries_max,
         metrics.usage.input_tokens,
         metrics.usage.output_tokens,
         metrics
@@ -2174,6 +2273,7 @@ async fn replay_cell(
             context_budget: meta.context_budget,
             prompt,
             guidance: cell_guidance(meta.guided),
+            full_payloads: false,
         },
         &workdir,
         &memory_dir,
@@ -2256,6 +2356,10 @@ async fn replay_cell(
         replayed_cmp.escalated_max = recorded.escalated_max;
         replayed_cmp.markers_max = recorded.markers_max;
         replayed_cmp.markers_suppressed = recorded.markers_suppressed;
+        replayed_cmp.ledger_entries_max = recorded.ledger_entries_max;
+        replayed_cmp.ledger_present_any = recorded.ledger_present_any;
+        replayed_cmp.ledger_suppressed_total = recorded.ledger_suppressed_total;
+        replayed_cmp.rpt_ledger_named = recorded.rpt_ledger_named;
         assert!(
             replayed.collections > 0 || recorded.collections == 0,
             "{}: replay lost the gc_collect stream entirely",
@@ -2281,6 +2385,68 @@ async fn replay_cell(
             "{}: recorded session re-injects evicted content but the \
              write-barrier did not fire on replay (t-1362 matcher regression)",
             path.display()
+        );
+    }
+    // t-1373 replayed-corpus sanity: GC re-runs live under replay, so the
+    // ledger builder just ran against this REAL recorded history. Every
+    // GC cell that evicted content after completing tool calls must show
+    // an in-window ledger (or a recorded suppression) in the replayed gc
+    // stream, bounded by the entry cap; control cells must show nothing.
+    let arm_collects = Arm::from_label(&meta.arm)?.collects();
+    if arm_collects && replayed.collections > 0 && replayed.eval_calls > 0 {
+        assert!(
+            replayed.ledger_present_any || replayed.ledger_suppressed_total > 0,
+            "{}: replayed collections over a tool-bearing session produced \
+             neither an in-window ledger nor a recorded suppression (t-1373)",
+            path.display()
+        );
+    }
+    assert!(
+        replayed.ledger_entries_max <= agent_core::MAX_LEDGER_ENTRIES as u64,
+        "{}: replayed ledger itemized {} entries — over the cap",
+        path.display(),
+        replayed.ledger_entries_max
+    );
+    if !arm_collects {
+        assert!(
+            !replayed.ledger_present_any && replayed.ledger_suppressed_total == 0,
+            "{}: control arm must never carry a ledger",
+            path.display()
+        );
+    }
+    // The t-1373 deciding needle, driven by the real histories: on every
+    // recording with the full restart-loop signature (>= 20 repeated
+    // commands — the 25-collection turn-cap loops of the tangent-return
+    // thrash cells and their kin), the replayed ledger must have NAMED at
+    // least one repeated call in its in-window digest at the moment of
+    // repetition. This is the offline form of the future recording
+    // round's question: the record was there; whether models consult it
+    // is what the online round measures. A lower bound, not a universal:
+    // at starvation budgets a heavily-suppressed ledger can miss milder
+    // repeat patterns (observed: early-needle stack guided s2, rpt 17,
+    // suppressed 17/22 collections). Observed on the loop cells proper:
+    // rpt_ledger_named 11-22.
+    if arm_collects && recorded.repeat_evals >= 20 {
+        assert!(
+            replayed.rpt_ledger_named > 0,
+            "{}: a restart-loop recording ({} repeats) replayed with no \
+             ledger-named repeat — the digest failed to name the loop (t-1373)",
+            path.display(),
+            recorded.repeat_evals,
+        );
+    }
+    if arm_collects {
+        // Diagnostic (visible under --nocapture): what the live ledger
+        // builder produced when driven by this recorded history — the
+        // t-1373 replayed-corpus evidence. The printed table shows the
+        // RECORDED metrics (pre-ledger recordings have none).
+        println!(
+            "  [t-1373 replay] {}: ledger present={} suppressed={} entries_max={} rpt_ledger_named={}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            replayed.ledger_present_any,
+            replayed.ledger_suppressed_total,
+            replayed.ledger_entries_max,
+            replayed.rpt_ledger_named,
         );
     }
     Ok((meta, recorded, recorded_events))
@@ -2344,6 +2510,7 @@ async fn record_missing_cells(dir: &Path) -> Result<()> {
                 context_budget: fixture.context_budget,
                 prompt,
                 guidance: cell_guidance(cell.guided),
+                full_payloads: false,
             },
             &workdir,
             &memory_dir,
@@ -2511,6 +2678,7 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
             // Guided, so plumbing also proves run_cell works under the
             // shipped fragment (the t-1364 guided arms' configuration).
             guidance: cell_guidance(true),
+            full_payloads: false,
         },
         &workdir,
         &memory_dir,
@@ -2554,6 +2722,21 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         metrics.collections > 0,
         "two 6KB tool results under a 400-token budget must collect"
     );
+    // Progress-ledger plumbing (t-1373): an evicting, tool-bearing session
+    // ends every collection with an in-window ledger or a recorded
+    // suppression, entries stay under the cap, and the turn-2 repeat of
+    // `cat fat.txt` was issued while the ledger itemized call-1 — the
+    // restart-loop needle counts it.
+    assert!(
+        metrics.ledger_present_any || metrics.ledger_suppressed_total > 0,
+        "collections fired but no ledger and no recorded suppression"
+    );
+    assert!(metrics.ledger_entries_max <= agent_core::MAX_LEDGER_ENTRIES as u64);
+    // The turn-2 repeat preceded the first eviction (the first collection
+    // only truncated the oversized result in place, dropping nothing), so
+    // it is NOT ledger-named: the needle counts re-runs issued against
+    // the model's own in-window record, never all repeats.
+    assert_eq!(metrics.rpt_ledger_named, 0);
     assert!(
         metrics
             .reasons
@@ -2563,6 +2746,116 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
         metrics.reasons
     );
     assert!(metrics.usage.cost_micro_usd.is_some());
+    Ok(())
+}
+
+/// The restart-loop needle, end to end (t-1373): when the model repeats a
+/// command after a collection, the WINDOW of the repeating turn already
+/// contained a `[gc-ledger]` digest naming the earlier identical call —
+/// i.e. the ledger would have told the model this step was done at the
+/// moment it repeated it. Full prompt payloads are recorded so the test
+/// inspects the exact window the turn saw; `rpt_ledger_named` counts the
+/// same fact from the trace alone (what the future recording round's
+/// table reports as `rptl`).
+#[tokio::test]
+async fn plumbing_ledger_names_the_repeated_call_at_the_moment_of_repetition() -> Result<()> {
+    let fixture = Fixture {
+        name: "plumbing-ledger",
+        task: "plumbing".into(),
+        context_budget: 700,
+        needles: vec!["391"],
+        ordered_needles: vec![],
+        rot_needles: vec![],
+        claim_marker: "RESULT",
+        probe: "a.txt",
+        probe_allowance: 1,
+        scripted_recalls: 0,
+        files: vec![
+            // Medium files: small enough that no single result trips the
+            // truncate pre-pass (which is not an eviction), big enough
+            // that the accumulated window forces real drops.
+            ("a.txt", filler(&MANUAL_WORDS, 9, 1600)),
+            ("b.txt", filler(&INGEST_WORDS, 5, 1600)),
+        ],
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::calls(vec![ToolCall::new(
+            "call-1",
+            "shell",
+            serde_json::json!({ "command": "cat a.txt" }),
+        )]),
+        ScriptedProvider::calls(vec![ToolCall::new(
+            "call-2",
+            "shell",
+            serde_json::json!({ "command": "cat b.txt" }),
+        )]),
+        // The restart-loop signature: the model re-runs the exact command
+        // it already ran, after a collection evicted the result.
+        ScriptedProvider::calls(vec![ToolCall::new(
+            "call-3",
+            "shell",
+            serde_json::json!({ "command": "cat a.txt" }),
+        )]),
+        ScriptedProvider::text("RESULT 391"),
+    ]));
+    let workdir = materialize_fixture(&fixture)?;
+    let memory_dir = std::env::temp_dir().join(format!("gc-behavior-mem-{}", Uuid::new_v4()));
+    fs::create_dir_all(&memory_dir)?;
+    let run = run_cell(
+        provider,
+        None,
+        CellSpec {
+            model: DEFAULT_MODEL.into(),
+            gc: Arm::Ring.gc_mode(),
+            context_budget: fixture.context_budget,
+            prompt: vec![
+                ChatMessage::system("plumbing"),
+                ChatMessage::user("read fat.txt and answer"),
+            ],
+            guidance: cell_guidance(false),
+            full_payloads: true,
+        },
+        &workdir,
+        &memory_dir,
+    )
+    .await?;
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&memory_dir);
+
+    let metrics = metrics_from_events(&run.events, &run.content, &fixture)?;
+    assert_eq!(metrics.repeat_evals, 1);
+    assert_eq!(
+        metrics.rpt_ledger_named, 1,
+        "the repeat must count as issued against the ledger's own record"
+    );
+    assert!(metrics.ledger_present_any);
+
+    // The stronger form, from the recorded window itself: the prompt of
+    // the repeating turn (the second parent Infer) carried a [gc-ledger]
+    // message naming call-1 and its command.
+    let prompts: Vec<&Vec<ChatMessage>> = run
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::InferCall {
+                parent_op_id: None,
+                prompt: Some(prompt),
+                ..
+            } => Some(prompt),
+            _ => None,
+        })
+        .collect();
+    assert!(prompts.len() >= 3, "expected full prompts on parent turns");
+    let repeat_window = prompts[2];
+    let ledger = repeat_window
+        .iter()
+        .find(|message| agent_core::is_gc_ledger(message))
+        .expect("the repeating turn's window carries the progress ledger");
+    let content = ledger.content.as_deref().unwrap_or("");
+    assert!(
+        content.contains("call-1") && content.contains("cat a.txt"),
+        "the ledger names the completed call and its command: {content}"
+    );
     Ok(())
 }
 
@@ -2602,6 +2895,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
             context_budget: fixture.context_budget,
             prompt: vec![ChatMessage::system("plumbing"), ChatMessage::user("go")],
             guidance: cell_guidance(false),
+            full_payloads: false,
         },
         &workdir,
         &memory_dir,
@@ -2612,6 +2906,10 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
     let metrics = metrics_from_events(&run.events, &run.content, &fixture)?;
     assert_eq!(metrics.collections, 0);
     assert_eq!(metrics.dropped_total, 0);
+    assert!(
+        !metrics.ledger_present_any && metrics.ledger_suppressed_total == 0,
+        "no collections = no ledger (t-1373)"
+    );
     Ok(())
 }
 
