@@ -2233,8 +2233,19 @@ async fn replay_cell(
         matches!(event, Event::Custom { name, data, .. }
             if name == "gc_collect" && data.get("hot_kept").is_none())
     });
+    // Pre-ledger recordings (before t-1373's progress ledger): the
+    // replayed collector now maintains an in-window `[gc-ledger]` digest,
+    // whose tokens shift what content-sensitive collection drops, so the
+    // gc stream cannot reproduce a recording made without it — the same
+    // lenient stance as the two eras above, detected by the absent
+    // `ledger_present` field. Everything effect-replayed (answers, turns,
+    // tool counts, usage) still reproduces exactly.
+    let pre_ledger_recording = recorded_events.iter().any(|event| {
+        matches!(event, Event::Custom { name, data, .. }
+            if name == "gc_collect" && data.get("ledger_present").is_none())
+    });
     let mut replayed_cmp = replayed.clone();
-    if bound_errors || pre_marker_recording || pre_hotkeep_recording {
+    if bound_errors || pre_marker_recording || pre_hotkeep_recording || pre_ledger_recording {
         replayed_cmp.collections = recorded.collections;
         replayed_cmp.reasons = recorded.reasons.clone();
         replayed_cmp.dropped_total = recorded.dropped_total;

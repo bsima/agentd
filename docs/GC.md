@@ -455,7 +455,7 @@ The re-injection signal is the exception that proves the rule: deciding
 "this result re-injected something we *previously collected*" requires
 memory of past collections, which no pure function of the current window
 has. So it lives in `GcState`: `collected_hashes` (the corpus) is written
-by `collect()`'s own eviction-marker wrapper — every dropped message and
+by `collect()`'s own bookkeeping wrapper (`with_window_bookkeeping`) — every dropped message and
 in-place rewrite contributes its chunks, so any caller threading a
 `GcState` feeds it — and `recall_hot` (the matches) is written by the
 interpreter pre-pass (`gc::record_reinjection_overlaps`) right before the
@@ -528,7 +528,7 @@ re-run tool call is a fresh JSON ENVELOPE (differing only in
 - **Corpus**: `GcState.collected_hashes` holds the chunk keys of
   everything collections removed this run — whole-message drops and
   in-place rewrites (mark-sweep elision, stack frame pops) alike — written
-  by `collect()`'s eviction-marker wrapper itself.
+  by `collect()`'s bookkeeping wrapper (`with_window_bookkeeping`) itself.
 - **Matching, both observed directions**: every tool result's chunks are
   checked against the corpus (a re-run call returning an evicted payload —
   t-1369's re-fetch loop); `recall` results additionally match every other
@@ -592,7 +592,8 @@ mark-sweep's in-place elision annotation is the same `[gc: ...]` family.
   ~30-token line; N consecutive drops share one line (item list capped,
   `+K more`).
 - **Budget-honest:** markers count toward the window budget. The ladder
-  in `with_eviction_markers`: per-run markers when the sweep's overshoot
+  in `with_window_bookkeeping` (né `with_eviction_markers`; it now also
+  maintains the progress ledger below): per-run markers when the sweep's overshoot
   funds them → re-collect with the marker cost reserved (rejected if it
   would invalidate the original budget's pinned prefix when the core
   didn't — markers never break the preserve billing contract) → one
@@ -651,6 +652,106 @@ re-derivation, and fabrication are distinguishable. Guidance §2.4
 escalation line — to the model: mechanism first, text second. Online
 behavioral validation of the markers is t-1369; of hot-keep +
 escalation, the t-1362 closing round (evals/gc/README.md).
+
+---
+
+## The progress ledger (t-1373): the model must know WHERE IT IS
+
+Five behavioral eval generations found one failure that markers and
+hot-keep did not touch — the **restart loop** (t-1349 finding 2, and
+t-1371's refutation, where the tuned curator re-ran `cat
+plans/approach-a.txt` ten times at 4x the budget the loop was discovered
+at). Post-collection the model loses its narrative position: not the
+FACTS (markers name losses, hot-keep makes recovery stick) but the PLAN
+STATE — what it already did, what worked, where it was. It re-reads the
+pinned task statement, concludes it is at step 1, and re-runs the work;
+the re-run regrows the window past threshold, which schedules the next
+collection. Markers are per-drop notices scattered through the window;
+nothing gave a consolidated "you are here". The ledger is that
+consolidation.
+
+**The mechanism.** `GcState.ledger` is a journal of every completed tool
+call the run has observed at a collection (call id, tool, args preview,
+outcome preview, content fingerprint), maintained by
+`with_window_bookkeeping` from the raw pre-collection window — before the
+core elides or drops anything. Outcome previews come from the same
+normalized-payload machinery the write-barrier chunks by
+(`payload_strings`: first meaningful line, capped), so volatile envelope
+fields never enter the digest. Whenever a collection has evicted
+anything (`GcState.evictions_seen`), the wrapper renders ONE synthetic
+assistant message and splices it into the collected window:
+
+```
+[gc-ledger] your progress record, auto-updated — 7 tool calls done this session; consult it before re-running work, these steps are DONE:
+older work: 3 earlier calls completed (3 evicted) — already done, do not redo
+call-4: shell(cat logs/batch-2.log) -> batch-2 record ingest parser payload sequ... [evicted]
+call-5: shell(cat logs/batch-3.log) -> batch-3 record ingest parser payload sequ... [evicted 3x — do not re-fetch]
+call-6: shell(cat logs/batch-4.log) -> batch-4 record ingest parser payload sequ... [hot]
+call-7: shell(cat logs/batch-5.log) -> batch-5 record ingest parser payload sequ... [in-window]
+evicted results are recoverable: re-run the call or recall the memory — do not guess.
+```
+
+Entry states are derived per collection: `in-window` (full body still
+present), `hot` (present and write-barrier hot), `evicted` (gone or
+elided), escalating to `evicted Nx — do not re-fetch` at
+`EVICTION_ESCALATION_AFTER` evictions — the ledger carries the t-1370
+escalation state even when degrade pressure has coalesced the markers to
+a single handle-less line, so recovery handles survive marker
+coalescing. Coordination, not duplication: markers say WHERE content was
+removed (positional, per-drop); the ledger says WHAT the session has
+done (global, per-call).
+
+**Ledger economics:**
+
+- **One instance, replaced.** The previous collection's ledger is
+  stripped from the input before the core runs — bookkeeping
+  replacement, never an eviction: no marker counts it, and
+  `gc_collect.dropped_count` excludes it.
+- **No collections = no ledger; no evictions = no ledger.** The ledger
+  is built only inside `collect()` (unfired GC stays invisible — the
+  t-1371 control regime), and only once something has actually been
+  evicted (`GcState.evictions_seen`): until then the window itself is
+  the complete work record and an under-budget collect() stays a no-op.
+- **Placement: the tail.** Appended at the end of the collected window —
+  the churn region, maximal recency salience — stepping back over a
+  trailing user run (the ledger sits immediately before the latest user
+  turn) and over a trailing open tool-call turn (pair adjacency), and
+  clamped to never enter the surviving byte-stable pinned prefix: the
+  ledger cannot cause a cache invalidation the core did not commit
+  (asserted by the preserve gate).
+- **Budget-honest, slack-funded.** The ledger counts toward the window
+  budget and degrades on its own ladder: full itemization
+  (`MAX_LEDGER_ENTRIES` newest, older work coalesced to one line) → the
+  compact tail → the last two calls → header + coalesced line only →
+  suppression, recorded as `ledger_suppressed` on the gc_collect event,
+  never silent. It is deliberately NOT funded by re-collection: a
+  ledger-sized reserve shrinks the re-collection budget enough to push
+  cores past their heuristic guards (observed: the cited-keep and
+  preserve-prefix promotion gates fail), and content decisions outrank
+  bookkeeping — markers keep their re-collection reserve because silent
+  eviction is a correctness failure, while a coalesced ledger is not.
+- **Deterministic.** Journal order and entry states are pure functions of
+  the collection sequence; the message id derives from the rendered
+  content (never minted), so the same session produces byte- and
+  id-identical ledgers every run — `collect()` stays pure, and replay
+  reproduces the ledger exactly.
+- **Never self-vouching.** Ledger content produces no write-barrier chunk
+  keys (`reinjection_chunk_keys` skips it), so a digest describing
+  content can never mark that content hot or count as its re-injection.
+
+**Observability:** gc_collect events carry `ledger_present`,
+`ledger_entries` (itemized lines), `ledger_suppressed`, and
+`ledger_calls` (the itemized call ids — the restart-loop needle: a
+repeat of a ledger-named call is a re-run AGAINST the model's own
+record). Recordings made before the ledger replay with gc-derived fields
+lenient, detected by the absent `ledger_present` field (the established
+pre-marker/pre-hot-keep pattern). Guidance §2.4 (docs/GUIDANCE.md)
+describes the `[gc-ledger]` format to the model — mechanism first, text
+second. Online behavioral validation is the follow-up recording round
+(filed from t-1373); until then the ledger's evidence is offline — the
+matrix asserts presence/determinism/budget/prefix-stability per cell,
+and the behavioral harness replays the five recorded generations through
+the live ledger builder.
 
 ---
 

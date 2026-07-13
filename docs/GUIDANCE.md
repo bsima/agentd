@@ -260,7 +260,8 @@ plus the cost columns.
 **What.** Tell the model its context is not an append-only log: results
 get popped to `[frame ...]` annotations, evicted content is replaced by
 `[gc: ...]` markers naming what was removed and how to recover it
-(t-1360), durable facts belong in memory, and (where the strategy
+(t-1360), a `[gc-ledger]` line is its own auto-maintained progress
+record (t-1373), durable facts belong in memory, and (where the strategy
 supports it) citing a result by id protects it.
 
 **When it pays.** Any session long enough to trigger collection.
@@ -295,6 +296,10 @@ default; the SDK's in-process `Runner` runs no GC and gets no block):
 > - A marker saying content "cannot stay in context" means re-fetching
 >   will not help: summarize what you need into memory with `remember` or
 >   ask the user, then move on.
+> - A `[gc-ledger]` line is your own progress record — an auto-maintained
+>   digest of the tool calls you have already completed and their current
+>   state; consult it before re-running work, because the steps it lists
+>   are done.
 
 And, **only** when `semantic` + `cited-keep` is the active strategy:
 
@@ -312,6 +317,17 @@ and the escalation bullet's "summarize what you need into memory with
 you need, then move on". Guidance naming tools the model does not have
 is noise; both variants live in `guidance.rs` as `GC_BLOCK_WITH_MEMORY` /
 `GC_BLOCK_WITHOUT_MEMORY`.)
+
+The ledger bullet (t-1373) describes the progress-ledger mechanism
+(docs/GC.md "The progress ledger"): a consolidated, deterministic
+`[gc-ledger]` digest of the session's completed tool calls — the
+mechanism-level fix for the restart loop, where post-collection the
+model lost its plan state and re-ran completed work. The bullet is
+identical in both variants (it names no memory tools). Like every §2.4
+sentence, mechanism ships first and the text merely describes it; its
+online validation batches into the ledger recording round (filed from
+t-1373), which the §5 gate's re-record obligation for this text edit
+also rides.
 
 The escalation bullet (t-1370) describes the escalated marker mechanism:
 when the same content is evicted `EVICTION_ESCALATION_AFTER` (3) times in

@@ -758,7 +758,14 @@ async fn collect_prompt(
     // (GcState.collected_hashes) is maintained by collect()'s own marker
     // wrapper since t-1362, so every GcState-threading caller gets it.
     let recall_report = crate::gc::record_reinjection_overlaps(&prompt, gc_state);
-    let before_ids: BTreeSet<_> = prompt.iter().map(|message| message.id).collect();
+    // The previous collection's progress ledger (t-1373) is replaced by
+    // this one as GC bookkeeping — excluded here so its churn never counts
+    // as an eviction in dropped_count.
+    let before_ids: BTreeSet<_> = prompt
+        .iter()
+        .filter(|message| !crate::gc::is_gc_ledger(message))
+        .map(|message| message.id)
+        .collect();
     let collected = config.gc.collect(prompt, target_budget, gc_state);
     let after_ids: BTreeSet<_> = collected.iter().map(|message| message.id).collect();
     let dropped_count = before_ids.difference(&after_ids).count();
@@ -802,6 +809,15 @@ async fn collect_prompt(
             // Escalated markers in-window (t-1370): honest-exit lines for
             // content evicted EVICTION_ESCALATION_AFTER+ times.
             "markers_escalated": markers.escalated,
+            // Progress ledger (t-1373): the consolidated task-state digest
+            // this collection left in-window. `ledger_calls` names the
+            // itemized call ids — the restart-loop needle (a repeat of a
+            // ledger-named call happened AGAINST the record). Absent on
+            // pre-ledger recordings, the lenient-replay detector.
+            "ledger_present": gc_state.ledger_summary.present,
+            "ledger_entries": gc_state.ledger_summary.entries,
+            "ledger_suppressed": gc_state.ledger_summary.suppressed,
+            "ledger_calls": gc_state.ledger_summary.calls.clone(),
         });
         if let Some(cycle) = overflow_cycle {
             let object = data.as_object_mut().expect("gc_collect data is an object");

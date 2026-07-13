@@ -32,9 +32,10 @@ pub use chat_history::ChatHistory;
 pub use cost::{format_micro_usd, Pricing, PricingTable, RunUsage};
 pub use embedding::{content_hash, cosine, Embedder, EmbeddingClient, EmbeddingIndex};
 pub use gc::{
-    estimate_tokens, is_eviction_marker, truncate_oversized_message, ContextGc,
-    EvictionMarkerSummary, FrameId, FrameStatus, GcMode, GcState, GcTiming, LifecycleState,
-    MarkSweepGc, MsgId, RingGc, StackFrameGc, EVICTION_MARKER_PREFIX,
+    estimate_tokens, is_eviction_marker, is_gc_ledger, truncate_oversized_message, ContextGc,
+    EvictionMarkerSummary, FrameId, FrameStatus, GcMode, GcState, GcTiming, LedgerEntry,
+    LedgerSummary, LifecycleState, MarkSweepGc, MsgId, RingGc, StackFrameGc,
+    EVICTION_MARKER_PREFIX, GC_LEDGER_PREFIX, MAX_LEDGER_ENTRIES,
 };
 pub use guidance::{
     runtime_guidance_fragment, runtime_guidance_section, DelegateModel, GuidanceCapabilities,

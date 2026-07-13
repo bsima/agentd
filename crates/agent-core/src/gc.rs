@@ -109,6 +109,27 @@ pub struct GcState {
     /// (t-1360). Set by every strategy on every collection, like
     /// `prefix_invalidated`; read for gc_collect trace events.
     pub marker_summary: EvictionMarkerSummary,
+    /// Any collection this run has actually removed or rewritten window
+    /// content (t-1373). Gates the progress ledger: until something has
+    /// been evicted, the window itself is the complete work record and a
+    /// digest would be noise — an under-budget collect() stays a no-op
+    /// (the t-1371 lesson generalized: GC that reclaims nothing must stay
+    /// invisible). Set by the bookkeeping wrapper's finish pass.
+    pub evictions_seen: bool,
+    /// The progress-ledger journal (t-1373): every completed tool call this
+    /// run has ever observed at a collection, in first-completed order —
+    /// call id, tool, args preview, outcome preview (normalized-payload
+    /// first meaningful line, the write-barrier machinery), and content
+    /// fingerprint. Written by the bookkeeping wrapper inside `collect()`
+    /// before the core runs (so a result elided or dropped by the same
+    /// collection is journaled from its raw content); read by the ledger
+    /// renderer. Deterministic (pure function of the collection sequence),
+    /// runtime-only, never serialized — like `eviction_counts`.
+    pub ledger: Vec<LedgerEntry>,
+    /// What the most recent collect() did for the progress ledger
+    /// (t-1373). Set by the bookkeeping wrapper on every collection, like
+    /// `marker_summary`; read for gc_collect trace events.
+    pub ledger_summary: LedgerSummary,
 }
 
 /// When GC runs, independent of which strategy reclaims tokens (t-1151).
@@ -634,7 +655,7 @@ impl ContextGc for SemanticGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
-        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+        with_window_bookkeeping(messages, budget, state, |messages, budget, state| {
             self.collect_inner(messages, budget, state)
         })
     }
@@ -953,11 +974,14 @@ const RECALL_TOOL_NAMES: [&str; 1] = ["recall"];
 const MIN_CHUNK_CHARS: usize = 12;
 
 /// Is this line GC's own annotation output (`[gc: ...]` markers,
-/// `[frame ...]` summaries)? Annotation lines never become chunk keys: a
-/// marker *describing* an eviction must not vouch for evicted content.
+/// `[frame ...]` summaries, `[gc-ledger]` headers)? Annotation lines never
+/// become chunk keys: a marker *describing* an eviction must not vouch for
+/// evicted content.
 fn is_gc_annotation_line(line: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed.starts_with(EVICTION_MARKER_PREFIX) || trimmed.starts_with("[frame ")
+    trimmed.starts_with(EVICTION_MARKER_PREFIX)
+        || trimmed.starts_with("[frame ")
+        || trimmed.starts_with(GC_LEDGER_PREFIX)
 }
 
 fn collect_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
@@ -1002,6 +1026,12 @@ fn payload_strings(content: &str) -> Vec<String> {
 /// re-injected as a memory render, yields overlapping keys.
 pub fn reinjection_chunk_keys(content: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
+    // A progress-ledger message (t-1373) is GC's own bookkeeping: its entry
+    // lines carry outcome PREVIEWS of real content, and a digest describing
+    // content must never vouch for it (the same rule as marker lines).
+    if content.trim_start().starts_with(GC_LEDGER_PREFIX) {
+        return keys;
+    }
     for payload in payload_strings(content) {
         for line in payload.lines() {
             if is_gc_annotation_line(line) {
@@ -1156,7 +1186,7 @@ pub fn record_reinjection_overlaps(
 //   derives only from the dropped messages; ids are UUIDv5 over the dropped
 //   ids, so the same collection produces byte- and id-identical markers.
 //
-// Integration is strategy-uniform via [`with_eviction_markers`], with two
+// Integration is strategy-uniform via [`with_window_bookkeeping`], with two
 // strategy-honest carve-outs: a tool result dropped by StackFrameGc's frame
 // pop is NOT double-marked (the surviving `[frame ...]` annotation, which
 // now names the call id and the recovery affordance, IS its marker), and
@@ -1706,22 +1736,364 @@ fn coalesce_markers(
     merge_eviction_markers(original, &stripped, &[(first_position, coalesced)])
 }
 
+// --- Progress ledger (t-1373) -------------------------------------------------
+//
+// The mechanism-level fix for the restart loop — the dominant failure of
+// every behavioral eval generation (evals/gc/README.md: t-1349 finding 2,
+// t-1371's refutation where the tuned curator re-ran `cat
+// plans/approach-a.txt` ten times). Post-collection, the model loses its
+// narrative position: not the facts (markers + hot-keep fixed fact
+// recovery) but the PLAN STATE — what it already did, what worked, where
+// it was. Markers are per-drop notices scattered through the window;
+// nothing gave a consolidated "you are here". The ledger is that
+// consolidation: ONE synthetic assistant message, a deterministic digest
+// of the session's completed tool calls and their eviction state,
+// rebuilt (replaced, never appended) by every collection. No collections
+// = no ledger — unfired GC stays invisible (the t-1371 control regime).
+//
+// Coordination with markers, not duplication: markers say WHERE content
+// was removed (positional, per-drop, with recovery affordances); the
+// ledger says WHAT the session has already done (global, per-call, with
+// each call's current state). When degrade pressure coalesces markers to
+// a single handle-less "earlier context compacted" line, the ledger still
+// carries the per-call handles and the escalation state ("evicted 3x — do
+// not re-fetch"), so recovery affordances survive marker coalescing.
+
+/// Every progress-ledger message starts with this. Distinct from
+/// [`EVICTION_MARKER_PREFIX`] (`[gc:`) so ledger and markers never
+/// mistake each other; the §2.4 guidance block describes the format to
+/// the model.
+pub const GC_LEDGER_PREFIX: &str = "[gc-ledger]";
+
+/// At most this many journal entries are itemized per ledger (newest
+/// first-class; older entries coalesce into one "older work" line).
+pub const MAX_LEDGER_ENTRIES: usize = 10;
+
+/// The compact rung of the ledger ladder: the newest few entries, the
+/// rest coalesced. Also the reserve target for re-collections — reserving
+/// the FULL ledger would trip the rung-2 gate on exactly the windows that
+/// need it most, so the reserve guarantees a compact ledger and the full
+/// one appears only when the sweep's natural overshoot funds it.
+const LEDGER_COMPACT_ENTRIES: usize = 4;
+
+/// The coalesce-harder ladder for the ledger's own budget honesty: full
+/// itemization, the compact tail, the last two calls, then header +
+/// coalesced line only.
+const LEDGER_SHOWN_LADDER: [usize; 4] = [MAX_LEDGER_ENTRIES, LEDGER_COMPACT_ENTRIES, 2, 0];
+
+/// Cap for a ledger entry's outcome preview (chars of the first
+/// meaningful normalized-payload line).
+const LEDGER_OUTCOME_CHARS: usize = 48;
+
+/// One journaled completed tool call (t-1373). Journal identity is the
+/// call id; the fingerprint ties the entry to its content across
+/// re-fetches and envelope changes (the t-1370 machinery).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntry {
+    pub call_id: String,
+    pub tool: String,
+    pub args_preview: String,
+    /// First meaningful line of the result's normalized payload
+    /// ([`payload_strings`] — the write-barrier machinery, so volatile
+    /// envelope fields never enter the preview), capped at
+    /// [`LEDGER_OUTCOME_CHARS`]. Empty when the journal only ever saw an
+    /// already-elided annotation (a resumed window).
+    pub outcome_preview: String,
+    /// [`content_fingerprint`] of the raw result content — the key into
+    /// `GcState.eviction_counts` for the entry's escalation state.
+    pub fingerprint: String,
+}
+
+/// What the most recent collect() left as the progress ledger (t-1373),
+/// reported on the gc_collect trace event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerSummary {
+    /// A ledger message is in the returned window.
+    pub present: bool,
+    /// Itemized entry lines in the rendered ledger (older work coalesces).
+    pub entries: usize,
+    /// Terminal degrade: the session has tool history but not even the
+    /// coalesced ledger fit the budget. Never silent.
+    pub suppressed: bool,
+    /// Call ids itemized in the rendered ledger — the restart-loop needle:
+    /// a repeated command whose earlier call id is listed here was
+    /// re-run AGAINST the ledger's own record.
+    pub calls: Vec<String>,
+}
+
+/// Is this message the progress ledger written by a previous collection?
+pub fn is_gc_ledger(message: &ChatMessage) -> bool {
+    message.role == "assistant"
+        && message.tool_call_id.is_none()
+        && message.tool_calls.is_none()
+        && message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.starts_with(GC_LEDGER_PREFIX))
+}
+
+/// A ledger entry's args preview: the same argument keys the marker/frame
+/// summaries use, plus `query` (recall) — first match wins.
+fn ledger_args_preview(arguments: &serde_json::Value) -> String {
+    ["path", "file", "command", "query", "prompt"]
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(serde_json::Value::as_str))
+        .map(|value| preview_chars(value, 60))
+        .unwrap_or_default()
+}
+
+/// A ledger entry's outcome preview: the first meaningful line of the
+/// normalized payload — the first whitespace-folded non-annotation line
+/// of >= [`MIN_CHUNK_CHARS`] chars (falling back to the first non-empty
+/// line), capped. The same normalization the write-barrier chunks by, so
+/// `duration_ms` and friends never enter the preview.
+fn ledger_outcome_preview(content: &str) -> String {
+    let mut fallback: Option<String> = None;
+    for payload in payload_strings(content) {
+        for line in payload.lines() {
+            if is_gc_annotation_line(line) {
+                continue;
+            }
+            let folded = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if folded.is_empty() {
+                continue;
+            }
+            if folded.chars().count() >= MIN_CHUNK_CHARS {
+                return preview_chars(&folded, LEDGER_OUTCOME_CHARS);
+            }
+            fallback.get_or_insert(folded);
+        }
+    }
+    fallback
+        .map(|line| preview_chars(&line, LEDGER_OUTCOME_CHARS))
+        .unwrap_or_default()
+}
+
+/// Journal every completed tool call the pre-collection window shows
+/// (t-1373): a tool result answering a known call, first occurrence wins,
+/// window order preserved. Runs BEFORE the core so a result the same
+/// collection elides or drops is journaled from its raw content; an
+/// already-annotated result (resumed window) is journaled with an empty
+/// outcome preview rather than a preview of GC's own annotation.
+fn update_ledger_journal(window: &[ChatMessage], state: &mut GcState) {
+    let mut call_info: HashMap<&str, (&str, &serde_json::Value)> = HashMap::new();
+    for message in window {
+        for call in message.tool_calls.as_deref().unwrap_or_default() {
+            call_info
+                .entry(call.id.as_str())
+                .or_insert((call.name.as_str(), &call.arguments));
+        }
+    }
+    for message in window {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some((tool, arguments)) = call_info.get(call_id) else {
+            continue;
+        };
+        if state.ledger.iter().any(|entry| entry.call_id == call_id) {
+            continue;
+        }
+        let content = message.content.as_deref().unwrap_or("");
+        let annotated = content.trim_start().starts_with(EVICTION_MARKER_PREFIX)
+            || content.trim_start().starts_with(GC_LEDGER_PREFIX);
+        state.ledger.push(LedgerEntry {
+            call_id: call_id.to_string(),
+            tool: (*tool).to_string(),
+            args_preview: ledger_args_preview(arguments),
+            outcome_preview: if annotated {
+                String::new()
+            } else {
+                ledger_outcome_preview(content)
+            },
+            fingerprint: if annotated {
+                String::new()
+            } else {
+                content_fingerprint(content)
+            },
+        });
+    }
+}
+
+/// One entry's current state against a collected window: the full result
+/// body is still present (`in-window`), present and write-barrier hot
+/// (`hot`), or gone/elided (`evicted`, escalating to the honest exit at
+/// [`EVICTION_ESCALATION_AFTER`] evictions — the t-1370 ladder).
+fn ledger_entry_state(entry: &LedgerEntry, window: &[ChatMessage], state: &GcState) -> String {
+    let live = window.iter().find_map(|message| {
+        (message.tool_call_id.as_deref() == Some(entry.call_id.as_str()))
+            .then(|| message.content.as_deref().unwrap_or(""))
+    });
+    if let Some(content) = live {
+        if !content.trim_start().starts_with(EVICTION_MARKER_PREFIX)
+            && !entry.fingerprint.is_empty()
+            && content_fingerprint(content) == entry.fingerprint
+        {
+            let hot = reinjection_chunk_keys(content)
+                .iter()
+                .any(|key| state.recall_hot.contains(key));
+            return if hot {
+                "hot".into()
+            } else {
+                "in-window".into()
+            };
+        }
+    }
+    let evictions = state
+        .eviction_counts
+        .get(&entry.fingerprint)
+        .copied()
+        .unwrap_or(0);
+    if evictions >= EVICTION_ESCALATION_AFTER {
+        format!("evicted {evictions}x — do not re-fetch")
+    } else {
+        "evicted".into()
+    }
+}
+
+struct LedgerRender {
+    content: String,
+    entries: usize,
+    calls: Vec<String>,
+}
+
+/// Render the ledger for one collected window: header, an optional
+/// coalesced older-work line, the newest `shown` entries as
+/// `call-id: tool(args) -> outcome [state]` one-liners, and one recovery
+/// footer when anything is evicted (the affordance once, not per line —
+/// markers already carry the per-drop affordances). Pure text analysis:
+/// stateless, deterministic, LLM-free.
+fn render_ledger(state: &GcState, window: &[ChatMessage], shown: usize) -> LedgerRender {
+    use std::fmt::Write as _;
+    let total = state.ledger.len();
+    let start = total.saturating_sub(shown);
+    let mut content = format!(
+        "{GC_LEDGER_PREFIX} your progress record, auto-updated — {total} tool \
+call{} done this session; consult it before re-running work, these steps are DONE:",
+        if total == 1 { "" } else { "s" }
+    );
+    let mut entries = 0usize;
+    let mut calls = Vec::new();
+    let mut older_evicted = 0usize;
+    let mut any_evicted = false;
+    for (index, entry) in state.ledger.iter().enumerate() {
+        let entry_state = ledger_entry_state(entry, window, state);
+        let evicted = entry_state.starts_with("evicted");
+        any_evicted |= evicted;
+        if index < start {
+            older_evicted += usize::from(evicted);
+            continue;
+        }
+        if entry.outcome_preview.is_empty() {
+            let _ = write!(
+                content,
+                "\n{}: {}({}) [{entry_state}]",
+                entry.call_id, entry.tool, entry.args_preview
+            );
+        } else {
+            let _ = write!(
+                content,
+                "\n{}: {}({}) -> {} [{entry_state}]",
+                entry.call_id, entry.tool, entry.args_preview, entry.outcome_preview
+            );
+        }
+        entries += 1;
+        calls.push(entry.call_id.clone());
+    }
+    if start > 0 {
+        // Splice the coalesced line in right after the header.
+        let line = format!(
+            "\nolder work: {start} earlier call{} completed ({older_evicted} evicted) — already done, do not redo",
+            if start == 1 { "" } else { "s" }
+        );
+        let header_end = content.find('\n').unwrap_or(content.len());
+        content.insert_str(header_end, &line);
+    }
+    if any_evicted {
+        content.push_str(
+            "\nevicted results are recoverable: re-run the call or recall the memory — do not guess.",
+        );
+    }
+    LedgerRender {
+        content,
+        entries,
+        calls,
+    }
+}
+
+/// Deterministic ledger identity: derived from the rendered content, so
+/// the same collection produces the same message id every run (no fresh
+/// UUIDs — the marker-id rule).
+fn ledger_id(content: &str) -> MsgId {
+    let digest = content_hash(&format!("gc-ledger:{content}"));
+    let mut bytes = [0u8; 16];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .expect("content_hash emits lowercase hex");
+    }
+    Uuid::from_bytes(bytes)
+}
+
+/// Where the ledger goes: the TAIL of the window — the churn region, with
+/// maximal recency salience — stepping back over a trailing user run (the
+/// ledger sits immediately before the latest user turn when the window
+/// ends with one) and over a trailing open tool-call turn (a result
+/// arriving later must stay adjacent to its call). Never before `clamp`
+/// (the surviving byte-stable pinned prefix): the ledger must not cause a
+/// cache invalidation the core did not already commit.
+fn ledger_insert_position(window: &[ChatMessage], clamp: usize) -> usize {
+    let mut position = window.len();
+    while position > clamp {
+        let previous = &window[position - 1];
+        let open_call_turn = previous.role == "assistant"
+            && previous
+                .tool_calls
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|call| {
+                    !window
+                        .iter()
+                        .any(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+                });
+        if previous.role == "user" || open_call_turn {
+            position -= 1;
+        } else {
+            break;
+        }
+    }
+    position.max(clamp)
+}
+
 /// Wrap a strategy's core collection with eviction-marker emission
-/// (t-1360). Budget honesty: markers count toward the window budget, so
+/// (t-1360) and progress-ledger maintenance (t-1373). Budget honesty:
+/// markers and the ledger count toward the window budget, so
 /// the ladder makes room for them instead of shipping over budget —
 ///
 /// 1. per-run markers into the core's collection, when they fit;
-/// 2. re-collect with the marker cost reserved, then per-run markers;
+/// 2. re-collect with the marker + ledger cost reserved, then per-run
+///    markers;
 /// 3. one coalesced "earlier context compacted" line, into the core's
 ///    collection or a re-collection;
 /// 4. nothing — recorded as `suppressed` on the summary, never silent.
+///
+/// The ledger rides `finish`: after the marker ladder settles a window,
+/// the ledger is attached at the tail if it fits, coalesced harder
+/// (fewer itemized entries) if not, and suppressed-with-record
+/// (`ledger_suppressed` on the gc_collect event) under terminal
+/// pressure. The previous collection's ledger instance is stripped from
+/// the input up front — replaced as GC bookkeeping, never counted or
+/// marked as an eviction.
 ///
 /// Re-collections run on a scratch GcState that is committed only when
 /// their window is the one returned, so the strategy's cross-collection
 /// metadata (frame statuses, lifecycle tags, prefix_invalidated) always
 /// describes the returned window. The wrapper never pushes the window over
 /// budget: every strategy's convergence contract is exactly its core's.
-fn with_eviction_markers<F>(
+fn with_window_bookkeeping<F>(
     messages: Vec<ChatMessage>,
     budget: usize,
     state: &mut GcState,
@@ -1730,11 +2102,65 @@ fn with_eviction_markers<F>(
 where
     F: Fn(Vec<ChatMessage>, usize, &mut GcState) -> Vec<ChatMessage>,
 {
+    // Replace, never append: the old ledger instance is bookkeeping. It
+    // leaves before the core sees the window, so no strategy can evict it
+    // (which would mark bookkeeping as an eviction) and its tokens are
+    // freed for real content.
+    let messages: Vec<ChatMessage> = messages
+        .into_iter()
+        .filter(|message| !is_gc_ledger(message))
+        .collect();
+    // Journal completed calls from the raw pre-collection window (t-1373)
+    // before the core elides or drops anything.
+    update_ledger_journal(&messages, state);
     let original = messages.clone();
+    let full_boundary = cache_prefix_boundary(&original, budget).min(original.len());
+    let prefix_snapshot: Vec<ChatMessage> = original[..full_boundary].to_vec();
     let collected = core(messages, budget, state);
     let build = build_eviction_markers(&original, &collected, &state.eviction_counts);
     let count_markers =
         |window: &[ChatMessage]| window.iter().filter(|m| is_eviction_marker(m)).count();
+    let attach_ledger = |mut window: Vec<ChatMessage>, state: &mut GcState| -> Vec<ChatMessage> {
+        state.ledger_summary = LedgerSummary::default();
+        // No evictions yet = no ledger: the window is still the complete
+        // work record, and an under-budget collect() must stay a no-op.
+        if state.ledger.is_empty() || !state.evictions_seen {
+            return window;
+        }
+        // The surviving byte-stable prefix: insertion below this index
+        // would be a cache invalidation the core did not commit.
+        let clamp = window
+            .iter()
+            .zip(&prefix_snapshot)
+            .take_while(|(after, before)| after == before)
+            .count();
+        for shown in LEDGER_SHOWN_LADDER {
+            let render = render_ledger(state, &window, shown);
+            let message = marker_message(ledger_id(&render.content), render.content.clone());
+            if estimate_tokens(&window)
+                .saturating_add(estimate_tokens(std::slice::from_ref(&message)))
+                > budget
+            {
+                continue;
+            }
+            let position = ledger_insert_position(&window, clamp);
+            window.insert(position, message);
+            state.ledger_summary = LedgerSummary {
+                present: true,
+                entries: render.entries,
+                suppressed: false,
+                calls: render.calls,
+            };
+            return window;
+        }
+        // Terminal: the session has tool history but no room for even the
+        // coalesced ledger — recorded, never silent.
+        state.ledger_summary = LedgerSummary {
+            suppressed: true,
+            ..LedgerSummary::default()
+        };
+        window
+    };
     let finish = |window: Vec<ChatMessage>,
                   mut summary: EvictionMarkerSummary,
                   state: &mut GcState|
@@ -1774,6 +2200,7 @@ where
                 Some(now) => *now != Some(content),
             };
             if removed {
+                state.evictions_seen = true;
                 state
                     .collected_hashes
                     .extend(reinjection_chunk_keys(content));
@@ -1797,14 +2224,20 @@ where
                 .count(),
             reevictions,
         };
-        window
+        // The progress ledger (t-1373) attaches last, so entry states see
+        // this collection's eviction counts and hot set.
+        attach_ledger(window, state)
     };
     if build.markers.is_empty() {
         return finish(collected, build.summary, state);
     }
 
     // Rung 1: per-run markers fit the core's own collection (the sweep's
-    // natural overshoot funds them).
+    // natural overshoot funds them). The ledger is deliberately NOT part
+    // of this gate: bookkeeping must never force a re-collection that
+    // perturbs the core's content decisions (cited-keep, hot-keep, the
+    // preserve boundary) — the ledger coalesces down to the slack the
+    // sweep left, and records its own suppression when there is none.
     let merged = merge_eviction_markers(&original, &collected, &build.markers);
     if estimate_tokens(&merged) <= budget {
         return finish(merged, build.summary, state);
@@ -1815,9 +2248,7 @@ where
     // it keeps the ORIGINAL budget's prefix byte-stable wherever the first
     // collection did (the preserve-mode billing contract; markers must
     // never cause a cache invalidation the core did not already commit).
-    let full_boundary = cache_prefix_boundary(&original, budget).min(original.len());
-    let prefix_snapshot = &original[..full_boundary];
-    let first_invalidated = prefix_changed(prefix_snapshot, &collected);
+    let first_invalidated = prefix_changed(&prefix_snapshot, &collected);
     let recollect =
         |reserve: usize, scratch: &mut GcState| -> Option<(Vec<ChatMessage>, MarkerBuild)> {
             let recollected = core(
@@ -1825,21 +2256,32 @@ where
                 budget.saturating_sub(reserve).max(1),
                 scratch,
             );
-            if prefix_changed(prefix_snapshot, &recollected) && !first_invalidated {
+            if prefix_changed(&prefix_snapshot, &recollected) && !first_invalidated {
                 return None;
             }
-            scratch.prefix_invalidated = prefix_changed(prefix_snapshot, &recollected);
+            scratch.prefix_invalidated = prefix_changed(&prefix_snapshot, &recollected);
             let rebuild = build_eviction_markers(&original, &recollected, &scratch.eviction_counts);
             Some((recollected, rebuild))
         };
 
-    // Rung 2: reserve the markers' cost and re-collect, so the markers are
-    // paid for by evicting more content — never by overflowing the budget.
+    // Rung 2: reserve the markers' + ledger's cost and re-collect, so the
+    // bookkeeping is paid for by evicting more content — never by
+    // overflowing the budget. The ledger reserve is a provisional render
+    // against the core's collection (entry states shift the text by a few
+    // chars; MARKER_RESERVE_PAD absorbs that).
     let marker_tokens: usize = build
         .markers
         .iter()
         .map(|(_, marker)| estimate_tokens(std::slice::from_ref(marker)))
         .sum();
+    // The ledger is deliberately NOT reserved for here: a ledger-sized
+    // reserve shrinks the re-collection budget enough to push the core
+    // past its heuristic guards (observed: the cited-keep and
+    // preserve-prefix promotion gates fail when the ledger rides this
+    // reserve), and content decisions outrank bookkeeping. Markers stay
+    // reserved — silent eviction is a correctness failure; a coalesced
+    // ledger is not. The ledger's own ladder (coalesce harder, then
+    // suppress-with-record) runs in finish, funded by the sweep's slack.
     let reserve = marker_tokens.saturating_add(MARKER_RESERVE_PAD);
     if reserve <= budget / 4 {
         let mut scratch = state.clone();
@@ -1944,7 +2386,7 @@ impl ContextGc for MarkSweepGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
-        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+        with_window_bookkeeping(messages, budget, state, |messages, budget, state| {
             self.collect_inner(messages, budget, state)
         })
     }
@@ -2240,7 +2682,7 @@ impl ContextGc for RingGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
-        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+        with_window_bookkeeping(messages, budget, state, |messages, budget, state| {
             self.collect_inner(messages, budget, state)
         })
     }
@@ -2319,7 +2761,7 @@ impl ContextGc for StackFrameGc {
         budget: usize,
         state: &mut GcState,
     ) -> Vec<ChatMessage> {
-        with_eviction_markers(messages, budget, state, |messages, budget, state| {
+        with_window_bookkeeping(messages, budget, state, |messages, budget, state| {
             self.collect_inner(messages, budget, state)
         })
     }
@@ -4822,6 +5264,320 @@ mod tests {
         assert!(
             text.contains("shell call-7 (cited by turn 4)"),
             "cited evicted results must carry the citing handle: {text}"
+        );
+    }
+
+    // --- progress ledger (t-1373) --------------------------------------------
+
+    fn find_ledger(window: &[ChatMessage]) -> Option<&ChatMessage> {
+        window.iter().find(|message| is_gc_ledger(message))
+    }
+
+    #[test]
+    fn ledger_appears_after_an_evicting_collection_and_names_completed_calls() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages, 300, &mut state);
+
+        let ledgers = collected
+            .iter()
+            .filter(|message| is_gc_ledger(message))
+            .count();
+        assert_eq!(ledgers, 1, "exactly one ledger instance: {collected:#?}");
+        let content = find_ledger(&collected)
+            .and_then(|message| message.content.as_deref())
+            .unwrap();
+        assert!(content.starts_with(GC_LEDGER_PREFIX));
+        assert!(
+            content.contains("call-1: shell(cargo test)"),
+            "entries are call-id: tool(args-preview) one-liners: {content}"
+        );
+        assert!(
+            content.contains("-> test output") || content.contains("[evicted]"),
+            "entries carry outcome previews and eviction state: {content}"
+        );
+        assert!(
+            content.contains("[evicted]") || content.contains("[in-window]"),
+            "entries carry window state tags: {content}"
+        );
+        assert!(state.ledger_summary.present);
+        assert_eq!(state.ledger_summary.entries, 2);
+        assert_eq!(
+            state.ledger_summary.calls,
+            vec!["call-1".to_string(), "call-2".to_string()]
+        );
+        // Budget honesty: the window including the ledger converges.
+        assert!(estimate_tokens(&collected) <= 300);
+    }
+
+    #[test]
+    fn ledger_absent_until_something_is_evicted() {
+        // A fired-but-eviction-free collection must stay a no-op: the
+        // window is still the complete work record.
+        let messages = stack_fixture();
+        let budget = estimate_tokens(&messages) + 100;
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages.clone(), budget, &mut state);
+        assert_eq!(collected, messages, "under budget = untouched");
+        assert!(find_ledger(&collected).is_none());
+        assert_eq!(state.ledger_summary, LedgerSummary::default());
+        // The journal still learned the session's completed calls.
+        assert_eq!(state.ledger.len(), 2);
+    }
+
+    #[test]
+    fn ledger_is_replaced_not_appended_and_never_marked_as_an_eviction() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        let first = RingGc::default().collect(messages, 300, &mut state);
+        assert_eq!(
+            first.iter().filter(|m| is_gc_ledger(m)).count(),
+            1,
+            "first collection writes the ledger"
+        );
+        let markers_before = state.marker_summary;
+
+        // Re-collect the already-collected window: idempotent — the old
+        // ledger is replaced (same content, same derived id), nothing is
+        // dropped, and no marker counts the replacement as an eviction.
+        let second = RingGc::default().collect(first.clone(), 300, &mut state);
+        assert_eq!(
+            second, first,
+            "re-collecting a collected window is a no-op incl. the ledger"
+        );
+        assert_eq!(
+            second.iter().filter(|m| is_gc_ledger(m)).count(),
+            1,
+            "replaced, never appended"
+        );
+        let markers_after = state.marker_summary;
+        assert_eq!(
+            markers_after.evicted_assistant_turns, 0,
+            "the replaced ledger instance is bookkeeping, not an eviction"
+        );
+        assert_eq!(markers_after.markers, markers_before.markers);
+    }
+
+    #[test]
+    fn ledger_is_deterministic_including_its_id() {
+        let messages = stack_fixture();
+        let run = |messages: Vec<ChatMessage>| {
+            let mut state = GcState::default();
+            RingGc::default().collect(messages, 300, &mut state)
+        };
+        let first = run(messages.clone());
+        let second = run(messages);
+        assert_eq!(first, second);
+        assert_eq!(
+            first.iter().map(|m| m.id).collect::<Vec<_>>(),
+            second.iter().map(|m| m.id).collect::<Vec<_>>(),
+            "ledger ids are derived from content, never minted"
+        );
+    }
+
+    #[test]
+    fn ledger_respects_the_budget_ladder_and_records_suppression() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        // A budget with room for the hard guards and little else: the
+        // ledger must degrade to suppression rather than overflow.
+        let collected = RingGc::default().collect(messages, 60, &mut state);
+        assert!(find_ledger(&collected).is_none());
+        assert!(
+            state.ledger_summary.suppressed,
+            "no room for the ledger must be recorded, never silent"
+        );
+        assert!(!state.ledger_summary.present);
+    }
+
+    #[test]
+    fn ledger_never_touches_the_pinned_prefix() {
+        // Enough early ballast that the preserve-mode prefix allowance
+        // pins real messages, then heavy pressure.
+        let mut messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("please run the tests"),
+        ];
+        for index in 0..8 {
+            let call_id = format!("call-{index}");
+            messages.push(ChatMessage::assistant(
+                Some(format!("step {index}")),
+                vec![ToolCall::new(
+                    &call_id,
+                    "shell",
+                    serde_json::json!({ "command": format!("make step-{index}") }),
+                )],
+            ));
+            messages.push(ChatMessage::tool(
+                call_id,
+                format!("output {index} {}", "z".repeat(600)),
+            ));
+        }
+        messages.push(ChatMessage::user("now finish up"));
+        let budget = estimate_tokens(&messages) / 2;
+        let boundary = cache_prefix_boundary(&messages, budget);
+        let prefix = messages[..boundary].to_vec();
+
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages, budget, &mut state);
+        assert!(
+            !state.prefix_invalidated,
+            "preserve mode with a ledger must keep the prefix byte-stable"
+        );
+        assert_eq!(
+            &collected[..prefix.len()],
+            &prefix[..],
+            "the pinned prefix is byte-identical with the ledger in-window"
+        );
+        let ledger_index = collected
+            .iter()
+            .position(is_gc_ledger)
+            .expect("heavy pressure with tool history writes a ledger");
+        assert!(
+            ledger_index >= prefix.len(),
+            "the ledger lives in the tail region, never the pinned prefix"
+        );
+        // Tail placement: immediately before the trailing user turn.
+        assert_eq!(
+            collected[ledger_index + 1].role,
+            "user",
+            "the ledger sits immediately before the latest user turn"
+        );
+        assert_eq!(ledger_index + 2, collected.len());
+    }
+
+    #[test]
+    fn ledger_caps_entries_and_coalesces_older_work() {
+        let mut messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("do the work"),
+        ];
+        for index in 0..(MAX_LEDGER_ENTRIES + 3) {
+            let call_id = format!("call-{index}");
+            messages.push(ChatMessage::assistant(
+                None,
+                vec![ToolCall::new(
+                    &call_id,
+                    "shell",
+                    serde_json::json!({ "command": format!("make step-{index}") }),
+                )],
+            ));
+            messages.push(ChatMessage::tool(
+                call_id,
+                format!("output {index} {}", "w".repeat(3000)),
+            ));
+        }
+        messages.push(ChatMessage::assistant(Some("done so far".into()), vec![]));
+        let budget = estimate_tokens(&messages) / 2;
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages, budget, &mut state);
+        let content = find_ledger(&collected)
+            .and_then(|m| m.content.as_deref())
+            .expect("ledger present");
+        assert!(
+            (1..=MAX_LEDGER_ENTRIES).contains(&state.ledger_summary.entries),
+            "itemized entries are capped and non-empty: {}",
+            state.ledger_summary.entries
+        );
+        assert!(
+            content.contains("older work:") && content.contains("earlier calls completed"),
+            "older entries coalesce into one line: {content}"
+        );
+        let newest = format!("call-{}:", MAX_LEDGER_ENTRIES + 2);
+        assert!(
+            content.contains(&newest) && !content.contains("call-0:"),
+            "newest entries are itemized, oldest coalesced: {content}"
+        );
+    }
+
+    #[test]
+    fn ledger_carries_escalation_state_for_repeatedly_evicted_content() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        // Two prior evictions of call-1's content: this collection makes
+        // the third, which must surface the honest exit in the ledger.
+        let fingerprint = content_fingerprint(
+            messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("call-1"))
+                .and_then(|m| m.content.as_deref())
+                .unwrap(),
+        );
+        state.eviction_counts.insert(fingerprint, 2);
+        let collected = RingGc::default().collect(messages, 420, &mut state);
+        let content = find_ledger(&collected)
+            .and_then(|m| m.content.as_deref())
+            .expect("ledger present");
+        assert!(
+            content.contains("call-1: shell(cargo test) -> ")
+                && content.contains("[evicted 3x — do not re-fetch]"),
+            "the ledger names the re-eviction loop and the exit: {content}"
+        );
+    }
+
+    #[test]
+    fn ledger_lines_never_become_write_barrier_chunks() {
+        let messages = stack_fixture();
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages, 300, &mut state);
+        let ledger = find_ledger(&collected).expect("ledger present");
+        assert!(
+            reinjection_chunk_keys(ledger.content.as_deref().unwrap()).is_empty(),
+            "a digest describing content must never vouch for it"
+        );
+        assert!(
+            !hot_mask(&collected, &state)[collected.iter().position(is_gc_ledger).unwrap()],
+            "the ledger can never be write-barrier hot"
+        );
+    }
+
+    #[test]
+    fn ledger_absent_when_the_session_has_no_tool_history() {
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("first question {}", "a".repeat(900))),
+            ChatMessage::assistant(Some(format!("first answer {}", "b".repeat(900))), vec![]),
+            ChatMessage::user("second question"),
+        ];
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages, 250, &mut state);
+        assert!(
+            find_ledger(&collected).is_none(),
+            "no completed tool calls = nothing to digest"
+        );
+        assert_eq!(state.ledger_summary, LedgerSummary::default());
+    }
+
+    #[test]
+    fn ledger_steps_back_over_a_trailing_open_tool_call() {
+        let mut messages = stack_fixture();
+        messages.push(ChatMessage::assistant(
+            None,
+            vec![ToolCall::new(
+                "call-open",
+                "shell",
+                serde_json::json!({ "command": "cargo build" }),
+            )],
+        ));
+        let mut state = GcState::default();
+        let collected = RingGc::default().collect(messages, 700, &mut state);
+        let ledger_index = collected
+            .iter()
+            .position(is_gc_ledger)
+            .expect("ledger present");
+        let open_index = collected
+            .iter()
+            .position(|m| {
+                m.tool_calls
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|call| call.id == "call-open")
+            })
+            .expect("open frame survives");
+        assert!(
+            ledger_index < open_index,
+            "the ledger must not strand an open call from its future result"
         );
     }
 }
