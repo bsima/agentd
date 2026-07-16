@@ -1131,7 +1131,15 @@ mark-sweep s1, `clean-long` stack s1, `clean-long` mark-sweep s1, and
 the class-3 `tangent-return` semantic guided s1. Priority order
 protected the deciding cells as designed; the casualty ordering is
 uncomfortable in hindsight — mark-sweep, the strategy with the best
-behavioral record, went entirely unfunded. Offline replay reproduces
+behavioral record, went entirely unfunded. **(t-1374 funded all four —
+on the ledger-era runtime, one mechanism generation later, so they are
+not same-runtime rows of this table: mark-sweep completed BOTH
+curation fixtures (distractor-update 10 turns, rpt 0, 3/3 judge,
+$0.056 — 57% of control cost; clean-long 16 turns, $0.085 — below both
+control samples), clean-long stack looped to the cap, and the class-3
+tangent-return semantic cell completed cleanly at the starvation
+budget. P3/P4/P5 re-scores in the t-1374 section below.)** Offline
+replay reproduces
 every recorded cell strictly (asserted per cell, re-verified from a
 cold offline run); the `minimal` guidance variant was confirmed
 delivered on every turn of every cell from the recorded prompt_ir
@@ -1251,6 +1259,9 @@ rounds).
    restart loop (it refuses incomplete lifecycles) is the one this
    round never got to test, and on four generations of starvation
    evidence it is the likeliest to have matched the control.
+   **Done — t-1374 ($0.33 for the four): the prediction held —
+   mark-sweep matched the control on both fixtures at roughly half its
+   cost (with the ledger live; see below).**
 2. **A true curation regime**, which this design failed to build:
    budget sized so the RELEVANT content plus working margin fits
    comfortably (e.g. 12-14k for this session shape, or shorter
@@ -1349,5 +1360,227 @@ canonical loops break?), the 4 unfunded t-1371 cells (mark-sweep on
 both curation fixtures, clean-long stack, and the class-3 regime
 contrast), and early-needle stack guided (does "these steps are DONE"
 terminate the t-1369 recovery loop?). It also discharges the §2.4
-ledger-sentence re-record obligation, degenerately (the fragment is
-suppressed at these budgets — the t-1369 stance).
+ledger-sentence re-record obligation, degenerately (the ledger
+sentence lives only in the FULL fragment, which no planned cell's
+budget renders: suppressed at the starvation budgets, distilled to the
+minimal core — which has no ledger line — at 8000). **Ran — next
+section.**
+
+## The ledger round (t-1374, online): the restart loop, with the model shown its own record
+
+The deciding question, after t-1373's offline validation (the replayed
+ledger NAMED the repeated call in 10-22 of ~24 loop iterations on the
+old recordings): does the in-window `[gc-ledger]` digest change
+BEHAVIOR — rpt collapsing, tasks completing or failing honestly
+instead of looping to the turn cap — when a real model sees it?
+
+**Design.** 11 cells recorded 2026-07-16 on the ledger-era runtime
+(a359696 + 12eb710), same model/provider/defaults as every round
+(`anthropic/claude-haiku-4.5` via OpenRouter), priority-ordered under
+a $2.00 cap:
+
+1. **The loop-breakers** (deciding): the worst restart-loop cells
+   across the prior generations — tangent-return stack guided n=2
+   (rpt 21-24 at the cap in t-1362/t-1367), distractor-update semantic
+   guided n=2 and stack guided n=1 (rpt 16-17, t-1371). Stale
+   recordings at these five paths were deleted (the tables above are
+   the historical record).
+2. **The four unfunded t-1371 cells**: distractor-update mark-sweep,
+   clean-long stack + mark-sweep, tangent-return semantic guided s1
+   (the class-3 regime contrast).
+3. **early-needle stack guided s1** (the t-1369/t-1362 recovery
+   looper — hot-keep mostly fixed the value loss; this measures the
+   ledger + hot-keep composition), and **early-needle ring guided s1**
+   (the narrate-to-cap cell), recorded last — their stale recordings
+   deleted only once the earlier cells' spend confirmed the budget
+   reached them (s2 of each cell remains pre-ledger and replays
+   leniently).
+
+New columns, both trace-derived: `pldr` (post-ledger repeats — the
+earlier identical call was itemized by ANY ledger already shown to the
+model, even one later coalesced away; the obedience metric,
+rptl <= pldr <= rpt) and `rpte` (repeats after the first in-window
+escalated "do not re-fetch again" marker — coarse escalation
+obedience; the event stream does not name which content escalated).
+Attribution is clean: the §2.4 ledger sentence lives only in the FULL
+fragment, which no cell here renders — the starvation budgets suppress
+guidance entirely, and the 8000-budget curation cells deliver the same
+MINIMAL core (marker + memory sentences, no ledger line) that t-1371's
+cells did — so the in-window ledger itself is the whole delta against
+each cell's own baseline. Spend: **$0.947 matrix + $0.045 judge =
+$0.992** (cap $2.00).
+Offline replay reproduces every cell strictly — gc stream, ledger and
+obedience fields included — re-verified from a cold offline run.
+
+### Results (the 11 ledger-era cells)
+
+```
+fixture            arm        guid s turns evals  rpt rptl pldr rpte refx rem prem rec coll reasons     drop ovl hot reev esc mkr mkref ldg   in_tok  out_tok       cost wall_s  ok cfab rot rcov admt judge
+tangent-return     stack      on   1    25    15    8    2    8    6    3   2    0  17   23 s:23         642 2655   1  384  10  17     2  10    56067     2748  $0.069807   43.1 yes    -   -  yes    -   1/3
+tangent-return     stack      on   2    27     5    2    2    2    0    0   0    0  39   25 s:25        1015 2016   0  662  11  16     1  10    56991     3018  $0.072081   46.6  NO    -   -  yes    -   0/3
+tangent-return     semantic   on   1    10     6    2    1    2    1    0   2    0   3    8 s:8           75 355   3   35   7  13     2   6    21874     1028  $0.027014   16.8 yes    -   -  yes    -   0/3
+distractor-update  stack      on   1    27    22   14    8   13   12    5   1    1   3   23 s:23         442 3209   4  288  17  34     0  10   149139     2329  $0.160784   50.6  NO    -   -  yes    -   0/3
+distractor-update  mark-sweep on   1    10     8    0    0    0    0    0   1    0   0    7 s:7           40 266   2   16   4   9     0   9    51795      775  $0.055670   17.6 yes    -   -    -    -   3/3
+distractor-update  semantic   on   1    16    14   10    9   10    8    3   2    0   0   13 s:13         196 1144   2   99  15  29     0  10    81938     1308  $0.088478   26.4  NO    -   -  yes    -   0/3
+distractor-update  semantic   on   2    20    14    6    6    6    4    3   1    0   8   17 s:17         327 1598   4  166  17  32     1  10   105564     2057  $0.115849   39.8 yes    -   -  yes    -   1/3
+clean-long         stack      on   1    27    19   10    7   10    9    2   3    1   4   23 s:23         389 1913   3  283  19  24     0  10   148031     2623  $0.161146   51.6  NO    -   -  yes    -     -
+clean-long         mark-sweep on   1    16    11    3    1    1    1    1   2    1   2   12 s:12         130 560   7   55   7  15     0  10    78874     1233  $0.085039   25.9 yes    -   -  yes    -   1/3
+early-needle       stack      on   1    12     9    0    0    0    0    0   1    0   1    7 s:7           77  35   1   31   2   5     0   4    28113     1145  $0.033838   21.6  NO    -   -  yes    -   0/3
+early-needle       ring       on   1    27    14    9    1    8    8    1   3    0   9   24 s:24         614 765   2  296   2   5     3   4    64311     2576  $0.077191   48.4  NO  YES   -  yes    -   0/3
+```
+
+Flag honesty first: early-needle ring's `cfab YES` is the known
+commentary artifact — its last text is "Let me recall the access code
+..." at the cap (the word "access" with no asserted value); **no cell
+in this round fabricated a needle value**, the first zero-fabrication
+round of the eval. The clean-long stack judge verdict was recorded but
+wrapped its JSON in prose (printed `-`; its own conclusion is all
+three booleans false — the usual least-reliable-row caveat).
+
+### Per-cell before/after (every baseline is that cell's own path, prior generation)
+
+| cell | before (round) | after (this round) |
+|---|---|---|
+| tangent-return stack g s1 | 27 turns, rpt 21, no answer, $0.064 (t-1362) | **completes, correct order** — 25 turns, rpt 8, rec 17, $0.070, the first stack completion of this fixture in six generations |
+| tangent-return stack g s2 | 27 turns, rpt 24, no answer, $0.059 (t-1367) | command loop GONE (rpt 2, evals 5) — replaced by a **recall loop** (rec 39) to the cap, no answer, $0.072 |
+| distractor-update semantic g s1 | 27 turns, rpt 16, turn-cap loop, $0.152 (t-1371) | 16 turns, rpt 10, **honest failure**: run ended mid-task on a malformed tool call emitted as text (no quote asserted), $0.088 |
+| distractor-update semantic g s2 | 27 turns, rpt 17, turn-cap loop, $0.149 (t-1371) | **completes** — `QUOTE UNIT 57 TOTAL 570`, 20 turns, rpt 6, $0.116 |
+| distractor-update stack g s1 | 27 turns, rpt 17, turn-cap loop, $0.154 (t-1371) | still loops — 27 turns, rpt 14 (pldr 13), $0.161; last text names the CORRECT $57 price, never answers |
+| early-needle stack g s1 | 27 turns, rpt 19, answerless recovery loop, $0.078 (t-1362) | **loop terminated**: 12 turns, rpt 0, honest `ACCESS MX-7749-KESTREL TOTAL 0` (right code, wrong sum), $0.034 — 43% of the loop's cost |
+| early-needle ring g s1 | 27 turns, rpt 17, narrate-to-cap, $0.073 (t-1362) | still caps — rpt 9, rec 9: narration traded for recall attempts, no answer, $0.077 |
+| distractor-update mark-sweep g s1 | UNFUNDED (t-1371; predicted: completes) | **completes clean** — 10 turns, rpt 0, 3/3 judge, $0.056 (57% of control) |
+| clean-long stack g s1 | UNFUNDED | loops — 27 turns, rpt 10 (pldr 10), ends "Let me recall the memory I saved:", $0.161 |
+| clean-long mark-sweep g s1 | UNFUNDED | **completes** — `REGION NORTH-7 SHIPPED 8 AUDIT AUD-4413`, 16 turns, rpt 3, $0.085 (below both control samples) |
+| tangent-return semantic g s1 (1600) | UNFUNDED (class-3; this arm looped in every generation, e.g. unguided s1: 27 turns, rpt 24) | **completes, correct order** — 10 turns, rpt 2, $0.027 |
+
+### Verdict: the ledger breaks or shrinks the restart loop in every deciding cell — rpt 95 -> 40, two of five loop-breakers complete outright — but one command loop persists, two cells convert to a recall loop, and obedience is partial, not total
+
+Caveats as always: one model, n<=2, extreme-to-moderate pressure,
+provider-default temperature.
+
+1. **The trichotomy, 11 cells: 5 completions / 2 honest failures /
+   4 loops.** The seven re-recorded cells' baselines were 7/7
+   turn-cap loops with zero completions; they are now 2 completions
+   (tangent stack s1 — the fixture's first non-mark-sweep completion
+   in six generations — and distractor semantic s2), 2 honest
+   failures, 3 loops. The four newly funded cells add 3 completions
+   (both mark-sweeps, class-3 semantic) and 1 loop (clean-long
+   stack). rpt on the seven re-recorded cells: **131 -> 49**; on the
+   five deciding loop-breakers: **95 -> 40**. No cell fabricated a
+   value, and four of the five completions cost 0.6-1.2x their
+   controls where the old loops cost 1.5-2.9x (the fifth, tangent
+   stack s1, completed the expensive way: 25 turns of ledger-guided
+   recovery at 3.2x control — visible cost, correct answer).
+2. **The residual loop moved up one level: from re-running work to
+   re-recalling it.** Three of the four loop cells end mid-recall,
+   and the recall counts are unprecedented — rec 39 (tangent stack
+   s2, against 5 shell commands total), 9 (early-needle ring), 4
+   (clean-long stack), plus 17 in the tangent stack s1 COMPLETION,
+   where every prior generation of these arms sat at 0-3. The ledger says steps are DONE with their outcomes
+   evicted, and the markers offer "recall the memory"; models now
+   reach for retrieval instead of re-execution — but mostly nothing
+   was remembered (prem <= 1), so recall returns noise and the cell
+   burns turns retrieving instead of re-fetching. Cheaper per token
+   than the old thrash and honest (nothing asserted), but still
+   answerless at the cap. The affordance gap: the ledger names WHAT
+   was done, and nothing yet says "and your memory is empty — re-run
+   or answer with what you have."
+3. **Obedience is real but partial.** Where cells still repeat, they
+   repeat against their own record: pldr ~= rpt (13/14, 10/10, 8/9,
+   2/2) — the model re-runs work a ledger it saw had itemized. But the
+   collapse in absolute counts (rpt 16-24 -> 0-14 everywhere) and
+   tangent stack s1's mid-loop exit (rptl 2 of rpt 8, then
+   completion) say the record is consulted: `mkref` now includes
+   literal `[gc-ledger]` quotes (0-3 per cell), and rptl < pldr in
+   the stack loop cells (8 vs 13; 7 vs 10) — a third of the
+   against-the-record repeats target entries the CURRENT ledger had
+   already coalesced into its older-work line, i.e. the itemized
+   window matters, not just ledger presence.
+4. **Escalation obedience ("do not re-fetch again", t-1370's open
+   half): improved in aggregate, still not held inside loops.**
+   rpte/rpt in the loop cells that still repeat commands is 12/14,
+   9/10, 8/9 (tangent stack s2's two repeats predate its first
+   escalation) — the same near-total disobedience ratio as t-1371's
+   14-16/16-17 — but
+   escalation pressure itself dropped (esc 2-19 in-window vs 16-25
+   in t-1371), and in completing cells post-escalation repeats are
+   0-6 absolute. Same shape as finding 3: escalation
+   does not rescue a looping cell; the ledger prevents many cells
+   from looping at all.
+5. **Admissions: admt 0/11 — six generations running.** The t-1370
+   residual did not move: no cell ever answers "the value is
+   unavailable". The admission-adjacent affordance ("ask the user,
+   then move on") still exists only in the FULL §2.4 text, which no
+   cell's budget has rendered since the t-1368 gate landed. An
+   explicit "if recovery fails, say so" is still unshipped and
+   untested.
+6. **Mark-sweep + ledger matched the control on both fixtures it ran
+   this round, cheaper than every control sample** — and the t-1373
+   honest-ceiling worry (mark-sweep's over-target windows suppress
+   the slack-funded ledger) did not bind at 8k budgets: ldg 9-10,
+   zero suppressions, rpt 0-3, completions at $0.056 (vs $0.097-0.098
+   control) and $0.085 (vs $0.095-0.120). The starvation-budget
+   mark-sweep cells were not re-recorded (not in this round's plan),
+   so the suppression question at 1.6-2k remains open.
+7. **The curation-regime verdict softens: GC arms can now complete
+   curation fixtures** (3 of 6 curation-regime GC cells complete vs
+   0 of 5 in t-1371), though still not beating the control's 4/4,
+   and the strong form (curation IMPROVES accuracy) stays refuted —
+   the control still never rotted. What t-1371 demonstrated as "the
+   restart loop is budget-independent" is better stated as: the
+   restart loop was ledger-absence-dependent, and the t-1349
+   finding-2 chain (evicted progress narration -> restart) is now
+   directly patched by the mechanism built for it.
+
+### P3/P4/P5 re-scores (the pre-registered t-1371 predictions, funded halves)
+
+Confound stated plainly: these cells ran one mechanism generation
+later than the t-1371 table (ledger live; guidance delivery unchanged
+— the same minimal core renders at 8k as in t-1371). They fund the
+pre-registered CELLS on the current runtime; they do not retroactively
+re-run the t-1371 round.
+
+- **P3 (clean-long: every GC arm matches control):** mark-sweep half
+  now SUPPORTED (completes, exact answer, cheaper than both control
+  samples); stack half REFUTED (turn-cap loop). P3 as pre-registered
+  (universal match) stays **refuted** — semantic already failed it
+  and stack now does too; the artifact half (no GC arm beats control
+  on accuracy) still holds. The pre-registered verdict does not flip.
+- **P4 (equal-or-lower cost at equal success):** was refuted on every
+  funded t-1371 cell; now **supported for mark-sweep on both
+  fixtures** ($0.056 vs $0.097-0.098 control; $0.085 vs
+  $0.095-0.120) and for the completing semantic sample within 1.2x.
+  As a universal claim it stays refuted (stack pays 1.6x for zero
+  success).
+- **P5 (regime contrast — the tuned curator still fails at the 1600
+  starvation budget):** funded at last and **refuted in the
+  unexpected direction**: tangent-return semantic guided completed
+  cleanly (10 turns, rpt 2, $0.027). But it no longer measures what
+  P5 pre-registered — the ledger, not the regime, is the delta vs
+  the generations that looped — so it reads as loop-break evidence,
+  not regime evidence.
+
+### What remains, and what t-1167 gets
+
+- **For t-1167 generational GC: every signal it was waiting on is now
+  live in one table** — write-barrier overlap (ovl), hot-keep
+  retention (hot), re-eviction pressure (reev), escalation state
+  (esc), and the ledger's completed-work record with per-call ids
+  (ldg/rptl/pldr). The remaining design input from this round:
+  recovered-and-recalled content needs a tier between "hot" and
+  "gone" (the recall-loop cells re-evicted 283-662 times at
+  starvation), and the ledger's handle-not-content stance (t-1369)
+  held for the record itself — completing cells re-fetched named
+  work when they needed the values (refx 0-3), never the evicted
+  content wholesale.
+- **The recall loop wants its own affordance**: recall-miss feedback
+  ("nothing stored under that query — re-run the call or answer
+  now"), or a ledger line naming memory state. Cheap A/B on this
+  harness.
+- **Admissions (t-1370 residual): unmoved, 0/11.** Next candidate: an
+  explicit if-recovery-fails-say-so line in the escalated marker,
+  which is the only text a looping cell reliably re-reads.
+- The loop-termination gap is now the whole residual failure mode:
+  4/11 cells still burn to the cap doing honest, visible,
+  non-repeating work. The model needs permission to STOP — answer
+  with what it has, or admit — which no mechanism yet grants.
