@@ -1215,6 +1215,19 @@ struct CellMetrics {
     /// own in-window progress record — the restart-loop needle for the
     /// next recording round. Always <= repeat_evals.
     rpt_ledger_named: usize,
+    /// Repeats of a command whose earlier call id ANY prior in-window
+    /// ledger had itemized (t-1374): a ledger naming the call was in a
+    /// prompt the model already saw — even if the current ledger has
+    /// since coalesced the entry away — and it re-ran the command anyway.
+    /// The ledger-obedience metric; rpt_ledger_named <= this <=
+    /// repeat_evals.
+    post_ledger_repeats: usize,
+    /// Repeated commands issued after the first collection whose window
+    /// carried an escalated marker (t-1370's "do not re-fetch again").
+    /// A coarse escalation-obedience bound: gc_collect events do not name
+    /// WHICH content escalated, so this counts every post-escalation
+    /// repeat, not only repeats of the escalated content.
+    repeats_after_escalation: usize,
     usage: RunUsage,
     success: bool,
     /// The final answer asserts the claim marker with a wrong claim value
@@ -1249,6 +1262,8 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         ledger_present_any: false,
         ledger_suppressed_total: 0,
         rpt_ledger_named: 0,
+        post_ledger_repeats: 0,
+        repeats_after_escalation: 0,
         recovered: false,
         admitted: false,
         usage: RunUsage::default(),
@@ -1263,6 +1278,11 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
     // collection's ledger itemized, and which call ids ran which command
     // (from InferResult tool_calls — EvalCall events carry no call id).
     let mut ledger_calls: BTreeSet<String> = BTreeSet::new();
+    // t-1374 obedience needles: every call id any ledger has EVER itemized
+    // (the model has seen its own record name the call), and whether an
+    // escalated marker has entered the window yet.
+    let mut ever_ledger_calls: BTreeSet<String> = BTreeSet::new();
+    let mut escalation_seen = false;
     let mut command_calls: HashMap<String, Vec<String>> = HashMap::new();
     for event in events {
         match event {
@@ -1314,6 +1334,20 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                         .any(|call_id| ledger_calls.contains(call_id));
                     if named {
                         metrics.rpt_ledger_named += 1;
+                    }
+                    // t-1374: the model was ALREADY shown a ledger naming
+                    // this call (in this or an earlier window) and re-ran
+                    // the command anyway — the obedience metric.
+                    let ever_named = command_calls
+                        .get(&trimmed)
+                        .into_iter()
+                        .flatten()
+                        .any(|call_id| ever_ledger_calls.contains(call_id));
+                    if ever_named {
+                        metrics.post_ledger_repeats += 1;
+                    }
+                    if escalation_seen {
+                        metrics.repeats_after_escalation += 1;
                     }
                 }
                 if command.contains(fixture.probe) {
@@ -1371,6 +1405,10 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                     .flatten()
                     .filter_map(|value| value.as_str().map(str::to_string))
                     .collect();
+                ever_ledger_calls.extend(ledger_calls.iter().cloned());
+                if data["markers_escalated"].as_u64().unwrap_or(0) > 0 {
+                    escalation_seen = true;
+                }
                 // Structural: the write-barrier fields must be present on
                 // every gc_collect event (t-1351) — absent fields would
                 // silently zero the behavioral signal.
@@ -1453,9 +1491,28 @@ struct CellId {
     sample: u32,
 }
 
-/// The recording plan, in SPEND-PRIORITY order. Four generations:
+/// The recording plan, in SPEND-PRIORITY order. Five generations:
 ///
-/// t-1371 curation-regime cells (first: the pre-registered plan order —
+/// t-1374 ledger recording round (first, so the spend cap can never cut
+/// the deciding cells): does the t-1373 progress ledger break the restart
+/// loop when a real model sees it?
+///
+/// 1. the loop-breakers — the worst restart-loop cells across the prior
+///    generations (rpt 19-25 at the turn cap): tangent-return stack
+///    guided n=2, distractor-update semantic guided n=2, and
+///    distractor-update stack guided n=1;
+/// 2. the four cells the t-1371 hard cap left unfunded: distractor-update
+///    mark-sweep (the strategy that historically completes), clean-long
+///    stack + mark-sweep (P3's missing halves), and the class-3
+///    tangent-return semantic regime contrast;
+/// 3. early-needle stack guided n=1 — the t-1369 recovery loop; hot-keep
+///    mostly fixed the value loss, the ledger is belt-and-braces, so the
+///    cell measures the composition;
+/// 4. early-needle ring guided n=1 — the narrate-to-cap cell — last.
+///
+/// Earlier generations:
+///
+/// t-1371 curation-regime cells (the pre-registered plan order —
 /// evals/gc/README.md "GC as curation — PRE-REGISTRATION" — puts the
 /// hypothesis-deciding cells ahead of everything, so the spend cap can
 /// never cut them):
@@ -1519,6 +1576,39 @@ struct CellId {
 /// Then the t-1364 unguided coverage and `none` baselines, all recorded.
 fn planned_cells() -> Vec<CellId> {
     let mut cells = Vec::new();
+    // t-1374 ledger round, priority order (see the doc comment above).
+    for sample in [1, 2] {
+        cells.push(CellId {
+            fixture: "tangent-return",
+            arm: Arm::Stack,
+            guided: true,
+            sample,
+        });
+    }
+    for sample in [1, 2] {
+        cells.push(CellId {
+            fixture: "distractor-update",
+            arm: Arm::Semantic,
+            guided: true,
+            sample,
+        });
+    }
+    for (fixture, arm) in [
+        ("distractor-update", Arm::Stack),
+        ("distractor-update", Arm::MarkSweep),
+        ("clean-long", Arm::Stack),
+        ("clean-long", Arm::MarkSweep),
+        ("tangent-return", Arm::Semantic),
+        ("early-needle", Arm::Stack),
+        ("early-needle", Arm::Ring),
+    ] {
+        cells.push(CellId {
+            fixture,
+            arm,
+            guided: true,
+            sample: 1,
+        });
+    }
     // t-1371 curation-regime cells, in pre-registered priority order.
     for fixture in ["distractor-update", "clean-long"] {
         for sample in [1, 2] {
@@ -1938,7 +2028,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -1947,6 +2037,8 @@ fn print_header() {
         "evals",
         "rpt",
         "rptl",
+        "pldr",
+        "rpte",
         "refx",
         "rem",
         "prem",
@@ -1987,7 +2079,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -1996,6 +2088,8 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         metrics.eval_calls,
         metrics.repeat_evals,
         metrics.rpt_ledger_named,
+        metrics.post_ledger_repeats,
+        metrics.repeats_after_escalation,
         metrics.needle_refetches,
         metrics.remember_calls,
         metrics.proactive_remembers,
@@ -2360,6 +2454,8 @@ async fn replay_cell(
         replayed_cmp.ledger_present_any = recorded.ledger_present_any;
         replayed_cmp.ledger_suppressed_total = recorded.ledger_suppressed_total;
         replayed_cmp.rpt_ledger_named = recorded.rpt_ledger_named;
+        replayed_cmp.post_ledger_repeats = recorded.post_ledger_repeats;
+        replayed_cmp.repeats_after_escalation = recorded.repeats_after_escalation;
         assert!(
             replayed.collections > 0 || recorded.collections == 0,
             "{}: replay lost the gc_collect stream entirely",
@@ -2735,8 +2831,11 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
     // The turn-2 repeat preceded the first eviction (the first collection
     // only truncated the oversized result in place, dropping nothing), so
     // it is NOT ledger-named: the needle counts re-runs issued against
-    // the model's own in-window record, never all repeats.
+    // the model's own in-window record, never all repeats. Same for the
+    // cumulative t-1374 obedience needle — no ledger had named the call
+    // yet when the repeat was issued.
     assert_eq!(metrics.rpt_ledger_named, 0);
+    assert_eq!(metrics.post_ledger_repeats, 0);
     assert!(
         metrics
             .reasons
@@ -2827,6 +2926,10 @@ async fn plumbing_ledger_names_the_repeated_call_at_the_moment_of_repetition() -
     assert_eq!(
         metrics.rpt_ledger_named, 1,
         "the repeat must count as issued against the ledger's own record"
+    );
+    assert_eq!(
+        metrics.post_ledger_repeats, 1,
+        "a ledger-named repeat is also a post-ledger repeat (t-1374)"
     );
     assert!(metrics.ledger_present_any);
 
