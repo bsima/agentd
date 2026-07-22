@@ -82,7 +82,7 @@ pub enum Terminator {
 }
 ```
 
-The first version uses an environment-carrying CFG rather than strict SSA block scope. `Goto` binds target params, but the runtime environment is carried across block transitions so loop builders can keep durable locals without threading every variable through every block. This is simpler for the first interpreter. A later normalization pass can tighten this into stricter SSA if that becomes valuable.
+The runtime uses an environment-carrying CFG rather than strict SSA block scope. `Goto` binds target params, but the runtime environment is carried across block transitions so loop builders can keep durable locals without threading every variable through every block. This is simpler for authoring. The normalization pass (`ir_normalize`, implemented) tightens programs into strict SSA for the canonical form used by hashing — authored programs keep the looser scope at runtime.
 
 The first version can use `serde_json::Value` for runtime values. A richer type system can come later.
 
@@ -103,7 +103,7 @@ At minimum validation should check:
 - effect inputs have the expected runtime shape where statically knowable
 - `PromptRef::Var` values are expected to decode as prompts
 
-Normalization should produce the canonical form used for hashing, trace locations, replay, and inspection. Equivalent programs should not get different identities because of incidental map order or formatting.
+Normalization produces the canonical form used for hashing, trace locations, replay, and inspection (implemented: `normalize_program`/`canonical_program_hash` in `ir_normalize`; `program_hash` hashes the canonical form). Equivalent programs do not get different identities because of incidental map order, variable naming, or formatting — alpha-equivalent programs share identity.
 
 ## Abstract machine
 
@@ -269,7 +269,7 @@ Directly writing blocks is useful for tests and serialization, but normal agent 
 
 The closure-based `Op` representation can remain as a compatibility layer or builder if useful. It should not be the stable runtime representation.
 
-## Migration plan
+## Migration plan (completed)
 
 1. Add `agent-core::ir` with serializable AST/CFG types.
 2. Add `run_ir_sequential` beside the current closure-based `run_sequential`.
@@ -279,7 +279,7 @@ The closure-based `Op` representation can remain as a compatibility layer or bui
 6. Switch the CLI to AgentIR once the release evals pass under both interpreters.
 7. Keep closure-based `Op` as an ergonomic builder or compatibility layer if useful.
 
-## Acceptance for next stable release
+## Acceptance (met)
 
 - Existing CLI behavior is preserved.
 - Existing release evals pass with the AgentIR interpreter.

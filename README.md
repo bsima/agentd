@@ -4,18 +4,19 @@
 
 A Rust runtime for long-running AI agents. The main idea is that **Linux is the harness**.
 
-This repo currently contains:
+This repo contains:
 
-- `agent-core`: a free-monad-based interpreter with an `Infer` operation
+- `agent-core`: the runtime kernel — a serializable agent IR with an `Infer` operation, interpreters, providers, hydration, context GC, cost accounting, approvals, tracing
 - `agent`: CLI for oneshot and persistent agents, this follows the Unix philosophy of "do one thing well", all it does is run an agentic loop
-- `agent-oauth`: experimental support for using codex/claude-code subscription
+- `agentd`: process supervisor for named, long-running sessions — start/stop/resume, turn delivery, systemd unit generation
+- `agent-sdk`: Rust SDK for embedding the agent loop — typed tools, structured output, streaming events, replay
+- `agent-oauth`: support for using codex/claude-code subscription auth
 
-This was originally written in Haskell in my private monorepo of projects, I'm in the process of porting it to Rust and releasing it here.
-There's also an `agentd` process supervisor, eventually I will port that to Rust too.
+This was originally written in Haskell in my private monorepo of projects. The Rust port is now the reference implementation, including the `agentd` supervisor.
 
 ## Core ideas
 
-Between the Haskell prototype and this Rust port, the implementation is changing a lot, but the core ideas have remained.
+Between the Haskell prototype and this Rust port, the implementation changed a lot, but the core ideas have remained.
 
 ### An agent is a free-monad over inference
 
@@ -45,15 +46,17 @@ pub enum OpF<S, A> {
 }
 ```
 
-The CLI's actual runtime is the serializable AgentIR, which carries the same `Infer`/`Eval`/`Emit` core and adds two hydration effects: `Retrieve` (a ranked, query-based read over registered context sources) and `Store` (a create/update/delete write to a registered sink). See [ARCHITECTURE.md](./ARCHITECTURE.md) for the longer version and [docs/MEMORY.md](./docs/MEMORY.md) for the retrieval/memory design.
+The CLI's actual runtime is the serializable AgentIR, which carries the same `Infer`/`Eval`/`Emit` core and adds `Retrieve` (a ranked, query-based read over registered context sources), `Store` (a create/update/delete write to a registered sink), and `Tool` (typed in-process native tools, recorded and replayed like every other effect). `Par` runs for real in the IR: a dynamic-width map whose branches execute concurrently, with deterministic effect ids and order-independent replay. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the longer version and [docs/MEMORY.md](./docs/MEMORY.md) for the retrieval/memory design.
 
 ### Infer can call Infer
 
-All `OpF` variants are available to agent programs, including `Infer`.
+All effects are available to agent programs, including `Infer`.
 
 So a multi-agent system is not a special framework layer. It is just an agent program that emits multiple `Infer` calls, maybe with different models, prompts, budgets, or context windows. The outer agent is the orchestrator.
 
 This is the SICP meta-circular idea applied to agents. `eval` calling `eval` collapses the interpreter/object-language boundary, `Infer` calling `Infer` does the same thing for agents.
+
+This is not just a design stance anymore; it is implemented, measured, and guided. The agent loop exposes an `infer` tool so the model can dispatch a sub-inference directly, passing bulky tool output by reference (`context_refs`) instead of copying it. The recorded evals show delegation pays where you'd expect: generation-heavy work measured ~2.7x cheaper in scripted mechanics (1.4-2.3x in the behavioral rounds) via output-rate arbitrage, and pass-by-reference makes delegation-of-reading viable where by-copy delegation costs more than doing it yourself. Models don't discover the mechanism on their own, so the runtime ships operations guidance describing when to delegate — with it, models delegated exactly where the economics pay and nowhere else; without it, they never delegated at all. Details and recorded runs: [evals/infer-infer/](./evals/infer-infer/README.md), [evals/delegation/](./evals/delegation/README.md), [docs/GUIDANCE.md](./docs/GUIDANCE.md).
 
 ### Context is a window over a log, not the log itself
 
@@ -61,7 +64,10 @@ The durable history is an append-only record (checkpoints, traces, replay all
 depend on that). What the *model sees per turn* is a managed window over it:
 `agent-core` models context reads as queries over registered hydration
 sources, hydrates passively before each turn, and garbage-collects the
-outbound window under budget pressure (see `docs/GC.md`). This is similar to RLM.
+outbound window under budget pressure with five strategies — `stack` (default),
+`ring`, `mark-sweep`, `semantic`, `generational` — plus eviction markers and a
+progress ledger so the model knows what was dropped and where it is (see
+[docs/GC.md](./docs/GC.md)). This is similar to RLM.
 
 There are really only 2 ways to lookup content for context: temporally via chat history, and semantically via similarity search; these operations work on any unstructured text.
 Similarly, there are 2 times during an agentic turn that an agent can build context: it can be injected passively into the LLM prompt, or the agent can actively use a tool call to find more context.
@@ -92,26 +98,30 @@ agent --fifo .agent.fifo --checkpoint-dir .agent-checkpoints &
 printf 'run cargo test\0' > .agent.fifo
 ```
 
-The future Rust supervisor will wrap this with commands like:
+The `agentd` supervisor wraps this with named sessions:
 
 ```sh
-agentd start myagent
+agentd start myagent --model openrouter/auto
 agentd send myagent "go build the thing"
 agentd logs myagent
+agentd status
 agentd stop myagent
+agentd resume myagent          # restart from the latest checkpoint
+agentd set-model myagent openai/gpt-4o-mini
+agentd gen-systemd myagent     # emit a systemd user unit
 ```
+
+It is a thin CLI over a conventional directory layout (`~/.local/share/agentd/<name>/` with a canonical `agent.md` spec, a FIFO, a pid file, and checkpoints) — no daemon, no broker, no registry database; the filesystem is the API. Turn delivery is correlated by turn id, `send --timeout` leaves the turn running and `attach` re-attaches to it later. See [docs/SUPERVISOR.md](./docs/SUPERVISOR.md).
 
 This allows us to use all the regular Linux tooling for managing agents: systemd, kubernetes, docker/podman.
 Feel free to sandbox your agent with bwrap or nix or whatever you want.
 
 ## Install
 
-The binary is named `agent`.
-
-Prebuilt static musl binaries (x86_64 and aarch64 Linux) are attached to [GitHub Releases](https://github.com/bsima/agentd/releases) as `agent-<tag>-<target>.tar.gz` with a combined `SHA256SUMS`:
+Prebuilt static musl binaries of `agent` (x86_64 and aarch64 Linux) are attached to [GitHub Releases](https://github.com/bsima/agentd/releases) as `agent-<tag>-<target>.tar.gz` with a combined `SHA256SUMS`:
 
 ```sh
-v=v0.1.0
+v=v0.2.0
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 curl -LO "https://github.com/bsima/agentd/releases/download/$v/agent-$v-$target.tar.gz"
 curl -LO "https://github.com/bsima/agentd/releases/download/$v/SHA256SUMS"
@@ -120,10 +130,11 @@ tar xzf "agent-$v-$target.tar.gz"
 install -m 755 "agent-$v-$target/agent" ~/.local/bin/
 ```
 
-Or build from source with cargo:
+Or build from source with cargo (the `agentd` supervisor binary is source-only for now):
 
 ```sh
 cargo install --git https://github.com/bsima/agentd agent
+cargo install --git https://github.com/bsima/agentd agentd
 ```
 
 ## Quickstart
@@ -161,14 +172,14 @@ export OPENROUTER_API_KEY=...
 Run a one-shot prompt:
 
 ```sh
-cargo run -- --model openrouter/auto "say hello"
+cargo run -p agent -- --model openrouter/auto "say hello"
 ```
 
 You can also run a markdown file as the prompt:
 
 ```sh
-cargo run -- ./task.md
-cat input.json | cargo run -- ./task.md
+cargo run -p agent -- ./task.md
+cat input.json | cargo run -p agent -- ./task.md
 ```
 
 Markdown prompts may include YAML frontmatter for fields the CLI applies directly: `provider`, `model`, `max_iterations`, and `system_prompt`.
@@ -201,10 +212,21 @@ read the key the agent runs on. Working credentials like `GITHUB_TOKEN` are
 not stripped. Use `--eval-env inherit-full` if your commands genuinely need
 the provider keys, or `--eval-env clean` for an empty environment.
 
+To put a human in the loop, `--require-shell-approval` gates every shell
+command: the run pauses durably (surviving process restarts) until someone
+resolves it with `agent approvals --approve/--deny`. A denial is a typed
+value the model reads and reacts to, not a crash.
+
 Replay recorded `Infer` and `Eval` results without an API key or shell execution:
 
 ```sh
 agent --replay-trace ~/.local/share/agent/traces/<run-id>.jsonl --model ignored "same prompt"
+```
+
+Inspect what a run cost, from its trace:
+
+```sh
+agent cost --trace ~/.local/share/agent/traces/<run-id>.jsonl
 ```
 
 ## Running safely
@@ -238,23 +260,47 @@ Keep traces and checkpoints outside your main home directory if command output m
 
 ## Architecture
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the free monad design, hydration model, session model, and interpreter story.
-See [ROADMAP.md](./ROADMAP.md) for the Rust port plan.
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the effect algebra, hydration model, session model, and interpreter story.
+See [ROADMAP.md](./ROADMAP.md) for milestone status.
+
+Design docs for the subsystems:
+
+- [docs/AGENT_IR.md](./docs/AGENT_IR.md) — the serializable IR, effect ids, replay, `Par`
+- [docs/GC.md](./docs/GC.md) — context GC: strategies, invariants, eviction markers, the progress ledger
+- [docs/MEMORY.md](./docs/MEMORY.md) and [docs/PROVIDERS.md](./docs/PROVIDERS.md) — retrieval/memory design and the provider-author contract
+- [docs/GUIDANCE.md](./docs/GUIDANCE.md) — the runtime operations guidance shipped to models
+- [docs/SUPERVISOR.md](./docs/SUPERVISOR.md) — the `agentd` supervisor
+- [docs/TRACE_SCHEMA.md](./docs/TRACE_SCHEMA.md) — the versioned public trace event schema
+- [docs/OTEL.md](./docs/OTEL.md) — OpenTelemetry export
 
 ## Status
 
-M1 and the AgentIR track are implemented: single-agent CLI, the serializable AgentIR runtime (the CLI's only runtime; the closure-based `Op` layer remains a library builder/test API), bounded shell-backed `Eval`, model-backed `Infer`, NUL/FIFO session input, structured traces with error events, stable-effect-id replay (including replay of failures), mid-turn IR checkpoints, context GC (`stack` by default, plus `ring` and `mark-sweep`; `--gc-cache preserve` is the default cache policy — see [docs/GC.md](./docs/GC.md)), hydration registry with PromptIR provenance, `Retrieve`/`Store` effects with a file-backed memory backend (`--memory-dir`) and model-facing `remember`/`recall` tools, turn-completion checkpointing through the `ChatHistory` sink, and optional model registry loading.
+Implemented and tested, at v0.2.0:
+
+- the serializable AgentIR runtime (the CLI's only runtime; the closure-based `Op` layer remains a library builder/test API), with validation, canonical-form hashing, stable effect ids, mid-turn checkpoints, and deterministic replay (including replay of failures)
+- bounded shell-backed `Eval` (timeouts, output caps, env policy with credential stripping) plus direct-exec argv `Eval` for typed tool calls
+- `Retrieve`/`Store` hydration effects with a file-backed memory backend (`--memory-dir`), optional embedding-based semantic retrieval, and model-facing `remember`/`recall` tools
+- concurrent `Par` (dynamic-width map; deterministic ids, order-independent replay)
+- context GC: five strategies (`stack` default), hard guards, eviction markers, escalation, and the progress ledger — behaviorally evaluated on recorded sessions (see [evals/gc/](./evals/gc/README.md))
+- model-visible sub-inference (`infer` tool) with pass-by-reference `context_refs` and trace lineage
+- runtime operations guidance: per-tool descriptions plus a capability-keyed, budget-aware prompt fragment (`--no-runtime-guidance` to opt out)
+- human-in-the-loop approvals: durable pauses resolved by `agent approvals`, in-process hooks in the SDK
+- cost accounting: per-call and per-run token/cost rollups in traces, `agent cost` to inspect them
+- output contracts (`--output-schema`): JSON Schema-constrained final answers with bounded repair turns
+- structured traces with a versioned public event schema, plus optional OpenTelemetry export
+- the `agentd` supervisor: named sessions, turn delivery with re-attachment, spec-file config, systemd unit generation
+- the `agent-sdk` crate: embed the loop with typed native tools, structured output, streaming public events, and replay
 
 Active development:
 
-- M2: Rust `agentd` supervisor/daemon port from the working Haskell implementation (design: [docs/SUPERVISOR.md](./docs/SUPERVISOR.md))
-- M3: hermetic PATH, stronger sandbox integration, richer `HydrationSource` implementations
-- M4: parallel interpreter with real `Par` execution
-- M5: distributed interpreter, multi-VM campaigns
+- behavioral evals: GC strategy validation on recorded sessions continues; guidance A/Bs at realistic budgets
+- sandboxing: documented container patterns exist, first-class sandbox-runner integration does not yet
+- PromptIR optimization passes (structure and provenance are shipped; optimization is future)
+- distributed interpretation, multi-VM campaigns (future)
 
 ## Prior art
 
-The design comes from `Omni/Agent/Op.hs`, a Haskell prototype that proved the free monad Op abstraction in production use. This Rust port is a translation, not a rewrite. The Haskell codebase remains the reference for Op semantics.
+The design comes from `Omni/Agent/Op.hs`, a Haskell prototype that proved the free monad Op abstraction in production use. The Rust port started as a translation and has since become the reference implementation.
 
 The meta-circular `Infer`-emitting-`Infer` pattern has direct precedent in the SICP meta-circular evaluator.
 

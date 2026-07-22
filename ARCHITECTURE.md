@@ -22,14 +22,14 @@ An agent needs both. It infers from text, history, files, and command output. Th
 
 The loop is the agent.
 
-`agentd` encodes that loop with a small effect algebra — `Infer`, `Eval`, `Retrieve`, `Store`, `Emit` — carried by two program representations:
+`agentd` encodes that loop with a small effect algebra — `Infer`, `Eval`, `Retrieve`, `Store`, `Tool`, `Emit`, plus `Par` for fan-out — carried by two program representations:
 
 | Representation | Module | Status |
 |---|---|---|
 | **AgentIR** — serializable block/instruction CFG with an explicit machine | `agent-core::ir`, `ir_interpreter` | Stable runtime; the CLI's only runtime |
 | **Op** — free monad with Rust closure continuations | `agent-core::op`, `interpreter` | Library-level builder/test API; no CLI runtime mode |
 
-The effect algebra, not either encoding, is the architectural constraint. Interpreters must preserve explicit `Infer`/`Eval`/`Retrieve`/`Store`/`Emit` effects regardless of how programs are authored. (The Op builder covers the `Infer`/`Eval`/`Emit`/`Par` subset; `Retrieve` and `Store` exist only in the IR. Their key-based predecessor, `Get`/`Put`, was deleted — see [docs/MEMORY.md](./docs/MEMORY.md).)
+The effect algebra, not either encoding, is the architectural constraint. Interpreters must preserve explicit `Infer`/`Eval`/`Retrieve`/`Store`/`Tool`/`Emit` effects regardless of how programs are authored. (The Op builder covers the `Infer`/`Eval`/`Emit`/`Par` subset; `Retrieve`, `Store`, and `Tool` exist only in the IR. The key-based `Get`/`Put` predecessor of the hydration effects was deleted — see [docs/MEMORY.md](./docs/MEMORY.md).)
 
 ## AgentIR: programs are data, literally
 
@@ -49,8 +49,11 @@ pub enum Instr {
     Emit     { event },                       // trace
     Retrieve { out, query, kind, max_bytes, policy },  // ranked read from hydration sources
     Store    { out, sink, op, id, item, policy },      // write to a hydration sink
+    Tool     { out, name, arguments, policy },         // registered native tool (in-process handler)
 }
 ```
+
+(Control flow — `Goto`/`If`/`Match`/`Return`/`Par` — lives in block terminators, not instructions.)
 
 Execution is an explicit machine — `{program, block, pc, env, budgets}` — stepped by `run_ir_sequential`. Because the machine is plain data:
 
@@ -93,9 +96,11 @@ A tool eventually becomes process execution, file IO, an HTTP call, or some othe
 
 So `Eval` is the primitive.
 
-Today `Eval` forks the configured shell with `-c <command>`. The default shell is `$SHELL`, falling back to `/bin/sh`. `Eval` also has interpreter-owned policy: timeout, stdout/stderr caps, cwd, and environment mode. The agent program does not care.
+`Eval` has two request forms, one per trust model: `Shell { command }` forks the configured shell with `-c <command>` (default `$SHELL`, falling back to `/bin/sh`), and `Argv { argv }` execs a program directly — no shell, no re-parsing, so typed tool calls never compile to shell templates. Both share interpreter-owned policy: timeout, stdout/stderr caps, cwd, and environment mode (credential stripping by default). The agent program does not care.
 
 It also gives one sandboxing hook. You do not sandbox each tool. You sandbox the evaluator. The interpreter can wrap every `Eval` with `bwrap`, a container, a VM, a remote worker, or a hermetic PATH.
+
+Named tools do exist as an API shape: the SDK registers typed native tools (in-process async handlers), and the runtime dispatches them as `Tool` effects — recorded, replayed, and traced like every other effect, never routed through a shell. But they are handlers on the interpreter side of the boundary, not a third kind of environment access; the general environment primitive remains `Eval`.
 
 ## Retrieve/Store is the hydration model
 
@@ -111,7 +116,7 @@ Store { sink, op: create | update | delete, id?, item }
     -> sink-assigned stable id
 ```
 
-`Retrieve` fans out to every registered query-capable source, optionally narrowed to one `SourceKind` (`Temporal` | `Semantic` | `Knowledge`), and returns full bodies under `max_bytes` — no second round-trip. `Store` targets one sink by registered name; the runtime — never the program — attaches provenance (run id, effect id, timestamp) to every write, and each sink declares a write policy (`Free` writes execute immediately with the trace as the audit; `RequireApproval` sinks refuse until the approval flow exists).
+`Retrieve` fans out to every registered query-capable source, optionally narrowed to one `SourceKind` (`Temporal` | `Semantic` | `Knowledge`), and returns full bodies under `max_bytes` — no second round-trip. `Store` targets one sink by registered name; the runtime — never the program — attaches provenance (run id, effect id, timestamp) to every write, and each sink declares a write policy: `Free` writes execute immediately with the trace as the audit, and `RequireApproval` writes pause at the approval gate — in the CLI the run pauses durably (a pending record plus a mid-turn machine checkpoint, resolved by `agent approvals --approve/--deny`, even after a process restart); in the SDK an `on_approval` hook decides at the effect site. The same gate covers approval-gated `Eval`s (`--require-shell-approval`). A denial binds a typed denial value the model can read and react to.
 
 Both are effects in the full sense: stable effect ids, `RetrieveCall`/`RetrieveResult` and `StoreCall`/`StoreResult` trace events, and deterministic replay. A replayed `Retrieve` returns the recorded hits without touching any source; a replayed `Store` returns the recorded id without mutating the sink — replay never writes.
 
@@ -158,6 +163,8 @@ They are deliberately separate traits (the std::io `Read`/`Write` precedent), so
 
 Passively hydrated sections are assembled through PromptIR — labeled, sourced, budgeted sections compiled to provider messages — so every context chunk has a key, source, and hash in the trace. See [docs/PROMPT_IR.md](./docs/PROMPT_IR.md).
 
+The runtime also ships its own operations guidance through this machinery: per-tool descriptions plus a capability-keyed, budget-aware fragment delivered as a separate Developer/Constraint section, so a user system prompt composes with it instead of deleting it (`--no-runtime-guidance` opts out). See [docs/GUIDANCE.md](./docs/GUIDANCE.md).
+
 ## Sessions are FIFOs plus checkpoints
 
 An agent session is a long-lived process.
@@ -187,14 +194,13 @@ The interpreter decides what each effect means. Change the interpreter and the s
 
 | Interpreter | `Eval` behavior        | `Infer` behavior         | `Par` behavior       |
 |-------------|-------------------------|--------------------------|----------------------|
-| IR sequential (CLI) | fork `$SHELL -c`    | HTTP provider call       | not yet implemented (errors) |
+| IR sequential (CLI) | fork `$SHELL -c` / direct exec | HTTP provider call | concurrent (map-Par) |
 | Op sequential (library) | fork `$SHELL -c` | HTTP provider call      | serial execution     |
-| Replay      | return recorded result/failure | return recorded result/failure | serial |
+| Replay      | return recorded result/failure | return recorded result/failure | id-keyed, order-independent |
 | Sandboxed   | wrapped fork            | HTTP provider call       | (future)             |
-| Parallel    | fork `$SHELL -c`        | HTTP provider call       | concurrent (future)  |
 | Distributed | RPC to worker/sandbox   | RPC/provider pool        | distributed (future) |
 
-`Par` is deliberately unimplemented in the IR runtime until its semantics (store isolation, join merge, failure propagation, trace ordering) are settled — see docs/AGENT_IR.md.
+`Par` in the IR is a dynamic-width map: one body block per element of a runtime list, branches executed concurrently (provider calls and Evals overlap), joined all-of in element order — never completion order. Effect ids fork deterministically at dispatch, so replay is order-independent; branch env is a fork-snapshot, and v1 rejects `Store` and approval gates inside branches at validation. See docs/AGENT_IR.md "`Par` semantics".
 
 ## Resource governance
 
@@ -221,6 +227,8 @@ Failures close their call with `InferError`/`EvalError` (or `RetrieveError`/`Sto
 
 Full prompts are opt-in (`--trace-full-payloads`); by default traces carry previews, keeping trace growth linear in session length. Two deliberate exceptions: `Retrieve` results are always recorded in full, because replay returns them verbatim, and `Store` records a payload preview plus a content hash, so replay can detect same-site divergence without recording the item.
 
+The runtime event names and fields are replay identity, not public API. Observability consumers get a versioned projection into dotted lifecycle events (`infer.started`, `run.completed`, ...) — see [docs/TRACE_SCHEMA.md](./docs/TRACE_SCHEMA.md). Traces also carry usage and cost: per-`Infer` token counts and integer micro-USD cost from the model registry's pricing, rolled up per run (`agent cost`).
+
 ## Non-goals
 
 `agentd` is not a full-stack agent framework. It is a runtime substrate.
@@ -234,12 +242,17 @@ The model is: agent programs emit operations; interpreters run them; Linux is th
 ```text
 crates/
   agent-core/   -- effect algebra, AgentIR + machine, Op builder, interpreters,
-                   hydration, PromptIR, GC, providers, tracing
+                   hydration, PromptIR, GC, guidance, approvals, cost,
+                   providers, tracing
   agent/        -- CLI binary, session loop, FIFO management
+  agentd/       -- supervisor CLI: named sessions, turn delivery, lifecycle,
+                   systemd unit generation (docs/SUPERVISOR.md)
+  agent-sdk/    -- embedding SDK: typed tools, output contracts, approvals,
+                   streaming public events, replay
   agent-oauth/  -- OAuth flows for claude-code / openai-codex providers
 ```
 
-`agent-core` is the kernel. `agent` is the CLI shell around it. That boundary is intentional.
+`agent-core` is the kernel. `agent` is the CLI shell around it, `agentd` supervises named `agent` processes, and `agent-sdk` embeds the same loop in your own binary. Those boundaries are intentional.
 
 ## Prior art
 
