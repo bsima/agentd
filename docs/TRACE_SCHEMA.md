@@ -1,6 +1,6 @@
 # Public Trace Event Schema
 
-`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.4**, see the version history at the end)
+`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.5**, see the version history at the end)
 
 This document is the contract for consumers of agentd trace data: the SDK
 trace adapter, dashboard ingest, and any external tooling. It defines a

@@ -1,8 +1,12 @@
 # Memory, retrieval, and the end of Get/Put (v2 design)
 
-Status: **design pinned, approved for implementation** (t-1165). All
-decisions below — including the formerly-open questions at the bottom —
-were settled with Ben on 2026-06-12.
+Status: **implemented** (design pinned t-1165; all decisions below —
+including the formerly-open questions at the bottom — were settled with
+Ben on 2026-06-12). The `Retrieve`/`Store` effects, the `remember`/`recall`
+tools, the file-backed memory backend (`--memory-dir`), the `ChatHistory`
+backend, and semantic retrieval via embeddings (t-1340) all ship; the
+acceptance list at the bottom is met. The implementer-facing provider
+contract lives in [docs/PROVIDERS.md](PROVIDERS.md).
 
 ## Pinned decisions
 
@@ -295,7 +299,7 @@ shapes do not preclude it (they do not — that is rather the point).
    sink is a trap), and ship in the same change as the effects so the
    round-trip eval lands with the machinery.
 
-## Acceptance (when implementation is approved)
+## Acceptance (met)
 
 - `Retrieve`/`Store` execute in the IR interpreter with stable effect
   ids, trace events, and recorded-replay parity (an eval fixture proves a

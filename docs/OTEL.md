@@ -1,6 +1,6 @@
 # OpenTelemetry
 
-`agent` can export run telemetry to an OTLP collector while still writing the JSONL trace used by replay and eval tooling.
+`agent` can export run telemetry to an OTLP collector while still writing the JSONL trace used by replay and eval tooling. (The OTel sink is one consumer of runtime trace events; the versioned JSON contract for observability consumers is [TRACE_SCHEMA.md](TRACE_SCHEMA.md) — the two are independent, see that document's "Relation to the OTel sink".)
 
 Enable it with either:
 

@@ -14,9 +14,10 @@ Observed across t-1031, t-1064, t-1067. Only on gpt-5.5 so far.
 ## Mechanism
 
 The provider returns a 200 OK with empty `content` AND empty `tool_calls`. The
-agent loop (`agent_loop` in `op.rs`) treats an empty `tool_calls` list as "the
-model is done", so an empty turn is surfaced as a final, empty response that
-silently kills an otherwise-active run.
+agent loop (`agent_loop` in `op.rs` at the time; `agent_loop_ir` today) treats
+an empty `tool_calls` list as "the model is done", so an empty turn is
+surfaced as a final, empty response that silently kills an otherwise-active
+run.
 
 Critically, the empty completion is **deterministic for a given context**: it is
 not a flaky network blip. Retrying the *identical* request hits the same wall,

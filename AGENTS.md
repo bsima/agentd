@@ -5,35 +5,45 @@ Guidance for AI agents (and humans) working in this repository.
 ## What this project is
 
 `agentd` is a Rust runtime for long-running AI agents. The central design choice
-is that **Linux is the harness** and **agent programs are data**: an agent is a
-free monad over an operation language (`OpF`), interpreted by a runtime. You can
-inspect, replay, test, sandbox, parallelize, or distribute the same agent program
-by swapping interpreters.
+is that **Linux is the harness** and **agent programs are data**: an agent
+program is serializable AgentIR interpreted by a runtime. You can inspect,
+replay, test, sandbox, parallelize, or distribute the same agent program by
+swapping interpreters.
 
 Core ideas (see `README.md` and `ARCHITECTURE.md` for the long version):
 
 - An agent alternates between `infer(unstructured)` and `eval(structured)`. The
   loop is the agent.
-- The op language is `OpF`: `Infer`, `Eval`, `Get`, `Put`, `Emit`, `Par`, `Pure`.
+- The effect algebra is `Infer`, `Eval`, `Retrieve`, `Store`, `Emit`, plus
+  `Par` for fan-out; the CLI runtime is the serializable AgentIR
+  (`agent-core::ir`); the closure-based `OpF` free monad remains a library
+  builder/test API.
 - `Infer` can call `Infer`, so multi-agent orchestration is just an agent program,
   not a special framework layer (the SICP meta-circular idea applied to agents).
-- Context is a keyed buffer (read/write), not an append-only log.
+- Context is a managed window over an append-only log: hydration sources feed
+  it, GC keeps it under budget (`docs/GC.md`).
 - Sessions are Unix processes; the protocol is pipes and files.
 
-This is a Rust port of a Haskell prototype (`Omni/Agent/Op.hs`). The Haskell
-codebase remains the reference for Op semantics. This repo is the open-core
-runtime; see `ROADMAP.md` for the milestone plan (M1 done, M2–M5 active).
+This started as a Rust port of a Haskell prototype (`Omni/Agent/Op.hs`); the
+Rust implementation has long since become the reference. See `ROADMAP.md` for
+milestone status.
 
 ## Source layout
 
-- `crates/agent-core` — the free-monad interpreter, `OpF`, providers, hydration,
-  tracing. The heart of the runtime.
+- `crates/agent-core` — the runtime kernel: AgentIR + machine, interpreters,
+  providers, hydration, PromptIR, GC, approvals, cost, tracing.
 - `crates/agent` — the CLI (`agent`): one-shot prompts, NUL/FIFO sessions,
   checkpoints, traces, replay, markdown prompts.
-- `crates/agent-oauth` — experimental codex/claude-code subscription support.
-- `docs/` — design docs: `AGENT_IR.md`, `PROMPT_IR.md`, `GC.md`, `OTEL.md`,
+- `crates/agentd` — the supervisor CLI: named long-running sessions, turn
+  delivery, lifecycle, systemd unit generation (`docs/SUPERVISOR.md`).
+- `crates/agent-sdk` — the embedding SDK: typed tools, output contracts,
+  approvals, replay.
+- `crates/agent-oauth` — codex/claude-code subscription auth.
+- `docs/` — design docs: `AGENT_IR.md`, `PROMPT_IR.md`, `GC.md`, `MEMORY.md`,
+  `PROVIDERS.md`, `GUIDANCE.md`, `SUPERVISOR.md`, `TRACE_SCHEMA.md`, `OTEL.md`,
   `EMPTY_COMPLETION.md`. Read the relevant one before touching that subsystem.
-- `evals/` — offline + online eval harness (`release.sh`, `release-online.sh`).
+- `evals/` — offline + online eval harness (`release.sh`, `release-online.sh`)
+  plus recorded behavioral evals (`gc/`, `delegation/`, `infer-infer/`).
 - `examples/` — `models.yaml` template.
 - `agents/` — example agent prompt files (e.g. `coder.md`) and session FIFOs.
 
@@ -118,7 +128,7 @@ blocked. Always pass `--json`.
 
 ## Style notes
 
-- Idiomatic Rust; keep `OpF` variants and the interpreter the source of truth.
+- Idiomatic Rust; the IR effects and the interpreter are the source of truth.
 - Don't add ambient global mutation for trace/context propagation — follow the
   existing seam patterns (e.g. `TraceSink`, env-injection for context).
 - Mount source read-only and run agents in disposable workspaces when testing

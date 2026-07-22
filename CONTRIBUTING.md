@@ -68,8 +68,9 @@ Look at `git log` for the house style. In short:
 
 - Small, focused commits — one logical change each.
 - Subject line prefixed with the area it touches when that adds clarity:
-  `agent-core: ...`, `agent: ...`, `agent-oauth: ...`, `docs: ...`,
-  `evals: ...`. Plain subjects are fine for repo-wide changes.
+  `agent-core: ...`, `agent: ...`, `agentd: ...`, `agent-sdk: ...`,
+  `agent-oauth: ...`, `docs: ...`, `evals: ...`. Plain subjects are fine for
+  repo-wide changes.
 - Imperative or descriptive subject, no trailing period, aim for <72 chars.
 - The body explains **what and why**, not just what. For behavior changes,
   say what the failure mode was and how the change addresses it. Mention

@@ -143,8 +143,9 @@ gone. A fact that lives only in a popped result body must be re-computed
 (paying tokens and latency again) or, worse, confabulated. There is a
 write-barrier synergy on the recall side: `recall` results whose content
 matches previously-seen or previously-collected content are recorded in
-`GcState.recall_hot` (docs/GC.md, t-1351) — the signal the future
-generational strategy consumes to retain recalled content preferentially.
+`GcState.recall_hot` (docs/GC.md, t-1351) — the signal `hot-keep` (t-1362,
+every strategy) and the generational strategy's hot tier (t-1167, both now
+shipped) consume to retain recalled content preferentially.
 Evict → recall → re-inject → evict thrashing is exactly what that
 mechanism exists to stop; guidance that routes the model through `recall`
 feeds it.
@@ -207,11 +208,11 @@ the GC eval surface (`gc_evals.rs`, `evals/gc/`).
 
 **Mechanism gaps:**
 
-- **"Retained preferentially" is today a signal, not a behavior**: no GC
-  strategy consumes `recall_hot` yet (generational, t-1167, is its first
-  customer). The retention sentence is therefore held out of the shipped
-  block (see the parenthetical above) and returns with t-1167. Ship order
-  matters.
+- **"Retained preferentially" — gap since closed**: `recall_hot` now has
+  consumers (`hot-keep`, t-1362, every strategy; the generational hot
+  tier, t-1167), so a retention sentence would no longer be a false
+  promise. Moot while the block itself stays demoted (see the status note
+  above); if the block returns, the sentence can return with it.
 - **The model can't see GC pressure** (see §2.4's gap): "before GC
   pressure" is undetectable from inside; the model can only adopt
   save-early discipline unconditionally.
@@ -301,7 +302,9 @@ default; the SDK's in-process `Runner` runs no GC and gets no block):
 >   state; consult it before re-running work, because the steps it lists
 >   are done.
 
-And, **only** when `semantic` + `cited-keep` is the active strategy:
+And, **only** where citation protection actually runs — `semantic` with
+`cited-keep` on, or `generational` (whose warm tier is citation
+membership, t-1167):
 
 > - Referring to a tool call by its id in your text (for example, "per
 >   the output of call-12") marks that result as load-bearing and
@@ -325,9 +328,10 @@ mechanism-level fix for the restart loop, where post-collection the
 model lost its plan state and re-ran completed work. The bullet is
 identical in both variants (it names no memory tools). Like every §2.4
 sentence, mechanism ships first and the text merely describes it; its
-online validation batches into the ledger recording round (filed from
-t-1373), which the §5 gate's re-record obligation for this text edit
-also rides.
+online validation ran as the ledger recording round (t-1374,
+evals/gc/README.md): the restart loop broke or shrank in every deciding
+cell, with a residual recall loop and partial — not total — obedience
+to the ledger's do-not-redo instruction.
 
 The escalation bullet (t-1370) describes the escalated marker mechanism:
 when the same content is evicted `EVICTION_ESCALATION_AFTER` (3) times in
@@ -350,12 +354,14 @@ mechanism's own online validation.
 **Mechanism gaps:**
 
 - **The citation-protection sentence is strategy-conditional.**
-  `cited-keep` is implemented for `semantic` only; under the default
-  `stack` strategy the sentence would be a false promise. Either the
-  delivery mechanism supports strategy-conditional blocks, or cited-keep
-  lands for `stack` (listed as future work in docs/GC.md) before the
-  sentence ships. Guidance must never claim protection the active
-  strategy does not implement.
+  Citation protection runs under `semantic` (cited-keep) and
+  `generational` (citation-membership warm tier); under the default
+  `stack` strategy the sentence would be a false promise. The delivery
+  mechanism supports strategy-conditional lines (shipped — the line
+  renders only under those two strategies); cited-keep for
+  `ring`/`stack`/`mark-sweep` remains future work in docs/GC.md.
+  Guidance must never claim protection the active strategy does not
+  implement.
 - **GC pressure is invisible to the model.** Post-fact visibility landed
   with t-1360 (eviction markers say what a collection removed and how to
   recover it), but there is still no in-window signal that a collection
@@ -475,9 +481,13 @@ needles.
 
 ## 3. Appendix: Par requirements, demand-first
 
-Par is listed in docs/AGENT_IR.md as designed-but-rejected at runtime
-until its open questions settle. Rather than settle them in the abstract,
-derive them from the fan-out patterns this document creates demand for.
+This appendix derived Par's requirements demand-first, from the fan-out
+patterns this document creates demand for — and the derivation held: the
+minimal Par recommended at the end shipped as the IR's dynamic-width
+map-Par (t-1358, docs/AGENT_IR.md "`Par` semantics"), settling the open
+questions exactly as specified below. The section is kept as the demand
+rationale; the first-customer wiring (concurrent turn-batch dispatch) is
+still open.
 
 ### The demand
 
@@ -774,7 +784,7 @@ gates):
 | delegate-catalog line (§2.1, interim pending t-1345) | delegation block on AND the deployment supplied `RuntimeGuidance.delegate_models` (the runtime cannot yet promise which ids the run's provider resolves, so the CLI default is empty) |
 | memory discipline (§2.2) | **never — demoted to draft (t-1368)** after its t-1364 A/B moved nothing; the remember/recall tool descriptions remain shipped |
 | GC awareness (§2.4; with/without-memory variant) | a GC strategy is active |
-| cited-keep line (§2.4) | strategy is `semantic` with `cited-keep` on — strategy-honest per gap 6 |
+| cited-keep line (§2.4) | strategy is `semantic` with `cited-keep` on, or `generational` (citation-membership warm tier) — strategy-honest per gap 6 |
 | approval awareness (§2.6) | any effect in the run's config is gated (an Eval site with `require_approval`, or a sink whose writes require approval) |
 | cost awareness (§2.5) | unconditional within a delivered fragment |
 
@@ -992,10 +1002,11 @@ Gaps guidance cannot paper over, surfaced per-pattern above:
 2. **Running usage/budget surfacing to the model** — RunUsage exists in
    traces only; no injected usage line, no `usage` tool, no budget
    concept to spend against (§2.5). Blocks quantitative cost guidance.
-3. **Minimal Par: concurrent turn-batch dispatch** — dynamic-width
-   map-Par per §3, first customer the tool-dispatch arm; removes
-   delegation's serialized-latency penalty (t-1354 candidate task,
-   sharpened here into requirements).
+3. **Concurrent turn-batch dispatch** — the map-Par itself shipped
+   (t-1358, per §3's requirements); what remains is wiring the loop
+   program's tool-dispatch arm through it so the model's turn batch runs
+   concurrently, removing delegation's serialized-latency penalty
+   (t-1354 candidate task).
 4. **Guidance delivery mechanism** — capability-keyed runtime fragment as
    a PromptIR Developer/Constraint section + tool-description fattening +
    compose-not-replace system prompt (§4). The implementation task this
@@ -1006,8 +1017,9 @@ Gaps guidance cannot paper over, surfaced per-pattern above:
    (GC.md future work) or strategy-conditional fragment lines (§2.4).
 7. **Gated-effect advertisement + pending-approval introspection for the
    model** (§2.6).
-8. **`recall_hot` consumer** — already filed as t-1167 (generational GC);
-   noted because §2.2's "retained preferentially" sentence only fully
-   lands with it.
+8. **`recall_hot` consumer** — closed: `hot-keep` (t-1362) consumes it in
+   every strategy and the generational hot tier (t-1167) is built on it;
+   §2.2's "retained preferentially" sentence is unblocked (though its
+   block remains demoted).
 9. Carried from t-1354, still open: child-process usage lineage in parent
    traces; provider-layer temperature control for multi-sample evals.
