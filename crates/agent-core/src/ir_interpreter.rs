@@ -2132,8 +2132,11 @@ async fn apply_runtime_guidance(
         memory: offered("remember") && offered("recall"),
         gc: config.gc.enabled(),
         // Strategy-honest citation guidance (GUIDANCE.md gap 6): the
-        // protection line renders only where cited-keep actually runs.
-        cited_keep: matches!(&config.gc, crate::gc::GcMode::Semantic(gc) if gc.cited_keep),
+        // protection line renders only where citation protection actually
+        // runs — semantic with cited-keep on, or generational, whose warm
+        // tier IS citation membership (t-1167).
+        cited_keep: matches!(&config.gc, crate::gc::GcMode::Semantic(gc) if gc.cited_keep)
+            || matches!(&config.gc, crate::gc::GcMode::Generational(_)),
         approvals: run_has_gated_effects(config, program),
         delegate_models: config.guidance.delegate_models.clone(),
     };

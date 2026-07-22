@@ -130,6 +130,12 @@ pub struct GcState {
     /// (t-1373). Set by the bookkeeping wrapper on every collection, like
     /// `marker_summary`; read for gc_collect trace events.
     pub ledger_summary: LedgerSummary,
+    /// What the most recent GenerationalGc collect() decided (t-1167):
+    /// per-tier assignment counts, per-tier elide/evict counts, and which
+    /// degrade rungs fired. Set by [`GenerationalGc`] on every collection
+    /// (left at default by every other strategy); read for the gc_collect
+    /// trace event's `tiers` object.
+    pub tier_report: GenerationalReport,
 }
 
 /// When GC runs, independent of which strategy reclaims tokens (t-1151).
@@ -431,90 +437,110 @@ pub struct SemanticPrimeReport {
     pub failed: bool,
 }
 
+/// The async embedding pre-pass shared by the embedding-consuming
+/// strategies (t-1350 semantic; t-1167 generational's warm-by-similarity
+/// signal): embed every window message whose content hash is not yet
+/// cached, pruning entries whose content left the window (bounding the
+/// cache to the live window). Best-effort by contract — any failure leaves
+/// the cache as-is and is reported, never returned as an error, so an
+/// embedding outage can never fail a turn.
+///
+/// Called from `interpreter::collect_prompt` after the truncate pre-pass
+/// (truncation rewrites content, and the cache keys on content). Never
+/// called by `collect()`.
+pub async fn prime_embedding_cache(
+    embedder: Option<&Arc<dyn Embedder>>,
+    messages: &[ChatMessage],
+    state: &mut GcState,
+) -> SemanticPrimeReport {
+    let live: BTreeSet<String> = messages.iter().map(semantic_cache_key).collect();
+    state.embeddings.retain(|key, _| live.contains(key));
+
+    let mut report = SemanticPrimeReport {
+        cached: state.embeddings.len(),
+        ..Default::default()
+    };
+    let Some(embedder) = embedder else {
+        return report;
+    };
+    let mut missing: Vec<(String, String)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for message in messages {
+        let text = message_embedding_text(message);
+        let key = content_hash(&text);
+        if state.embeddings.contains_key(&key) || !seen.insert(key.clone()) {
+            continue;
+        }
+        missing.push((key, text));
+    }
+    if missing.is_empty() {
+        return report;
+    }
+    let texts: Vec<String> = missing.iter().map(|(_, text)| text.clone()).collect();
+    match embedder.embed(&texts).await {
+        Ok(vectors) if vectors.len() == missing.len() => {
+            for ((key, _), vector) in missing.into_iter().zip(vectors) {
+                state.embeddings.insert(key, vector);
+                report.embedded += 1;
+            }
+        }
+        // Failure = heuristic path: cache unchanged, no error.
+        _ => report.failed = true,
+    }
+    report
+}
+
+/// Centroid of the cached vectors of the last `window` messages. `None`
+/// when none of them have a vector (heuristic-only mode). Vectors with a
+/// mismatched dimension (an embedding-model switch mid-run) are skipped
+/// rather than mixed.
+fn cached_recent_centroid(
+    messages: &[ChatMessage],
+    state: &GcState,
+    window: usize,
+) -> Option<Vec<f32>> {
+    let start = messages.len().saturating_sub(window.max(1));
+    let mut sum: Option<Vec<f32>> = None;
+    let mut count = 0usize;
+    for message in &messages[start..] {
+        let Some(vector) = state.embeddings.get(&semantic_cache_key(message)) else {
+            continue;
+        };
+        match &mut sum {
+            None => {
+                sum = Some(vector.clone());
+                count = 1;
+            }
+            Some(acc) if acc.len() == vector.len() => {
+                for (slot, value) in acc.iter_mut().zip(vector) {
+                    *slot += value;
+                }
+                count += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    sum.map(|mut acc| {
+        for slot in &mut acc {
+            *slot /= count as f32;
+        }
+        acc
+    })
+}
+
 impl SemanticGc {
-    /// The async pre-pass (t-1350): embed every window message whose
-    /// content hash is not yet cached, pruning entries whose content left
-    /// the window (bounding the cache to the live window). Best-effort by
-    /// contract — any failure leaves the cache as-is and is reported, never
-    /// returned as an error, so an embedding outage can never fail a turn.
-    ///
-    /// Called from `interpreter::collect_prompt` after the truncate
-    /// pre-pass (truncation rewrites content, and the cache keys on
-    /// content). Never called by `collect()`.
+    /// The async pre-pass (t-1350): see [`prime_embedding_cache`].
     pub async fn prime_cache(
         &self,
         messages: &[ChatMessage],
         state: &mut GcState,
     ) -> SemanticPrimeReport {
-        let live: BTreeSet<String> = messages.iter().map(semantic_cache_key).collect();
-        state.embeddings.retain(|key, _| live.contains(key));
-
-        let mut report = SemanticPrimeReport {
-            cached: state.embeddings.len(),
-            ..Default::default()
-        };
-        let Some(embedder) = &self.embedder else {
-            return report;
-        };
-        let mut missing: Vec<(String, String)> = Vec::new();
-        let mut seen = BTreeSet::new();
-        for message in messages {
-            let text = message_embedding_text(message);
-            let key = content_hash(&text);
-            if state.embeddings.contains_key(&key) || !seen.insert(key.clone()) {
-                continue;
-            }
-            missing.push((key, text));
-        }
-        if missing.is_empty() {
-            return report;
-        }
-        let texts: Vec<String> = missing.iter().map(|(_, text)| text.clone()).collect();
-        match embedder.embed(&texts).await {
-            Ok(vectors) if vectors.len() == missing.len() => {
-                for ((key, _), vector) in missing.into_iter().zip(vectors) {
-                    state.embeddings.insert(key, vector);
-                    report.embedded += 1;
-                }
-            }
-            // Failure = heuristic path: cache unchanged, no error.
-            _ => report.failed = true,
-        }
-        report
+        prime_embedding_cache(self.embedder.as_ref(), messages, state).await
     }
 
     /// Centroid of the cached vectors of the last `recent_window` messages.
-    /// `None` when none of them have a vector (heuristic-only mode).
-    /// Vectors with a mismatched dimension (an embedding-model switch
-    /// mid-run) are skipped rather than mixed.
     fn recent_centroid(&self, messages: &[ChatMessage], state: &GcState) -> Option<Vec<f32>> {
-        let start = messages.len().saturating_sub(self.recent_window.max(1));
-        let mut sum: Option<Vec<f32>> = None;
-        let mut count = 0usize;
-        for message in &messages[start..] {
-            let Some(vector) = state.embeddings.get(&semantic_cache_key(message)) else {
-                continue;
-            };
-            match &mut sum {
-                None => {
-                    sum = Some(vector.clone());
-                    count = 1;
-                }
-                Some(acc) if acc.len() == vector.len() => {
-                    for (slot, value) in acc.iter_mut().zip(vector) {
-                        *slot += value;
-                    }
-                    count += 1;
-                }
-                Some(_) => {}
-            }
-        }
-        sum.map(|mut acc| {
-            for slot in &mut acc {
-                *slot /= count as f32;
-            }
-            acc
-        })
+        cached_recent_centroid(messages, state, self.recent_window)
     }
 
     /// Score every message: cosine to the recent centroid when both the
@@ -747,6 +773,445 @@ impl SemanticGc {
             .collect();
         state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
         collected
+    }
+}
+
+// --- Generational GC (t-1167) -----------------------------------------------
+//
+// The synthesis strategy, designed against six generations of behavioral
+// evidence (docs/GC.md "Strategy 5: Generational" carries the full
+// failure-mode -> tier mapping; evals/gc/README.md is the corpus). Every
+// window message is tiered from live signals at collect() time — nursery
+// (recency floor), hot (recall write-barrier ∪ hard guards ∪ escalated
+// content), warm (citation in-degree ∪ centroid-near when embeddings are
+// cached), cold (the unvouched remainder) — and the reclaim follows
+// mark-sweep's behaviorally-validated annotate-don't-drop shape: cold
+// bodies ELIDE in place to one-line annotations before anything is
+// whole-evicted, and true deletion (markers/ledger accounted, via the
+// shared bookkeeping wrapper) is the last resort. Unlike mark-sweep, the
+// phases continue into the established degrade ladder, so convergence is
+// asserted (not best-effort) — which also leaves the slack that funds the
+// progress ledger (the t-1362 honest-ceiling note).
+
+/// Default nursery size for [`GenerationalGc`]: the recency floor. Same
+/// value and rationale as [`DEFAULT_SEMANTIC_RECENT_WINDOW`] — the last 8
+/// messages are the live working set, including the model's own
+/// step-completion narration (evicting that narration is the restart-loop
+/// trigger, t-1349 finding 2).
+pub const DEFAULT_NURSERY_WINDOW: usize = 8;
+
+/// Default warm-by-similarity floor for [`GenerationalGc`], active only
+/// when embeddings are cached. Same value and rationale as
+/// [`DEFAULT_SEMANTIC_SIMILARITY_FLOOR`]: below ~0.25 cosine two passages
+/// share almost no topic.
+pub const DEFAULT_WARM_SIMILARITY_FLOOR: f32 = 0.25;
+
+/// One message's generation (t-1167), assigned deterministically inside
+/// collect() from live signals — no cross-turn tier state to corrupt:
+/// promotion (cold -> warm on first citation, any -> hot on
+/// re-acquisition) and demotion happen implicitly on recomputation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcTier {
+    /// The recency floor: the last `nursery_window` messages. Never
+    /// collected in any normal phase; falls only on the terminal degrade
+    /// rungs every strategy shares.
+    Nursery,
+    /// The hard guards (system, last user), write-barrier-hot content
+    /// (`GcState.recall_hot` — re-acquired after eviction, t-1362), and
+    /// in-window results whose content already escalated
+    /// ([`EVICTION_ESCALATION_AFTER`] evictions, t-1370): protected
+    /// through every normal phase, relaxed only per the hot-keep ladder.
+    Hot,
+    /// Cited by a later window message (CitationGraph in-degree, t-1351)
+    /// or semantically near the nursery centroid (>= `warm_floor`, when
+    /// embeddings are cached). Bodies may elide; structure survives the
+    /// normal phases.
+    Warm,
+    /// The unvouched remainder: uncited, distant or unscoreable, not hot,
+    /// not recent. First to elide, first to evict.
+    Cold,
+}
+
+/// What one GenerationalGc collection decided (t-1167), reported on the
+/// gc_collect trace event as the `tiers` object: assignment counts,
+/// per-tier elide/evict counts, and which degrade rungs fired. The
+/// evicted-per-tier counts are computed from the final keep decisions
+/// against the tier assignment — a mechanism-vs-accounting cross-check
+/// the eval harness asserts on (e.g. `evicted_nursery` must be 0 unless
+/// `floor_relaxed`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationalReport {
+    /// Tier assignment counts for the pre-collection window.
+    pub nursery: usize,
+    pub hot: usize,
+    pub warm: usize,
+    pub cold: usize,
+    /// Tool-result bodies elided in place, per phase.
+    pub cold_elided: usize,
+    pub warm_elided: usize,
+    pub hot_elided: usize,
+    /// Whole messages evicted, attributed to their assigned tier.
+    pub evicted_cold: usize,
+    pub evicted_warm: usize,
+    pub evicted_hot: usize,
+    pub evicted_nursery: usize,
+    /// Degrade rungs, in ladder order: warm eviction, hot relax, nursery
+    /// floor relax, prefix relax (the billing contract falls last; the
+    /// hard guards never do).
+    pub warm_relaxed: bool,
+    pub hot_relaxed: bool,
+    pub floor_relaxed: bool,
+    pub prefix_relaxed: bool,
+}
+
+/// Strategy 5 (docs/GC.md, t-1167): hot/warm/cold tiered collection with a
+/// nursery recency floor, consuming the citation graph (t-1351), the
+/// re-injection write-barrier (t-1362), and the escalation counts
+/// (t-1370) as tier membership rather than bolt-on masks. Collection
+/// policy: cold elides, then cold evicts, then warm elides; the degrade
+/// ladder (warm evict -> hot relax -> floor relax -> prefix relax) runs
+/// only when the vouched-for window alone exceeds the budget. The GC
+/// invariant holds: collect() is stateless, deterministic, and LLM-free —
+/// embeddings arrive via the shared async pre-pass
+/// ([`prime_embedding_cache`]) and are consumed read-only; without them
+/// the warm tier is citation-only (strategy-honest, documented).
+#[derive(Clone)]
+pub struct GenerationalGc {
+    /// Preserve the cached prefix: same boundary semantics as every other
+    /// strategy — elision and eviction are restricted to the interior
+    /// until the prefix-relax degrade rung.
+    pub preserve_prefix: bool,
+    /// The recency floor: the last N messages are the nursery.
+    pub nursery_window: usize,
+    /// Warm-by-similarity floor (cosine against the nursery centroid),
+    /// active only for messages with cached embeddings.
+    pub warm_floor: f32,
+    /// Carried for the interpreter's async pre-pass ONLY
+    /// ([`Self::prime_cache`]); `collect()` never touches it. None =
+    /// citation-only warm tier.
+    pub embedder: Option<Arc<dyn Embedder>>,
+}
+
+impl Default for GenerationalGc {
+    fn default() -> Self {
+        Self {
+            preserve_prefix: true,
+            nursery_window: DEFAULT_NURSERY_WINDOW,
+            warm_floor: DEFAULT_WARM_SIMILARITY_FLOOR,
+            embedder: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for GenerationalGc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationalGc")
+            .field("preserve_prefix", &self.preserve_prefix)
+            .field("nursery_window", &self.nursery_window)
+            .field("warm_floor", &self.warm_floor)
+            .field(
+                "embedder",
+                &self.embedder.as_ref().map(|embedder| embedder.model_id()),
+            )
+            .finish()
+    }
+}
+
+impl GenerationalGc {
+    /// The async pre-pass: see [`prime_embedding_cache`]. Without an
+    /// embedder this still prunes the cache to the live window.
+    pub async fn prime_cache(
+        &self,
+        messages: &[ChatMessage],
+        state: &mut GcState,
+    ) -> SemanticPrimeReport {
+        prime_embedding_cache(self.embedder.as_ref(), messages, state).await
+    }
+
+    /// Warm-by-similarity scores: cosine against the nursery centroid for
+    /// messages with cached vectors, `None` otherwise (never a provider
+    /// call — an unscoreable message simply cannot be warm by similarity).
+    fn warm_scores(&self, messages: &[ChatMessage], state: &GcState) -> Vec<Option<f32>> {
+        let Some(centroid) = cached_recent_centroid(messages, state, self.nursery_window) else {
+            return vec![None; messages.len()];
+        };
+        messages
+            .iter()
+            .map(|message| {
+                state
+                    .embeddings
+                    .get(&semantic_cache_key(message))
+                    .map(|vector| cosine(vector, &centroid))
+            })
+            .collect()
+    }
+
+    /// Assign every window message a tier (t-1167), in precedence order:
+    /// nursery (recency floor) > hot (hard guards ∪ write-barrier ∪
+    /// escalated content) > warm (cited ∪ centroid-near) > cold. Pure and
+    /// deterministic — exactly the inputs collect() already has.
+    pub fn tiers(&self, messages: &[ChatMessage], state: &GcState) -> Vec<GcTier> {
+        let len = messages.len();
+        let nursery_start = len.saturating_sub(self.nursery_window.max(1));
+        let last_user = messages.iter().rposition(|message| message.role == "user");
+        let hot = hot_mask(messages, state);
+        let cited = cited_mask(messages);
+        let scores = self.warm_scores(messages, state);
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                if index >= nursery_start {
+                    return GcTier::Nursery;
+                }
+                if message.role == "system" || Some(index) == last_user || hot[index] {
+                    return GcTier::Hot;
+                }
+                // Escalated-content protection (t-1370 cost accounting): a
+                // result whose content already escalated and is BACK in
+                // the window was re-fetched against the honest-exit
+                // marker; a further eviction is pure thrash.
+                let escalated = message.role == "tool"
+                    && message.content.as_deref().is_some_and(|content| {
+                        !content.trim_start().starts_with(EVICTION_MARKER_PREFIX)
+                            && state
+                                .eviction_counts
+                                .get(&content_fingerprint(content))
+                                .copied()
+                                .unwrap_or(0)
+                                >= EVICTION_ESCALATION_AFTER
+                    });
+                if escalated {
+                    return GcTier::Hot;
+                }
+                if cited[index] {
+                    return GcTier::Warm;
+                }
+                if scores[index].is_some_and(|score| score >= self.warm_floor) {
+                    return GcTier::Warm;
+                }
+                GcTier::Cold
+            })
+            .collect()
+    }
+
+    fn collect_inner(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
+        let full_boundary = cache_prefix_boundary(&messages, budget).min(messages.len());
+        let prefix_snapshot = messages[..full_boundary].to_vec();
+        let boundary = if self.preserve_prefix {
+            full_boundary
+        } else {
+            0
+        };
+
+        let tiers = self.tiers(&messages, state);
+        let mut report = GenerationalReport::default();
+        for tier in &tiers {
+            match tier {
+                GcTier::Nursery => report.nursery += 1,
+                GcTier::Hot => report.hot += 1,
+                GcTier::Warm => report.warm += 1,
+                GcTier::Cold => report.cold += 1,
+            }
+        }
+        let tier_mask =
+            |wanted: GcTier| -> Vec<bool> { tiers.iter().map(|tier| *tier == wanted).collect() };
+
+        let mut keep = vec![true; messages.len()];
+        let over = |messages: &[ChatMessage], keep: &[bool]| {
+            estimate_tokens(&kept_messages(messages, keep)) > budget
+        };
+        if over(&messages, &keep) {
+            // Phase 1: cold bodies elide in place (annotate, don't drop —
+            // the behavioral north star; structure and handles survive).
+            report.cold_elided = elide_tool_results(
+                &mut messages,
+                &keep,
+                budget,
+                &tier_mask(GcTier::Cold),
+                boundary,
+                &state.eviction_counts,
+            );
+            // Phase 2: whole cold groups evict, oldest first (deletion is
+            // the cold tier's last resort, and it feeds markers + ledger
+            // via the bookkeeping wrapper).
+            if over(&messages, &keep) {
+                let mut protected = protected_with_prefix(&messages, boundary);
+                for (slot, tier) in protected.iter_mut().zip(&tiers) {
+                    *slot = *slot || *tier != GcTier::Cold;
+                }
+                sweep_ring(&messages, &mut keep, budget, &protected);
+            }
+            // Phase 3: warm bodies elide; warm structure stays (the
+            // citation handle survives in the annotation).
+            if over(&messages, &keep) {
+                report.warm_elided = elide_tool_results(
+                    &mut messages,
+                    &keep,
+                    budget,
+                    &tier_mask(GcTier::Warm),
+                    boundary,
+                    &state.eviction_counts,
+                );
+            }
+            // Degrade rung a: warm evicts (cited-keep strength relaxes).
+            if over(&messages, &keep) {
+                report.warm_relaxed = true;
+                let mut protected = protected_with_prefix(&messages, boundary);
+                for (slot, tier) in protected.iter_mut().zip(&tiers) {
+                    *slot = *slot || matches!(tier, GcTier::Nursery | GcTier::Hot);
+                }
+                sweep_ring(&messages, &mut keep, budget, &protected);
+            }
+            // Degrade rung b: hot relaxes (hot-keep strength) — elide
+            // first, then evict; the nursery is still untouched.
+            if over(&messages, &keep) {
+                report.hot_relaxed = true;
+                report.hot_elided = elide_tool_results(
+                    &mut messages,
+                    &keep,
+                    budget,
+                    &tier_mask(GcTier::Hot),
+                    boundary,
+                    &state.eviction_counts,
+                );
+                if over(&messages, &keep) {
+                    let mut protected = protected_with_prefix(&messages, boundary);
+                    for (slot, tier) in protected.iter_mut().zip(&tiers) {
+                        *slot = *slot || *tier == GcTier::Nursery;
+                    }
+                    sweep_ring(&messages, &mut keep, budget, &protected);
+                }
+            }
+            // Degrade rung c: the nursery floor relaxes (semantic's
+            // phase-3 precedent); the prefix pin — a billing contract —
+            // still holds.
+            if over(&messages, &keep) {
+                report.floor_relaxed = true;
+                sweep_ring(
+                    &messages,
+                    &mut keep,
+                    budget,
+                    &protected_with_prefix(&messages, boundary),
+                );
+            }
+            // Degrade rung d: the pinned prefix falls last (overflowing
+            // the model is worse than a cache miss; the invalidation is
+            // reported); system + last user never drop.
+            if boundary > 0 && over(&messages, &keep) {
+                report.prefix_relaxed = true;
+                sweep_ring(
+                    &messages,
+                    &mut keep,
+                    budget,
+                    &hard_protected_mask(&messages),
+                );
+            }
+        }
+
+        // Evicted-per-tier accounting from the final keep decisions — the
+        // mechanism-vs-accounting cross-check the eval harness asserts on.
+        for (index, kept) in keep.iter().enumerate() {
+            if !kept {
+                match tiers[index] {
+                    GcTier::Nursery => report.evicted_nursery += 1,
+                    GcTier::Hot => report.evicted_hot += 1,
+                    GcTier::Warm => report.evicted_warm += 1,
+                    GcTier::Cold => report.evicted_cold += 1,
+                }
+            }
+        }
+
+        let collected: Vec<ChatMessage> = messages
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(message, _)| message)
+            .collect();
+        state.prefix_invalidated = prefix_changed(&prefix_snapshot, &collected);
+        state.tier_report = report;
+        collected
+    }
+}
+
+/// Elide eligible kept tool-result bodies in place, oldest first, until
+/// the kept window fits the budget (t-1167 generational phases; the
+/// annotate-don't-drop shape). A result is only elided when it has been
+/// incorporated (a later kept assistant message exists — never destroy
+/// the live working set), is not already an annotation, and the
+/// annotation actually shrinks it. Returns how many bodies were elided.
+fn elide_tool_results(
+    messages: &mut [ChatMessage],
+    keep: &[bool],
+    budget: usize,
+    eligible: &[bool],
+    boundary: usize,
+    counts: &BTreeMap<String, u32>,
+) -> usize {
+    let summaries = tool_call_summaries(messages);
+    let mut elided = 0usize;
+    for index in boundary..messages.len() {
+        if estimate_tokens(&kept_messages(messages, keep)) <= budget {
+            break;
+        }
+        if !keep[index] || !eligible[index] || messages[index].role != "tool" {
+            continue;
+        }
+        let Some(call_id) = messages[index].tool_call_id.clone() else {
+            continue;
+        };
+        let Some(content) = messages[index].content.clone() else {
+            continue;
+        };
+        if content.trim_start().starts_with(EVICTION_MARKER_PREFIX) {
+            continue;
+        }
+        let incorporated = messages
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .any(|(idx, later)| keep[idx] && later.role == "assistant");
+        if !incorporated {
+            continue;
+        }
+        let summary = summaries
+            .get(call_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| call_id.clone());
+        let annotation = elision_annotation(&content, &call_id, &summary, counts);
+        if annotation.chars().count() >= content.chars().count() {
+            continue;
+        }
+        messages[index].content = Some(annotation);
+        elided += 1;
+    }
+    elided
+}
+
+impl ContextGc for GenerationalGc {
+    fn collect(
+        &self,
+        messages: Vec<ChatMessage>,
+        budget: usize,
+        state: &mut GcState,
+    ) -> Vec<ChatMessage> {
+        with_window_bookkeeping(messages, budget, state, |messages, budget, state| {
+            self.collect_inner(messages, budget, state)
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "generational"
+    }
+
+    fn cache_preserving(&self) -> bool {
+        self.preserve_prefix
     }
 }
 
@@ -2332,6 +2797,7 @@ pub enum GcMode {
     MarkSweep(MarkSweepGc),
     Stack(StackFrameGc),
     Semantic(SemanticGc),
+    Generational(GenerationalGc),
 }
 
 impl GcMode {
@@ -2347,6 +2813,7 @@ impl GcMode {
             Self::MarkSweep(gc) => gc.collect(messages, budget, state),
             Self::Stack(gc) => gc.collect(messages, budget, state),
             Self::Semantic(gc) => gc.collect(messages, budget, state),
+            Self::Generational(gc) => gc.collect(messages, budget, state),
         }
     }
 
@@ -2357,6 +2824,7 @@ impl GcMode {
             Self::MarkSweep(gc) => gc.name(),
             Self::Stack(gc) => gc.name(),
             Self::Semantic(gc) => gc.name(),
+            Self::Generational(gc) => gc.name(),
         }
     }
 
@@ -2367,6 +2835,7 @@ impl GcMode {
             Self::MarkSweep(gc) => gc.cache_preserving(),
             Self::Stack(gc) => gc.cache_preserving(),
             Self::Semantic(gc) => gc.cache_preserving(),
+            Self::Generational(gc) => gc.cache_preserving(),
         }
     }
 
@@ -2546,6 +3015,36 @@ fn is_large_tool_result(message: &ChatMessage) -> bool {
             .content
             .as_deref()
             .is_some_and(|content| content.len() > 512)
+}
+
+/// The in-place elision annotation for one tool result: the `[gc: ...]`
+/// marker family (t-1360) — the old "result incorporated" wording reported
+/// the call happened while silently withholding its body, the
+/// confabulation-inviting shape; naming the eviction and the recovery
+/// affordance invites recovery instead. Escalation (t-1370): content
+/// elided/evicted N times already gets the honest exit instead of another
+/// recovery affordance — elision joins the same escalation ladder as
+/// whole-message drops. Used by generational's elide phases (mark-sweep's
+/// annotate pass keeps its own historical logic byte-for-byte — recorded
+/// sessions replay its collections strictly).
+fn elision_annotation(
+    content: &str,
+    tool_call_id: &str,
+    summary: &str,
+    counts: &BTreeMap<String, u32>,
+) -> String {
+    let evictions = counts
+        .get(&content_fingerprint(content))
+        .copied()
+        .unwrap_or(0)
+        + 1;
+    if evictions >= EVICTION_ESCALATION_AFTER {
+        escalation_marker_content(tool_call_id, evictions)
+    } else {
+        format!(
+            "[gc: result elided — {summary} ({tool_call_id}); recover: re-run the call — do not guess]"
+        )
+    }
 }
 
 fn annotate_evictable_tool_results(
@@ -5579,5 +6078,325 @@ mod tests {
             ledger_index < open_index,
             "the ledger must not strand an open call from its future result"
         );
+    }
+
+    // --- Generational GC (t-1167) -------------------------------------------
+
+    /// A window long enough that the nursery (last 8) is distinct from the
+    /// interior: system + task + three fat cold frames + a fat cited frame
+    /// + a fat hot frame, then a chatty 8-message tail.
+    fn generational_fixture() -> Vec<ChatMessage> {
+        let mut messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("audit the ingest pipeline and report the final total"),
+        ];
+        for step in 0..3 {
+            messages.push(ChatMessage::assistant(
+                Some(format!("Reading batch log {step}.")),
+                vec![ToolCall::new(
+                    format!("call-cold-{step}"),
+                    "shell",
+                    serde_json::json!({ "command": format!("cat logs/batch-{step}.log") }),
+                )],
+            ));
+            messages.push(ChatMessage::tool(
+                format!("call-cold-{step}"),
+                format!("batch {step} noise {}", "x".repeat(900)),
+            ));
+        }
+        messages.push(ChatMessage::assistant(
+            None,
+            vec![ToolCall::new(
+                "call-cited",
+                "shell",
+                serde_json::json!({ "command": "cat audit/summary.txt" }),
+            )],
+        ));
+        messages.push(ChatMessage::tool(
+            "call-cited",
+            format!("audit summary {}", "y".repeat(900)),
+        ));
+        messages.push(ChatMessage::assistant(
+            None,
+            vec![ToolCall::new(
+                "call-hot",
+                "shell",
+                serde_json::json!({ "command": "cat config/access-code.txt" }),
+            )],
+        ));
+        messages.push(ChatMessage::tool(
+            "call-hot",
+            format!("ACCESS CODE MX-7749-KESTREL {}", "z".repeat(400)),
+        ));
+        // The citation: a later message builds on call-cited by id.
+        messages.push(ChatMessage::assistant(
+            Some("Per the output of call-cited, the audit total carries.".into()),
+            vec![],
+        ));
+        for step in 0..3 {
+            messages.push(ChatMessage::user(format!("continue step {step}")));
+            messages.push(ChatMessage::assistant(
+                Some(format!("Working on step {step}.")),
+                vec![],
+            ));
+        }
+        messages.push(ChatMessage::user("what is the final total?"));
+        messages
+    }
+
+    /// Mark the hot frame's content write-barrier hot, as the interpreter
+    /// pre-pass would after a re-fetch of evicted content.
+    fn mark_hot(messages: &[ChatMessage], state: &mut GcState) {
+        let hot = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-hot"))
+            .expect("hot frame present");
+        state
+            .recall_hot
+            .extend(reinjection_chunk_keys(hot.content.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn generational_tiers_assign_by_precedence() {
+        let messages = generational_fixture();
+        let mut state = GcState::default();
+        mark_hot(&messages, &mut state);
+        let gc = GenerationalGc::default();
+        let tiers = gc.tiers(&messages, &state);
+        assert_eq!(
+            tiers,
+            gc.tiers(&messages, &state),
+            "tiering is deterministic"
+        );
+
+        let index_of = |call_id: &str| {
+            messages
+                .iter()
+                .position(|m| m.tool_call_id.as_deref() == Some(call_id))
+                .unwrap()
+        };
+        // The tail is the nursery.
+        let nursery_start = messages.len() - DEFAULT_NURSERY_WINDOW;
+        for (index, tier) in tiers.iter().enumerate() {
+            if index >= nursery_start {
+                assert_eq!(*tier, GcTier::Nursery, "tail message {index} is nursery");
+            }
+        }
+        assert_eq!(tiers[0], GcTier::Hot, "system is a hard guard: hot");
+        assert_eq!(
+            tiers[index_of("call-hot")],
+            GcTier::Hot,
+            "write-barrier-hot content is hot"
+        );
+        assert_eq!(
+            tiers[index_of("call-cited")],
+            GcTier::Warm,
+            "cited content is warm"
+        );
+        assert_eq!(
+            tiers[index_of("call-cold-0")],
+            GcTier::Cold,
+            "uncited, unscored interior content is cold"
+        );
+    }
+
+    #[test]
+    fn generational_escalated_content_is_hot() {
+        let messages = generational_fixture();
+        let mut state = GcState::default();
+        let cold0 = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-cold-0"))
+            .unwrap();
+        state.eviction_counts.insert(
+            content_fingerprint(cold0.content.as_deref().unwrap()),
+            EVICTION_ESCALATION_AFTER,
+        );
+        let gc = GenerationalGc::default();
+        let tiers = gc.tiers(&messages, &state);
+        let index = messages
+            .iter()
+            .position(|m| m.tool_call_id.as_deref() == Some("call-cold-0"))
+            .unwrap();
+        assert_eq!(
+            tiers[index],
+            GcTier::Hot,
+            "content at the escalation threshold joins hot (t-1370 cost accounting)"
+        );
+    }
+
+    #[test]
+    fn generational_elides_cold_before_evicting_and_converges() {
+        let messages = generational_fixture();
+        let gc = GenerationalGc::default();
+        // Mild pressure: eliding the cold bodies alone reaches the budget.
+        let budget = (estimate_tokens(&messages) as f64 * 0.72) as usize;
+
+        let mut state = GcState::default();
+        mark_hot(&messages, &mut state);
+        let mut state_again = state.clone();
+        let collected = gc.collect(messages.clone(), budget, &mut state);
+        let again = gc.collect(messages.clone(), budget, &mut state_again);
+        assert_eq!(collected, again, "generational must be deterministic");
+        assert_eq!(
+            collected.iter().map(|m| m.id).collect::<Vec<_>>(),
+            again.iter().map(|m| m.id).collect::<Vec<_>>(),
+            "ids too"
+        );
+
+        assert!(
+            estimate_tokens(&collected) <= budget,
+            "must converge: {} > {budget}",
+            estimate_tokens(&collected)
+        );
+        let report = state.tier_report;
+        assert!(
+            report.cold_elided > 0,
+            "cold bodies elide first: {report:?}"
+        );
+        assert_eq!(
+            report.evicted_cold + report.evicted_warm + report.evicted_hot + report.evicted_nursery,
+            0,
+            "elision alone reaches this budget — nothing whole-evicted: {report:?}"
+        );
+        // The elided results are STILL PRESENT as annotations (structure
+        // survives; the mark-sweep behavioral shape). call-cold-0 sits in
+        // the pinned prefix (pair-pinned) and keeps its body; the interior
+        // cold frames elide.
+        let elided = collected
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-cold-2"))
+            .expect("elided cold result keeps its message");
+        assert!(
+            elided
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with(EVICTION_MARKER_PREFIX),
+            "cold body became an annotation: {:?}",
+            elided.content
+        );
+        // Hot and nursery bodies are untouched.
+        let hot = collected
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-hot"))
+            .expect("hot frame survives");
+        assert!(
+            hot.content.as_deref().unwrap().contains("MX-7749-KESTREL"),
+            "the hot needle keeps its body"
+        );
+        let nursery_start = messages.len() - DEFAULT_NURSERY_WINDOW;
+        for message in &messages[nursery_start..] {
+            let survivor = collected
+                .iter()
+                .find(|m| m.id == message.id)
+                .expect("nursery message survives");
+            assert_eq!(
+                survivor.content, message.content,
+                "nursery bodies are untouched"
+            );
+        }
+
+        // Idempotence: collecting the collected window is a no-op.
+        let mut state_two = state.clone();
+        let recollected = gc.collect(collected.clone(), budget, &mut state_two);
+        assert_eq!(
+            recollected.len(),
+            collected.len(),
+            "already-under-budget windows are not shrunk further"
+        );
+    }
+
+    #[test]
+    fn generational_evicts_cold_whole_only_after_elision_and_keeps_hot_and_cited() {
+        let messages = generational_fixture();
+        let gc = GenerationalGc {
+            // Ignore mode: the prefix pin would otherwise shelter the cold
+            // frames sitting at the front of this small window.
+            preserve_prefix: false,
+            ..Default::default()
+        };
+        // Heavy pressure: elision alone cannot reach this budget.
+        let budget = (estimate_tokens(&messages) as f64 * 0.35) as usize;
+
+        let mut state = GcState::default();
+        mark_hot(&messages, &mut state);
+        let collected = gc.collect(messages.clone(), budget, &mut state);
+        assert!(
+            estimate_tokens(&collected) <= budget,
+            "must converge: {} > {budget}",
+            estimate_tokens(&collected)
+        );
+        let report = state.tier_report;
+        assert!(
+            report.evicted_cold > 0,
+            "cold groups evict under heavy pressure: {report:?}"
+        );
+        assert_eq!(
+            report.evicted_nursery, 0,
+            "the nursery is untouched while cheaper tiers remain: {report:?}"
+        );
+        if !report.hot_relaxed {
+            assert_eq!(
+                report.evicted_hot, 0,
+                "hot survives every normal phase: {report:?}"
+            );
+            let hot = collected
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("call-hot"))
+                .expect("hot frame survives normal phases");
+            assert!(
+                hot.content.as_deref().unwrap().contains("MX-7749-KESTREL"),
+                "the hot needle keeps its body through normal phases"
+            );
+        }
+        if !report.warm_relaxed {
+            assert!(
+                collected
+                    .iter()
+                    .any(|m| m.tool_call_id.as_deref() == Some("call-cited")),
+                "cited (warm) structure survives the normal phases"
+            );
+        }
+    }
+
+    #[test]
+    fn generational_hard_guards_survive_terminal_pressure() {
+        let messages = generational_fixture();
+        let gc = GenerationalGc {
+            preserve_prefix: false,
+            ..Default::default()
+        };
+        let mut state = GcState::default();
+        let collected = gc.collect(messages, 60, &mut state);
+        assert!(
+            collected.iter().any(|m| m.role == "system"),
+            "system survives terminal pressure"
+        );
+        assert!(
+            collected.iter().rfind(|m| m.role == "user").is_some(),
+            "a user message survives terminal pressure"
+        );
+        assert!(
+            state.tier_report.floor_relaxed,
+            "terminal pressure relaxes the floor"
+        );
+    }
+
+    #[test]
+    fn generational_warm_by_similarity_requires_cached_vectors() {
+        let messages = generational_fixture();
+        let gc = GenerationalGc::default();
+        let state = GcState::default();
+        // No embeddings cached: no message is warm-by-similarity; the only
+        // warm member is the cited one (citation-only mode, docs/GC.md).
+        let tiers = gc.tiers(&messages, &state);
+        let warm: Vec<usize> = tiers
+            .iter()
+            .enumerate()
+            .filter(|(_, tier)| **tier == GcTier::Warm)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(warm.len(), 1, "citation-only warm tier without vectors");
     }
 }

@@ -728,9 +728,17 @@ async fn collect_prompt(
     // heuristic — an embedding outage can never fail a turn. Replay runs
     // are offline by contract and skip the embedder entirely (the same
     // heuristic path as "no embedder configured").
-    if let GcMode::Semantic(semantic) = &config.gc {
+    let gc_embedder = match &config.gc {
+        GcMode::Semantic(gc) => Some(gc.embedder.as_ref()),
+        // Generational's warm-by-similarity signal (t-1167) rides the same
+        // pre-pass; without an embedder the pass still prunes the cache
+        // and the warm tier is citation-only.
+        GcMode::Generational(gc) => Some(gc.embedder.as_ref()),
+        _ => None,
+    };
+    if let Some(embedder) = gc_embedder {
         if config.replay.is_none() {
-            let report = semantic.prime_cache(&prompt, gc_state).await;
+            let report = crate::gc::prime_embedding_cache(embedder, &prompt, gc_state).await;
             if config.gc_log && (report.embedded > 0 || report.failed) {
                 config
                     .trace
@@ -823,6 +831,16 @@ async fn collect_prompt(
             let object = data.as_object_mut().expect("gc_collect data is an object");
             object.insert("trigger".into(), "context_overflow".into());
             object.insert("cycle".into(), cycle.into());
+        }
+        // Generational tiers (t-1167): per-tier assignment counts, per-tier
+        // elide/evict counts, and which degrade rungs fired — tier
+        // decisions are replayable and eval-visible.
+        if matches!(&config.gc, GcMode::Generational(_)) {
+            let object = data.as_object_mut().expect("gc_collect data is an object");
+            object.insert(
+                "tiers".into(),
+                serde_json::to_value(gc_state.tier_report).expect("GenerationalReport serializes"),
+            );
         }
         config
             .trace

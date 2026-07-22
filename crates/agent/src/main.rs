@@ -180,6 +180,16 @@ struct Args {
     /// cited-keep. Pass `false` for pre-t-1362 sweep behavior.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     gc_hot_keep: bool,
+    /// Nursery size for `--gc generational` (t-1167): the last N messages
+    /// are the recency floor — never collected in any normal phase.
+    #[arg(long = "gc-nursery", default_value_t = agent_core::gc::DEFAULT_NURSERY_WINDOW)]
+    gc_nursery: usize,
+    /// Warm similarity floor for `--gc generational` (t-1167): messages
+    /// scoring at or above this cosine similarity to the nursery centroid
+    /// join the warm tier. Active only with a models.yaml `embeddings`
+    /// entry; without one the warm tier is citation-only.
+    #[arg(long = "gc-warm-floor", default_value_t = agent_core::gc::DEFAULT_WARM_SIMILARITY_FLOOR)]
+    gc_warm_floor: f32,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -215,6 +225,12 @@ enum GcArg {
     /// `embeddings` entry — the same config memory retrieval uses; without
     /// one, scoring degrades to a deterministic recency heuristic.
     Semantic,
+    /// Hot/warm/cold tiered collection (t-1167): tiers from live signals
+    /// (recency, citations, the recall write-barrier, escalation counts,
+    /// embeddings when configured), cold bodies elide before anything is
+    /// whole-evicted. Without a registry `embeddings` entry the warm tier
+    /// is citation-only.
+    Generational,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -658,6 +674,24 @@ async fn main() -> Result<()> {
                         hot_keep: args.gc_hot_keep,
                     })
                 }
+                GcArg::Generational => {
+                    // Strategy-honest degrade (docs/GC.md Strategy 5):
+                    // without an embedder the warm tier is citation-only —
+                    // softer than semantic's warning because citations
+                    // still carry the tier.
+                    if embedder.is_none() {
+                        eprintln!(
+                            "warning: --gc generational without a models.yaml `embeddings` \
+                             entry runs a citation-only warm tier (see docs/GC.md)"
+                        );
+                    }
+                    GcMode::Generational(agent_core::gc::GenerationalGc {
+                        preserve_prefix,
+                        nursery_window: args.gc_nursery,
+                        warm_floor: args.gc_warm_floor,
+                        embedder: embedder.clone(),
+                    })
+                }
             }
         },
         gc_threshold: args.gc_threshold,
@@ -668,7 +702,7 @@ async fn main() -> Result<()> {
     };
     if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
         return Err(anyhow!(
-            "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, --gc mark-sweep, or --gc semantic",
+            "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, --gc mark-sweep, --gc semantic, or --gc generational",
             args.gc_timing.name()
         ));
     }

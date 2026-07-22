@@ -179,9 +179,10 @@ state; consult it before re-running work, because the steps it lists \
 are done.";
 
 /// §2.4 citation-protection line. Strategy-conditional (GUIDANCE.md gap
-/// 6): cited-keep is implemented for the `semantic` strategy only, so this
-/// line renders ONLY under `semantic` with `cited_keep` on — under any
-/// other strategy it would be a false promise.
+/// 6): citation protection runs under `semantic` with `cited_keep` on and
+/// under `generational` (whose warm tier is citation membership, t-1167),
+/// so this line renders ONLY there — under any other strategy it would be
+/// a false promise.
 pub const GC_CITED_KEEP_LINE: &str = "\
 - Referring to a tool call by its id in your text (for example, \"per the \
 output of call-12\") marks that result as load-bearing and protects it \
@@ -381,8 +382,10 @@ pub struct GuidanceCapabilities {
     pub memory: bool,
     /// A GC strategy is active for this run.
     pub gc: bool,
-    /// The active strategy is `semantic` with cited-keep on — the only
-    /// configuration where the citation-protection line is true.
+    /// The active strategy carries citation protection — `semantic` with
+    /// cited-keep on, or `generational` (warm tier = citation membership,
+    /// t-1167): the only configurations where the citation-protection
+    /// line is true.
     pub cited_keep: bool,
     /// Some effect in the run's config is gated behind approval.
     pub approvals: bool,
