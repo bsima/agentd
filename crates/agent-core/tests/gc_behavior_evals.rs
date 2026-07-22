@@ -143,10 +143,10 @@
 use agent_core::gc::SemanticGc;
 use agent_core::{
     agent_loop_ir_with_options, run_ir_sequential_with_store_and_replay, ChatMessage, ChatProvider,
-    Embedder, EnvPolicy, EvalConfig, Event, GcMode, GcTiming, InMemoryStore, IrReplayTrace,
-    MarkSweepGc, MemorySource, Model, PassiveHydrationConfig, Pricing, PricingTable,
-    ProviderClient, ProviderConfig, ReplayOnlyProvider, Response, RingGc, RunUsage,
-    RuntimeGuidance, SeqConfig, SourceRegistry, StackFrameGc, ToolCall, TraceLogger,
+    Embedder, EnvPolicy, EvalConfig, Event, GcMode, GcTiming, GenerationalGc, GenerationalReport,
+    InMemoryStore, IrReplayTrace, MarkSweepGc, MemorySource, Model, PassiveHydrationConfig,
+    Pricing, PricingTable, ProviderClient, ProviderConfig, ReplayOnlyProvider, Response, RingGc,
+    RunUsage, RuntimeGuidance, SeqConfig, SourceRegistry, StackFrameGc, ToolCall, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -246,15 +246,17 @@ enum Arm {
     MarkSweep,
     Stack,
     Semantic,
+    Generational,
 }
 
 impl Arm {
-    const ALL: [Arm; 5] = [
+    const ALL: [Arm; 6] = [
         Arm::NoGc,
         Arm::Ring,
         Arm::MarkSweep,
         Arm::Stack,
         Arm::Semantic,
+        Arm::Generational,
     ];
 
     fn label(&self) -> &'static str {
@@ -264,6 +266,7 @@ impl Arm {
             Self::MarkSweep => "mark-sweep",
             Self::Stack => "stack",
             Self::Semantic => "semantic",
+            Self::Generational => "generational",
         }
     }
 
@@ -292,6 +295,14 @@ impl Arm {
                 preserve_prefix: true,
             }),
             Self::Semantic => GcMode::Semantic(SemanticGc {
+                preserve_prefix: true,
+                embedder: Some(Arc::new(BagOfTokensEmbedder)),
+                ..Default::default()
+            }),
+            // The t-1167 synthesis strategy, with the same deterministic
+            // embedder stance as semantic (identical vectors in record and
+            // replay; without it the warm tier would be citation-only).
+            Self::Generational => GcMode::Generational(GenerationalGc {
                 preserve_prefix: true,
                 embedder: Some(Arc::new(BagOfTokensEmbedder)),
                 ..Default::default()
@@ -2189,7 +2200,9 @@ async fn gc_behavior_matrix() -> Result<()> {
     println!("== t-1349 legacy cells (pre-guidance tool descriptions) ==");
     print_header();
     for fixture in &fixtures {
-        for arm in Arm::ALL {
+        // Generational (t-1167) postdates the legacy era; no legacy cell
+        // ever existed for it.
+        for arm in Arm::ALL.into_iter().filter(|arm| *arm != Arm::Generational) {
             let path = legacy_cell_path(&dir, fixture.name, arm);
             if !path.exists() {
                 println!(
@@ -2250,7 +2263,13 @@ async fn gc_behavior_matrix() -> Result<()> {
     println!("== t-1371 curation regime (budget 8000, guided/minimal fragment) ==");
     print_header();
     for fixture in &curation_fixtures() {
-        for arm in [Arm::NoGc, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
+        for arm in [
+            Arm::NoGc,
+            Arm::Stack,
+            Arm::MarkSweep,
+            Arm::Semantic,
+            Arm::Generational,
+        ] {
             for sample in [1, 2] {
                 let path = cell_path(&dir, fixture.name, arm, true, sample);
                 if !path.exists() {
@@ -3391,4 +3410,176 @@ fn fixture_arithmetic_is_honest() {
             fixture.context_budget
         );
     }
+}
+
+/// t-1167 offline corpus check, the t-1373 pattern: GC re-runs live during
+/// replay, so substituting GenerationalGc for every recorded cell's arm
+/// drives its tier assigner and collector over the REAL histories of all
+/// six behavioral-eval generations (provider/tool effects replay by effect
+/// id, so the sessions reproduce regardless of window bytes). Asserted per
+/// recording:
+///
+/// - effect-replay integrity: the final answer reproduces;
+/// - the tiny budgets force collections, and every gc_collect carries the
+///   `tiers` object;
+/// - tier sanity on real windows: assignments cover the window, a nursery
+///   always exists, and the ladder accounting holds — no nursery eviction
+///   without the floor-relax rung, no hot eviction without a degrade rung,
+///   no warm eviction without warm-relax (cold never captures protected
+///   content: anything hot/cited is by construction not cold, and the
+///   accounting proves the protected tiers were not silently reclaimed);
+/// - the ledger discipline holds for the new strategy (present or
+///   recorded-suppressed whenever a tool-bearing session evicted).
+#[tokio::test]
+async fn generational_replays_the_six_generation_corpus_with_sane_tiers() -> Result<()> {
+    let dir = recordings_dir()?;
+    if !dir.exists() {
+        println!("no recordings — offline no-op");
+        return Ok(());
+    }
+    let fixtures = all_fixtures();
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "recordings dir exists but is empty");
+
+    let mut replayed_cells = 0usize;
+    for path in paths {
+        let (meta, recorded_events) = load_cell_recording(&path)?;
+        let Some(fixture) = fixtures.iter().find(|fixture| fixture.name == meta.fixture) else {
+            panic!(
+                "{}: recording names unknown fixture {}",
+                path.display(),
+                meta.fixture
+            );
+        };
+        let replay = IrReplayTrace::from_events(&recorded_events)
+            .with_context(|| format!("building replay from {}", path.display()))?;
+        let prompt = vec![
+            ChatMessage::system(system_prompt()),
+            ChatMessage::user(fixture.task.clone()),
+        ];
+        let workdir = materialize_fixture(fixture)?;
+        let memory_dir = std::env::temp_dir().join(format!("gc-gen-corpus-{}", Uuid::new_v4()));
+        fs::create_dir_all(&memory_dir)?;
+        let run = run_cell(
+            Arc::new(ReplayOnlyProvider),
+            Some(&replay),
+            CellSpec {
+                model: meta.model.clone(),
+                gc: Arm::Generational.gc_mode(),
+                context_budget: meta.context_budget,
+                prompt,
+                guidance: cell_guidance(meta.guided),
+                full_payloads: false,
+            },
+            &workdir,
+            &memory_dir,
+        )
+        .await
+        .with_context(|| format!("replaying {} under generational", path.display()))?;
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&memory_dir);
+
+        assert_eq!(
+            run.content,
+            meta.final_content,
+            "{}: effect-id replay must reproduce the recorded final answer \
+             regardless of the substituted collector",
+            path.display()
+        );
+
+        let mut collections = 0usize;
+        let mut ledger_ok = 0usize;
+        let mut evicting = 0usize;
+        for event in &run.events {
+            let Event::Custom { name, data, .. } = event else {
+                continue;
+            };
+            if name != "gc_collect" {
+                continue;
+            }
+            collections += 1;
+            let tiers: GenerationalReport = serde_json::from_value(
+                data.get("tiers")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}: generational gc_collect event without a tiers object",
+                            path.display()
+                        )
+                    })
+                    .clone(),
+            )?;
+            let assigned = tiers.nursery + tiers.hot + tiers.warm + tiers.cold;
+            assert!(assigned > 0, "{}: empty tier assignment", path.display());
+            assert!(
+                tiers.nursery > 0,
+                "{}: a live window always has a nursery",
+                path.display()
+            );
+            if !tiers.floor_relaxed && !tiers.prefix_relaxed {
+                assert_eq!(
+                    tiers.evicted_nursery,
+                    0,
+                    "{}: nursery evicted without the floor-relax rung: {tiers:?}",
+                    path.display()
+                );
+            }
+            if !tiers.hot_relaxed && !tiers.floor_relaxed && !tiers.prefix_relaxed {
+                assert_eq!(
+                    tiers.evicted_hot,
+                    0,
+                    "{}: hot evicted without a degrade rung: {tiers:?}",
+                    path.display()
+                );
+            }
+            if !tiers.warm_relaxed {
+                assert_eq!(
+                    tiers.evicted_warm,
+                    0,
+                    "{}: warm evicted without the warm-relax rung: {tiers:?}",
+                    path.display()
+                );
+            }
+            let dropped = data
+                .get("dropped_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if dropped > 0 {
+                evicting += 1;
+                let present = data
+                    .get("ledger_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let suppressed = data
+                    .get("ledger_suppressed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if present || suppressed {
+                    ledger_ok += 1;
+                }
+            }
+        }
+        assert!(
+            collections > 0,
+            "{}: the corpus budgets must force generational to collect",
+            path.display()
+        );
+        assert_eq!(
+            evicting,
+            ledger_ok,
+            "{}: every evicting collection must carry a ledger or a recorded \
+             suppression",
+            path.display()
+        );
+        replayed_cells += 1;
+        println!(
+            "  [t-1167 corpus] {}: collections={collections} evicting={evicting}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+        );
+    }
+    println!("t-1167 corpus: {replayed_cells} recorded cells replayed under generational");
+    Ok(())
 }

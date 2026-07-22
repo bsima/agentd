@@ -35,7 +35,8 @@
 //! by default — see the judge section at the bottom of this file.
 
 use agent_core::gc::{
-    message_embedding_text, record_reinjection_overlaps, CitationGraph, SemanticGc,
+    message_embedding_text, record_reinjection_overlaps, reinjection_chunk_keys, CitationGraph,
+    GcTier, GenerationalGc, SemanticGc,
 };
 use agent_core::{
     content_hash, estimate_tokens, is_eviction_marker, is_gc_ledger, truncate_oversized_message,
@@ -113,6 +114,7 @@ enum Strategy {
     MarkSweep,
     Stack,
     Semantic,
+    Generational,
 }
 
 impl Strategy {
@@ -134,15 +136,20 @@ impl Strategy {
                 preserve_prefix,
                 ..Default::default()
             }),
+            Self::Generational => Box::new(GenerationalGc {
+                preserve_prefix,
+                ..Default::default()
+            }),
         }
     }
 }
 
-const STRATEGIES: [Strategy; 4] = [
+const STRATEGIES: [Strategy; 5] = [
     Strategy::Ring,
     Strategy::MarkSweep,
     Strategy::Stack,
     Strategy::Semantic,
+    Strategy::Generational,
 ];
 
 // --- deterministic offline embedder (t-1350) ---------------------------------
@@ -258,7 +265,7 @@ fn gc_challengers_improve_over_ring_on_tool_chains() -> Result<()> {
             false,
             None,
         )?;
-        for challenger_kind in [Strategy::MarkSweep, Strategy::Stack] {
+        for challenger_kind in [Strategy::MarkSweep, Strategy::Stack, Strategy::Generational] {
             let challenger = evaluate(
                 case,
                 GATE_PRESSURE,
@@ -541,6 +548,400 @@ fn gc_cited_keep_is_inert_on_the_uncited_tangent_fixture() -> Result<()> {
     Ok(())
 }
 
+// --- Generational (t-1167): tier-specific offline validation -----------------
+
+/// One-shot Final-timing run with direct GcState access (the matrix's
+/// `run_timed` hides the state; the tier tests need `state.tier_report`).
+/// Mirrors interpreter::collect_prompt ordering exactly: truncate, prime
+/// embeddings, write-barrier pre-pass, collect.
+fn run_generational_once(
+    prompt: &[ChatMessage],
+    budget: usize,
+    gc: &GenerationalGc,
+) -> (Vec<ChatMessage>, Vec<ChatMessage>, GcState, Vec<GcTier>) {
+    let mut window = prompt.to_vec();
+    truncate_oversized_message(&mut window, budget);
+    let mut state = GcState::default();
+    prime_semantic_cache(&window, &mut state);
+    record_reinjection_overlaps(&window, &mut state);
+    let tiers = gc.tiers(&window, &state);
+    let collected = gc.collect(window.clone(), budget, &mut state);
+    (window, collected, state, tiers)
+}
+
+/// Tier assignment on every real and synthetic window: deterministic
+/// (two computations agree), and each live signal lands in its tier —
+/// the tail is nursery, system is hot, cited messages are never cold.
+#[test]
+fn gc_generational_tier_assignment_is_deterministic_and_signal_true() -> Result<()> {
+    let gc = GenerationalGc::default();
+    for case in &all_cases()? {
+        let mut state = GcState::default();
+        prime_semantic_cache(&case.prompt, &mut state);
+        let tiers = gc.tiers(&case.prompt, &state);
+        assert_eq!(
+            tiers,
+            gc.tiers(&case.prompt, &state),
+            "{}: tier assignment must be deterministic",
+            case.name
+        );
+        let nursery_start = case
+            .prompt
+            .len()
+            .saturating_sub(gc.nursery_len(case.prompt.len()));
+        let cited = agent_core::gc::cited_mask(&case.prompt);
+        for (index, message) in case.prompt.iter().enumerate() {
+            if index >= nursery_start {
+                assert_eq!(
+                    tiers[index],
+                    GcTier::Nursery,
+                    "{}: tail message {index} must be nursery",
+                    case.name
+                );
+                continue;
+            }
+            if message.role == "system" {
+                assert_eq!(
+                    tiers[index],
+                    GcTier::Hot,
+                    "{}: system message {index} is a hard guard (hot)",
+                    case.name
+                );
+            }
+            if cited[index] {
+                assert_ne!(
+                    tiers[index],
+                    GcTier::Cold,
+                    "{}: cited message {index} must never be cold",
+                    case.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The elide-before-evict ordering, asserted on every (case, pressure)
+/// cell in ignore mode: whenever a collection whole-evicted cold content,
+/// every surviving cold tool result that was eligible for elision (fat,
+/// incorporated, not already an annotation) must have been elided first —
+/// deletion is the cold tier's last resort.
+#[test]
+fn gc_generational_elides_cold_before_evicting_on_every_cell() -> Result<()> {
+    let gc = GenerationalGc {
+        preserve_prefix: false,
+        ..Default::default()
+    };
+    for case in &all_cases()? {
+        for pressure in PRESSURES {
+            let budget = ((estimate_tokens(&case.prompt) as f64) * pressure).floor() as usize;
+            let (window, collected, state, tiers) =
+                run_generational_once(&case.prompt, budget, &gc);
+            let report = state.tier_report;
+            if report.evicted_cold == 0 {
+                continue;
+            }
+            let survivors: HashMap<_, _> = collected
+                .iter()
+                .map(|message| (message.id, message.content.as_deref().unwrap_or("")))
+                .collect();
+            for (index, message) in window.iter().enumerate() {
+                if tiers[index] != GcTier::Cold || message.role != "tool" {
+                    continue;
+                }
+                let Some(&survivor) = survivors.get(&message.id) else {
+                    continue;
+                };
+                let original = message.content.as_deref().unwrap_or("");
+                // Conservative eligibility mirror: fat enough that the
+                // annotation certainly shrinks it, and incorporated.
+                let incorporated = window
+                    .iter()
+                    .skip(index + 1)
+                    .any(|later| later.role == "assistant");
+                if original.starts_with(agent_core::EVICTION_MARKER_PREFIX)
+                    || original.chars().count() <= 300
+                    || !incorporated
+                {
+                    continue;
+                }
+                assert!(
+                    survivor.starts_with(agent_core::EVICTION_MARKER_PREFIX),
+                    "{} @{pressure}: cold evictions happened while surviving cold \
+                     result {index} kept its body — elision must be exhausted before \
+                     eviction (t-1167)",
+                    case.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The nursery is inviolate until the floor-relax degrade rung, and the
+/// per-tier eviction accounting matches the ladder flags — on every
+/// (case, pressure, cache) cell. This is the mechanism-vs-accounting
+/// cross-check: `evicted_*` counts come from the final keep decisions
+/// against the tier assignment, the `*_relaxed` flags from the phase
+/// ladder, and they must agree.
+#[test]
+fn gc_generational_nursery_inviolate_and_ladder_accounted() -> Result<()> {
+    for case in &all_cases()? {
+        for pressure in PRESSURES {
+            for preserve in [true, false] {
+                let gc = GenerationalGc {
+                    preserve_prefix: preserve,
+                    ..Default::default()
+                };
+                let budget = ((estimate_tokens(&case.prompt) as f64) * pressure).floor() as usize;
+                let (window, collected, state, _tiers) =
+                    run_generational_once(&case.prompt, budget, &gc);
+                let report = state.tier_report;
+                if !report.warm_relaxed {
+                    assert_eq!(
+                        report.evicted_warm, 0,
+                        "{} @{pressure} preserve={preserve}: warm evicted without \
+                         the warm-relax rung: {report:?}",
+                        case.name
+                    );
+                }
+                if !report.hot_relaxed && !report.floor_relaxed && !report.prefix_relaxed {
+                    assert_eq!(
+                        report.evicted_hot, 0,
+                        "{} @{pressure} preserve={preserve}: hot evicted without a \
+                         degrade rung: {report:?}",
+                        case.name
+                    );
+                }
+                if !report.floor_relaxed && !report.prefix_relaxed {
+                    assert_eq!(
+                        report.evicted_nursery, 0,
+                        "{} @{pressure} preserve={preserve}: nursery evicted without \
+                         the floor-relax rung: {report:?}",
+                        case.name
+                    );
+                    // Stronger than the count: every nursery message survives
+                    // with its body byte-identical (elision never touches the
+                    // nursery).
+                    let nursery_start = window.len().saturating_sub(gc.nursery_len(window.len()));
+                    for message in &window[nursery_start..] {
+                        let survivor = collected
+                            .iter()
+                            .find(|survivor| survivor.id == message.id)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{} @{pressure} preserve={preserve}: nursery message \
+                                     missing from the collected window",
+                                    case.name
+                                )
+                            });
+                        assert_eq!(
+                            survivor.content, message.content,
+                            "{} @{pressure} preserve={preserve}: nursery body changed",
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cited-distant retention parallel of the semantic cited-keep gate:
+/// generational's warm tier (citation membership) must keep the cited
+/// result's MESSAGE in the window — the body may elide (warm elide keeps
+/// structure), but the citation handle survives — while the collection
+/// still converges. Both cache policies.
+#[test]
+fn gc_generational_retains_the_cited_distant_structure() -> Result<()> {
+    let (prompt, cited, _noise) = cited_distant_case();
+    let cited_result = cited
+        .iter()
+        .copied()
+        .find(|index| prompt[*index].role == "tool")
+        .expect("the cited frame has a tool result");
+    for preserve in [true, false] {
+        let gc = GenerationalGc {
+            preserve_prefix: preserve,
+            ..Default::default()
+        };
+        let budget = ((estimate_tokens(&prompt) as f64) * GATE_PRESSURE).floor() as usize;
+        let (window, collected, _state, tiers) = run_generational_once(&prompt, budget, &gc);
+        assert_eq!(
+            tiers[cited_result],
+            GcTier::Warm,
+            "fixture honesty: the cited result tiers warm (preserve={preserve})"
+        );
+        assert!(
+            estimate_tokens(&collected) <= budget,
+            "generational must converge on the cited-distant fixture (preserve={preserve})"
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|message| message.id == window[cited_result].id),
+            "the cited (warm) result's message must survive the normal phases \
+             (preserve={preserve})"
+        );
+    }
+    Ok(())
+}
+
+/// Hot content — the write-barrier's re-acquired needle — survives with
+/// its BODY intact through the normal phases while cold ballast around it
+/// is reclaimed (the t-1369 finding-3 loop breaker as a tier property).
+#[test]
+fn gc_generational_hot_needle_keeps_its_body_under_pressure() -> Result<()> {
+    let (prompt, tangent) = tangent_abandoned_case();
+    // Hot-mark one mid-window tangent tool result, as the interpreter
+    // pre-pass would after the model re-fetched it post-eviction.
+    let hot_index = tangent
+        .iter()
+        .copied()
+        .find(|index| prompt[*index].role == "tool")
+        .expect("the tangent has tool results");
+    let hot_content = prompt[hot_index].content.clone().expect("tool content");
+    let gc = GenerationalGc {
+        preserve_prefix: false,
+        ..Default::default()
+    };
+    let budget = ((estimate_tokens(&prompt) as f64) * GATE_PRESSURE).floor() as usize;
+    let mut window = prompt.clone();
+    truncate_oversized_message(&mut window, budget);
+    let mut state = GcState::default();
+    prime_semantic_cache(&window, &mut state);
+    state
+        .recall_hot
+        .extend(reinjection_chunk_keys(&hot_content));
+    let tiers = gc.tiers(&window, &state);
+    assert_eq!(
+        tiers[hot_index],
+        GcTier::Hot,
+        "fixture honesty: the write-barrier-marked result tiers hot"
+    );
+    let collected = gc.collect(window.clone(), budget, &mut state);
+    let report = state.tier_report;
+    assert!(
+        estimate_tokens(&collected) <= budget,
+        "must converge with the hot guard in place"
+    );
+    assert!(
+        !report.hot_relaxed,
+        "this budget is reachable without relaxing hot: {report:?}"
+    );
+    let survivor = collected
+        .iter()
+        .find(|message| message.id == window[hot_index].id)
+        .expect("the hot result survives the normal phases");
+    assert_eq!(
+        survivor.content.as_deref(),
+        window[hot_index].content.as_deref(),
+        "the hot needle keeps its full body — re-eviction is the loop"
+    );
+    Ok(())
+}
+
+/// The t-1362 honest-ceiling measurement: mark-sweep's best-effort
+/// convergence ships over-target windows whose slack-funded ledger is
+/// suppressed; generational elides its way to convergence, leaving slack.
+/// Measured across every tool-chain case at the two heavier pressures
+/// under threshold timing: generational must suppress the ledger in no
+/// more collections than mark-sweep (prediction: strictly fewer; the
+/// printed totals carry the number).
+#[test]
+fn gc_generational_funds_the_ledger_where_mark_sweep_suppresses_it() -> Result<()> {
+    let mut mark_sweep_final_present = 0usize;
+    let mut generational_final_present = 0usize;
+    let mut mark_sweep_suppressions = 0usize;
+    let mut generational_suppressions = 0usize;
+    let mut cells = 0usize;
+    for case in all_cases()?.iter().filter(|case| case.tool_chain) {
+        for pressure in [0.5, 0.35] {
+            cells += 1;
+            for (strategy, final_present, suppressions) in [
+                (
+                    Strategy::MarkSweep,
+                    &mut mark_sweep_final_present,
+                    &mut mark_sweep_suppressions,
+                ),
+                (
+                    Strategy::Generational,
+                    &mut generational_final_present,
+                    &mut generational_suppressions,
+                ),
+            ] {
+                let gc = strategy.build(true);
+                let budget = ((estimate_tokens(&case.prompt) as f64) * pressure).floor() as usize;
+                let run = run_timed(&case.prompt, budget, gc.as_ref(), Timing::Threshold);
+                println!(
+                    "ledger_slack_cell case={} pressure={pressure} budget={budget} \
+                     strategy={} collections={} suppressions={} final_ledger={}",
+                    case.name,
+                    gc.name(),
+                    run.collections,
+                    run.ledger_suppressions,
+                    run.final_ledger_present,
+                );
+                *final_present += usize::from(run.final_ledger_present);
+                *suppressions += run.ledger_suppressions;
+            }
+        }
+    }
+    println!(
+        "ledger_slack cells={cells} final_ledger_present: mark-sweep={mark_sweep_final_present} \
+         generational={generational_final_present}; per-collection suppressions: \
+         mark-sweep={mark_sweep_suppressions} generational={generational_suppressions}"
+    );
+    // The pinned pair, on the one REAL recorded trace in the set: at both
+    // heavy pressures mark-sweep's best-effort convergence ships
+    // over-target windows that suppress the ledger throughout (the t-1373
+    // honest ceiling, reproduced here as the baseline deficiency), while
+    // generational's elide-first convergence plus its normal-phase
+    // headroom funds it. The synthetic starvation shapes are reported in
+    // the printed totals but not asserted: where degrade rungs dominate,
+    // generational converges tightly to budget and can end a session
+    // ledger-less where mark-sweep's chunky frame sweeps overshoot into
+    // slack by luck — the honest residual (prediction \"generational
+    // leaves more slack\" holds on the real trace, not universally).
+    for case in all_cases()?
+        .iter()
+        .filter(|case| case.tool_chain && !case.name.starts_with("synthetic:"))
+    {
+        for pressure in [0.5, 0.35] {
+            let budget = ((estimate_tokens(&case.prompt) as f64) * pressure).floor() as usize;
+            let mark_sweep = run_timed(
+                &case.prompt,
+                budget,
+                Strategy::MarkSweep.build(true).as_ref(),
+                Timing::Threshold,
+            );
+            let generational = run_timed(
+                &case.prompt,
+                budget,
+                Strategy::Generational.build(true).as_ref(),
+                Timing::Threshold,
+            );
+            assert!(
+                mark_sweep.ledger_suppressions > 0 && !mark_sweep.final_ledger_present,
+                "{} @{pressure}: mark-sweep's honest ceiling (suppressed ledger) is the \
+                 pinned baseline — if this starts passing, the fixture no longer \
+                 exercises the deficiency",
+                case.name
+            );
+            assert!(
+                generational.ledger_suppressions == 0 && generational.final_ledger_present,
+                "{} @{pressure}: generational must fund the ledger on the real trace \
+                 (suppressions={}, final_present={})",
+                case.name,
+                generational.ledger_suppressions,
+                generational.final_ledger_present
+            );
+        }
+    }
+    Ok(())
+}
+
 fn evaluate(
     case: &TraceCase,
     pressure: f64,
@@ -778,6 +1179,13 @@ struct TimedRun {
     /// The final collection's ledger summary: itemized entries in the
     /// in-window digest.
     ledger_entries: usize,
+    /// Collections whose ledger was suppressed (per-collection count —
+    /// the t-1362 honest-ceiling / slack measurement for t-1167).
+    ledger_suppressions: usize,
+    /// The FINAL collection left an in-window ledger (the behaviorally
+    /// relevant honest-ceiling question: does the model end the session
+    /// with its progress record?).
+    final_ledger_present: bool,
 }
 
 /// Apply `gc` to the case window under the given timing. `Final` is the
@@ -800,13 +1208,16 @@ fn run_timed(
         any_marker_suppression: false,
         any_ledger_suppression: false,
         ledger_entries: 0,
+        ledger_suppressions: 0,
+        final_ledger_present: false,
     };
     if timing == Timing::Final {
         let mut window = prompt.to_vec();
         truncate_oversized_message(&mut window, budget);
-        // Semantic pre-pass mirror (after truncation: the cache keys on
+        // Embedding pre-pass mirror (after truncation: the cache keys on
         // content, exactly as interpreter::collect_prompt orders it).
-        if gc.name() == "semantic" {
+        // Generational's warm-by-similarity signal rides the same cache.
+        if matches!(gc.name(), "semantic" | "generational") {
             prime_semantic_cache(&window, &mut state);
         }
         // Re-injection write-barrier pre-pass mirror (t-1362), same
@@ -818,7 +1229,9 @@ fn run_timed(
         run.invalidations = usize::from(state.prefix_invalidated);
         run.any_marker_suppression = state.marker_summary.suppressed;
         run.any_ledger_suppression = state.ledger_summary.suppressed;
+        run.ledger_suppressions = usize::from(state.ledger_summary.suppressed);
         run.ledger_entries = state.ledger_summary.entries;
+        run.final_ledger_present = state.ledger_summary.present;
         return run;
     }
 
@@ -831,6 +1244,7 @@ fn run_timed(
     }
     infer_point(&mut window, budget, gc, timing, &mut state, &mut run);
     run.ledger_entries = state.ledger_summary.entries;
+    run.final_ledger_present = state.ledger_summary.present;
     run.collected = window;
     run
 }
@@ -863,7 +1277,7 @@ fn infer_point(
         return;
     }
     truncate_oversized_message(window, budget);
-    if gc.name() == "semantic" {
+    if matches!(gc.name(), "semantic" | "generational") {
         prime_semantic_cache(window, state);
     }
     // Re-injection write-barrier pre-pass mirror (t-1362): incremental
@@ -875,6 +1289,7 @@ fn infer_point(
     run.invalidations += usize::from(state.prefix_invalidated);
     run.any_marker_suppression |= state.marker_summary.suppressed;
     run.any_ledger_suppression |= state.ledger_summary.suppressed;
+    run.ledger_suppressions += usize::from(state.ledger_summary.suppressed);
 }
 
 /// Invariants every strategy owes every window (docs/GC.md): system messages

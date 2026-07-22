@@ -865,6 +865,20 @@ pub struct GenerationalReport {
     pub prefix_relaxed: bool,
 }
 
+/// Ledger headroom for generational's normal phases (t-1167 x the t-1362
+/// honest-ceiling note): mark-sweep's over-target windows suppress the
+/// slack-funded progress ledger — and a collector that converges EXACTLY
+/// to budget does the same thing from the other side (measured: 49 vs 35
+/// suppressed collections against mark-sweep on the offline matrix at
+/// heavy pressure before this reserve existed). The normal cold/warm
+/// phases therefore target `budget - headroom`, leaving room the ledger's
+/// own ladder can fund itself from; the degrade rungs target the full
+/// budget — under real pressure content decisions still outrank
+/// bookkeeping, exactly the t-1373 value ordering. Applied only when the
+/// budget dwarfs the reserve (>= 4x) so tiny windows never over-evict
+/// cold content for a ledger that could not render anyway.
+const GENERATIONAL_LEDGER_HEADROOM: usize = 128;
+
 /// Strategy 5 (docs/GC.md, t-1167): hot/warm/cold tiered collection with a
 /// nursery recency floor, consuming the citation graph (t-1351), the
 /// re-injection write-barrier (t-1362), and the escalation counts
@@ -933,7 +947,9 @@ impl GenerationalGc {
     /// messages with cached vectors, `None` otherwise (never a provider
     /// call — an unscoreable message simply cannot be warm by similarity).
     fn warm_scores(&self, messages: &[ChatMessage], state: &GcState) -> Vec<Option<f32>> {
-        let Some(centroid) = cached_recent_centroid(messages, state, self.nursery_window) else {
+        let Some(centroid) =
+            cached_recent_centroid(messages, state, self.nursery_len(messages.len()))
+        else {
             return vec![None; messages.len()];
         };
         messages
@@ -947,13 +963,23 @@ impl GenerationalGc {
             .collect()
     }
 
+    /// The effective nursery size for a window of `window_len` messages:
+    /// `nursery_window`, capped at half the window (floor 1). A recency
+    /// floor that swallows a short window would force the collector
+    /// straight to the degrade rungs — whole-message ring behavior,
+    /// exactly the drop-and-hope shape the design rejects — so short
+    /// windows keep an elidable interior instead.
+    pub fn nursery_len(&self, window_len: usize) -> usize {
+        self.nursery_window.max(1).min((window_len / 2).max(1))
+    }
+
     /// Assign every window message a tier (t-1167), in precedence order:
     /// nursery (recency floor) > hot (hard guards ∪ write-barrier ∪
     /// escalated content) > warm (cited ∪ centroid-near) > cold. Pure and
     /// deterministic — exactly the inputs collect() already has.
     pub fn tiers(&self, messages: &[ChatMessage], state: &GcState) -> Vec<GcTier> {
         let len = messages.len();
-        let nursery_start = len.saturating_sub(self.nursery_window.max(1));
+        let nursery_start = len.saturating_sub(self.nursery_len(len));
         let last_user = messages.iter().rposition(|message| message.role == "user");
         let hot = hot_mask(messages, state);
         let cited = cited_mask(messages);
@@ -1024,16 +1050,24 @@ impl GenerationalGc {
             |wanted: GcTier| -> Vec<bool> { tiers.iter().map(|tier| *tier == wanted).collect() };
 
         let mut keep = vec![true; messages.len()];
-        let over = |messages: &[ChatMessage], keep: &[bool]| {
-            estimate_tokens(&kept_messages(messages, keep)) > budget
+        // Normal phases target the soft budget (ledger headroom, see
+        // [`GENERATIONAL_LEDGER_HEADROOM`]); the degrade rungs target the
+        // full budget.
+        let soft = if budget >= 4 * GENERATIONAL_LEDGER_HEADROOM {
+            budget - GENERATIONAL_LEDGER_HEADROOM
+        } else {
+            budget
         };
-        if over(&messages, &keep) {
+        let over = |messages: &[ChatMessage], keep: &[bool], target: usize| {
+            estimate_tokens(&kept_messages(messages, keep)) > target
+        };
+        if over(&messages, &keep, budget) {
             // Phase 1: cold bodies elide in place (annotate, don't drop —
             // the behavioral north star; structure and handles survive).
             report.cold_elided = elide_tool_results(
                 &mut messages,
                 &keep,
-                budget,
+                soft,
                 &tier_mask(GcTier::Cold),
                 boundary,
                 &state.eviction_counts,
@@ -1041,27 +1075,30 @@ impl GenerationalGc {
             // Phase 2: whole cold groups evict, oldest first (deletion is
             // the cold tier's last resort, and it feeds markers + ledger
             // via the bookkeeping wrapper).
-            if over(&messages, &keep) {
+            if over(&messages, &keep, soft) {
                 let mut protected = protected_with_prefix(&messages, boundary);
                 for (slot, tier) in protected.iter_mut().zip(&tiers) {
                     *slot = *slot || *tier != GcTier::Cold;
                 }
-                sweep_ring(&messages, &mut keep, budget, &protected);
+                sweep_ring(&messages, &mut keep, soft, &protected);
             }
             // Phase 3: warm bodies elide; warm structure stays (the
             // citation handle survives in the annotation).
-            if over(&messages, &keep) {
+            if over(&messages, &keep, soft) {
                 report.warm_elided = elide_tool_results(
                     &mut messages,
                     &keep,
-                    budget,
+                    soft,
                     &tier_mask(GcTier::Warm),
                     boundary,
                     &state.eviction_counts,
                 );
             }
             // Degrade rung a: warm evicts (cited-keep strength relaxes).
-            if over(&messages, &keep) {
+            // Full-budget target from here on: content decisions outrank
+            // bookkeeping (the t-1373 value ordering) — no degrade rung
+            // ever evicts more of a relaxed guard to fund the ledger.
+            if over(&messages, &keep, budget) {
                 report.warm_relaxed = true;
                 let mut protected = protected_with_prefix(&messages, boundary);
                 for (slot, tier) in protected.iter_mut().zip(&tiers) {
@@ -1071,7 +1108,7 @@ impl GenerationalGc {
             }
             // Degrade rung b: hot relaxes (hot-keep strength) — elide
             // first, then evict; the nursery is still untouched.
-            if over(&messages, &keep) {
+            if over(&messages, &keep, budget) {
                 report.hot_relaxed = true;
                 report.hot_elided = elide_tool_results(
                     &mut messages,
@@ -1081,7 +1118,7 @@ impl GenerationalGc {
                     boundary,
                     &state.eviction_counts,
                 );
-                if over(&messages, &keep) {
+                if over(&messages, &keep, budget) {
                     let mut protected = protected_with_prefix(&messages, boundary);
                     for (slot, tier) in protected.iter_mut().zip(&tiers) {
                         *slot = *slot || *tier == GcTier::Nursery;
@@ -1092,7 +1129,7 @@ impl GenerationalGc {
             // Degrade rung c: the nursery floor relaxes (semantic's
             // phase-3 precedent); the prefix pin — a billing contract —
             // still holds.
-            if over(&messages, &keep) {
+            if over(&messages, &keep, budget) {
                 report.floor_relaxed = true;
                 sweep_ring(
                     &messages,
@@ -1104,7 +1141,7 @@ impl GenerationalGc {
             // Degrade rung d: the pinned prefix falls last (overflowing
             // the model is worse than a cache miss; the invalidation is
             // reported); system + last user never drop.
-            if boundary > 0 && over(&messages, &keep) {
+            if boundary > 0 && over(&messages, &keep, budget) {
                 report.prefix_relaxed = true;
                 sweep_ring(
                     &messages,
@@ -6229,8 +6266,9 @@ mod tests {
     fn generational_elides_cold_before_evicting_and_converges() {
         let messages = generational_fixture();
         let gc = GenerationalGc::default();
-        // Mild pressure: eliding the cold bodies alone reaches the budget.
-        let budget = (estimate_tokens(&messages) as f64 * 0.72) as usize;
+        // Mild pressure: eliding the cold bodies alone reaches the budget
+        // (including the ledger headroom the normal phases reserve).
+        let budget = (estimate_tokens(&messages) as f64 * 0.80) as usize;
 
         let mut state = GcState::default();
         mark_hot(&messages, &mut state);

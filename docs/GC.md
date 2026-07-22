@@ -792,7 +792,7 @@ the observed failure it answers.
 | **On-topic old work outlives its usefulness gradually, not positionally** (t-1350: tangents sit mid-window where position-based strategies miss them) | Warm additionally admits messages **semantically near the recent centroid** (>= `--gc-warm-floor`, default 0.25) when an embedder is configured. Without one, warm is citation-only — strategy-honest: no fake similarity, no hidden provider calls, same degrade stance as semantic's heuristic mode. |
 | **Drop-and-hope loses behaviorally to annotate-and-elide** — mark-sweep completed tangent-return in every generation, cheapest, honest re-fetches; the retention-arithmetic winners thrashed or fabricated (t-1349 f1; t-1364 f6; t-1369; t-1374 f6: matched control on both curation fixtures at ~half cost) | **The reclaim shape is mark-sweep's, not ring's**: cold tool-result *bodies elide in place* to one-line `[gc: result elided …]` annotations (structure, ids, and recovery handles stay) *before* any whole-message eviction. True deletion is the last resort, and it feeds the markers and the ledger. |
 | **Abandoned tangents are the safe reclaim** (t-1350: semantic dropped 88% of the tangent at 100% relevant retention; uncited by construction) | **Cold = everything no signal vouches for**: not nursery, not hot, uncited, not near the centroid. Cold elides first, evicts first. |
-| **Mark-sweep's honest ceiling** — best-effort convergence ships over-target windows that suppress the slack-funded ledger (t-1373: ledger suppressed 6-12x on its early-needle cells) | Generational **converges**: after the elide passes it sweeps cold → degrade ladder like ring/stack, so the offline gates assert convergence — and the slack that funds the ledger survives (prediction tested by the offline matrix: fewer ledger suppressions than mark-sweep on the same cells). |
+| **Mark-sweep's honest ceiling** — best-effort convergence ships over-target windows that suppress the slack-funded ledger (t-1373: ledger suppressed 6-12x on its early-needle cells) | Generational **converges**: after the elide passes it sweeps cold → degrade ladder like ring/stack, so the offline gates assert convergence. Tight convergence has its own ceiling, though — a collector landing a few tokens under budget also starves the ledger — so the normal phases target `budget - 128` (the ledger headroom; measured before it existed: 49 vs mark-sweep's 35 suppressed collections on the matrix). Measured after: on the real recorded trace generational funds the ledger at both heavy pressures where mark-sweep suppresses it throughout (asserted); on degrade-dominated synthetic shapes it can still end ledger-less where mark-sweep's chunky frame sweeps overshoot into slack by luck — the honest residual, printed by the matrix. |
 
 ### Tier assignment (pure, at collect() time)
 
@@ -801,7 +801,10 @@ computed from exactly the inputs `collect()` already has:
 
 1. **Nursery** — the last `--gc-nursery` messages (default 8, the semantic
    recent-window rationale: the live working set, including the model's
-   own step-completion narration).
+   own step-completion narration), capped at half the window (floor 1): a
+   recency floor that swallowed a short window would force the collector
+   straight to the degrade rungs — whole-message ring behavior, exactly
+   the drop-and-hope shape this design rejects.
 2. **Hot** — the hard guards (system, last user message), messages whose
    chunk keys intersect `GcState.recall_hot` (the t-1362 write-barrier),
    and in-window tool results whose `content_fingerprint` has reached
@@ -850,6 +853,14 @@ Nursery is untouched by phases 1-4a/4b: "never collected" holds
 everywhere short of the terminal degrade rungs that every strategy shares
 (if even the protected set exceeds the budget, the t-1343
 backstop/overflow paths own the outcome).
+
+The normal phases (1-3) target `budget - 128` — the ledger headroom (see
+the honest-ceiling row above): the reclaim trades ~128 tokens of the
+least-vouched-for content so the progress ledger, the restart-loop
+breaker (t-1374), has room to render. The degrade rungs target the full
+budget: content decisions outrank bookkeeping (the t-1373 value
+ordering), so no rung ever evicts more of a relaxed guard to fund the
+ledger, and tiny budgets (< 4x the headroom) skip the reserve entirely.
 
 Interplay is honest, not duplicated: hot-keep and cited-keep are not
 bolt-on masks here — hot and warm membership *are* the tiers. The

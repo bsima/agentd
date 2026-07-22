@@ -1584,3 +1584,73 @@ re-run the t-1371 round.
   4/11 cells still burn to the cap doing honest, visible,
   non-repeating work. The model needs permission to STOP — answer
   with what it has, or admit — which no mechanism yet grants.
+
+## Generational GC (t-1167): offline validation
+
+Six generations of behavioral evidence gated this strategy; docs/GC.md
+"Strategy 5: Generational" carries the failure-mode -> tier mapping (every
+tier decision cites the round that forces it). Mechanism summary: tiers
+assigned inside collect() from live signals — nursery (recency floor,
+default 8, capped at half the window), hot (hard guards ∪ write-barrier membership ∪
+escalated-content protection), warm (citation in-degree ∪ centroid-near
+when embeddings are cached; citation-only without an embedder), cold (the
+unvouched remainder) — and the reclaim is mark-sweep's
+behaviorally-validated annotate-don't-drop shape: cold bodies ELIDE to
+one-line `[gc: result elided ...]` annotations before anything is
+whole-evicted, then cold evicts, warm elides, and the established degrade
+ladder (warm -> hot -> nursery floor -> prefix, hard guards never) makes
+convergence asserted rather than best-effort.
+
+**Offline validation (this repo, asserted):**
+
+- **Matrix (gc_evals):** `generational` is a full fifth strategy row —
+  every fixture x pressure x timing x cache-policy cell runs the
+  established assertion suite (determinism incl. derived message ids,
+  convergence — asserted, not best-effort like mark-sweep — hard guards,
+  pair atomicity, eviction visibility, ledger discipline, preserve-prefix
+  billing), plus the challenger gate: generational retains more coherent
+  structure than ring on every tool-chain window.
+- **Tier-specific gates:** tier assignment is deterministic and
+  signal-true on every real and synthetic window (tail = nursery, system
+  = hot, cited never cold); elide-before-evict ordering is asserted on
+  every cell that whole-evicted cold content (surviving fat cold results
+  must already be annotations); the nursery is inviolate until the
+  floor-relax rung with per-tier eviction accounting cross-checked
+  against the ladder flags (`evicted_*` vs `*_relaxed` on the gc_collect
+  `tiers` object); the cited-distant fixture's warm structure survives
+  (the citation-signal parallel of the semantic cited-keep gate); and a
+  write-barrier-marked hot needle keeps its full body under gate
+  pressure while cold ballast is reclaimed (t-1369 finding 3 as a tier
+  property).
+- **Replayed corpus (gc_behavior_evals, the t-1373 pattern):** all 61
+  recorded cells across the six generations replay with GenerationalGc
+  substituted for the recorded arm (provider/tool effects replay by
+  effect id, so every session reproduces its final answer — asserted).
+  The corpus budgets force 2-25 collections per cell; every gc_collect
+  carries the `tiers` object, tier sanity and ladder accounting hold on
+  every real window, and every evicting collection carries a ledger or a
+  recorded suppression.
+- **The t-1362 honest-ceiling measurement (prediction: elide-first
+  leaves more ledger slack — tested, and honestly mixed):** before the
+  ledger headroom existed, generational's tight convergence (landing a
+  few tokens under budget) suppressed the ledger MORE than mark-sweep's
+  over-target windows (49 vs 35 suppressed collections across the
+  tool-chain matrix at 0.5/0.35 pressure) — the prediction was refuted
+  as-built, from the opposite side of the budget line. The design
+  answer: normal phases target `budget - 128` (degrade rungs keep the
+  full budget — content outranks bookkeeping, the t-1373 value
+  ordering). Measured after: on the REAL recorded trace
+  (gc-coder-tool-chain) generational funds the ledger at both heavy
+  pressures with zero suppressions where mark-sweep suppresses it
+  throughout (asserted as the pinned deficiency/fix pair); across the
+  synthetic starvation shapes the totals are mark-sweep 35 vs
+  generational 39 per-collection suppressions and 7 vs 6 sessions ending
+  ledger-present — where degrade rungs dominate, generational converges
+  tightly and can end ledger-less while mark-sweep's chunky frame sweeps
+  overshoot into slack by luck. Printed per-cell by
+  `gc_generational_funds_the_ledger_where_mark_sweep_suppresses_it`.
+
+Positioning (docs/GC.md): the synthesis strategy — candidate future
+default pending behavioral validation; the shipped default stays `stack`
+(Ben's standing decision). The behavioral recording round is the final
+commit of this task (below).
