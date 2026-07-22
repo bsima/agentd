@@ -1,19 +1,26 @@
-# agentd Context GC Design
+# agentd Context GC
 
-Status: **`ring`, `mark-sweep`, `stack`, and `semantic` are implemented**
-(with `--gc`, `--gc-threshold`, `--gc-log`, `--gc-timing`, the
-`truncate_oversized_message` pre-pass, pair atomicity, and the eval
-harness). **`stack` is the default strategy** (t-1348, promoted on the
-t-1339 strategy-matrix data). **`--gc-cache preserve|ignore` is
-implemented** and `preserve` is the default: the system prompt plus the
-oldest ~25% of the budget are pinned as the stable cache prefix, eviction
-happens in the interior, and ring falls back to front-drop (reported via
-`cache_invalidated` on the `gc_collect` event, which is observed per
-collection rather than static per strategy) only when preserving cannot
-reach the budget. `tests/gc_evals.rs::gc_cache_preserve_keeps_prefix_stable`
-gates the preserve behavior. Every timing composes with the
-collect-on-overflow backstop (t-1343, see Trigger Policy). The `gc_collect`
-event reports `dropped_count`, not `frames_popped`.
+The agent context window is a fixed-size buffer, not an infinite log.
+agentd treats it as such: instead of crashing with `context_overflow` when
+the window fills, the runtime garbage-collects it — under budget pressure,
+old content is popped to one-line annotations, elided, or evicted, always
+with an in-window record of what was removed and how to recover it. The
+name is deliberate — this is GC, not "context compaction." Calling it what
+it is makes the design constraints and tradeoffs legible.
+
+Status: **all five strategies are implemented** — `ring`, `mark-sweep`,
+`stack` (the default, promoted on the t-1339 strategy-matrix data,
+t-1348), `semantic`, and `generational` — along with the hard guards,
+eviction markers with escalation, the progress ledger, the write-barrier
+`hot-keep` and citation `cited-keep` modifiers, cache-prefix
+preservation, and the collect-on-overflow backstop. Everything is
+exercised by an offline eval matrix plus recorded behavioral evals
+(`evals/gc/README.md`).
+
+This document has two layers: a **user guide** (defaults, flags, choosing
+a strategy, what your model will see in its window) and, below the
+divider, the **design and internals** (invariants, per-strategy
+mechanics, the signal machinery, and the generational design).
 
 ## Defaults and quick reference
 
@@ -27,8 +34,8 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 | `ring` | Drops oldest messages first | Chat-only windows; simplest, most predictable | `--gc ring` |
 | `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
 | `semantic` | Drops messages semantically distant from the recent thread (abandoned tangents first) | Long meandering sessions with dead ends; needs a registry `embeddings` entry | `--gc semantic` |
-| `generational` | Tiers the window from live signals (nursery/hot/warm/cold) and elides cold bodies before evicting anything | The synthesis strategy — candidate future default pending behavioral validation (default stays `stack`) | `--gc generational` |
-| `cited-keep` (default on, semantic only) | Messages cited by later ones (id mentions, `context_refs`) join the protected set | A recent turn builds on an old, off-topic tool result | `--gc-cited-keep false` to disable |
+| `generational` | Tiers the window from live signals (nursery/hot/warm/cold) and elides cold bodies before evicting anything | The synthesis strategy — candidate future default; its first online round matched mark-sweep's wins on 3/4 canon fixtures (default stays `stack`) | `--gc generational` |
+| `cited-keep` (default on; flag applies to `semantic` — `generational`'s warm tier bakes citations in) | Messages cited by later ones (id mentions, `context_refs`) join the protected set | A recent turn builds on an old, off-topic tool result | `--gc-cited-keep false` to disable |
 | `hot-keep` (default on, every strategy) | Content the model re-fetched or recalled after eviction (write-barrier hot set, t-1362) joins the protected set | Breaks the evict → re-fetch → re-evict loss loop (t-1369 finding 3) | `--gc-hot-keep false` to disable |
 | `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
 | cache `preserve` (default) | Pins system prompt + oldest ~25% of budget; evicts interior | Cached providers: zero prefix invalidations | `--gc-cache preserve` |
@@ -95,11 +102,14 @@ timings x 3 strategies x 2 cache policies):
   behaviorally-validated annotate-don't-drop shape to the reclaim: cold
   bodies elide to one-line annotations before anything is whole-evicted.
   Designed against six generations of behavioral evidence (see "Strategy 5:
-  Generational" below for the failure-mode-to-tier mapping). Positioning:
-  candidate future default pending behavioral validation; the current
-  default stays `stack` (Ben's standing decision). Without a registry
-  `embeddings` entry the warm tier is citation-only (strategy-honest;
-  documented below).
+  Generational" below for the failure-mode-to-tier mapping), and validated
+  in its first online round: it matched mark-sweep's behavioral wins on
+  three of the four canon fixtures — the only non-mark-sweep arm to
+  complete tangent-return — and never entered a restart loop
+  (evals/gc/README.md, "The generational round"). Positioning: candidate
+  future default; the current default stays `stack` (Ben's standing
+  decision). Without a registry `embeddings` entry the warm tier is
+  citation-only (strategy-honest; documented below).
 - **Cache `preserve`.** Delivered exactly what it promises: 0 prefix
   invalidations across all 180 preserve cells vs 733 across ignore cells.
   Every invalidation is a full-window re-read at provider prices, so on
@@ -112,23 +122,10 @@ timings x 3 strategies x 2 cache policies):
   regardless of timing, so this is a redundancy question, not a safety
   one.
 
-## Overview
-
-The agent context window is a fixed-size buffer, not an infinite log.
-We should treat it as such: apply garbage collection to keep it under budget
-rather than crashing with `context_overflow` when it fills up.
-
-This doc specifies the `--gc` flag, a `ContextGc` trait, and the first two
-implementations to build: `MarkSweep` and `StackFrame`. The name is deliberate
-— this is GC, not "context compaction." Calling it what it is makes the design
-constraints and tradeoffs legible.
-
----
-
 ## CLI Flags
 
 ```
-agent --gc <strategy>          # default: stack
+agent --gc <strategy>          # none | ring | mark-sweep | stack | semantic | generational (default: stack)
 agent --gc-threshold <0.0-1.0> # trigger GC at this fraction of budget (default: 0.85)
 agent --gc none                # disable GC entirely (hard overflow = error)
 agent --gc-log                 # emit gc_collect trace events (for debugging)
@@ -137,16 +134,18 @@ agent --gc-timing <when>       # threshold | catch-overflow | eager | every:N (d
 agent --gc-semantic-window <N> # semantic: recent-window size (centroid + recency floor; default: 8)
 agent --gc-semantic-floor <f>  # semantic: similarity floor (default: 0.25)
 agent --gc-cited-keep <bool>   # semantic: protect messages cited by later ones (default: true)
+agent --gc-hot-keep <bool>     # every strategy: protect re-fetched/recalled content (default: true)
 agent --gc-nursery <N>         # generational: nursery size (recency floor; default: 8)
 agent --gc-warm-floor <f>      # generational: warm similarity floor when an embedder is configured (default: 0.25)
 ```
 
-`--gc none` restores the current behavior and is important for deterministic
-evals that must not have GC noise in their context.
+`--gc none` disables collection entirely (overflow becomes a hard error) and
+is important for deterministic evals that must not have GC noise in their
+context.
 
 `--gc-threshold` is tunable because different workloads have different optimal
 trigger points: long tool chains benefit from earlier GC, short chat sessions
-don't need it at all. Make it tunable from day one.
+don't need it at all.
 
 `--gc-log` emits structured trace events on every collection:
 ```json
@@ -184,7 +183,7 @@ whose 0.85 trigger never fired). The timings:
   `gc_collect{trigger: "context_overflow", cycle: k}` event. A target that
   the provider accepted is remembered for the rest of the session turn, so
   later calls collect proactively instead of paying a failed request each.
-  Requires a GC strategy (`--gc ring` or `mark-sweep`).
+  Requires an actual GC strategy (any `--gc` value other than `none`).
 - `eager`: collect to the threshold target before every infer call.
 - `every:N`: collect to the threshold target on every Nth infer call.
 
@@ -199,7 +198,7 @@ The gc_collect event carries `timing`, `target_budget`, and `reason`
 (`scheduled` | `backstop` | `overflow`) fields so `--gc-log` makes all
 four timings — and the backstop — observable.
 
-Strategies (planned, not all implemented at once):
+Strategies:
 
 | Name           | Description                                      | Status      |
 |----------------|--------------------------------------------------|-------------|
@@ -218,7 +217,77 @@ Cross-strategy modifier:
 | `cited-keep` | Messages cited by later ones join the protected set (t-1351)   | implemented for `semantic` (`--gc-cited-keep`, default on) |
 | `hot-keep`   | Re-acquired-after-eviction content joins the protected set (t-1362) | implemented for every strategy (`--gc-hot-keep`, default on) |
 
+## What the model sees: markers, frames, the ledger, escalation
+
+GC never removes content silently — three behavioral eval rounds showed
+that silent removal makes models **fabricate** the missing content
+instead of recovering it. Every collection leaves an in-window record.
+As an operator reading a session (or a trace), these are the artifacts
+you and the model will see:
+
+- **Frame annotations** (`stack`): a popped tool call+result pair becomes
+  one line — `[frame call-3: shell(cat logs/x.log) -> first line of
+  output... — evicted; re-run to recover]`. The call id is the recovery
+  handle.
+- **Eviction markers** (every strategy): dropped messages are replaced by
+  a compact `[gc: ...]` line naming what was evicted and how to recover
+  it — `[gc: 2 evicted — shell call-3; recover: re-run the call — do not
+  guess]`. Consecutive drops share one line; markers count toward the
+  window budget and are themselves droppable (never silently).
+- **Escalation**: when the same content has been evicted 3 times in one
+  run, its marker stops offering recovery and names the honest exit —
+  `[gc: 'call-7' evicted 3 times — this content cannot stay in context:
+  summarize what you need into memory (remember) or ask the user — do
+  not re-fetch again]`. This terminates the evict → re-fetch → re-evict
+  loop for content that genuinely cannot fit.
+- **The progress ledger**: after any collection that evicted something,
+  one `[gc-ledger]` message near the tail lists every tool call the
+  session has completed, with per-entry state (`in-window` / `hot` /
+  `evicted` / `evicted Nx — do not re-fetch`). It is the model's own
+  auto-maintained "you are here" — the fix for the restart loop, where a
+  post-collection model concluded it was at step 1 and re-ran finished
+  work.
+- **Protection you don't see**: the system prompt and the last user
+  message always survive; content the model re-fetched or recalled after
+  eviction stops being evictable (`hot-keep`); results cited by later
+  messages are protected under `semantic` and `generational`
+  (`cited-keep`).
+
+The runtime tells the model all of this itself: the shipped guidance
+fragment (docs/GUIDANCE.md §2.4, `--no-runtime-guidance` to opt out)
+describes the marker, escalation, and ledger formats, so the model treats
+them as affordances rather than mystery text. Observability: with
+`--gc-log`, every collection emits a `gc_collect` trace event carrying
+tokens before/after, dropped counts, marker/ledger/hot-keep counters, and
+the trigger reason; `agent gc-stats <trace.jsonl>` summarizes them.
+
+Full mechanics: "Eviction markers", "The progress ledger", and "Citation
+signals" in the internals below.
+
+## The evidence
+
+Every mechanism above was promoted on recorded evidence, not taste: an
+offline matrix across strategies, timings, cache policies, and budget
+pressures (`cargo test -p agent-core --test gc_evals`) plus seven
+generations of recorded behavioral evals replaying real models under
+forced GC pressure.
+The headline findings: `stack` never dropped the live task statement in
+any cell (why it is the default); silent eviction reliably produced
+confident fabrication and markers flipped it into recovery attempts;
+hot-keep made recovery stick; the ledger broke or shrank the restart loop
+in every deciding cell; and `generational` — designed against the six
+prior generations of observed failure — matched mark-sweep's behavioral
+wins on three of the four canon fixtures with no restart loop anywhere.
+The full tables, fixtures, and per-round findings live in
+[evals/gc/README.md](../evals/gc/README.md).
+
 ---
+
+# Design & internals
+
+Everything below is the design layer: the trait contract, per-strategy
+mechanics, the signal machinery (citations, the write-barrier), marker and
+ledger internals, invariants, caching, and trigger policy.
 
 ## Trait Design
 
@@ -269,6 +338,8 @@ pub enum GcMode {
     Ring(RingGc),
     MarkSweep(MarkSweepGc),
     StackFrame(StackFrameGc),
+    Semantic(SemanticGc),
+    Generational(GenerationalGc),
 }
 ```
 
@@ -280,7 +351,7 @@ headroom for the response). Because strategies are stateless, `gc` itself is
 
 ---
 
-## Strategy 1: Ring Buffer (default)
+## Strategy 1: Ring Buffer
 
 **Policy:** When over budget, drop oldest `assistant`/`user`/`tool` messages
 until under budget. Never drop the system prompt or the last user message
@@ -405,6 +476,32 @@ to ~200 tokens of annotations without losing the semantic record.
 
 ---
 
+## Strategy 4: Semantic (t-1350)
+
+**Policy:** Score each message by cosine similarity between its embedding
+and the centroid of the last `--gc-semantic-window` messages (default 8 —
+the recency floor, immune from eviction), and drop the most distant
+first. Conversational dead ends and abandoned tangents go before older
+but on-topic history — which no position-based strategy can do.
+
+**Mechanics:** embeddings come from the model registry's `embeddings`
+entry (the same config memory retrieval uses, t-1340), computed in an
+async pre-pass and cached in `GcState` keyed by content hash (see "The
+cache-consuming pattern" under Invariants — `collect()` itself stays
+synchronous, deterministic, and provider-free). Without an embeddings
+entry — or when the endpoint fails, or under replay — scoring degrades to
+a deterministic recency heuristic rather than erroring.
+`--gc-semantic-floor` (default 0.25 cosine) keeps plausibly-related
+messages for a second pass; the protected set grows with `cited-keep`
+(default on — see Citation signals below) and `hot-keep`. Sweep phases:
+below-floor candidates most-distant-first, then above-floor, then the
+shared degrade ladder. Embedding calls are visible per collection as
+`gc_semantic_embed{embedded,cached,failed}` under `--gc-log`; embedding
+tokens are billed by the provider but are orders of magnitude cheaper
+than chat tokens.
+
+---
+
 ## Citation signals (t-1351): RC-via-citation and the recall write-barrier
 
 Position (`ring`, `stack`) and topic (`semantic`) are *proxies* for whether a
@@ -413,7 +510,8 @@ later message references is dead weight; one that a later turn quotes by id or
 re-pulls through `context_refs` is load-bearing regardless of its age or its
 topic. This section defines the citation graph, the `cited-keep` modifier
 built on it, and the recall-overlap write-barrier signal — the inputs the
-future `generational` (t-1167) and `refcount` strategies are designed against.
+`generational` strategy (t-1167, since shipped) and the future `refcount`
+strategy are designed against.
 
 ### The citation graph
 
@@ -762,11 +860,14 @@ record). Recordings made before the ledger replay with gc-derived fields
 lenient, detected by the absent `ledger_present` field (the established
 pre-marker/pre-hot-keep pattern). Guidance §2.4 (docs/GUIDANCE.md)
 describes the `[gc-ledger]` format to the model — mechanism first, text
-second. Online behavioral validation is the follow-up recording round
-(filed from t-1373); until then the ledger's evidence is offline — the
-matrix asserts presence/determinism/budget/prefix-stability per cell,
-and the behavioral harness replays the five recorded generations through
-the live ledger builder.
+second. Online behavioral validation ran as the ledger round (t-1374,
+evals/gc/README.md): the restart loop broke or shrank in every deciding
+cell (rpt 95 -> 40, two of five loop-breaker cells completing outright);
+the residual is a recall loop, and obedience to escalated markers is
+partial, not total. Offline, the matrix asserts
+presence/determinism/budget/prefix-stability per cell, and the
+behavioral harness replays the earlier recorded generations through the
+live ledger builder.
 
 ---
 
@@ -1101,24 +1202,23 @@ eval set. This also lets us tune `--gc-threshold` empirically.
 
 ---
 
-## Implementation Order
+## Implementation Order (historical — 1-5 are done)
 
-1. `RingGc` + `--gc` flag + `--gc-threshold` + `--gc-log` wiring + **pair-atomic drop test first**
-2. `MarkSweepGc` keyed on `ChatMessage.id` (UUID) + PromptIR section integration
-3. `StackFrameGc` with heuristic summarization (no LLM in v1)
-4. Eval harness before any new strategy is added after v1
-5. `GenerationalGc` — **done** (t-1167, designed against the six
-   behavioral-eval generations; see Strategy 5 above)
+1. `RingGc` + `--gc` flag + `--gc-threshold` + `--gc-log` wiring + **pair-atomic drop test first** — done
+2. `MarkSweepGc` keyed on `ChatMessage.id` (UUID) + PromptIR section integration — done
+3. `StackFrameGc` with heuristic summarization (no LLM in v1) — done
+4. Eval harness before any new strategy is added after v1 — done (`gc_evals` + `evals/gc/`)
+5. `GenerationalGc` — done (t-1167, designed against the six
+   behavioral-eval generations; see Strategy 5 above). `SemanticGc`
+   (t-1350) landed between 4 and 5.
 6. `stack-smart` variant with LLM summarization (future, gated on eval improvement)
 
 ---
 
-## Files to Touch
+## Where the code lives
 
-- `crates/agent-core/src/gc.rs` — new; trait + all strategy impls
-- `crates/agent-core/src/lib.rs` — pub mod gc
-- `crates/agent-core/src/interpreter.rs` — wire `ContextGc` into turn loop, emit `gc_collect` trace event
-- `crates/agent/src/main.rs` — `--gc`, `--gc-threshold`, `--gc-log` CLI flags; construct `GcMode`; pass to runtime
-- `crates/agent-core/src/prompt_ir.rs` — add `LifecycleState` to `Section`, and add a stable `id: Uuid` to `ChatMessage` (assigned on construction; breaks the schema, which is fine — no legacy persistence to preserve). `GcState.lifecycle` is keyed on this UUID.
-- `crates/agent-core/src/gc.rs` — also defines `GcState` (owned by Runtime, threaded into `collect`) and `truncate_oversized_message` pre-pass.
-- Runtime holds `gc: GcMode` + `gc_state: GcState`; strategies stay `&self`, only `gc_state` is `&mut`.
+- `crates/agent-core/src/gc.rs` — the `ContextGc` trait, all strategy impls, `GcState` (owned by the runtime, threaded into `collect`), the `truncate_oversized_message` pre-pass, citation/write-barrier machinery, markers, and the ledger
+- `crates/agent-core/src/interpreter.rs` — `ContextGc` wired into the turn loop (`collect_prompt`/`maybe_collect_prompt`), the embedding pre-pass, the overflow backstop, `gc_collect` trace events
+- `crates/agent/src/main.rs` — the `--gc*` CLI flags; constructs `GcMode` and passes it to the runtime
+- `crates/agent-core/src/prompt_ir.rs` — `ChatMessage.id` (stable UUID, assigned on construction), the canonical key into `GcState`
+- `crates/agent-core/tests/gc_evals.rs` — the offline matrix; `evals/gc/` — recorded fixtures and the behavioral eval rounds
