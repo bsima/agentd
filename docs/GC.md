@@ -27,6 +27,7 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 | `ring` | Drops oldest messages first | Chat-only windows; simplest, most predictable | `--gc ring` |
 | `mark-sweep` | Evicts dead call/result lifecycles; annotates incorporated results | Tool-heavy *batch* runs with `--gc-cache ignore` (best raw reduction) | `--gc mark-sweep` |
 | `semantic` | Drops messages semantically distant from the recent thread (abandoned tangents first) | Long meandering sessions with dead ends; needs a registry `embeddings` entry | `--gc semantic` |
+| `generational` | Tiers the window from live signals (nursery/hot/warm/cold) and elides cold bodies before evicting anything | The synthesis strategy — candidate future default pending behavioral validation (default stays `stack`) | `--gc generational` |
 | `cited-keep` (default on, semantic only) | Messages cited by later ones (id mentions, `context_refs`) join the protected set | A recent turn builds on an old, off-topic tool result | `--gc-cited-keep false` to disable |
 | `hot-keep` (default on, every strategy) | Content the model re-fetched or recalled after eviction (write-barrier hot set, t-1362) joins the protected set | Breaks the evict → re-fetch → re-evict loss loop (t-1369 finding 3) | `--gc-hot-keep false` to disable |
 | `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
@@ -87,6 +88,18 @@ timings x 3 strategies x 2 cache policies):
   protected set during the normal sweep phases, so a semantically distant
   result a recent message builds on ("per the output of call-X…") survives;
   see the Citation signals section.
+- **`generational`** (t-1167). The synthesis strategy: tiers every window
+  message from the live signals the other strategies consume piecemeal
+  (recency, the citation graph, the recall write-barrier hot set, eviction
+  counts, embeddings when configured) and applies mark-sweep's
+  behaviorally-validated annotate-don't-drop shape to the reclaim: cold
+  bodies elide to one-line annotations before anything is whole-evicted.
+  Designed against six generations of behavioral evidence (see "Strategy 5:
+  Generational" below for the failure-mode-to-tier mapping). Positioning:
+  candidate future default pending behavioral validation; the current
+  default stays `stack` (Ben's standing decision). Without a registry
+  `embeddings` entry the warm tier is citation-only (strategy-honest;
+  documented below).
 - **Cache `preserve`.** Delivered exactly what it promises: 0 prefix
   invalidations across all 180 preserve cells vs 733 across ignore cells.
   Every invalidation is a full-window re-read at provider prices, so on
@@ -124,6 +137,8 @@ agent --gc-timing <when>       # threshold | catch-overflow | eager | every:N (d
 agent --gc-semantic-window <N> # semantic: recent-window size (centroid + recency floor; default: 8)
 agent --gc-semantic-floor <f>  # semantic: similarity floor (default: 0.25)
 agent --gc-cited-keep <bool>   # semantic: protect messages cited by later ones (default: true)
+agent --gc-nursery <N>         # generational: nursery size (recency floor; default: 8)
+agent --gc-warm-floor <f>      # generational: warm similarity floor when an embedder is configured (default: 0.25)
 ```
 
 `--gc none` restores the current behavior and is important for deterministic
@@ -193,7 +208,7 @@ Strategies (planned, not all implemented at once):
 | `mark-sweep`   | Evict "dead" sections by type annotation         | implemented |
 | `stack`        | Pop completed tool-call frames to summaries      | implemented (default) |
 | `semantic`     | Drop messages semantically distant from the recent thread | implemented |
-| `generational` | Hot/warm/cold compaction (JVM-style)             | future (t-1167; consumes the citation + recall signals below) |
+| `generational` | Hot/warm/cold tiered collection (t-1167; consumes the citation + recall signals below) | implemented |
 | `refcount`     | Dependency-graph reachability eviction           | future (the citation graph below is its reachability structure) |
 
 Cross-strategy modifier:
@@ -755,6 +770,114 @@ the live ledger builder.
 
 ---
 
+## Strategy 5: Generational (t-1167) — tiers from six generations of observed failure
+
+Generational GC was explicitly gated on eval data: "the design should be
+written against observed failure modes, not speculation" (its own task
+description). Six behavioral-eval generations later (t-1349 → t-1364 →
+t-1367 → t-1369 → t-1362/t-1370 → t-1371/t-1373/t-1374 —
+evals/gc/README.md), the evidence exists. Every tier decision below cites
+the observed failure it answers.
+
+### The evidence → tier mapping
+
+| Observed failure (round) | Design commitment it forces |
+|---|---|
+| **Confabulation of evicted needles** — models fabricate access codes instead of recovering (t-1349 f3: cfab 7/9; t-1364 f3; the t-1367 re-run) | Silent loss is banned (markers, t-1360 — inherited unchanged); content the task provably needs again must stop being evictable — the **hot** tier exists. |
+| **Recovery that doesn't stick** — re-fetched values re-evicted 2-3x, then a guess (t-1369 f3: 4/10 residual fabrications; reev 20-354 in t-1362's round) | **Hot = write-barrier membership** (`GcState.recall_hot`, chunk-matched since t-1362): a re-acquired value joins hot the moment it re-enters the window, and hot is protected through every normal phase. |
+| **Escalated content churned anyway** — "do not re-fetch again" markers disobeyed inside loops (t-1370; t-1374 f4: rpte/rpt near-total in loop cells) | In-window content whose fingerprint reached `EVICTION_ESCALATION_AFTER` evictions also joins **hot** — a fourth eviction is pure thrash; its elision, when forced, carries the honest-exit text. |
+| **Silent task eviction** — ring/stack degrade evicted the live task; the loop accepted "I'm ready to help!" as final (t-1364 f2, 8/8 cells) | Hard guards (system + last user, t-1367) are **hot by definition** and survive every phase — inherited invariant, now also a tier membership. |
+| **The restart loop** — evicting the model's own recent step-completion narration resets it to step 1 (t-1349 f2; t-1371's refutation at 4x budget; the ledger halved it, t-1374) | The **nursery** (recency floor, default 8 messages) covers the live working set *including the model's own recent narration* — never collected in any normal phase, relaxed only in terminal degrade (semantic's floor precedent). The ledger (t-1373) remains the cross-window consolidation. |
+| **Cited-but-distant results dropped** — similarity-only scoring evicts the old lookup a recent turn builds on (t-1351, the 2x2's gap cell; pinned by the cited-distant fixture) | **Warm = citation in-degree** (`CitationGraph`, in-`collect()` extraction): cited messages are protected through normal sweeps with cited-keep strength. |
+| **On-topic old work outlives its usefulness gradually, not positionally** (t-1350: tangents sit mid-window where position-based strategies miss them) | Warm additionally admits messages **semantically near the recent centroid** (>= `--gc-warm-floor`, default 0.25) when an embedder is configured. Without one, warm is citation-only — strategy-honest: no fake similarity, no hidden provider calls, same degrade stance as semantic's heuristic mode. |
+| **Drop-and-hope loses behaviorally to annotate-and-elide** — mark-sweep completed tangent-return in every generation, cheapest, honest re-fetches; the retention-arithmetic winners thrashed or fabricated (t-1349 f1; t-1364 f6; t-1369; t-1374 f6: matched control on both curation fixtures at ~half cost) | **The reclaim shape is mark-sweep's, not ring's**: cold tool-result *bodies elide in place* to one-line `[gc: result elided …]` annotations (structure, ids, and recovery handles stay) *before* any whole-message eviction. True deletion is the last resort, and it feeds the markers and the ledger. |
+| **Abandoned tangents are the safe reclaim** (t-1350: semantic dropped 88% of the tangent at 100% relevant retention; uncited by construction) | **Cold = everything no signal vouches for**: not nursery, not hot, uncited, not near the centroid. Cold elides first, evicts first. |
+| **Mark-sweep's honest ceiling** — best-effort convergence ships over-target windows that suppress the slack-funded ledger (t-1373: ledger suppressed 6-12x on its early-needle cells) | Generational **converges**: after the elide passes it sweeps cold → degrade ladder like ring/stack, so the offline gates assert convergence — and the slack that funds the ledger survives (prediction tested by the offline matrix: fewer ledger suppressions than mark-sweep on the same cells). |
+
+### Tier assignment (pure, at collect() time)
+
+Deterministic classification of every window message, in precedence order,
+computed from exactly the inputs `collect()` already has:
+
+1. **Nursery** — the last `--gc-nursery` messages (default 8, the semantic
+   recent-window rationale: the live working set, including the model's
+   own step-completion narration).
+2. **Hot** — the hard guards (system, last user message), messages whose
+   chunk keys intersect `GcState.recall_hot` (the t-1362 write-barrier),
+   and in-window tool results whose `content_fingerprint` has reached
+   `EVICTION_ESCALATION_AFTER` evictions.
+3. **Warm** — messages cited by a later window message
+   (`CitationGraph::extract` in-degree >= 1), or — when embeddings are
+   cached — scoring at or above `--gc-warm-floor` cosine against the
+   centroid of the nursery messages.
+4. **Cold** — the remainder: uncited, distant (or unscoreable), not hot,
+   not recent.
+
+Promotion is implicit and per-collection: tiers are recomputed from live
+signals every `collect()`, so a message promotes (cold → warm on first
+citation; any → hot on re-acquisition) or demotes (warm → cold when its
+citer is evicted) with no cross-turn tier state to corrupt. All inputs
+(`recall_hot`, `eviction_counts`, `embeddings`) are the existing GcState
+fields with their existing write disciplines; `collect()` stays a pure
+function of `(messages, budget, state)`.
+
+### Collection policy by tier
+
+Phases, in order, each stopping the moment the window fits the budget:
+
+1. **Cold elide** — cold tool-result bodies rewrite in place to the
+   `[gc: result elided — …; recover: re-run the call — do not guess]`
+   annotation family (escalation-aware, t-1370), oldest first, only when
+   the annotation is smaller than the body and a later assistant message
+   exists (the incorporation rule — never destroy the live working set).
+2. **Cold evict** — whole cold atomic groups drop, oldest first, pair
+   atomicity preserved. Markers and the ledger account for every drop
+   (the `with_window_bookkeeping` wrapper, unchanged).
+3. **Warm elide** — warm tool-result bodies shrink the same way;
+   warm *structure* stays (the citation handle survives in the
+   annotation).
+4. **Degrade ladder**, established ordering (heuristic guards → billing
+   contract → hard guards):
+   a. warm evicts (cited-keep strength relaxes);
+   b. hot elides, then evicts (hot-keep strength relaxes) — nursery still
+      untouched;
+   c. the nursery floor relaxes (semantic's phase-3 precedent), prefix
+      pin still held;
+   d. the pinned prefix falls (billing contract last, invalidation
+      reported) — system + last user never drop.
+
+Nursery is untouched by phases 1-4a/4b: "never collected" holds
+everywhere short of the terminal degrade rungs that every strategy shares
+(if even the protected set exceeds the budget, the t-1343
+backstop/overflow paths own the outcome).
+
+Interplay is honest, not duplicated: hot-keep and cited-keep are not
+bolt-on masks here — hot and warm membership *are* the tiers. The
+standalone strategies keep their existing hot-keep/cited-keep behavior
+unchanged; generational is a new `GcMode::Generational`, not a rewrite.
+Markers, escalation, and the ledger ride the shared bookkeeping wrapper
+exactly as for every other strategy.
+
+### Config
+
+`--gc generational` plus two knobs:
+
+- `--gc-nursery <N>` (default 8): the recency floor. Same default and
+  rationale as `--gc-semantic-window` — the last ~3-4 exchanges define
+  the live task; larger nurseries starve the collector at small budgets.
+- `--gc-warm-floor <f>` (default 0.25): warm-by-similarity threshold,
+  active only when a registry `embeddings` entry exists. Same default and
+  rationale as `--gc-semantic-floor` — below ~0.25 cosine two passages
+  share almost no topic.
+
+Without an embedder the warm tier is citation-only (a startup warning
+says so); everything else is unchanged. Observability: `gc_collect`
+events gain a `tiers` object (per-tier assignment counts, elide/evict
+counts per tier, and which degrade rungs fired) so tier decisions are
+replayable and eval-visible.
+
+---
+
 ## Invariants (apply to every strategy)
 
 These hold for `ring`, `mark-sweep`, `stack`, and all future strategies. They
@@ -973,7 +1096,8 @@ eval set. This also lets us tune `--gc-threshold` empirically.
 2. `MarkSweepGc` keyed on `ChatMessage.id` (UUID) + PromptIR section integration
 3. `StackFrameGc` with heuristic summarization (no LLM in v1)
 4. Eval harness before any new strategy is added after v1
-5. `GenerationalGc` (future, after eval data exists)
+5. `GenerationalGc` — **done** (t-1167, designed against the six
+   behavioral-eval generations; see Strategy 5 above)
 6. `stack-smart` variant with LLM summarization (future, gated on eval improvement)
 
 ---
