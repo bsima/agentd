@@ -1587,6 +1587,36 @@ struct CellId {
 /// Then the t-1364 unguided coverage and `none` baselines, all recorded.
 fn planned_cells() -> Vec<CellId> {
     let mut cells = Vec::new();
+    // t-1167 generational round, priority order (first, so the spend cap
+    // can never cut the deciding cells): the behavioral canon vs the
+    // existing baselines — does generational match mark-sweep's
+    // behavioral wins (the only tangent-return completer across
+    // generations; the honest early-needle answers) while beating its
+    // starvation-budget ledger-suppression ceiling and retention
+    // weaknesses? n=2 where the canon's deciding failures live
+    // (early-needle confabulation/recovery; tangent-return restart
+    // loop), n=1 on the curation fixtures. All guided (the shipped
+    // default; at the starvation budgets the t-1368 gate suppresses the
+    // fragment, at 8000 the minimal core renders — identical delivery to
+    // every baseline recording).
+    for fixture in ["early-needle", "tangent-return"] {
+        for sample in [1, 2] {
+            cells.push(CellId {
+                fixture,
+                arm: Arm::Generational,
+                guided: true,
+                sample,
+            });
+        }
+    }
+    for fixture in ["distractor-update", "clean-long"] {
+        cells.push(CellId {
+            fixture,
+            arm: Arm::Generational,
+            guided: true,
+            sample: 1,
+        });
+    }
     // t-1374 ledger round, priority order (see the doc comment above).
     for sample in [1, 2] {
         cells.push(CellId {

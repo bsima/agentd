@@ -1654,3 +1654,124 @@ Positioning (docs/GC.md): the synthesis strategy — candidate future
 default pending behavioral validation; the shipped default stays `stack`
 (Ben's standing decision). The behavioral recording round is the final
 commit of this task (below).
+
+## The generational round (t-1167, online): the synthesis strategy vs the behavioral canon
+
+The deciding question, with every signal live in one strategy: does
+generational match mark-sweep's behavioral wins — the only tangent-return
+completer across the generations, the honest early-needle answers, the
+control-matching curation completions — while beating its
+starvation-budget ledger-suppression ceiling and its retention
+weaknesses (offline convergence is asserted for generational, not
+best-effort)?
+
+**Design.** 6 cells recorded 2026-07-22 on the t-1167 runtime (d26ec6b +
+the recording-plan commit), same model/provider/defaults as every round
+(`anthropic/claude-haiku-4.5` via OpenRouter), priority-ordered under a
+$1.50 cap: the behavioral canon x generational guided — early-needle n=2
+(the confabulation/recovery fixture), tangent-return n=2 (the restart
+loop; mark-sweep's fixture), distractor-update and clean-long n=1 (the
+curation regime). Guidance delivery is identical to every baseline
+(suppressed at the starvation budgets, minimal core at 8000).
+Comparisons are against the baselines already in this README — the
+t-1362/t-1374 rows for the starvation fixtures, the t-1371/t-1374 rows
+for the curation fixtures. Spend: **$0.326 matrix + ~$0.04 judge ≈
+$0.37** (cap $1.50). Offline replay reproduces every cell strictly — gc
+stream, tiers object, ledger fields included — re-verified from a cold
+offline run (and the six new recordings joined the 61-cell corpus the
+tier-sanity replay test drives).
+
+### Results (the 6 generational cells)
+
+```
+fixture            arm        guid s turns evals  rpt rptl pldr rpte refx rem prem rec coll reasons     drop ovl hot reev esc mkr mkref ldg   in_tok  out_tok       cost wall_s  ok cfab rot rcov admt judge
+early-needle       generational on   1    18    11    5    1    5    4    5   1    0   5   15 s:15         240 295   1  113   3   7     1   3    42466     1620  $0.050566   30.1  NO    -   -  yes    -   0/3
+early-needle       generational on   2    18    15    5    1    2    4    2   2    0   0   15 s:15         224 219   2  102   3   7     0   3    42835     1661  $0.051140   29.2  NO  YES   -  yes    -   0/3
+tangent-return     generational on   1     9     8    2    1    2    1    4   1    0   1    7 s:7           62 398   1   28   4   8     0  10    19877      852  $0.024137   16.0 yes    -   -  yes    -   1/3
+tangent-return     generational on   2    12     5    3    0    3    3    0   1    0   6   10 s:10         110 494   1   57   8  15     0  10    25937     1015  $0.031012   21.3 yes    -   -  yes    -   1/3
+distractor-update  generational on   1    11     9    0    0    0    0    0   1    0   0    8 s:8           48 330   1   25   5  10     0   9    57083      953  $0.061848   19.8 yes    -   -    -    -   3/3
+clean-long         generational on   1    19    13    6    6    6    5    3   4    1   3   15 s:15         180 1149   5  109  12  24     0  10    99151     1621  $0.107256   34.2 yes    -   -  yes    -   1/3
+```
+
+The final answers, verbatim where deciding: tangent-return s1/s2 both
+`CATEGORIES: timeout,checksum,quota` (the correct order, both samples);
+distractor-update `QUOTE UNIT 57 TOTAL 570` (exact, rot-free);
+clean-long `REGION NORTH-7 SHIPPED 8 AUDIT AUD-4413` (exact);
+early-needle s1 `ACCESS MX-7749-KESTREL TOTAL 278` (the REAL code, wrong
+sum — the honest-slip mode), s2 `ACCESS QT6-4X94 TOTAL 26` (fabricated).
+
+### Per-cell before/after (baselines are the named rows above)
+
+| cell | baseline (round) | generational (this round) |
+|---|---|---|
+| tangent-return s1 | mark-sweep the only reliable completer across five generations ($0.0146-0.0223, one n=1 order miss in t-1362); stack's first-ever completion needed the ledger + 25 turns/$0.070 (t-1374) | **completes, correct order** — 9 turns, rpt 2, $0.024, no restart loop |
+| tangent-return s2 | stack s2 recall-looped to the cap (rec 39, no answer, $0.072; t-1374) | **completes, correct order** — 12 turns, rpt 3, rec 6 (the recall detour contained), $0.031 |
+| early-needle s1 | t-1362 deciding cells: mark-sweep s1 the only both-needles pass in six generations; ring/stack burned to the 27-turn cap or fabricated | **no turn cap** (18 turns), answers with the REAL code, wrong sum ($0.051) — the honest ceiling, not confabulation |
+| early-needle s2 | pre-marker baseline cfab 7/9; hot-keep era 1 fabricated code in 10 cells | **fabricates** (`QT6-4X94`) — the one confabulation of this round (cfab 1/6 cells) |
+| distractor-update s1 | control 2/2 exact at $0.097-0.098; mark-sweep completes at $0.056 (t-1374); stack loops at $0.161 | **completes exact, 3/3 judge** — 11 turns, rpt 0, $0.062 (64% of control) |
+| clean-long s1 | control 2/2 exact at $0.095-0.120; mark-sweep completes at $0.085; stack loops (t-1374) | **completes exact** — 19 turns, rpt 6, $0.107 (inside the control band, above mark-sweep) |
+
+### Verdict: generational matches mark-sweep's behavioral wins on three of the four canon fixtures — the first non-mark-sweep arm to complete tangent-return at n=2 — and never enters a restart loop; the residuals are the honest ceiling (wrong sums), one fabrication, and cost above mark-sweep's
+
+Caveats as always: one model, n<=2, provider-default temperature, and
+mark-sweep's baselines partly come from different mechanism generations
+(named per row).
+
+1. **The restart loop never appears: 0/6 cells cap, 0/6 loop.** rpt 0-6
+   everywhere (the loop signature is >= 20); every cell either completes
+   (4/6) or answers wrongly without thrash (2/6). On the two fixtures
+   where stack looped in t-1374 (clean-long, tangent s2's recall loop),
+   generational completes. The nursery + ledger + tiers composition did
+   what the design intended: the model's own narration survives
+   collection, so it never resets to step 1.
+2. **Tangent-return, n=2, correct order — the fixture mark-sweep owned
+   for five generations.** Cheaper than every non-mark-sweep completion
+   ($0.024/$0.031 vs stack's $0.070 ledger-guided crawl) and without
+   mark-sweep's n=1 order miss (t-1362). The cost premium vs mark-sweep's
+   own best ($0.0146-0.0223) is real and reported.
+3. **Curation regime: 2/2 completions, control-matching answers.**
+   distractor-update matches mark-sweep's profile (rpt 0, 3/3 judge,
+   under control cost); clean-long completes exactly where stack looped,
+   at control-band cost. The control is still never beaten on accuracy —
+   consistent with every round since t-1371; the strong curation form
+   stays refuted.
+4. **Early-needle stays the honest ceiling.** No cell caps and no cell
+   loses the code silently: s1 carries the real code to a wrong sum
+   (right-code-wrong-sum, the mode t-1362 called the honest slip); s2
+   fabricates once. Mark-sweep's t-1362 s1 remains the only both-needles
+   pass of any generation; generational does not clear that bar, it
+   matches the shape of the era's second-best cells while ring/stack
+   burned to the cap. cfab 1/6 this round vs 7/9 pre-marker.
+5. **The suppression ceiling moved.** At 8000: ledger present with 9-10
+   itemized entries, 0-1 suppressions per cell (mark-sweep's t-1374
+   profile). At the starvation budgets, where t-1373 found mark-sweep's
+   ledger suppressed throughout: generational still renders it —
+   entries_max 3, present on the deciding collections, 8-9 of 15
+   suppressed — the offline headroom finding (budget-128 normal phases)
+   visible in vivo. Partial, honestly: more than half the starvation
+   collections still suppress; the record survives, coalesced.
+6. **Tiers behaved in vivo.** hot 1-5 per collection (the write-barrier
+   needle protected: early-needle s1's re-fetched code survived to the
+   answer), reev 25-113 at starvation (degrade pressure still dominates
+   there, as with every strategy), esc 3-12 with no unprompted
+   admissions (admt 0/6 — seven generations running). Unprompted memory
+   use continues (rem 1-4, rec 0-6; clean-long prem 1).
+7. **Judge column: completions score 1/3.** All three starvation-regime
+   completions read `stayed_on_task: false, no_redundant_work: false,
+   grounded_final_answer: true` — the judge dings the memory detours and
+   re-fetches the recovery affordances themselves induce; only
+   distractor-update's rpt-0 run scores 3/3. The tension between
+   recovery affordances and judge-visible tidiness is now a measured
+   property of the whole mechanism stack, not a generational quirk.
+
+**Positioning after this round:** the synthesis claim survives contact —
+generational is the only arm that completed tangent-return at n=2,
+completed both curation fixtures, and never looped or capped, while
+keeping the ledger alive at budgets that silence mark-sweep's. It does
+not yet beat mark-sweep's best single cells on cost or on the
+early-needle both-needles bar, and one fabrication remains. Default
+stays `stack` per the standing decision; on this table the
+candidate-future-default case now reads generational >= mark-sweep on
+behavior breadth, mark-sweep still ahead on per-cell cost, with
+steady-state evidence at realistic budgets still the missing piece for
+any promotion.
