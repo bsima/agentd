@@ -49,6 +49,17 @@ const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// `clientId` in Omni/Agent/Auth.hs.
 const CLAUDE_CODE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+/// Anthropic OAuth token endpoint. Mirrors `tokenUrl` in Omni/Agent/Auth.hs —
+/// note this is console.anthropic.com, not claude.ai.
+const CLAUDE_CODE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+
+/// Redirect URI registered for the Claude Code OAuth client. Mirrors
+/// `redirectUri` in Omni/Agent/Auth.hs.
+const CLAUDE_CODE_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+
+/// Anthropic OAuth scopes. Mirrors `scopes` in Omni/Agent/Auth.hs.
+const CLAUDE_CODE_SCOPES: &str = "org:create_api_key user:profile user:inference";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthToken {
     #[serde(rename = "access")]
@@ -348,79 +359,59 @@ impl OAuthChatProvider {
             );
             return Ok(token);
         }
-        tracing::info!(provider = self.kind.name(), "starting OAuth device login");
-        let device = self.start_device_login().await?;
+        // Claude: the authorization-code + PKCE paste-back flow, ported from
+        // the proven Haskell implementation (Omni/Agent/Auth.hs). The
+        // device-code endpoint this command used to call does not exist on
+        // claude.ai (405 Method Not Allowed) — same class of bug as t-1170's
+        // Codex device flow.
+        tracing::info!(provider = self.kind.name(), "starting OAuth PKCE login");
+        let pkce = generate_pkce();
+        // In this flow the state parameter is the PKCE verifier (mirroring
+        // the reference implementation, whose missing-state fallback assumes
+        // exactly that).
+        let url = anthropic_auth_url(&pkce, &pkce.verifier);
         eprintln!(
-            "Open this URL to authorize {}: {}",
-            self.kind.name(),
-            device
-                .verification_uri_complete
-                .as_deref()
-                .unwrap_or(&device.verification_uri)
+            "Open this URL to authorize {}:\n\n{url}\n",
+            self.kind.name()
         );
-        if let Some(code) = &device.user_code {
-            eprintln!("Enter code: {code}");
+        eprint!("Paste the authorization code (code#state): ");
+        let line = tokio::task::spawn_blocking(|| {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_line(&mut buf)
+                .map(|_| buf)
+                .context("reading authorization code from stdin")
+        })
+        .await??;
+        let (code, state) = split_pasted_code(line.trim(), &pkce.verifier);
+        if code.is_empty() {
+            return Err(anyhow!("no authorization code entered"));
         }
-        let token = self.poll_device_token(&device).await?;
-        tracing::info!(provider = self.kind.name(), "OAuth device login completed");
+        let response = self
+            .client
+            .post(CLAUDE_CODE_TOKEN_URL)
+            .json(&anthropic_exchange_body(&code, &state, &pkce.verifier))
+            .send()
+            .await
+            .context("exchanging authorization code")?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "OAuth login for {} returned {status}: {text}",
+                self.kind.name()
+            ));
+        }
+        let token = parse_token(&text)?;
+        tracing::info!(provider = self.kind.name(), "OAuth PKCE login completed");
         self.store.save(&token).await?;
         Ok(token)
-    }
-
-    async fn start_device_login(&self) -> Result<DeviceAuthorization> {
-        let endpoint = match self.kind {
-            OAuthProviderKind::Codex => "https://auth.openai.com/oauth/device/code",
-            OAuthProviderKind::ClaudeCode => "https://claude.ai/oauth/device/code",
-        };
-        let response = self.client.post(endpoint).send().await;
-        match response {
-            Ok(response) if response.status().is_success() => response
-                .json::<DeviceAuthorization>()
-                .await
-                .context("parsing OAuth device authorization"),
-            Ok(response) => Err(anyhow!(
-                "OAuth login for {} returned {}: {}",
-                self.kind.name(),
-                response.status(),
-                response.text().await.unwrap_or_default()
-            )),
-            Err(err) => Err(err).context("starting OAuth login"),
-        }
-    }
-
-    async fn poll_device_token(&self, device: &DeviceAuthorization) -> Result<OAuthToken> {
-        let endpoint = match self.kind {
-            OAuthProviderKind::Codex => "https://auth.openai.com/oauth/token",
-            OAuthProviderKind::ClaudeCode => "https://claude.ai/oauth/token",
-        };
-        let interval = device.interval.unwrap_or(5);
-        loop {
-            let response = self
-                .client
-                .post(endpoint)
-                .json(&json!({
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "device_code": device.device_code,
-                }))
-                .send()
-                .await
-                .context("polling OAuth token")?;
-            let status = response.status();
-            let text = response.text().await?;
-            if status.is_success() {
-                return parse_token(&text);
-            }
-            if !text.contains("authorization_pending") && !text.contains("slow_down") {
-                return Err(anyhow!("OAuth token polling returned {status}: {text}"));
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        }
     }
 
     async fn exchange_refresh_token(&self, refresh_token: &str) -> Result<OAuthToken> {
         let endpoint = match self.kind {
             OAuthProviderKind::Codex => "https://auth.openai.com/oauth/token",
-            OAuthProviderKind::ClaudeCode => "https://claude.ai/oauth/token",
+            OAuthProviderKind::ClaudeCode => CLAUDE_CODE_TOKEN_URL,
         };
         // The token endpoints require the client_id on the refresh_token grant.
         // Omitting it yields a 400 "Missing 'client_id'". These values mirror
@@ -696,13 +687,43 @@ pub fn generate_pkce() -> PkcePair {
     }
 }
 
-pub fn anthropic_auth_url(pkce: &PkcePair) -> String {
-    let redirect = "https://console.anthropic.com/oauth/code/callback";
+/// Build the Anthropic authorize URL. Parameter set and order mirror
+/// `buildAnthropicAuthUrl` in Omni/Agent/Auth.hs (the proven contract):
+/// code=true, the real client id, scope, and state are all required — the
+/// endpoint accepts the request but the token exchange rejects mismatches.
+pub fn anthropic_auth_url(pkce: &PkcePair, state: &str) -> String {
     format!(
-        "https://claude.ai/oauth/authorize?response_type=code&client_id=claude-code&redirect_uri={}&code_challenge={}&code_challenge_method=S256",
-        percent_encode(redirect),
-        pkce.challenge
+        "https://claude.ai/oauth/authorize?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
+        CLAUDE_CODE_CLIENT_ID,
+        percent_encode(CLAUDE_CODE_REDIRECT_URI),
+        percent_encode(CLAUDE_CODE_SCOPES),
+        pkce.challenge,
+        percent_encode(state),
     )
+}
+
+/// Split the pasted `code#state` string. Some authorize UIs omit the state
+/// fragment; the reference implementation then falls back to the PKCE
+/// verifier, which is what this flow sent as `state` in the authorize URL.
+fn split_pasted_code(input: &str, verifier: &str) -> (String, String) {
+    match input.split_once('#') {
+        Some((code, state)) if !state.is_empty() => (code.to_string(), state.to_string()),
+        Some((code, _)) => (code.to_string(), verifier.to_string()),
+        None => (input.to_string(), verifier.to_string()),
+    }
+}
+
+/// The authorization-code exchange body. Field set mirrors `exchangeCode`
+/// in Omni/Agent/Auth.hs.
+fn anthropic_exchange_body(code: &str, state: &str, verifier: &str) -> serde_json::Value {
+    json!({
+        "grant_type": "authorization_code",
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+        "code": code,
+        "state": state,
+        "redirect_uri": CLAUDE_CODE_REDIRECT_URI,
+        "code_verifier": verifier,
+    })
 }
 
 fn base64url_no_pad(bytes: &[u8]) -> String {
@@ -735,15 +756,6 @@ fn percent_encode(input: &str) -> String {
         }
     }
     out
-}
-
-#[derive(Debug, Deserialize)]
-struct DeviceAuthorization {
-    device_code: String,
-    user_code: Option<String>,
-    verification_uri: String,
-    verification_uri_complete: Option<String>,
-    interval: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1303,11 +1315,62 @@ mod tests {
             verifier: "v".repeat(43),
             challenge: "c".repeat(43),
         };
-        let url = anthropic_auth_url(&pkce);
+        let url = anthropic_auth_url(&pkce, &pkce.verifier);
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback"
         ));
         assert!(!url.contains("redirect_uri=https://console.anthropic.com/oauth/code/callback"));
+    }
+
+    /// The authorize URL must carry the full parameter set the working
+    /// Haskell implementation sends: code=true, the real client id, the
+    /// scopes (percent-encoded), and state. `client_id=claude-code` was the
+    /// old bug — the endpoint 405s/rejects without the registered id.
+    #[test]
+    fn anthropic_auth_url_matches_the_haskell_contract() {
+        let pkce = PkcePair {
+            verifier: "v".repeat(43),
+            challenge: "c".repeat(43),
+        };
+        let url = anthropic_auth_url(&pkce, "mystate");
+        assert!(url.starts_with("https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&"));
+        assert!(url.contains("scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("&state=mystate"));
+        assert!(!url.contains("client_id=claude-code"));
+    }
+
+    #[test]
+    fn pasted_code_splits_with_verifier_fallback() {
+        assert_eq!(
+            split_pasted_code("abc#st", "vrf"),
+            ("abc".into(), "st".into())
+        );
+        // Missing or empty state falls back to the verifier, mirroring the
+        // reference implementation's exchangeCode fallback.
+        assert_eq!(
+            split_pasted_code("abc", "vrf"),
+            ("abc".into(), "vrf".into())
+        );
+        assert_eq!(
+            split_pasted_code("abc#", "vrf"),
+            ("abc".into(), "vrf".into())
+        );
+    }
+
+    #[test]
+    fn anthropic_exchange_body_mirrors_the_haskell_field_set() {
+        let body = anthropic_exchange_body("thecode", "thestate", "theverifier");
+        assert_eq!(body["grant_type"], "authorization_code");
+        assert_eq!(body["client_id"], CLAUDE_CODE_CLIENT_ID);
+        assert_eq!(body["code"], "thecode");
+        assert_eq!(body["state"], "thestate");
+        assert_eq!(
+            body["redirect_uri"],
+            "https://console.anthropic.com/oauth/code/callback"
+        );
+        assert_eq!(body["code_verifier"], "theverifier");
+        assert_eq!(body.as_object().unwrap().len(), 6);
     }
 
     #[test]
