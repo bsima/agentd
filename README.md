@@ -10,7 +10,7 @@ This repo contains:
 - `agent`: CLI for oneshot and persistent agents, this follows the Unix philosophy of "do one thing well", all it does is run an agentic loop
 - `agentd`: process supervisor for named, long-running sessions — start/stop/resume, turn delivery, systemd unit generation
 - `agent-sdk`: Rust SDK for embedding the agent loop — typed tools, structured output, streaming events, replay
-- `agent-oauth`: support for using codex/claude-code subscription auth
+- `agent-oauth`: support for using codex/claude-code subscription auth. Tokens live in `~/.local/share/agent/auth.json` by default; set `AGENT_AUTH_FILE` (absolute path) to point at a different store — e.g. a per-context work token via direnv, kept separate from your personal one
 
 This was originally written in Haskell in my private monorepo of projects. The Rust port is now the reference implementation, including the `agentd` supervisor.
 

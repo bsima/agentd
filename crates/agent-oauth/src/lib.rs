@@ -161,6 +161,17 @@ impl TokenStore {
 }
 
 pub fn credentials_file() -> Result<PathBuf> {
+    // Explicit override: point the runtime at a specific auth store — e.g. a
+    // per-context work token loaded via direnv in ~/work/.envrc, kept separate
+    // from the personal store. Highest precedence so an `auth login` in the
+    // work context never clobbers the personal token (and vice versa). The
+    // value is taken literally (no shell or tilde expansion) and must be an
+    // absolute path — in direnv use `export AGENT_AUTH_FILE="$HOME/…"`.
+    // A dedicated var rather than XDG_DATA_HOME because that would relocate
+    // ALL agent state (traces, memory, checkpoints), not just auth.
+    if let Some(path) = std::env::var_os("AGENT_AUTH_FILE") {
+        return Ok(PathBuf::from(path));
+    }
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
@@ -1253,13 +1264,36 @@ mod tests {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
     }
 
+    /// Guards the two tests that touch AGENT_AUTH_FILE: env mutation races
+    /// under parallel `cargo test`, so both the reader and the mutator
+    /// serialize on this lock (the rest of the suite avoids env via
+    /// `with_path`).
+    static AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn credentials_file_returns_valid_path() -> Result<()> {
+        let _guard = AUTH_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AGENT_AUTH_FILE");
         let path = credentials_file()?;
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("auth.json")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn credentials_file_honors_agent_auth_file_verbatim() -> Result<()> {
+        let _guard = AUTH_ENV_LOCK.lock().unwrap();
+        let prior = std::env::var_os("AGENT_AUTH_FILE");
+        std::env::set_var("AGENT_AUTH_FILE", "/work/creds/agent-auth.json");
+        let path = credentials_file();
+        // Restore before asserting so a failure can't leak the var.
+        match prior {
+            Some(value) => std::env::set_var("AGENT_AUTH_FILE", value),
+            None => std::env::remove_var("AGENT_AUTH_FILE"),
+        }
+        assert_eq!(path?, PathBuf::from("/work/creds/agent-auth.json"));
         Ok(())
     }
 
