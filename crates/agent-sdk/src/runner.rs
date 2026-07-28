@@ -381,6 +381,7 @@ async fn execute(
         });
 
     let config = SeqConfig {
+        on_infer_delta: None,
         provider,
         hydration,
         tools: agent.tools.clone(),

@@ -783,6 +783,7 @@ async fn run_arm(
         std::env::temp_dir().join(format!("infer-infer-eval-{}.jsonl", Uuid::new_v4()));
     let trace = TraceLogger::new(Uuid::new_v4().to_string(), trace_path.clone());
     let config = SeqConfig {
+        on_infer_delta: None,
         approvals: Default::default(),
         guidance: Default::default(),
         tools: Default::default(),

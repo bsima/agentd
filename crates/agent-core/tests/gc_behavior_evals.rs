@@ -1096,6 +1096,7 @@ async fn run_cell(
         std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
     );
     let config = SeqConfig {
+        on_infer_delta: None,
         approvals: Default::default(),
         // Per-cell (t-1364): the guided arms run the shipped fragment, the
         // unguided arms and all t-1349 legacy replays run disabled — GC

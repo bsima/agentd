@@ -96,6 +96,11 @@ printf 'go build the thing\0\0' | agent --session --checkpoint-dir .agent-checkp
 mkfifo .agent.fifo
 agent --fifo .agent.fifo --checkpoint-dir .agent-checkpoints &
 printf 'run cargo test\0' > .agent.fifo
+
+# ACP server mode: any Agent Client Protocol frontend (e.g. Paseo) can
+# spawn this and drive sessions with streaming, permission prompts, and
+# session resume — see docs/ACP.md
+agent --acp
 ```
 
 The `agentd` supervisor wraps this with named sessions:

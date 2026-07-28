@@ -518,6 +518,7 @@ async fn run_cell(
     let trace_path = std::env::temp_dir().join(format!("delegation-eval-{}.jsonl", Uuid::new_v4()));
     let trace = TraceLogger::new(Uuid::new_v4().to_string(), trace_path.clone());
     let config = SeqConfig {
+        on_infer_delta: None,
         approvals: Default::default(),
         guidance,
         tools: Default::default(),

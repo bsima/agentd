@@ -159,6 +159,15 @@ fn base(
     }
 }
 
+/// Serialize a JSON value with object keys sorted, so previews are
+/// byte-stable regardless of whether some crate in the build graph enabled
+/// serde_json's `preserve_order` feature (the ACP stack does).
+fn canonical_json_string(value: &Value) -> String {
+    let mut owned = value.clone();
+    crate::ir_normalize::sort_json_value(&mut owned);
+    owned.to_string()
+}
+
 fn non_empty_preview(text: &str) -> Option<String> {
     if text.is_empty() {
         None
@@ -555,7 +564,10 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
             // The runtime event carries the full arguments (replay
             // identity); the public event carries only a preview, per the
             // payload rules.
-            out.payload_preview = Some(preview(&arguments.to_string(), PAYLOAD_PREVIEW_MAX_CHARS));
+            out.payload_preview = Some(preview(
+                &canonical_json_string(arguments),
+                PAYLOAD_PREVIEW_MAX_CHARS,
+            ));
             out.attrs.insert("name".into(), Value::String(name.clone()));
             Some(out)
         }
@@ -715,7 +727,10 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
                 PublicStatus::Started,
             );
             out.effect = Some(PublicEffect::from(effect.as_ref()));
-            out.payload_preview = Some(preview(&request.to_string(), PAYLOAD_PREVIEW_MAX_CHARS));
+            out.payload_preview = Some(preview(
+                &canonical_json_string(request),
+                PAYLOAD_PREVIEW_MAX_CHARS,
+            ));
             out.attrs.insert("kind".into(), Value::String(kind.clone()));
             out.attrs
                 .insert("pending_id".into(), Value::String(pending_id.clone()));
@@ -1483,6 +1498,7 @@ mod tests {
         ));
         let trace = TraceLogger::new("golden-run", trace_path.clone());
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             // Guidance off: the golden pins the public projection of the
             // recorded effects, and the runtime-guidance fragment (t-1359)

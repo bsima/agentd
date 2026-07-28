@@ -334,6 +334,21 @@ pub struct SeqConfig {
     /// Default-on; opt out (`RuntimeGuidance::disabled()`) for
     /// deterministic prompt-sensitive runs or a hand-written manual.
     pub guidance: crate::guidance::RuntimeGuidance,
+    /// Live streaming tap: incremental assistant text from
+    /// streaming-capable providers (see [`crate::provider::TextDeltaFn`]).
+    /// Never traced, never replayed — recorded runs are byte-identical with
+    /// or without a tap. `None` (the default everywhere but the ACP server)
+    /// calls providers non-streaming, exactly as before the field existed.
+    pub on_infer_delta: Option<Arc<dyn Fn(InferDelta) + Send + Sync>>,
+}
+
+/// One streamed text fragment from a live Infer. `op_id` matches the
+/// eventual `InferResult` trace event, so consumers can reconcile streamed
+/// text against the authoritative response.
+#[derive(Debug, Clone)]
+pub struct InferDelta {
+    pub op_id: u64,
+    pub text: String,
 }
 
 impl SeqConfig {
@@ -1258,6 +1273,7 @@ mod tests {
     #[tokio::test]
     async fn gc_collects_to_threshold_budget() -> Result<()> {
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1300,6 +1316,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1369,6 +1386,7 @@ mod tests {
 
     fn semantic_config(trace: TraceLogger, fail: bool) -> SeqConfig {
         SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1477,6 +1495,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1545,6 +1564,7 @@ mod tests {
     #[tokio::test]
     async fn gc_collect_records_dropped_contents_for_the_write_barrier() -> Result<()> {
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1592,6 +1612,7 @@ mod tests {
         timing: GcTiming,
     ) -> SeqConfig {
         SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1932,6 +1953,7 @@ mod tests {
             response("done", vec![]),
         ]));
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1990,6 +2012,7 @@ mod tests {
             response("finished", vec![]),
         ]));
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2037,6 +2060,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2130,6 +2154,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![response("ok", vec![])]));
         let queries = Arc::new(Mutex::new(Vec::new()));
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2184,6 +2209,7 @@ mod tests {
             clean_vars.insert("PATH".into(), path);
         }
         let mut config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2408,6 +2434,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             trace,
             ..seq_config_for_eval()
         };
@@ -2428,6 +2455,7 @@ mod tests {
         // Replay returns the recorded result without executing…
         let replay = ReplayTrace::from_events(&events);
         let config = SeqConfig {
+            on_infer_delta: None,
             replay: Some(replay.clone()),
             ..seq_config_for_eval()
         };
@@ -2436,6 +2464,7 @@ mod tests {
 
         // …a different argv diverges…
         let config = SeqConfig {
+            on_infer_delta: None,
             replay: Some(replay.clone()),
             ..seq_config_for_eval()
         };
@@ -2451,6 +2480,7 @@ mod tests {
         // …and a shell Eval whose rendered command matches the argv rendering
         // still diverges: the identities are distinct.
         let config = SeqConfig {
+            on_infer_delta: None,
             replay: Some(replay),
             ..seq_config_for_eval()
         };
@@ -2464,6 +2494,7 @@ mod tests {
 
     fn seq_config_for_eval() -> SeqConfig {
         SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2493,6 +2524,7 @@ mod tests {
         // non-zero without blocking or stealing any input.
         let provider = Arc::new(MockProvider::new(vec![]));
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2540,6 +2572,7 @@ mod tests {
         let trace = test_trace();
         let path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2578,6 +2611,7 @@ mod tests {
         let record_trace = test_trace();
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2603,6 +2637,7 @@ mod tests {
 
         let replay = ReplayTrace::load(record_path).await?;
         let replay_config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2660,6 +2695,7 @@ mod tests {
         let mut record_pricing = crate::cost::PricingTable::default();
         record_pricing.insert("mock", crate::cost::Pricing::from_usd_per_mtok(3.0, 15.0)?);
         let record_config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2710,6 +2746,7 @@ mod tests {
         let replay_trace = test_trace();
         let replay_path = replay_trace.path().clone();
         let replay_config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2767,6 +2804,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2810,6 +2848,7 @@ mod tests {
         let record_trace = test_trace();
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2849,6 +2888,7 @@ mod tests {
         let replay = ReplayTrace::load(record_path).await?;
         let live_provider = Arc::new(MockProvider::new(vec![response("unused", vec![])]));
         let replay_config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2888,6 +2928,7 @@ mod tests {
         let trace = test_trace();
         let trace_path = trace.path().clone();
         let config = SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),

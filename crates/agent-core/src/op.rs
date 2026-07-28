@@ -655,6 +655,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("agent-core-op-test-{}.jsonl", Uuid::new_v4()));
         SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -677,6 +678,7 @@ mod tests {
 
     fn seq_config_with_provider(provider: Arc<dyn ChatProvider>) -> SeqConfig {
         SeqConfig {
+            on_infer_delta: None,
             provider,
             ..seq_config()
         }

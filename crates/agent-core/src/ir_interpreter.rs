@@ -1272,9 +1272,32 @@ async fn execute_instr(
             let result = loop {
                 let attempt = match ir_replay {
                     Some(replay) => replay.infer_result(&location, &model),
-                    None => match &config.replay {
-                        Some(replay) => replay.infer_result(op_id, &model),
-                        None => {
+                    None => match (&config.replay, &config.on_infer_delta) {
+                        (Some(replay), _) => replay.infer_result(op_id, &model),
+                        (None, Some(tap)) => {
+                            // Live streaming tap (ACP): forward text deltas
+                            // as they arrive; the accumulated Response flows
+                            // through cost stamping and the InferResult
+                            // event identically to the non-streamed path.
+                            let tap = tap.clone();
+                            let on_delta: crate::provider::TextDeltaFn =
+                                std::sync::Arc::new(move |text: &str| {
+                                    tap(crate::interpreter::InferDelta {
+                                        op_id,
+                                        text: text.to_owned(),
+                                    })
+                                });
+                            config
+                                .provider
+                                .chat_streamed(
+                                    &Model(model.clone()),
+                                    &tool_specs,
+                                    &prompt,
+                                    &on_delta,
+                                )
+                                .await
+                        }
+                        (None, None) => {
                             config
                                 .provider
                                 .chat(&Model(model.clone()), &tool_specs, &prompt)
@@ -2692,6 +2715,7 @@ mod tests {
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),

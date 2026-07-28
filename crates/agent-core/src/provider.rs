@@ -29,6 +29,15 @@ pub struct ProviderConfig {
     pub model: Model,
 }
 
+/// Incremental assistant-text callback for streaming-capable providers.
+/// Called zero or more times per attempt with raw text fragments in arrival
+/// order. Purely a live UI side-channel: deltas are never traced and never
+/// part of the replay identity; the returned [`Response`] stays the single
+/// source of truth. A retried attempt (transport failure mid-stream) may
+/// re-emit text the caller already saw — consumers reconcile against the
+/// final response.
+pub type TextDeltaFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
     async fn chat(
@@ -37,6 +46,21 @@ pub trait ChatProvider: Send + Sync {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response>;
+
+    /// Streaming variant of [`ChatProvider::chat`]. The default falls back
+    /// to `chat` and never invokes `on_delta` — callers must treat "no
+    /// deltas arrived" as normal (custom providers, replay, non-streaming
+    /// endpoints all take this path).
+    async fn chat_streamed(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &TextDeltaFn,
+    ) -> Result<Response> {
+        let _ = on_delta;
+        self.chat(model, tools, messages).await
+    }
 }
 
 /// Provider for replay-only runs: every Infer must be satisfied from the
@@ -146,6 +170,25 @@ impl ChatProvider for ProviderClient {
         )
         .await
     }
+
+    async fn chat_streamed(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &TextDeltaFn,
+    ) -> Result<Response> {
+        openai_compatible_chat_streamed(
+            &self.client,
+            &self.config.url,
+            &self.config.api_key,
+            model,
+            tools,
+            messages,
+            on_delta,
+        )
+        .await
+    }
 }
 
 /// Full OpenAI-compatible chat call: pending-tool-call guard, wire
@@ -171,6 +214,44 @@ pub async fn openai_compatible_chat(
         |body| {
             let url = url.clone();
             async move { send_chat_request(client, bearer_token, &url, &body).await }
+        },
+    )
+    .await
+    .map_err(ProviderError::into_anyhow)
+}
+
+/// Streaming variant of [`openai_compatible_chat`]: `stream: true` +
+/// `stream_options.include_usage`, text deltas forwarded through `on_delta`
+/// as they arrive, and the same accumulated [`Response`] contract at the
+/// end. Providers that omit the final usage chunk degrade exactly like a
+/// non-streaming response without `usage`: token counts record zero and
+/// cost stays absent (never fabricated).
+#[allow(clippy::too_many_arguments)] // mirrors openai_compatible_chat + the tap
+pub async fn openai_compatible_chat_streamed(
+    client: &Client,
+    base_url: &str,
+    bearer_token: &str,
+    model: &Model,
+    tools: &[ToolSpec],
+    messages: &[ChatMessage],
+    on_delta: &TextDeltaFn,
+) -> Result<Response> {
+    if crate::op::has_pending_tool_calls(messages) {
+        return Err(anyhow::anyhow!(
+            "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
+        ));
+    }
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    chat_with_retries(
+        |nudge| {
+            let mut body = build_chat_body(model, tools, messages, nudge);
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({ "include_usage": true });
+            body
+        },
+        |body| {
+            let url = url.clone();
+            async move { send_chat_request_streamed(client, bearer_token, &url, &body, on_delta).await }
         },
     )
     .await
@@ -350,6 +431,210 @@ async fn send_chat_request(
             metadata: Default::default(),
         })
     }
+}
+
+async fn send_chat_request_streamed(
+    client: &Client,
+    bearer_token: &str,
+    url: &str,
+    body: &Value,
+    on_delta: &TextDeltaFn,
+) -> std::result::Result<Response, ProviderError> {
+    use futures::StreamExt;
+    let response = client
+        .post(url)
+        .bearer_auth(bearer_token)
+        .json(body)
+        .send()
+        .await
+        .map_err(ProviderError::transport)?;
+    let status = response.status();
+    // Errors arrive as a non-2xx status line before any SSE bytes, so the
+    // classification (overflow, model-not-found, retryable HTTP) is
+    // identical to the non-streaming path.
+    if !status.is_success() {
+        let retry_after = retry_after_delay(&response);
+        let text = response
+            .text()
+            .await
+            .map_err(|source| ProviderError::Transport {
+                source,
+                context: "reading provider response",
+            })?;
+        if is_context_overflow(status, &text) {
+            return Err(ProviderError::ContextOverflow { status, text });
+        }
+        if is_model_not_found(status, &text) {
+            return Err(ProviderError::ModelNotFound { status, text });
+        }
+        return Err(ProviderError::Http {
+            status,
+            text,
+            retry_after,
+        });
+    }
+
+    let mut decoder = crate::sse::SseDecoder::new();
+    let mut stream = response.bytes_stream();
+    let mut accum = OpenAiStreamAccum::default();
+    'outer: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|source| ProviderError::Transport {
+            source,
+            context: "reading provider stream",
+        })?;
+        for event in decoder.feed(&chunk) {
+            if event.data.trim() == "[DONE]" {
+                break 'outer;
+            }
+            let parsed: StreamChunk = serde_json::from_str(&event.data)
+                .context("parsing provider stream chunk")
+                .map_err(ProviderError::Other)?;
+            accum.absorb(parsed, on_delta);
+        }
+    }
+    accum.into_response()
+}
+
+/// Accumulates OpenAI-compatible stream chunks into the same [`Response`]
+/// the non-streaming path builds, forwarding text deltas as they arrive.
+#[derive(Default)]
+struct OpenAiStreamAccum {
+    content: String,
+    tool_calls: Vec<StreamPendingToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<Usage>,
+}
+
+#[derive(Default)]
+struct StreamPendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl OpenAiStreamAccum {
+    fn absorb(&mut self, chunk: StreamChunk, on_delta: &TextDeltaFn) {
+        if let Some(usage) = chunk.usage {
+            // Usage arrives on the final chunk (stream_options.include_usage).
+            self.usage = Some(usage);
+        }
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return;
+        };
+        if let Some(reason) = choice.finish_reason {
+            self.finish_reason = Some(reason);
+        }
+        let Some(delta) = choice.delta else {
+            return;
+        };
+        if let Some(text) = delta.content {
+            if !text.is_empty() {
+                on_delta(&text);
+                self.content.push_str(&text);
+            }
+        }
+        for call in delta.tool_calls.unwrap_or_default() {
+            let index = call
+                .index
+                .unwrap_or(self.tool_calls.len().saturating_sub(1));
+            while self.tool_calls.len() <= index {
+                self.tool_calls.push(StreamPendingToolCall::default());
+            }
+            let pending = &mut self.tool_calls[index];
+            if let Some(id) = call.id {
+                pending.id = id;
+            }
+            if let Some(function) = call.function {
+                if let Some(name) = function.name {
+                    pending.name = name;
+                }
+                if let Some(arguments) = function.arguments {
+                    pending.arguments.push_str(&arguments);
+                }
+            }
+        }
+    }
+
+    fn into_response(self) -> std::result::Result<Response, ProviderError> {
+        let usage = self.usage.unwrap_or_default();
+        let input_tokens = usage.prompt_tokens.unwrap_or_default();
+        let output_tokens = usage.completion_tokens.unwrap_or_default();
+        let total_tokens = usage
+            .total_tokens
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        let cached_input_tokens = usage
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens);
+        let finish_reason = self
+            .finish_reason
+            .as_deref()
+            .map(FinishReason::from_provider);
+        let tool_calls: Vec<ToolCall> = self
+            .tool_calls
+            .into_iter()
+            .map(|call| {
+                let arguments: Value = serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| json!({ "raw": call.arguments }));
+                ToolCall::new(call.id, call.name, arguments)
+            })
+            .collect();
+        // Same empty-completion contract as the non-streaming path: a turn
+        // with no content and no tool calls (and no clean stop) retries
+        // with the continuation nudge instead of silently ending the run.
+        if self.content.trim().is_empty()
+            && tool_calls.is_empty()
+            && !matches!(finish_reason.as_ref(), Some(FinishReason::Stop))
+        {
+            tracing::warn!("provider stream ended with empty completion");
+            return Err(ProviderError::EmptyCompletion {
+                raw: "<streamed response with no content or tool calls>".into(),
+            });
+        }
+        Ok(Response {
+            content: self.content,
+            tool_calls,
+            finish_reason,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_input_tokens,
+            cost_micro_usd: None,
+            pricing: None,
+            metadata: Default::default(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    delta: Option<StreamDelta>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCallDelta {
+    index: Option<usize>,
+    id: Option<String>,
+    function: Option<StreamToolFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug)]

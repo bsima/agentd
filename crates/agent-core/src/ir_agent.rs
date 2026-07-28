@@ -1811,6 +1811,7 @@ mod tests {
 
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
+            on_infer_delta: None,
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),

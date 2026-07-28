@@ -463,6 +463,41 @@ impl ChatProvider for OAuthChatProvider {
             }
         }
     }
+
+    async fn chat_streamed(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &agent_core::TextDeltaFn,
+    ) -> Result<Response> {
+        if agent_core::has_pending_tool_calls(messages) {
+            return Err(anyhow!(
+                "refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result; resume from a repaired checkpoint or reset the session"
+            ));
+        }
+        let token = self.access_token().await?;
+        match self.kind {
+            OAuthProviderKind::Codex => {
+                self.chat_codex_streamed(&token, model, tools, messages, on_delta)
+                    .await
+            }
+            // Same bearer + base_url as the buffered path; streaming comes
+            // from the shared OpenAI-compatible transport.
+            OAuthProviderKind::ClaudeCode => {
+                agent_core::provider::openai_compatible_chat_streamed(
+                    &self.client,
+                    &self.base_url,
+                    &token,
+                    model,
+                    tools,
+                    messages,
+                    on_delta,
+                )
+                .await
+            }
+        }
+    }
 }
 
 impl OAuthChatProvider {
@@ -518,6 +553,59 @@ impl OAuthChatProvider {
         }
         parse_codex_sse_response(&text)
     }
+
+    /// Live-streamed variant of [`Self::chat_codex`]: the endpoint already
+    /// responds with SSE; this decodes it incrementally instead of
+    /// buffering, forwarding text deltas through the tap. Same accumulator,
+    /// same final [`Response`].
+    async fn chat_codex_streamed(
+        &self,
+        token: &str,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &agent_core::TextDeltaFn,
+    ) -> Result<Response> {
+        use futures::StreamExt;
+        let account_id = extract_codex_account_id(token).ok_or_else(|| {
+            anyhow!("failed to extract chatgpt_account_id from OpenAI Codex token")
+        })?;
+        let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
+        let body = build_codex_request(model, tools, messages);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("chatgpt-account-id", account_id)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await?;
+            return Err(anyhow!("Codex OAuth provider returned {status}: {text}"));
+        }
+        let mut decoder = agent_core::sse::SseDecoder::new();
+        let mut stream = response.bytes_stream();
+        let mut accum = CodexStreamAccum::default();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading Codex stream")?;
+            for event in decoder.feed(&chunk) {
+                if event.data.trim() == "[DONE]" {
+                    continue;
+                }
+                let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
+                    continue;
+                };
+                accum.on_event(&parsed, Some(on_delta))?;
+            }
+        }
+        accum.into_response()
+    }
 }
 
 macro_rules! delegate_provider {
@@ -531,6 +619,18 @@ macro_rules! delegate_provider {
                 messages: &[ChatMessage],
             ) -> Result<Response> {
                 self.inner.chat(model, tools, messages).await
+            }
+
+            async fn chat_streamed(
+                &self,
+                model: &Model,
+                tools: &[ToolSpec],
+                messages: &[ChatMessage],
+                on_delta: &agent_core::TextDeltaFn,
+            ) -> Result<Response> {
+                self.inner
+                    .chat_streamed(model, tools, messages, on_delta)
+                    .await
             }
         }
 
@@ -878,27 +978,49 @@ fn tool_spec_to_codex(tool: &ToolSpec) -> Value {
 }
 
 fn parse_codex_sse_response(text: &str) -> Result<Response> {
-    let mut content = String::new();
-    let mut current_tool: Option<CodexToolAccum> = None;
-    let mut tool_calls = Vec::new();
-    let mut input_tokens = 0_u32;
-    let mut output_tokens = 0_u32;
-    let mut total_tokens = 0_u32;
-    let mut cached_input_tokens = None;
-
+    let mut accum = CodexStreamAccum::default();
     for event_text in parse_sse_events(text) {
         let Some(event) = parse_sse_event_json(event_text) else {
             continue;
         };
+        accum.on_event(&event, None)?;
+    }
+    accum.into_response()
+}
+
+/// Incremental accumulator over the codex Responses-API event stream.
+/// Drives both the buffered path ([`parse_codex_sse_response`]) and the
+/// live-streamed path (`chat_codex_streamed`), which additionally forwards
+/// `response.output_text.delta` fragments through the tap.
+#[derive(Default)]
+struct CodexStreamAccum {
+    content: String,
+    current_tool: Option<CodexToolAccum>,
+    tool_calls: Vec<ToolCall>,
+    input_tokens: u32,
+    output_tokens: u32,
+    total_tokens: u32,
+    cached_input_tokens: Option<u32>,
+}
+
+impl CodexStreamAccum {
+    fn on_event(
+        &mut self,
+        event: &Value,
+        on_delta: Option<&agent_core::TextDeltaFn>,
+    ) -> Result<()> {
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    content.push_str(delta);
+                    if let Some(tap) = on_delta {
+                        tap(delta);
+                    }
+                    self.content.push_str(delta);
                 }
             }
             Some("response.function_call_arguments.delta") => {
                 if let (Some(tool), Some(delta)) = (
-                    &mut current_tool,
+                    &mut self.current_tool,
                     event.get("delta").and_then(Value::as_str),
                 ) {
                     tool.arguments.push_str(delta);
@@ -908,7 +1030,7 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
                 if let Some(item) = event.get("item").filter(|item| {
                     item.get("type").and_then(Value::as_str) == Some("function_call")
                 }) {
-                    current_tool = Some(CodexToolAccum::from_item(item));
+                    self.current_tool = Some(CodexToolAccum::from_item(item));
                 }
             }
             Some("response.output_item.done") => {
@@ -917,16 +1039,16 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
                         Some("function_call") => {
                             let mut accum = CodexToolAccum::from_item(item);
                             if accum.arguments.is_empty() {
-                                if let Some(current) = current_tool.take() {
+                                if let Some(current) = self.current_tool.take() {
                                     accum.arguments = current.arguments;
                                 }
                             } else {
-                                current_tool = None;
+                                self.current_tool = None;
                             }
-                            tool_calls.push(accum.into_tool_call());
+                            self.tool_calls.push(accum.into_tool_call());
                         }
-                        Some("message") if content.is_empty() => {
-                            content.push_str(&extract_codex_output_text(item));
+                        Some("message") if self.content.is_empty() => {
+                            self.content.push_str(&extract_codex_output_text(item));
                         }
                         _ => {}
                     }
@@ -938,10 +1060,10 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
                     .and_then(|response| response.get("usage"))
                     .and_then(codex_token_usage)
                 {
-                    input_tokens = input;
-                    output_tokens = output;
-                    total_tokens = total;
-                    cached_input_tokens = cached;
+                    self.input_tokens = input;
+                    self.output_tokens = output;
+                    self.total_tokens = total;
+                    self.cached_input_tokens = cached;
                 }
             }
             Some("error" | "response.failed") => {
@@ -959,39 +1081,51 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
             }
             _ => {}
         }
+        Ok(())
     }
 
-    if let Some(current) = current_tool {
-        tool_calls.push(current.into_tool_call());
-    }
+    fn into_response(self) -> Result<Response> {
+        let CodexStreamAccum {
+            content,
+            current_tool,
+            mut tool_calls,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_input_tokens,
+        } = self;
+        if let Some(current) = current_tool {
+            tool_calls.push(current.into_tool_call());
+        }
 
-    // The codex harness contract (t-1134): a turn ends when the assistant
-    // returns a final response with no pending tool calls — there is no done
-    // tool and no explicit end_turn marker in the SSE stream. Derive the
-    // turn state from the parsed shape instead of hardcoding Stop: reporting
-    // Stop for tool-call turns made every gpt-5.5 turn look like
-    // "finish=stop + tool_call", masking the model's native end-of-turn
-    // signal from the agent loop (the smith/forge empty-response crashes).
-    // TODO(t-1134, Ben): live-verify against a real codex session that a
-    // tool-call-free final message arrives intact through this parser.
-    let finish_reason = if tool_calls.is_empty() {
-        FinishReason::Stop
-    } else {
-        FinishReason::ToolCalls
-    };
-    Ok(Response {
-        content,
-        tool_calls,
-        finish_reason: Some(finish_reason),
-        input_tokens,
-        output_tokens,
-        total_tokens,
-        cached_input_tokens,
-        // Cost is stamped at trace-emission time (agent_core::cost).
-        cost_micro_usd: None,
-        pricing: None,
-        metadata: Default::default(),
-    })
+        // The codex harness contract (t-1134): a turn ends when the assistant
+        // returns a final response with no pending tool calls — there is no done
+        // tool and no explicit end_turn marker in the SSE stream. Derive the
+        // turn state from the parsed shape instead of hardcoding Stop: reporting
+        // Stop for tool-call turns made every gpt-5.5 turn look like
+        // "finish=stop + tool_call", masking the model's native end-of-turn
+        // signal from the agent loop (the smith/forge empty-response crashes).
+        // TODO(t-1134, Ben): live-verify against a real codex session that a
+        // tool-call-free final message arrives intact through this parser.
+        let finish_reason = if tool_calls.is_empty() {
+            FinishReason::Stop
+        } else {
+            FinishReason::ToolCalls
+        };
+        Ok(Response {
+            content,
+            tool_calls,
+            finish_reason: Some(finish_reason),
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_input_tokens,
+            // Cost is stamped at trace-emission time (agent_core::cost).
+            cost_micro_usd: None,
+            pricing: None,
+            metadata: Default::default(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

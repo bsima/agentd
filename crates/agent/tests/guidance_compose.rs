@@ -54,6 +54,7 @@ fn config(provider: Arc<dyn ChatProvider>, guidance: RuntimeGuidance) -> SeqConf
     let trace_path =
         std::env::temp_dir().join(format!("guidance-compose-{}.jsonl", Uuid::new_v4()));
     SeqConfig {
+        on_infer_delta: None,
         approvals: Default::default(),
         guidance,
         tools: Default::default(),

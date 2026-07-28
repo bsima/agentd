@@ -26,6 +26,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
+#[cfg(feature = "acp")]
+mod acp;
 mod frontmatter;
 
 /// Soft turn ceiling per session turn (Ben's decision on t-1133). Models like
@@ -55,6 +57,21 @@ struct Args {
     /// Read NUL-terminated session turns from stdin.
     #[arg(long)]
     session: bool,
+    /// Serve the Agent Client Protocol (agentclientprotocol.com) over stdio
+    /// so ACP clients (e.g. Paseo) can spawn and drive this binary. Sessions
+    /// are created per `session/new`; stdout carries JSON-RPC frames, so
+    /// this conflicts with --debug and the other input modes.
+    #[cfg(feature = "acp")]
+    #[arg(long, conflicts_with_all = ["session", "fifo", "prompt", "resume", "debug"])]
+    acp: bool,
+    /// In ACP mode, gate shell commands behind a `session/request_permission`
+    /// round-trip to the client (default on: ACP clients render permission
+    /// prompts natively, and a denial is a typed value the model recovers
+    /// from). Disable with --acp-shell-approval=false, or per session via
+    /// the `yolo` session mode.
+    #[cfg(feature = "acp")]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    acp_shell_approval: bool,
     /// Read NUL-terminated session turns from this FIFO path.
     #[arg(long, env = "AGENT_FIFO")]
     fifo: Option<PathBuf>,
@@ -495,9 +512,10 @@ async fn main() -> Result<()> {
     if let Some(command) = args.command.as_ref() {
         return run_command(command).await;
     }
-    let file_config = read_config(args.config.as_ref()).await?;
-    let provider_file = file_config.provider.unwrap_or_default();
-
+    #[cfg(feature = "acp")]
+    if args.acp {
+        return acp::run(args).await;
+    }
     let loaded_prompt = match args.prompt.as_ref() {
         Some(prompt) => Some(frontmatter::MarkdownPrompt::from_arg(prompt).await?),
         None => None,
@@ -531,12 +549,92 @@ async fn main() -> Result<()> {
         }
         (None, None) => None,
     };
-    let system_prompt = build_system_prompt(system_prompt_override).await?;
+    let checkpoint = match args.resume.as_ref() {
+        Some(path) => Some(load_checkpoint(path).await?),
+        None => None,
+    };
+    let run_id = checkpoint
+        .as_ref()
+        .map(|cp| cp.run_id.clone())
+        .or(args.run_id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let otel = init_otel(args.otel_endpoint.as_deref(), &run_id)?;
+    let mut runtime = build_runtime(
+        &args,
+        SessionParams {
+            requested_model,
+            requested_provider,
+            max_turns,
+            system_prompt_override,
+            cwd: None,
+            checkpoint_dir: args.checkpoint_dir.clone(),
+            checkpoint,
+            run_id,
+            require_shell_approval: args.require_shell_approval,
+            trace_sinks_extra: Vec::new(),
+            otel_active: otel.is_some(),
+        },
+    )
+    .await?;
+
+    tracing::info!(model = %runtime.model.0, trace = %runtime.trace_path.display(), run_id = %runtime.run_id, provider = %runtime.provider_url, "agent runtime starting");
+    eprintln!("model: {}", runtime.model.0);
+    eprintln!("trace: {}", runtime.trace_path.display());
+    eprintln!("run_id: {}", runtime.run_id);
+    eprintln!("provider: {}", runtime.provider_url);
+    if let Some(prompt) = loaded_prompt.as_ref() {
+        eprintln!("prompt: {}", prompt.body);
+    }
+
+    let result = match (loaded_prompt, args.fifo, args.session) {
+        (Some(prompt), None, false) => {
+            let prompt = prompt_with_optional_stdin(prompt.body)?;
+            run_one_shot(&mut runtime, prompt).await
+        }
+        (Some(_), Some(_), _) => Err(anyhow!("provide either a prompt or --fifo, not both")),
+        (Some(_), None, true) => Err(anyhow!("provide either a prompt or --session, not both")),
+        (None, Some(path), _) => run_fifo_session(&mut runtime, path).await,
+        (None, None, _) => run_stdin_session(&mut runtime).await,
+    };
+    if let Some(otel) = otel {
+        otel.shutdown();
+    }
+    result
+}
+
+/// Per-session variation points for [`build_runtime`]. The CLI path derives
+/// one from flags in `main`; the ACP server (`--acp`) derives one per
+/// `session/new` / `session/load`.
+struct SessionParams {
+    requested_model: Option<String>,
+    requested_provider: Option<String>,
+    max_turns: usize,
+    system_prompt_override: Option<String>,
+    /// Session working directory: overrides `--eval-cwd` for shell effects
+    /// and replaces the process cwd in the system prompt's cwd line.
+    cwd: Option<PathBuf>,
+    checkpoint_dir: Option<PathBuf>,
+    checkpoint: Option<Checkpoint>,
+    run_id: String,
+    require_shell_approval: bool,
+    /// Extra sinks observing this runtime's trace events (the ACP bridge).
+    trace_sinks_extra: Vec<Arc<dyn agent_core::TraceSink>>,
+    /// Whether the process-wide OTel provider is initialized (adds the OTel
+    /// sink to this runtime's trace logger).
+    otel_active: bool,
+}
+
+async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
+    let file_config = read_config(args.config.as_ref()).await?;
+    let provider_file = file_config.provider.unwrap_or_default();
+    let system_prompt =
+        build_system_prompt(params.system_prompt_override, params.cwd.as_deref()).await?;
 
     let (resolved_model, pricing_table, embedder) =
-        resolve_model(requested_model, provider_file.model.clone()).await?;
+        resolve_model(params.requested_model, provider_file.model.clone()).await?;
+    let eval_cwd = params.cwd.clone().or_else(|| args.eval_cwd.clone());
     let eval_config = EvalConfig {
-        cwd: args.eval_cwd.clone(),
+        cwd: eval_cwd.clone(),
         timeout: Duration::from_secs(args.eval_timeout_seconds),
         max_stdout_bytes: args.eval_max_output_bytes.unwrap_or(1024 * 1024),
         max_stderr_bytes: args.eval_max_output_bytes.unwrap_or(1024 * 1024),
@@ -562,36 +660,27 @@ async fn main() -> Result<()> {
     let model = resolved_model.api_id.clone();
     let (provider, reported_provider_url) = build_provider(
         &resolved_model,
-        requested_provider.or(provider_file.url),
+        params.requested_provider.or(provider_file.url),
         args.key.clone().or(provider_file.api_key),
         replay_enabled,
     )?;
 
-    let checkpoint = match args.resume.as_ref() {
-        Some(path) => Some(load_checkpoint(path).await?),
-        None => None,
-    };
-    let run_id = checkpoint
-        .as_ref()
-        .map(|cp| cp.run_id.clone())
-        .or(args.run_id.clone())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let run_id = params.run_id;
     let trace_path = trace_path(&run_id)?;
-    let otel = init_otel(args.otel_endpoint.as_deref(), &run_id)?;
-    let trace = match &otel {
-        Some(_) => {
-            let context_env = TraceContextEnv::default();
-            TraceLogger::with_sinks_and_context(
-                run_id.clone(),
-                trace_path.clone(),
-                vec![
-                    Arc::new(JsonlTraceSink::new(trace_path.clone()).mirror_stdout(args.debug)),
-                    Arc::new(OtelTraceSink::with_context_env(context_env.clone())),
-                ],
-                context_env,
-            )
+    let trace = if params.otel_active || !params.trace_sinks_extra.is_empty() {
+        let context_env = TraceContextEnv::default();
+        let mut sinks: Vec<Arc<dyn agent_core::TraceSink>> = vec![Arc::new(
+            JsonlTraceSink::new(trace_path.clone()).mirror_stdout(args.debug),
+        )];
+        if params.otel_active {
+            sinks.push(Arc::new(OtelTraceSink::with_context_env(
+                context_env.clone(),
+            )));
         }
-        None => TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug),
+        sinks.extend(params.trace_sinks_extra);
+        TraceLogger::with_sinks_and_context(run_id.clone(), trace_path.clone(), sinks, context_env)
+    } else {
+        TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug)
     };
     let hydration = {
         let mut registry = SourceRegistry::new();
@@ -610,11 +699,12 @@ async fn main() -> Result<()> {
         }
         registry
     };
-    let (history, checkpoint_sequence, resumed_discovered_budget) = match checkpoint {
+    let (history, checkpoint_sequence, resumed_discovered_budget) = match params.checkpoint {
         Some(cp) => (cp.messages, cp.sequence, cp.discovered_budget),
         None => (initial_history(system_prompt), 0, None),
     };
     let config = SeqConfig {
+        on_infer_delta: None,
         // No in-process approval hook in the CLI: gated effects pause
         // durably and resolve via `agent approvals` (t-1308.10). Resume
         // drivers load resolutions into this config before re-entering.
@@ -706,19 +796,19 @@ async fn main() -> Result<()> {
             args.gc_timing.name()
         ));
     }
-    let mut runtime = Runtime {
+    Ok(Runtime {
         config,
         trace,
         run_id: run_id.clone(),
         model: agent_core::Model(model.clone()),
         provider_url: reported_provider_url.clone(),
         trace_path: trace_path.clone(),
-        checkpoint_dir: args.checkpoint_dir,
+        checkpoint_dir: params.checkpoint_dir,
         checkpoint_sequence,
         turn_seq: checkpoint_sequence,
         history,
         debug: args.debug,
-        max_turns,
+        max_turns: params.max_turns,
         ir_store: InMemoryStore::new(),
         ir_replay,
         ir_effect_visits: BTreeMap::new(),
@@ -729,20 +819,20 @@ async fn main() -> Result<()> {
             discovered_budget: resumed_discovered_budget,
             ..Default::default()
         },
-        shell_requires_approval: args.require_shell_approval,
+        shell_requires_approval: params.require_shell_approval,
         resume_facts: ResumeFacts {
             model: resolved_model.alias.clone(),
             trace_path: trace_path.clone(),
-            max_turns,
+            max_turns: params.max_turns,
             memory_dir: args.memory_dir.clone(),
             hydration_dir: args.hydration_dir.clone(),
             temporal_dir: args.temporal_dir.clone(),
             output_schema: args.output_schema.clone(),
             memory_tools: args.memory_dir.is_some(),
-            shell_requires_approval: args.require_shell_approval,
+            shell_requires_approval: params.require_shell_approval,
             runtime_guidance: !args.no_runtime_guidance,
             eval_timeout_seconds: args.eval_timeout_seconds,
-            eval_cwd: args.eval_cwd.clone(),
+            eval_cwd,
             eval_env: match args.eval_env {
                 EvalEnvMode::Inherit => "inherit".into(),
                 EvalEnvMode::InheritFull => "inherit-full".into(),
@@ -750,31 +840,7 @@ async fn main() -> Result<()> {
             },
             eval_max_output_bytes: args.eval_max_output_bytes,
         },
-    };
-
-    tracing::info!(%model, trace = %trace_path.display(), %run_id, provider = %reported_provider_url, "agent runtime starting");
-    eprintln!("model: {model}");
-    eprintln!("trace: {}", trace_path.display());
-    eprintln!("run_id: {run_id}");
-    eprintln!("provider: {reported_provider_url}");
-    if let Some(prompt) = loaded_prompt.as_ref() {
-        eprintln!("prompt: {}", prompt.body);
-    }
-
-    let result = match (loaded_prompt, args.fifo, args.session) {
-        (Some(prompt), None, false) => {
-            let prompt = prompt_with_optional_stdin(prompt.body)?;
-            run_one_shot(&mut runtime, prompt).await
-        }
-        (Some(_), Some(_), _) => Err(anyhow!("provide either a prompt or --fifo, not both")),
-        (Some(_), None, true) => Err(anyhow!("provide either a prompt or --session, not both")),
-        (None, Some(path), _) => run_fifo_session(&mut runtime, path).await,
-        (None, None, _) => run_stdin_session(&mut runtime).await,
-    };
-    if let Some(otel) = otel {
-        otel.shutdown();
-    }
-    result
+    })
 }
 
 struct OtelGuard {
@@ -1632,6 +1698,7 @@ async fn resume_run(
         .resolutions
         .insert(record.effect_id.clone(), resolution);
     let config = SeqConfig {
+        on_infer_delta: None,
         approvals,
         // Resume with the paused run's guidance setting (t-1359): the
         // fragment never affects effect-id replay or the checkpointed
@@ -2135,64 +2202,80 @@ async fn run_turn(
 ) -> Result<agent_core::Response> {
     runtime.history.push(ChatMessage::user(message));
     let prompt = runtime.history.clone();
-    let (response, mut new_history) = {
-        // The remember/recall tools ride with the memory backend (settled
-        // question 6): registering --memory-dir changes the loop program.
-        let memory_tools = !runtime
-            .config
-            .hydration
-            .sinks_of_kind(agent_core::SourceKind::Semantic)
-            .is_empty();
-        let options = agent_core::AgentLoopOptions {
-            memory_tools,
-            tool_names: runtime.config.tools.names(),
-            output_contract: runtime.output_contract.clone(),
-            shell_requires_approval: runtime.shell_requires_approval,
-            infer_system_prompt: None,
-        };
-        let outcome = agent_core::run_agent_loop_outcome(
-            &runtime.config,
-            &mut runtime.ir_store,
-            runtime.ir_replay.as_ref(),
-            &mut runtime.gc_state,
-            runtime.model.clone(),
-            prompt.clone(),
-            runtime.max_turns,
-            &options,
-            runtime.ir_effect_visits.clone(),
-        )
-        .await?;
-        let (value, machine) = match outcome {
-            agent_core::AgentLoopOutcome::Complete { value, machine } => (value, machine),
-            agent_core::AgentLoopOutcome::AwaitingApproval {
-                checkpoint,
-                pending,
-            } => {
-                return Err(pause_turn(runtime, turn_id, checkpoint, pending).await?);
-            }
-        };
-        runtime.ir_effect_visits = machine.effect_visits.clone();
-        // Exhausted output-schema repairs come back as a typed value (the
-        // loop's errors-as-values convention); surface them as a failed
-        // turn — agent_error in session mode, nonzero exit one-shot —
-        // rather than emitting non-conforming output as a completion.
-        if let Some(failure) = agent_core::output_contract_failure(&value) {
-            return Err(anyhow!(
-                "final output failed the output schema after {} attempt(s): {}",
-                failure.attempts,
-                failure.errors.join("; ")
-            ));
+    let options = agent_loop_options(runtime);
+    let outcome = agent_core::run_agent_loop_outcome(
+        &runtime.config,
+        &mut runtime.ir_store,
+        runtime.ir_replay.as_ref(),
+        &mut runtime.gc_state,
+        runtime.model.clone(),
+        prompt.clone(),
+        runtime.max_turns,
+        &options,
+        runtime.ir_effect_visits.clone(),
+    )
+    .await?;
+    let (value, machine) = match outcome {
+        agent_core::AgentLoopOutcome::Complete { value, machine } => (value, machine),
+        agent_core::AgentLoopOutcome::AwaitingApproval {
+            checkpoint,
+            pending,
+        } => {
+            return Err(pause_turn(runtime, turn_id, checkpoint, pending).await?);
         }
-        let response: agent_core::Response =
-            serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
-        let history = machine
-            .env
-            .get(&agent_core::Var("history".into()))
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or(prompt);
-        (response, history)
     };
+    finish_turn(runtime, value, machine, prompt).await
+}
+
+/// The loop options a turn runs with, derived from the runtime's current
+/// configuration. Shared by the CLI turn spine and the ACP turn driver.
+fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
+    // The remember/recall tools ride with the memory backend (settled
+    // question 6): registering --memory-dir changes the loop program.
+    let memory_tools = !runtime
+        .config
+        .hydration
+        .sinks_of_kind(agent_core::SourceKind::Semantic)
+        .is_empty();
+    agent_core::AgentLoopOptions {
+        memory_tools,
+        tool_names: runtime.config.tools.names(),
+        output_contract: runtime.output_contract.clone(),
+        shell_requires_approval: runtime.shell_requires_approval,
+        infer_system_prompt: None,
+    }
+}
+
+/// Post-outcome bookkeeping for a completed turn: decode the loop's value,
+/// fold the machine's history back into the runtime, close dangling tool
+/// calls, and persist the checkpoint. Shared by the CLI turn spine and the
+/// ACP turn driver.
+async fn finish_turn(
+    runtime: &mut Runtime,
+    value: serde_json::Value,
+    machine: agent_core::Machine,
+    prompt: Vec<ChatMessage>,
+) -> Result<agent_core::Response> {
+    runtime.ir_effect_visits = machine.effect_visits.clone();
+    // Exhausted output-schema repairs come back as a typed value (the
+    // loop's errors-as-values convention); surface them as a failed
+    // turn — agent_error in session mode, nonzero exit one-shot —
+    // rather than emitting non-conforming output as a completion.
+    if let Some(failure) = agent_core::output_contract_failure(&value) {
+        return Err(anyhow!(
+            "final output failed the output schema after {} attempt(s): {}",
+            failure.attempts,
+            failure.errors.join("; ")
+        ));
+    }
+    let response: agent_core::Response =
+        serde_json::from_value(value).context("decoding AgentIR agent loop response")?;
+    let mut new_history = machine
+        .env
+        .get(&agent_core::Var("history".into()))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(prompt);
     if !response.content.is_empty() || !response.tool_calls.is_empty() {
         new_history.push(ChatMessage::assistant(
             (!response.content.is_empty()).then_some(response.content.clone()),
@@ -2618,9 +2701,15 @@ fn base_system_prompt() -> &'static str {
     "You are a standalone agent runner. When finished, answer concisely."
 }
 
-async fn build_system_prompt(override_prompt: Option<String>) -> Result<String> {
+async fn build_system_prompt(
+    override_prompt: Option<String>,
+    cwd: Option<&Path>,
+) -> Result<String> {
     let base = override_prompt.unwrap_or_else(|| base_system_prompt().to_string());
-    let cwd = std::env::current_dir().context("getting current directory")?;
+    let cwd = match cwd {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().context("getting current directory")?,
+    };
     Ok(format!(
         "{base}\n\nCurrent date and time: {}\nCurrent working directory: {}",
         Utc::now().to_rfc3339(),
@@ -2758,11 +2847,11 @@ mod tests {
     /// runtime now delivers itself.
     #[tokio::test]
     async fn system_prompt_override_replaces_only_the_system_section() -> Result<()> {
-        let custom = build_system_prompt(Some("You are a mars rover.".into())).await?;
+        let custom = build_system_prompt(Some("You are a mars rover.".into()), None).await?;
         assert!(custom.starts_with("You are a mars rover."));
         assert!(!custom.contains("standalone agent runner"));
 
-        let default = build_system_prompt(None).await?;
+        let default = build_system_prompt(None, None).await?;
         assert!(default.starts_with(base_system_prompt()));
         assert!(
             !default.contains("shell tool"),

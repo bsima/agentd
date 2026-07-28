@@ -18,6 +18,7 @@ pub mod output_contract;
 pub mod prompt_ir;
 pub mod provider;
 pub mod public_trace;
+pub mod sse;
 pub mod temporal;
 pub mod tool;
 pub mod trace;
@@ -46,7 +47,7 @@ pub use hydration::{
     SinkItem, SinkWritePolicy, SourceCapability, SourceKind, SourceParams, SourceRegistry,
     SourceResult,
 };
-pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, ReplayTrace, SeqConfig};
+pub use interpreter::{run_sequential, EnvPolicy, EvalConfig, InferDelta, ReplayTrace, SeqConfig};
 pub use ir::{
     effect_location, program_hash, validate_program, Block, BlockId, Budgets, ControlPath,
     DynamicPath, EffectErrorMode, EffectId, EffectKind, EffectLocation, EffectSite, EvalPolicy,
@@ -85,7 +86,7 @@ pub use prompt_ir::{
 };
 pub use provider::{
     is_context_overflow_anyhow, is_context_overflow_message, ChatProvider, ContextOverflowError,
-    ProviderClient, ProviderConfig, ReplayOnlyProvider,
+    ProviderClient, ProviderConfig, ReplayOnlyProvider, TextDeltaFn,
 };
 pub use public_trace::{
     public_event, PublicDynamicPath, PublicEffect, PublicEffectSite, PublicEvent, PublicStatus,
