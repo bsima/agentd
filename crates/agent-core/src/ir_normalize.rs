@@ -30,9 +30,178 @@ pub fn normalize_program(program: &Program) -> Result<Program> {
 pub fn canonical_program_hash(program: &Program) -> Result<ProgramHash> {
     let mut normalized = normalize_program(program)?;
     canonicalize_inline_prompt_ids(&mut normalized);
+    canonicalize_embedded_json(&mut normalized);
     let bytes = serde_json::to_vec(&HashProgram::from(&normalized))?;
     let digest = Sha256::digest(bytes);
     Ok(ProgramHash(format!("sha256:{digest:x}")))
+}
+
+/// Hash-canonicalization for embedded `serde_json::Value`s. With serde_json's
+/// default `BTreeMap`-backed map, object keys always serialize sorted; if any
+/// crate in the build graph enables serde_json's `preserve_order` feature
+/// (the ACP dependency stack does), maps become insertion-ordered and the
+/// same program would serialize — and therefore hash — differently, orphaning
+/// every recorded trace. Re-sorting every embedded object at hash time makes
+/// the canonical bytes identical under either map implementation. This never
+/// moves a hash produced by a default-featured build: sorted order IS that
+/// build's order.
+fn canonicalize_embedded_json(program: &mut Program) {
+    for block in program.blocks.values_mut() {
+        for instr in &mut block.instructions {
+            canonicalize_instr_json(instr);
+        }
+        canonicalize_terminator_json(&mut block.terminator);
+    }
+}
+
+fn canonicalize_instr_json(instr: &mut Instr) {
+    match instr {
+        Instr::Let { expr, .. } => canonicalize_expr_json(expr),
+        Instr::Infer { model, prompt, .. } => {
+            canonicalize_expr_json(model);
+            canonicalize_prompt_ref_json(prompt);
+        }
+        Instr::Eval { request, .. } => match request {
+            EvalRequest::Shell { command } => canonicalize_expr_json(command),
+            EvalRequest::Argv { argv } => argv.iter_mut().for_each(canonicalize_expr_json),
+        },
+        Instr::Emit { event } => canonicalize_expr_json(event),
+        Instr::Retrieve { query, .. } => canonicalize_expr_json(query),
+        Instr::Store { sink, id, item, .. } => {
+            canonicalize_expr_json(sink);
+            if let Some(id) = id {
+                canonicalize_expr_json(id);
+            }
+            canonicalize_expr_json(item);
+        }
+        Instr::Tool { arguments, .. } => canonicalize_expr_json(arguments),
+    }
+}
+
+fn canonicalize_terminator_json(terminator: &mut Terminator) {
+    match terminator {
+        Terminator::Goto { args, .. } => args.iter_mut().for_each(canonicalize_expr_json),
+        Terminator::If {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
+            canonicalize_expr_json(cond);
+            then_args.iter_mut().for_each(canonicalize_expr_json);
+            else_args.iter_mut().for_each(canonicalize_expr_json);
+        }
+        Terminator::Match {
+            value,
+            arms,
+            default_args,
+            ..
+        } => {
+            canonicalize_expr_json(value);
+            for arm in arms {
+                arm.args.iter_mut().for_each(canonicalize_expr_json);
+            }
+            default_args.iter_mut().for_each(canonicalize_expr_json);
+        }
+        Terminator::Return { value } => canonicalize_expr_json(value),
+        Terminator::Par {
+            over,
+            body_args,
+            join_args,
+            ..
+        } => {
+            canonicalize_expr_json(over);
+            body_args.iter_mut().for_each(canonicalize_expr_json);
+            join_args.iter_mut().for_each(canonicalize_expr_json);
+        }
+    }
+}
+
+fn canonicalize_prompt_ref_json(prompt: &mut PromptRef) {
+    match prompt {
+        PromptRef::Inline(messages) => {
+            for message in messages {
+                if let Some(tool_calls) = &mut message.tool_calls {
+                    for call in tool_calls {
+                        sort_json_value(&mut call.arguments);
+                    }
+                }
+            }
+        }
+        PromptRef::PromptIr(ir) => {
+            for section in &mut ir.sections {
+                sort_json_value(&mut section.metadata);
+            }
+            for tool in &mut ir.tools {
+                sort_json_value(&mut tool.schema);
+            }
+        }
+        PromptRef::Var(_) | PromptRef::PromptIrVar(_) => {}
+    }
+}
+
+fn canonicalize_expr_json(expr: &mut Expr) {
+    match expr {
+        Expr::Value(value) => sort_json_value(value),
+        Expr::Var(_)
+        | Expr::Field { .. }
+        | Expr::Len { .. }
+        | Expr::IsEmpty { .. }
+        | Expr::HasPendingToolCalls { .. } => {}
+        Expr::FieldOr { default, .. } => canonicalize_expr_json(default),
+        Expr::StringOr { value, default } | Expr::JsonParseOr { value, default } => {
+            canonicalize_expr_json(value);
+            canonicalize_expr_json(default);
+        }
+        Expr::If {
+            cond,
+            then_value,
+            else_value,
+        } => {
+            canonicalize_expr_json(cond);
+            canonicalize_expr_json(then_value);
+            canonicalize_expr_json(else_value);
+        }
+        Expr::Index { index, .. } => canonicalize_expr_json(index),
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Or { left, right }
+        | Expr::And { left, right }
+        | Expr::Add { left, right }
+        | Expr::Sub { left, right }
+        | Expr::Concat { left, right } => {
+            canonicalize_expr_json(left);
+            canonicalize_expr_json(right);
+        }
+        Expr::Push { value, .. } => canonicalize_expr_json(value),
+        Expr::JsonParse { value } | Expr::ToString { value } => canonicalize_expr_json(value),
+        Expr::Array(items) => items.iter_mut().for_each(canonicalize_expr_json),
+        Expr::Object(map) => map.values_mut().for_each(canonicalize_expr_json),
+        Expr::SelectToolResults { ids, .. } => canonicalize_expr_json(ids),
+    }
+}
+
+/// Recursively rebuild every object in `value` with keys inserted in sorted
+/// order, so serialization is key-ordered under both map backends. Also used
+/// by the public-trace previews, which pin byte-stable output.
+pub(crate) fn sort_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(map).into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, item) in &mut entries {
+                sort_json_value(item);
+            }
+            map.extend(entries);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sort_json_value(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Hash-canonicalization for Inline prompts (t-1366). `ChatMessage`'s serde
@@ -1158,6 +1327,48 @@ mod tests {
         assert_eq!(
             canonical_program_hash(&p1).unwrap(),
             canonical_program_hash(&p2).unwrap()
+        );
+    }
+
+    #[test]
+    fn embedded_object_key_insertion_order_does_not_change_hash() {
+        // Two structurally identical programs whose embedded JSON objects
+        // were built with different key insertion orders. Under serde_json's
+        // default sorted map the orders converge trivially; under
+        // `preserve_order` (pulled in by the ACP dependency stack) they
+        // would serialize differently without hash-time canonicalization,
+        // silently orphaning every recorded trace.
+        let object_with = |order: &[(&str, serde_json::Value)]| {
+            let mut map = serde_json::Map::new();
+            for (key, value) in order {
+                map.insert((*key).into(), value.clone());
+            }
+            serde_json::Value::Object(map)
+        };
+        let program_with = |value: serde_json::Value| Program {
+            id: ProgramId("p".into()),
+            entry: BlockId(0),
+            blocks: BTreeMap::from([(
+                BlockId(0),
+                Block {
+                    params: vec![],
+                    instructions: vec![Instr::Let {
+                        out: Var("x".into()),
+                        expr: Expr::Value(value),
+                    }],
+                    terminator: Terminator::Return {
+                        value: Expr::Var(Var("x".into())),
+                    },
+                },
+            )]),
+        };
+        let nested =
+            |order: &[(&str, serde_json::Value)]| object_with(&[("outer", object_with(order))]);
+        let ab = program_with(nested(&[("a", json!(1)), ("b", json!(2))]));
+        let ba = program_with(nested(&[("b", json!(2)), ("a", json!(1))]));
+        assert_eq!(
+            canonical_program_hash(&ab).unwrap(),
+            canonical_program_hash(&ba).unwrap()
         );
     }
 
