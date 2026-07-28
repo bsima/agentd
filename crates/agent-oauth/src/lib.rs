@@ -994,6 +994,11 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
 /// `response.output_text.delta` fragments through the tap.
 #[derive(Default)]
 struct CodexStreamAccum {
+    /// `response.completed`/`response.done` arrived. EOF without it means
+    /// the stream was truncated; partial content is never accepted. Applies
+    /// to the buffered path too — `text()` of a cut connection yields the
+    /// same silent truncation.
+    completed: bool,
     content: String,
     current_tool: Option<CodexToolAccum>,
     tool_calls: Vec<ToolCall>,
@@ -1055,6 +1060,7 @@ impl CodexStreamAccum {
                 }
             }
             Some("response.completed" | "response.done") => {
+                self.completed = true;
                 if let Some((input, output, total, cached)) = event
                     .get("response")
                     .and_then(|response| response.get("usage"))
@@ -1086,6 +1092,7 @@ impl CodexStreamAccum {
 
     fn into_response(self) -> Result<Response> {
         let CodexStreamAccum {
+            completed,
             content,
             current_tool,
             mut tool_calls,
@@ -1094,6 +1101,11 @@ impl CodexStreamAccum {
             total_tokens,
             cached_input_tokens,
         } = self;
+        if !completed {
+            return Err(anyhow!(
+                "Codex response stream ended before response.completed; refusing truncated output"
+            ));
+        }
         if let Some(current) = current_tool {
             tool_calls.push(current.into_tool_call());
         }
@@ -1517,6 +1529,18 @@ mod tests {
         assert_eq!(
             extract_codex_account_id(&token).as_deref(),
             Some("acct_123")
+        );
+    }
+
+    #[test]
+    fn truncated_codex_stream_without_completed_is_rejected() {
+        // EOF before response.completed: partial output must not be
+        // accepted (a proxy closing cleanly mid-response).
+        let sse = r#"data: {"type":"response.output_text.delta","delta":"partial answ"}"#;
+        let err = parse_codex_sse_response(sse).map(|_| ()).unwrap_err();
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
         );
     }
 

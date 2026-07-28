@@ -239,6 +239,9 @@ impl AnthropicProvider {
 /// buffered body, forwarding `text_delta` fragments through `on_delta`.
 #[derive(Default)]
 struct AnthropicStreamAccum {
+    /// `message_stop` arrived. EOF without it means the stream was
+    /// truncated mid-response; partial content is never accepted.
+    stopped: bool,
     content: String,
     /// Open/finished tool_use blocks keyed by content-block index; the
     /// `input_json_delta` fragments buffer until `content_block_stop`.
@@ -291,7 +294,10 @@ impl AnthropicStreamAccum {
                     self.output_tokens = usage.output_tokens;
                 }
             }
-            AnthropicStreamEvent::MessageStop => return Ok(true),
+            AnthropicStreamEvent::MessageStop => {
+                self.stopped = true;
+                return Ok(true);
+            }
             AnthropicStreamEvent::Error { error } => {
                 let text = error.to_string();
                 // Mid-stream overloads are retryable per the API docs; the
@@ -314,6 +320,11 @@ impl AnthropicStreamAccum {
     }
 
     fn into_response(self) -> std::result::Result<Response, ProviderError> {
+        if !self.stopped {
+            return Err(ProviderError::TruncatedStream {
+                context: "Anthropic stream ended before message_stop",
+            });
+        }
         let tool_calls: Vec<ToolCall> = self
             .tool_blocks
             .into_values()
@@ -646,6 +657,28 @@ mod tests {
         assert_eq!(response.total_tokens, 15);
         assert_eq!(response.cached_input_tokens, Some(4));
         Ok(())
+    }
+
+    #[test]
+    fn truncated_stream_without_message_stop_is_rejected() {
+        use std::sync::Arc;
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#,
+            // EOF here: no message_delta, no message_stop.
+        ];
+        let on_delta: TextDeltaFn = Arc::new(|_| {});
+        let mut accum = AnthropicStreamAccum::default();
+        for event in events {
+            let parsed: AnthropicStreamEvent = serde_json::from_str(event).unwrap();
+            assert!(!accum.on_event(parsed, &on_delta).unwrap());
+        }
+        let err = accum.into_response().map(|_| ()).unwrap_err();
+        assert!(
+            err.is_retryable(),
+            "a cut stream is a transport interruption, not a terminal failure"
+        );
+        assert!(matches!(err, ProviderError::TruncatedStream { .. }));
     }
 
     #[test]

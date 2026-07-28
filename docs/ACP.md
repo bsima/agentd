@@ -18,12 +18,20 @@ Add agentd as a custom provider in `~/.paseo/config.json`:
       "agentd": {
         "extends": "acp",
         "label": "agentd",
-        "command": ["agent", "--acp"]
+        "command": ["agent", "--acp"],
+        "params": {
+          "supportsMcpServers": false
+        }
       }
     }
   }
 }
 ```
+
+`params.supportsMcpServers: false` stops Paseo injecting its internal MCP
+server into agentd sessions (see Paseo's `docs/custom-providers.md`) —
+agentd does not consume MCP servers yet, so without it Paseo's shared
+tools would be offered and silently dropped.
 
 Process-level flags become per-session defaults, so variants like
 `["agent", "--acp", "--model", "opus", "--memory-dir", "/home/you/notes"]`
@@ -31,12 +39,10 @@ work as separate provider entries.
 
 **MCP servers are not passed through (v1).** agentd advertises no MCP
 capabilities in `initialize`, and any servers a client offers in
-`session/new`/`session/load` are ignored with a stderr warning — tools
-Paseo normally injects via its internal MCP server (e.g. subagent
-creation) will not be available in agentd sessions. If your Paseo version
-supports disabling MCP injection per provider, turn it off for this entry;
-otherwise expect the warning and reduced Paseo-side tooling until MCP
-passthrough lands.
+`session/new`/`session/load` are ignored with a stderr warning — which is
+why the config above sets `supportsMcpServers: false`. Tools Paseo
+normally provides through its injected MCP server (e.g. subagent
+creation) are unavailable in agentd sessions until MCP passthrough lands.
 
 Authentication is agentd's normal provider auth, out of band: API keys via
 `models.yaml`/env, or subscription OAuth via `agent auth login claude-code`

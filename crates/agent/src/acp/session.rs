@@ -159,11 +159,17 @@ async fn set_model(
     args: &Args,
     alias: &str,
 ) -> Result<Vec<SessionConfigOption>> {
+    // Same url/key precedence as build_runtime: flags win, then the
+    // --config file's provider block — a session that started against a
+    // configured endpoint must not silently switch endpoints on a model
+    // change.
+    let file_config = crate::read_config(args.config.as_ref()).await?;
+    let provider_file = file_config.provider.unwrap_or_default();
     let (resolved, pricing, _embedder) = crate::resolve_model(Some(alias.to_owned()), None).await?;
     let (provider, provider_url) = crate::build_provider(
         &resolved,
-        args.provider.clone(),
-        args.key.clone(),
+        args.provider.clone().or(provider_file.url),
+        args.key.clone().or(provider_file.api_key),
         runtime.ir_replay.is_some(),
     )?;
     runtime.config.provider = provider;

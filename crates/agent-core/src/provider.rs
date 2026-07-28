@@ -484,6 +484,7 @@ async fn send_chat_request_streamed(
         })?;
         for event in decoder.feed(&chunk) {
             if event.data.trim() == "[DONE]" {
+                accum.terminated = true;
                 break 'outer;
             }
             let parsed: StreamChunk = serde_json::from_str(&event.data)
@@ -499,6 +500,11 @@ async fn send_chat_request_streamed(
 /// the non-streaming path builds, forwarding text deltas as they arrive.
 #[derive(Default)]
 struct OpenAiStreamAccum {
+    /// A terminal signal arrived (`[DONE]` or a `finish_reason` chunk). A
+    /// stream that hits EOF without one was truncated — a proxy or LB
+    /// closing cleanly mid-response — and its partial content must not be
+    /// accepted as a completed turn.
+    terminated: bool,
     content: String,
     tool_calls: Vec<StreamPendingToolCall>,
     finish_reason: Option<String>,
@@ -523,6 +529,9 @@ impl OpenAiStreamAccum {
         };
         if let Some(reason) = choice.finish_reason {
             self.finish_reason = Some(reason);
+            // A finish_reason is semantic completion even if the trailing
+            // usage chunk or [DONE] never arrives (graceful degradation).
+            self.terminated = true;
         }
         let Some(delta) = choice.delta else {
             return;
@@ -556,6 +565,11 @@ impl OpenAiStreamAccum {
     }
 
     fn into_response(self) -> std::result::Result<Response, ProviderError> {
+        if !self.terminated {
+            return Err(ProviderError::TruncatedStream {
+                context: "provider stream ended before [DONE] or a finish_reason",
+            });
+        }
         let usage = self.usage.unwrap_or_default();
         let input_tokens = usage.prompt_tokens.unwrap_or_default();
         let output_tokens = usage.completion_tokens.unwrap_or_default();
@@ -666,6 +680,13 @@ pub(crate) enum ProviderError {
     EmptyCompletion {
         raw: String,
     },
+    /// A streamed response hit EOF without its protocol's terminal event
+    /// (`[DONE]`/finish_reason, Anthropic `message_stop`). Partial content
+    /// must never be accepted as a completed turn; retryable like any
+    /// other transport interruption.
+    TruncatedStream {
+        context: &'static str,
+    },
     Other(anyhow::Error),
 }
 
@@ -687,6 +708,7 @@ impl ProviderError {
             // A non-existent model never becomes existent on retry.
             Self::ModelNotFound { .. } => false,
             Self::EmptyCompletion { .. } => true,
+            Self::TruncatedStream { .. } => true,
             Self::Other(_) => false,
         }
     }
@@ -710,6 +732,9 @@ impl ProviderError {
             ),
             Self::EmptyCompletion { raw } => {
                 anyhow!("provider returned an empty completion (no content or tool calls) after retries; raw response body: {raw}")
+            }
+            Self::TruncatedStream { context } => {
+                anyhow!("provider stream was truncated after retries: {context}")
             }
             Self::Other(err) => err,
         }
@@ -884,6 +909,41 @@ mod tests {
         ProviderError::EmptyCompletion {
             raw: r#"{"choices":[{"message":{"content":""}}]}"#.into(),
         }
+    }
+
+    #[test]
+    fn truncated_openai_stream_is_rejected() {
+        let on_delta: TextDeltaFn = std::sync::Arc::new(|_| {});
+        let mut accum = OpenAiStreamAccum::default();
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"partial answ"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        accum.absorb(chunk, &on_delta);
+        // EOF without [DONE] or a finish_reason: partial text must not be
+        // accepted as a completed turn.
+        let err = accum.into_response().map(|_| ()).unwrap_err();
+        assert!(err.is_retryable(), "truncation is a transport interruption");
+        assert!(matches!(err, ProviderError::TruncatedStream { .. }));
+    }
+
+    #[test]
+    fn finish_reason_terminates_a_stream_even_without_done() {
+        let on_delta: TextDeltaFn = std::sync::Arc::new(|_| {});
+        let mut accum = OpenAiStreamAccum::default();
+        for raw in [
+            r#"{"choices":[{"delta":{"content":"whole answer"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ] {
+            let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
+            accum.absorb(chunk, &on_delta);
+        }
+        // The trailing usage chunk / [DONE] were cut, but the semantic
+        // terminal (finish_reason) arrived: graceful degradation, zero
+        // usage, content intact.
+        let response = accum.into_response().expect("finish_reason terminates");
+        assert_eq!(response.content, "whole answer");
+        assert_eq!(response.total_tokens, 0);
     }
 
     #[test]
