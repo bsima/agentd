@@ -42,17 +42,30 @@ if missing:
 prompt_ir = [e for e in events if e.get("event") == "Custom" and e.get("name") == "prompt_ir"]
 if not prompt_ir:
     raise SystemExit("missing prompt_ir trace event")
-sections = prompt_ir[0]["data"].get("sections", [])
+# Runtime guidance (t-1359, default-on) emits its own prompt_ir event
+# ahead of the hydration one, so gather sections across ALL prompt_ir
+# events instead of assuming the first event carries the retrieval
+# sections.
+sections = [s for e in prompt_ir for s in e["data"].get("sections", [])]
 if not sections:
     raise SystemExit("prompt_ir trace has no sections")
-source = sections[0]["source"]
-if source.get("timing") != "Passive":
-    raise SystemExit(f"prompt_ir section missing passive timing: {source}")
-origin = source.get("origin", {})
-if origin.get("Retrieval", {}).get("mode") != "Semantic":
-    raise SystemExit(f"prompt_ir section missing semantic retrieval mode: {source}")
-if "content" in sections[0]:
-    raise SystemExit("prompt_ir trace should not include full content by default")
+retrieval = [
+    s for s in sections
+    if s["source"].get("origin", {}).get("Retrieval", {}).get("mode") == "Semantic"
+]
+if not retrieval:
+    raise SystemExit(f"no semantic-retrieval prompt_ir section: {sections}")
+if retrieval[0]["source"].get("timing") != "Passive":
+    raise SystemExit(f"retrieval section missing passive timing: {retrieval[0]['source']}")
+guidance = [
+    s for s in sections
+    if s["source"].get("origin", {}).get("Static", {}).get("name") == "runtime-guidance"
+]
+if not guidance:
+    raise SystemExit(f"runtime-guidance section missing (default-on, t-1359): {sections}")
+for section in sections:
+    if "content" in section:
+        raise SystemExit("prompt_ir trace should not include full content by default")
 for event in events:
     if event["event"] in {"HydrationStart", "InferCall", "InferResult"}:
         if "run_id" not in event or "op_id" not in event:

@@ -32,10 +32,15 @@ cat >"$trace" <<JSONL
 {"event":"InferResult","run_id":"smoke-replay","op_id":2,"response":{"finish_reason":"stop","content":"agentd-eval-smoke","tool_calls":[],"input_tokens":0,"output_tokens":1,"total_tokens":1},"response_preview":"agentd-eval-smoke","input_tokens":0,"output_tokens":1,"total_tokens":1,"duration_ms":0,"timestamp":"2026-01-01T00:00:00Z"}
 JSONL
 
-output="$({ env -u AGENT_API_KEY -u OPENROUTER_API_KEY "$agent_bin" \
+# HOME is isolated so a developer's real models.yaml cannot shadow the
+# no-registry fallback that `--model ignored` relies on (CI has no config,
+# so this only ever failed locally); stdin is closed so one-shot mode
+# cannot block draining a caller's open pipe.
+mkdir -p "$workdir/home"
+output="$({ env -u AGENT_API_KEY -u OPENROUTER_API_KEY HOME="$workdir/home" "$agent_bin" \
   --replay-trace "$trace" \
   --model ignored \
-  "smoke"; } 2>"$workdir/replay.stderr")"
+  "smoke" </dev/null; } 2>"$workdir/replay.stderr")"
 
 if [[ "$output" != *"agentd-eval-smoke"* ]]; then
   echo "error: replay output did not contain smoke marker" >&2
