@@ -323,6 +323,56 @@ fn new_session_reports_modes_and_model_options() {
 }
 
 #[test]
+fn gc_config_options_are_advertised_and_switchable() {
+    let root = temp_root("gc-config");
+    let port = spawn_mock_sse_server(vec![TEXT_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+
+    // session/new already advertised the GC options; fetch them via a
+    // strategy switch and assert the refreshed list reflects it.
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"gc","value":"semantic"}}}}"#
+    ));
+    let (response, _, _) = client.read_until_response(3, None);
+    let options = response["result"]["configOptions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no configOptions in {response}"));
+    let gc = options
+        .iter()
+        .find(|option| option["id"] == "gc")
+        .unwrap_or_else(|| panic!("no gc option in {response}"));
+    assert_eq!(gc["currentValue"], "semantic", "{response}");
+
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"gc-threshold","value":"0.7"}}}}"#
+    ));
+    let (response, _, _) = client.read_until_response(4, None);
+    let threshold = response["result"]["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["id"] == "gc-threshold"))
+        .unwrap_or_else(|| panic!("no gc-threshold option in {response}"));
+    assert_eq!(threshold["currentValue"], "0.7", "{response}");
+
+    // Bad values are rejected without killing the session.
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"gc","value":"bogus"}}}}"#
+    ));
+    let (response, _, _) = client.read_until_response(5, None);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown gc strategy")),
+        "{response}"
+    );
+
+    // The session still takes turns after the config churn.
+    client.prompt(6, &session_id, "greet");
+    let (response, _, _) = client.read_until_response(6, None);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+}
+
+#[test]
 fn yolo_mode_runs_shell_without_permission_prompts() {
     let root = temp_root("yolo");
     let port = spawn_mock_sse_server(vec![SHELL_TURN, DONE_TURN]);

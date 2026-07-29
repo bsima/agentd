@@ -7,9 +7,8 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    CurrentModeUpdate, PromptResponse, SessionConfigOption, SessionId, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionResponse, SetSessionModeResponse,
-    StopReason,
+    CurrentModeUpdate, PromptResponse, SessionId, SessionModeId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionResponse, SetSessionModeResponse, StopReason,
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
 use anyhow::Result;
@@ -29,8 +28,12 @@ pub(crate) enum SessionCommand {
         mode_id: SessionModeId,
         responder: Responder<SetSessionModeResponse>,
     },
-    SetModel {
-        alias: String,
+    /// A `session/set_config_option` write: model, GC strategy, or GC
+    /// threshold, dispatched by config id in the actor so all of them
+    /// mutate the runtime between turns, never mid-turn.
+    SetConfig {
+        config_id: String,
+        value: String,
         responder: Responder<SetSessionConfigOptionResponse>,
     },
 }
@@ -122,9 +125,25 @@ pub(crate) async fn session_actor(
                 ));
                 let _ = responder.respond(SetSessionModeResponse::new());
             }
-            SessionCommand::SetModel { alias, responder } => {
-                match set_model(&mut runtime, &args, &alias).await {
-                    Ok(config_options) => {
+            SessionCommand::SetConfig {
+                config_id,
+                value,
+                responder,
+            } => {
+                let result = match config_id.as_str() {
+                    registry::MODEL_CONFIG_ID => set_model(&mut runtime, &args, &value).await,
+                    registry::GC_CONFIG_ID => set_gc(&mut runtime, &args, &value).await,
+                    registry::GC_THRESHOLD_CONFIG_ID => set_gc_threshold(&mut runtime, &value),
+                    other => Err(anyhow::anyhow!("unknown config option: {other}")),
+                };
+                match result {
+                    Ok(()) => {
+                        let config_options = registry::session_config_options(
+                            &runtime.resume_facts.model,
+                            &runtime.config.gc,
+                            runtime.config.gc_threshold,
+                        )
+                        .await;
                         let _ =
                             responder.respond(SetSessionConfigOptionResponse::new(config_options));
                     }
@@ -154,11 +173,7 @@ async fn flush_updates(update_tx: &mpsc::UnboundedSender<ForwarderMsg>) {
 /// Re-resolve the model alias against the registry and swap the runtime's
 /// provider, context budget, and pricing in place — the same helpers the
 /// approvals-resume path already drives, so this is pure plumbing.
-async fn set_model(
-    runtime: &mut Runtime,
-    args: &Args,
-    alias: &str,
-) -> Result<Vec<SessionConfigOption>> {
+async fn set_model(runtime: &mut Runtime, args: &Args, alias: &str) -> Result<()> {
     // Same url/key precedence as build_runtime: flags win, then the
     // --config file's provider block — a session that started against a
     // configured endpoint must not silently switch endpoints on a model
@@ -178,5 +193,46 @@ async fn set_model(
     runtime.model = agent_core::Model(resolved.api_id.clone());
     runtime.provider_url = provider_url;
     runtime.resume_facts.model = resolved.alias.clone();
-    Ok(registry::model_config_options(&resolved.alias).await)
+    Ok(())
+}
+
+/// Swap the GC strategy between turns. Safe mid-session: GC mode is not
+/// part of program identity (no effect-id or replay impact) and the
+/// persistent `gc_state` (discovered budget, frame lifecycles, hot set) is
+/// strategy-agnostic. The process-level `--gc-*` knobs (cache policy,
+/// windows, floors) carry over into the new strategy.
+async fn set_gc(runtime: &mut Runtime, args: &Args, value: &str) -> Result<()> {
+    let choice = <crate::GcArg as clap::ValueEnum>::from_str(value, true)
+        .map_err(|_| anyhow::anyhow!("unknown gc strategy: {value}"))?;
+    // Mirror build_runtime's guard: non-threshold timing needs a strategy.
+    if matches!(choice, crate::GcArg::None) && args.gc_timing != agent_core::GcTiming::Threshold {
+        return Err(anyhow::anyhow!(
+            "--gc-timing {} requires a GC strategy; gc cannot be turned off for this session",
+            args.gc_timing.name()
+        ));
+    }
+    // The embedder for semantic/generational comes from the registry's
+    // `embeddings` entry, exactly as at session start; absent registry or
+    // entry degrades to the heuristic/citation-only modes with a stderr
+    // warning (same as the flags).
+    let embedder = match crate::resolve_model(Some(runtime.resume_facts.model.clone()), None).await
+    {
+        Ok((_, _, embedder)) => embedder,
+        Err(_) => None,
+    };
+    runtime.config.gc = crate::gc_mode_from_choice(args, choice, &embedder);
+    Ok(())
+}
+
+fn set_gc_threshold(runtime: &mut Runtime, value: &str) -> Result<()> {
+    let threshold: f32 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("gc threshold must be a number, got {value:?}"))?;
+    if !(0.1..=1.0).contains(&threshold) {
+        return Err(anyhow::anyhow!(
+            "gc threshold must be within 0.1..=1.0, got {threshold}"
+        ));
+    }
+    runtime.config.gc_threshold = threshold;
+    Ok(())
 }

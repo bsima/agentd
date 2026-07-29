@@ -79,9 +79,18 @@ the wire.
   traffic is not reconstructed.
 - Modes — `ask` (default; approval-gated shell) and `yolo`;
   `session/set_mode` flips them and emits `current_mode_update`.
-- Config options — a `model` select listing every `models.yaml` alias;
-  `session/set_config_option` re-resolves the alias and swaps the
-  provider, context budget, and pricing in place (next turn uses it).
+- Config options — rendered by Paseo next to the mode picker, applied
+  between turns via `session/set_config_option`:
+  - `model`: every `models.yaml` alias; switching re-resolves the
+    provider, context budget, and pricing in place.
+  - `gc`: the context-GC strategy (`none`/`ring`/`mark-sweep`/`stack`/
+    `semantic`/`generational`), defaulting to the `--gc` flag. Safe to
+    switch mid-session — GC is not part of program identity, and the
+    persistent GC state is strategy-agnostic. The process-level `--gc-*`
+    knobs (cache policy, windows, floors) carry into the new strategy;
+    switching to `none` is rejected when `--gc-timing` needs a strategy.
+  - `gc-threshold`: the collection trigger as a fraction of the context
+    budget (discrete steps; defaults to `--gc-threshold`).
 
 ## Streaming
 

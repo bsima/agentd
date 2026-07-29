@@ -728,62 +728,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         replay: None,
         trace_full_prompt_ir: args.trace_full_prompt_ir,
         trace_full_payloads: args.trace_full_payloads,
-        gc: {
-            let preserve_prefix = matches!(args.gc_cache, GcCacheArg::Preserve);
-            match args.gc {
-                GcArg::None => GcMode::None,
-                GcArg::Ring => GcMode::Ring(RingGc {
-                    preserve_prefix,
-                    hot_keep: args.gc_hot_keep,
-                }),
-                GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc {
-                    preserve_prefix,
-                    hot_keep: args.gc_hot_keep,
-                }),
-                GcArg::Stack => GcMode::Stack(StackFrameGc {
-                    preserve_prefix,
-                    hot_keep: args.gc_hot_keep,
-                }),
-                GcArg::Semantic => {
-                    // Same embedder the memory backend resolves from the
-                    // registry's `embeddings` entry (t-1340). None =
-                    // heuristic-only mode (documented in docs/GC.md), worth
-                    // a warning since semantic scoring is the point.
-                    if embedder.is_none() {
-                        eprintln!(
-                            "warning: --gc semantic without a models.yaml `embeddings` entry \
-                             scores by recency only (heuristic mode; see docs/GC.md)"
-                        );
-                    }
-                    GcMode::Semantic(agent_core::gc::SemanticGc {
-                        preserve_prefix,
-                        recent_window: args.gc_semantic_window,
-                        similarity_floor: args.gc_semantic_floor,
-                        embedder: embedder.clone(),
-                        cited_keep: args.gc_cited_keep,
-                        hot_keep: args.gc_hot_keep,
-                    })
-                }
-                GcArg::Generational => {
-                    // Strategy-honest degrade (docs/GC.md Strategy 5):
-                    // without an embedder the warm tier is citation-only —
-                    // softer than semantic's warning because citations
-                    // still carry the tier.
-                    if embedder.is_none() {
-                        eprintln!(
-                            "warning: --gc generational without a models.yaml `embeddings` \
-                             entry runs a citation-only warm tier (see docs/GC.md)"
-                        );
-                    }
-                    GcMode::Generational(agent_core::gc::GenerationalGc {
-                        preserve_prefix,
-                        nursery_window: args.gc_nursery,
-                        warm_floor: args.gc_warm_floor,
-                        embedder: embedder.clone(),
-                    })
-                }
-            }
-        },
+        gc: gc_mode_from_choice(args, args.gc, &embedder),
         gc_threshold: args.gc_threshold,
         gc_log: args.gc_log,
         gc_timing: args.gc_timing,
@@ -841,6 +786,66 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
             eval_max_output_bytes: args.eval_max_output_bytes,
         },
     })
+}
+
+/// Build a [`GcMode`] from a strategy choice plus the process-level GC
+/// knobs. Shared by `build_runtime` and the ACP session-config path, which
+/// switches strategies between turns (`session/set_config_option`).
+fn gc_mode_from_choice(args: &Args, choice: GcArg, embedder: &Option<Arc<dyn Embedder>>) -> GcMode {
+    let preserve_prefix = matches!(args.gc_cache, GcCacheArg::Preserve);
+    match choice {
+        GcArg::None => GcMode::None,
+        GcArg::Ring => GcMode::Ring(RingGc {
+            preserve_prefix,
+            hot_keep: args.gc_hot_keep,
+        }),
+        GcArg::MarkSweep => GcMode::MarkSweep(MarkSweepGc {
+            preserve_prefix,
+            hot_keep: args.gc_hot_keep,
+        }),
+        GcArg::Stack => GcMode::Stack(StackFrameGc {
+            preserve_prefix,
+            hot_keep: args.gc_hot_keep,
+        }),
+        GcArg::Semantic => {
+            // Same embedder the memory backend resolves from the
+            // registry's `embeddings` entry (t-1340). None =
+            // heuristic-only mode (documented in docs/GC.md), worth
+            // a warning since semantic scoring is the point.
+            if embedder.is_none() {
+                eprintln!(
+                    "warning: --gc semantic without a models.yaml `embeddings` entry \
+                     scores by recency only (heuristic mode; see docs/GC.md)"
+                );
+            }
+            GcMode::Semantic(agent_core::gc::SemanticGc {
+                preserve_prefix,
+                recent_window: args.gc_semantic_window,
+                similarity_floor: args.gc_semantic_floor,
+                embedder: embedder.clone(),
+                cited_keep: args.gc_cited_keep,
+                hot_keep: args.gc_hot_keep,
+            })
+        }
+        GcArg::Generational => {
+            // Strategy-honest degrade (docs/GC.md Strategy 5):
+            // without an embedder the warm tier is citation-only —
+            // softer than semantic's warning because citations
+            // still carry the tier.
+            if embedder.is_none() {
+                eprintln!(
+                    "warning: --gc generational without a models.yaml `embeddings` \
+                     entry runs a citation-only warm tier (see docs/GC.md)"
+                );
+            }
+            GcMode::Generational(agent_core::gc::GenerationalGc {
+                preserve_prefix,
+                nursery_window: args.gc_nursery,
+                warm_floor: args.gc_warm_floor,
+                embedder: embedder.clone(),
+            })
+        }
+    }
 }
 
 struct OtelGuard {

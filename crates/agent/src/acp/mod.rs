@@ -138,7 +138,12 @@ impl AcpServer {
                 .push_str(&delta.text);
         }));
         let modes = registry::session_modes(runtime.shell_requires_approval);
-        let config_options = registry::model_config_options(&runtime.resume_facts.model).await;
+        let config_options = registry::session_config_options(
+            &runtime.resume_facts.model,
+            &runtime.config.gc,
+            runtime.config.gc_threshold,
+        )
+        .await;
 
         // Forwarder: drains the bridge channel into session/update
         // notifications. Tied to the connection so it winds down with it.
@@ -339,14 +344,20 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
         .on_receive_request(
             async move |request: SetSessionConfigOptionRequest, responder, _cx| {
-                if request.config_id.0.as_ref() != registry::MODEL_CONFIG_ID {
+                let config_id = request.config_id.0.to_string();
+                if !matches!(
+                    config_id.as_str(),
+                    registry::MODEL_CONFIG_ID
+                        | registry::GC_CONFIG_ID
+                        | registry::GC_THRESHOLD_CONFIG_ID
+                ) {
                     return responder.respond_with_error(
                         Error::invalid_params().data(serde_json::json!("unknown config option")),
                     );
                 }
-                let Some(alias) = request.value.as_value_id().map(|id| id.0.to_string()) else {
+                let Some(value) = request.value.as_value_id().map(|id| id.0.to_string()) else {
                     return responder.respond_with_error(
-                        Error::invalid_params().data(serde_json::json!("expected a model id")),
+                        Error::invalid_params().data(serde_json::json!("expected a value id")),
                     );
                 };
                 let sessions = set_config_server
@@ -357,13 +368,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     drop(sessions);
                     return responder.respond_with_error(unknown_session());
                 };
-                if let Err(mpsc::error::SendError(session::SessionCommand::SetModel {
+                if let Err(mpsc::error::SendError(session::SessionCommand::SetConfig {
                     responder,
                     ..
-                })) = handle
-                    .cmd_tx
-                    .send(session::SessionCommand::SetModel { alias, responder })
-                {
+                })) = handle.cmd_tx.send(session::SessionCommand::SetConfig {
+                    config_id,
+                    value,
+                    responder,
+                }) {
                     return responder.respond_with_error(internal_error("session is gone"));
                 }
                 Ok(())
