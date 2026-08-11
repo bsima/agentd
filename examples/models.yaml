@@ -21,6 +21,12 @@
 # No pricing block = usage is still recorded, cost is omitted (absent means
 # unknown — it is never guessed and never zero). The legacy flat
 # `input`/`output` fields below are NOT read for cost accounting.
+#
+# Price the OAuth/subscription entries too (claude-code, openai-codex).
+# You are not billed per token on those, but the list rates are the only
+# way to see what a run WOULD have cost, i.e. what the subscription is
+# saving you and which agents are expensive. Leave pricing off only when
+# the rate is genuinely unknown; use 0/0 for genuinely free (local).
 # Roll up a trace with: agent cost --trace <file.jsonl> [--json]
 
 # Semantic memory retrieval (t-1340): an optional top-level `embeddings`
@@ -99,6 +105,9 @@ models:
     api_id: claude-opus-4-8
     input: 15.0
     output: 75.0
+    pricing:
+      input_per_mtok_usd: 15.0
+      output_per_mtok_usd: 75.0
     context: 1000000
     # Optional per-response output token cap (anthropic provider only;
     # defaults to 8192 when unset).
@@ -112,6 +121,9 @@ models:
     api_id: claude-opus-4-7
     input: 15.0
     output: 75.0
+    pricing:
+      input_per_mtok_usd: 15.0
+      output_per_mtok_usd: 75.0
     context: 1000000
     thinking: true
     vision: true
@@ -122,6 +134,9 @@ models:
     api_id: claude-sonnet-4-6
     input: 3.0
     output: 15.0
+    pricing:
+      input_per_mtok_usd: 3.0
+      output_per_mtok_usd: 15.0
     context: 200000
     thinking: false
     vision: false
@@ -132,6 +147,9 @@ models:
     api_id: claude-haiku-4-5
     input: 1.0
     output: 5.0
+    pricing:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 5.0
     context: 200000
     thinking: false
     vision: false
@@ -145,6 +163,9 @@ models:
     api_id: claude-opus-4-8
     input: 15.0
     output: 75.0
+    pricing:
+      input_per_mtok_usd: 15.0
+      output_per_mtok_usd: 75.0
     context: 1000000
     # Optional per-response output token cap (anthropic provider only;
     # defaults to 8192 when unset).
@@ -158,8 +179,11 @@ models:
   - name: codex/gpt-5
     provider: openai-codex
     api_id: gpt-5
-    input: 0
-    output: 0
+    input: 1.25
+    output: 10.0
+    pricing:
+      input_per_mtok_usd: 1.25
+      output_per_mtok_usd: 10.0
     context: 200000
     thinking: true
     vision: false
@@ -168,19 +192,52 @@ models:
   - name: openai/gpt-5.5
     provider: openai-codex
     api_id: gpt-5.5
-    input: 0
-    output: 0
+    input: 5.0
+    output: 20.0
+    pricing:
+      input_per_mtok_usd: 5.0
+      output_per_mtok_usd: 20.0
     context: 200000
     thinking: true
     vision: false
     display: GPT-5.5 via Codex OAuth
 
+  - name: openai/gpt-5.6-sol
+    provider: openai-codex
+    api_id: gpt-5.6-sol
+    input: 5.0
+    output: 30.0
+    pricing:
+      input_per_mtok_usd: 5.0
+      output_per_mtok_usd: 30.0
+    context: 272000
+    thinking: true
+    vision: true
+    display: GPT-5.6 sol via Codex OAuth
+
+  # Short alias for the same model.
+  - name: gpt-5.6-sol
+    provider: openai-codex
+    api_id: gpt-5.6-sol
+    input: 5.0
+    output: 30.0
+    pricing:
+      input_per_mtok_usd: 5.0
+      output_per_mtok_usd: 30.0
+    context: 272000
+    thinking: true
+    vision: true
+    display: GPT-5.6 sol via Codex OAuth (short alias)
+
   # Backward-compatible alias.
   - name: claude/sonnet-oauth
     provider: claude-code
     api_id: claude-sonnet-4-6
-    input: 0
-    output: 0
+    input: 3.0
+    output: 15.0
+    pricing:
+      input_per_mtok_usd: 3.0
+      output_per_mtok_usd: 15.0
     context: 200000
     thinking: true
     vision: true
