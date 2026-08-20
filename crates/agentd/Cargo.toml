@@ -23,6 +23,6 @@ uuid.workspace = true
 # Tests only (docs/SUPERVISOR.md quality bar): replay fixtures for driving
 # the real `agent` child without credentials. The supervisor itself talks
 # to the agent purely through the filesystem/process contract.
-agent-sdk = { path = "../agent-sdk", version = "0.3.0" }
+agent-sdk = { path = "../agent-sdk", version = "0.3.1" }
 serde_json.workspace = true
 uuid.workspace = true
