@@ -39,7 +39,9 @@ $AGENTD_HOME (default ~/.local/share/agentd)/
   <name>/
     agent.md            # CANONICAL session spec (YAML frontmatter + body)
     fifo                # turn delivery (mkfifo)
-    pid                 # supervisor-written, liveness-checked via kill -0
+    pid                 # supervisor-written process ID
+    process-start-time  # /proc start-time token; prevents PID-reuse signals
+    lifecycle.lock      # flock serializing start/resume/stop transitions
     run-id              # stable AGENT_RUN_ID for traces
     checkpoints/        # --checkpoint-dir
     stdout.jsonl        # captured --json stdout (machine events)
@@ -47,8 +49,10 @@ $AGENTD_HOME (default ~/.local/share/agentd)/
     send.lock           # per-session flock taken by `agentd send`
 ```
 
-A session "exists" if its directory exists; it is "running" if the pid is
-live. No registry database. Two `agentd` invocations coordinate through the
+A session "exists" if its directory exists; it is "running" only if both the
+PID is live and its Linux process start time matches `process-start-time`.
+Legacy PID-only records are never signaled and block a new launch while their PID remains live. Lifecycle transitions hold
+`lifecycle.lock`; `send.lock` remains separate for turn framing. No registry database. Two `agentd` invocations coordinate through the
 filesystem only.
 
 ## Turn delivery and response correlation

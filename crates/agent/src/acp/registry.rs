@@ -12,6 +12,10 @@ use agent_core::{GcMode, ModelRegistry};
 
 pub(crate) const MODE_ASK: &str = "ask";
 pub(crate) const MODE_YOLO: &str = "yolo";
+
+pub(crate) fn is_session_mode(id: &str) -> bool {
+    matches!(id, MODE_ASK | MODE_YOLO)
+}
 pub(crate) const MODEL_CONFIG_ID: &str = "model";
 pub(crate) const GC_CONFIG_ID: &str = "gc";
 pub(crate) const GC_THRESHOLD_CONFIG_ID: &str = "gc-threshold";
@@ -127,17 +131,11 @@ fn gc_threshold_option(current: f32) -> SessionConfigOption {
         .description("Collect once the prompt reaches this fraction of the context budget")
 }
 
-/// Canonical value id for a threshold fraction: trailing zeros trimmed so
-/// 0.85 and 0.850 collide onto one id.
+/// Round-trip-safe value id for a threshold fraction. `f32::to_string`
+/// emits the shortest decimal that parses back to the same float, so a
+/// custom process-level threshold is reported without changing its value.
 fn format_threshold(value: f32) -> String {
-    let mut id = format!("{value:.2}");
-    while id.ends_with('0') {
-        id.pop();
-    }
-    if id.ends_with('.') {
-        id.pop();
-    }
-    id
+    value.to_string()
 }
 
 fn percent(id: &str) -> String {
@@ -185,9 +183,11 @@ mod tests {
     }
 
     #[test]
-    fn threshold_ids_are_canonical() {
-        assert_eq!(format_threshold(0.85), "0.85");
-        assert_eq!(format_threshold(0.8), "0.8");
-        assert_eq!(format_threshold(0.5), "0.5");
+    fn threshold_ids_round_trip_without_losing_precision() {
+        for value in [0.85, 0.8, 0.5, 0.854_321] {
+            let id = format_threshold(value);
+            assert_eq!(id.parse::<f32>(), Ok(value));
+        }
+        assert_eq!(format_threshold(0.854_321), "0.854321");
     }
 }

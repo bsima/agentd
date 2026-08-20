@@ -138,6 +138,10 @@ pub(crate) async fn session_actor(
                 };
                 match result {
                     Ok(()) => {
+                        // Config is session state, not connection state. Write
+                        // it immediately so session/load preserves a change
+                        // even when the client disconnects before another turn.
+                        crate::persist_session(&mut runtime).await;
                         let config_options = registry::session_config_options(
                             &runtime.resume_facts.model,
                             &runtime.config.gc,
@@ -188,6 +192,9 @@ async fn set_model(runtime: &mut Runtime, args: &Args, alias: &str) -> Result<()
         runtime.ir_replay.is_some(),
     )?;
     runtime.config.provider = provider;
+    // Learned overflow ceilings are specific to the old provider/model.
+    // Preserve the rest of GcState (lifecycles, frames, hot-set history).
+    runtime.gc_state.discovered_budget = None;
     runtime.config.context_budget = resolved.context;
     runtime.config.pricing = pricing;
     runtime.model = agent_core::Model(resolved.api_id.clone());

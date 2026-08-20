@@ -322,6 +322,50 @@ fn start_send_status_stop_roundtrip() {
     assert!(again.contains("not running"));
 }
 
+/// The lifecycle flock covers check, spawn, and identity persistence: two
+/// simultaneous starts may not create two FIFO readers.
+#[test]
+fn concurrent_starts_spawn_exactly_one_agent() {
+    let scratch = Scratch::new();
+    let fixture = scratch.write_replay_fixture(&["unused"]);
+    let fixture = fixture.display().to_string();
+    scratch.sessions.lock().unwrap().push("launch-race".into());
+    let args = [
+        "start",
+        "launch-race",
+        "--model",
+        MODEL,
+        "--",
+        "--replay-trace",
+        fixture.as_str(),
+    ];
+    let first = scratch
+        .agentd(&args, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = scratch
+        .agentd(&args, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_eq!(
+        usize::from(first.status.success()) + usize::from(second.status.success()),
+        1,
+        "first={first:?} second={second:?}"
+    );
+    let status = scratch.status_json("launch-race");
+    assert_eq!(status["running"], true);
+    assert!(status["pid"].as_i64().is_some());
+    assert!(scratch
+        .session_file("launch-race", "process-start-time")
+        .is_file());
+}
+
 /// Two overlapping senders: the first turn is slow, the second sender's
 /// tail must skip the first sender's completion (id filter) and both must
 /// get exactly their own response.

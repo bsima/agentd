@@ -115,6 +115,7 @@ impl AcpServer {
             cwd: Some(cwd),
             checkpoint_dir: Some(checkpoint_dir),
             checkpoint,
+            restore_checkpoint_config: true,
             run_id: session_id.clone(),
             require_shell_approval,
             trace_sinks_extra: vec![sink],
@@ -321,6 +322,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
         .on_receive_request(
             async move |request: SetSessionModeRequest, responder, _cx| {
+                if !registry::is_session_mode(request.mode_id.0.as_ref()) {
+                    return responder.respond_with_error(
+                        Error::invalid_params().data(serde_json::json!("unknown session mode")),
+                    );
+                }
                 let sessions = set_mode_server
                     .sessions
                     .lock()

@@ -7,6 +7,7 @@ use crate::spec::{self, Spec, SPEC_FILE};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
@@ -58,6 +59,14 @@ impl Session {
         self.dir().join("pid")
     }
 
+    pub fn process_start_path(&self) -> PathBuf {
+        self.dir().join("process-start-time")
+    }
+
+    pub fn lifecycle_lock_path(&self) -> PathBuf {
+        self.dir().join("lifecycle.lock")
+    }
+
     pub fn run_id_path(&self) -> PathBuf {
         self.dir().join("run-id")
     }
@@ -103,10 +112,34 @@ impl Session {
             .ok()
     }
 
-    /// The live pid, or `None` when stopped/crashed (pid file missing,
-    /// unparseable, or pointing at a dead process).
+    /// A live PID without a usable identity token is a legacy/partial record.
+    /// It is unsafe to signal, but equally unsafe to launch a second FIFO
+    /// reader over it; lifecycle launch therefore refuses it as ambiguous.
+    fn live_pid_without_identity(&self) -> Option<i32> {
+        let pid = self.pid()?;
+        if !pid_alive(pid) {
+            return None;
+        }
+        let has_identity = std::fs::read_to_string(self.process_start_path())
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some();
+        (!has_identity).then_some(pid)
+    }
+
+    /// The live pid, or `None` when stopped/crashed. A PID is only ours when
+    /// its Linux process start time matches the token recorded at launch.
+    /// PID-only directories from older agentd versions deliberately fail
+    /// safe: they are stale rather than grounds for signaling a process.
     pub fn running(&self) -> Option<i32> {
-        self.pid().filter(|&pid| pid_alive(pid))
+        let pid = self.pid()?;
+        let expected = std::fs::read_to_string(self.process_start_path())
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        process_start_time(pid).filter(|actual| *actual == expected)?;
+        Some(pid)
     }
 
     pub fn run_id(&self) -> Option<String> {
@@ -168,6 +201,89 @@ pub fn pid_alive(pid: i32) -> bool {
     }
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Linux `/proc/<pid>/stat` field 22. Unlike a bare PID, this identifies one
+/// incarnation of a process across PID reuse.
+fn process_start_time(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may contain spaces or `)`.
+    let after_comm = stat.rsplit_once(')')?.1;
+    // The suffix starts at field 3; starttime is field 22.
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+struct SessionProcess {
+    pid: i32,
+    pidfd: OwnedFd,
+}
+
+/// Open a stable reference before checking identity. Once opened, the pidfd
+/// continues to name this process incarnation even if it exits and Linux
+/// reuses the integer PID before we send a signal.
+fn open_session_process(session: &Session) -> Result<Option<SessionProcess>> {
+    let Some(pid) = session.pid() else {
+        return Ok(None);
+    };
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("opening pidfd for pid {pid}"));
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let expected = std::fs::read_to_string(session.process_start_path())
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if expected.is_none() || process_start_time(pid) != expected {
+        return Ok(None);
+    }
+    Ok(Some(SessionProcess { pid, pidfd }))
+}
+
+fn signal_process(process: &SessionProcess, sig: i32) -> Result<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.pidfd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(err).with_context(|| format!("signaling pid {} via pidfd", process.pid));
+        }
+    }
+    Ok(())
+}
+
+struct LifecycleLock {
+    _file: std::fs::File,
+}
+
+impl LifecycleLock {
+    fn acquire(session: &Session) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(session.lifecycle_lock_path())
+            .with_context(|| format!("opening {}", session.lifecycle_lock_path().display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("taking the per-session lifecycle lock");
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 fn ensure_fifo(path: &Path) -> Result<()> {
@@ -244,6 +360,12 @@ pub struct Launch<'a> {
 /// stdout to `stdout.jsonl`, detaches the child into its own session, and
 /// writes pid/run-id. Returns (pid, run_id).
 pub fn launch(session: &Session, launch: Launch<'_>) -> Result<(u32, String)> {
+    if launch.resume {
+        session.require_exists()?;
+    }
+    std::fs::create_dir_all(session.dir())
+        .with_context(|| format!("creating {}", session.dir().display()))?;
+    let _lifecycle_lock = LifecycleLock::acquire(session)?;
     if let Some(pid) = session.running() {
         bail!(
             "session '{}' is already running (pid {pid}); stop it first with `agentd stop {}`",
@@ -251,9 +373,14 @@ pub fn launch(session: &Session, launch: Launch<'_>) -> Result<(u32, String)> {
             session.name
         );
     }
-    if launch.resume {
-        session.require_exists()?;
+    if let Some(pid) = session.live_pid_without_identity() {
+        bail!(
+            "session '{}' has a live legacy pid {pid} but no process identity; refusing to launch or signal it",
+            session.name
+        );
     }
+    let _ = std::fs::remove_file(session.pid_path());
+    let _ = std::fs::remove_file(session.process_start_path());
     std::fs::create_dir_all(session.checkpoints_dir())
         .with_context(|| format!("creating {}", session.checkpoints_dir().display()))?;
 
@@ -354,8 +481,26 @@ pub fn launch(session: &Session, launch: Launch<'_>) -> Result<(u32, String)> {
         .spawn()
         .with_context(|| format!("spawning {}", launch.agent_bin.display()))?;
     let pid = child.id();
-    std::fs::write(session.pid_path(), format!("{pid}\n"))
-        .with_context(|| format!("writing {}", session.pid_path().display()))?;
+    let pid_i32 = i32::try_from(pid).context("child PID does not fit i32")?;
+    let start_time = match process_start_time(pid_i32) {
+        Some(start_time) => start_time,
+        None => {
+            let _ = unsafe { libc::kill(pid_i32, libc::SIGKILL) };
+            bail!("spawned agent pid {pid} exited before its identity could be recorded");
+        }
+    };
+    if let Err(err) = std::fs::write(session.process_start_path(), format!("{start_time}\n"))
+        .with_context(|| format!("writing {}", session.process_start_path().display()))
+        .and_then(|()| {
+            std::fs::write(session.pid_path(), format!("{pid}\n"))
+                .with_context(|| format!("writing {}", session.pid_path().display()))
+        })
+    {
+        let _ = unsafe { libc::kill(pid_i32, libc::SIGKILL) };
+        let _ = std::fs::remove_file(session.pid_path());
+        let _ = std::fs::remove_file(session.process_start_path());
+        return Err(err);
+    }
     Ok((pid, run_id))
 }
 
@@ -376,37 +521,31 @@ fn checkpoint_run_id(path: &Path) -> Option<String> {
 /// lifecycle table). Returns whether escalation happened.
 pub fn stop(session: &Session, grace: Duration) -> Result<Option<bool>> {
     session.require_exists()?;
-    let Some(pid) = session.running() else {
-        // Clean up a stale pid file so `status` stays truthful.
-        let _ = std::fs::remove_file(session.pid_path());
+    let _lifecycle_lock = LifecycleLock::acquire(session)?;
+    let Some(process) = open_session_process(session)? else {
+        // Legacy PID-only records fail safe: never signal them. Keep a live
+        // ambiguous PID record so launch also refuses to create a duplicate.
+        if session.live_pid_without_identity().is_none() {
+            let _ = std::fs::remove_file(session.pid_path());
+            let _ = std::fs::remove_file(session.process_start_path());
+        }
         return Ok(None);
     };
-    signal(pid, libc::SIGTERM)?;
+    signal_process(&process, libc::SIGTERM)?;
     let deadline = Instant::now() + grace;
-    while pid_alive(pid) && Instant::now() < deadline {
+    while session.running() == Some(process.pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    let escalated = pid_alive(pid);
+    let escalated = session.running() == Some(process.pid);
     if escalated {
-        signal(pid, libc::SIGKILL)?;
-        while pid_alive(pid) {
+        signal_process(&process, libc::SIGKILL)?;
+        while session.running() == Some(process.pid) {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     let _ = std::fs::remove_file(session.pid_path());
+    let _ = std::fs::remove_file(session.process_start_path());
     Ok(Some(escalated))
-}
-
-fn signal(pid: i32, sig: i32) -> Result<()> {
-    if unsafe { libc::kill(pid, sig) } != 0 {
-        let err = std::io::Error::last_os_error();
-        // The process exiting between liveness check and kill is a win,
-        // not an error.
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            return Err(err).with_context(|| format!("signaling pid {pid}"));
-        }
-    }
-    Ok(())
 }
 
 /// One session's status snapshot (`agentd status`).
@@ -548,6 +687,53 @@ mod tests {
         if !pid_alive(999_999_999) {
             assert!(session.running().is_none());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pid_identity_must_match_and_pid_only_records_fail_safe() {
+        let dir = std::env::temp_dir().join(format!("agentd-identity-{}", uuid::Uuid::new_v4()));
+        let session = Session::new(dir.clone(), "s").unwrap();
+        std::fs::create_dir_all(session.dir()).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        std::fs::write(session.pid_path(), format!("{pid}\n")).unwrap();
+        assert_eq!(
+            session.running(),
+            None,
+            "legacy PID-only record must fail safe"
+        );
+        let actual = process_start_time(pid).unwrap();
+        std::fs::write(session.process_start_path(), format!("{}\n", actual + 1)).unwrap();
+        assert_eq!(session.running(), None, "mismatched identity must be stale");
+        std::fs::write(session.process_start_path(), format!("{actual}\n")).unwrap();
+        assert_eq!(session.running(), Some(pid));
+        // Stop must not signal this test process after identity is corrupted.
+        std::fs::write(session.process_start_path(), format!("{}\n", actual + 1)).unwrap();
+        assert_eq!(stop(&session, Duration::ZERO).unwrap(), None);
+        assert!(pid_alive(pid));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_legacy_pid_refuses_launch_without_signaling() {
+        let dir = std::env::temp_dir().join(format!("agentd-legacy-{}", uuid::Uuid::new_v4()));
+        let session = Session::new(dir.clone(), "s").unwrap();
+        std::fs::create_dir_all(session.dir()).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        std::fs::write(session.pid_path(), format!("{pid}\n")).unwrap();
+        let err = launch(
+            &session,
+            Launch {
+                agent_bin: Path::new("/bin/false"),
+                seed: SpecSeed::default(),
+                resume: false,
+                extra_args: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("live legacy pid"), "{err:#}");
+        assert_eq!(session.pid(), Some(pid));
+        assert!(pid_alive(pid));
         std::fs::remove_dir_all(&dir).ok();
     }
 

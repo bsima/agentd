@@ -231,7 +231,8 @@ struct Args {
     command: Option<Command>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum GcArg {
     None,
     Ring,
@@ -360,6 +361,10 @@ struct Checkpoint {
     run_id: String,
     sequence: u64,
     model: String,
+    /// Registry alias selected for this session. `model` remains the resolved
+    /// provider API id for checkpoint compatibility and diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_alias: Option<String>,
     provider_url: String,
     messages: Vec<ChatMessage>,
     trace_path: PathBuf,
@@ -368,6 +373,12 @@ struct Checkpoint {
     /// absent in checkpoints written before t-1162.
     #[serde(default)]
     discovered_budget: Option<usize>,
+    /// Session-selected GC strategy and threshold. Optional for checkpoints
+    /// written before ACP exposed these as mutable session configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gc: Option<GcArg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gc_threshold: Option<f32>,
 }
 
 /// A parsed session turn frame (t-1308.2; docs/SUPERVISOR.md "Turn envelope").
@@ -569,6 +580,7 @@ async fn main() -> Result<()> {
             cwd: None,
             checkpoint_dir: args.checkpoint_dir.clone(),
             checkpoint,
+            restore_checkpoint_config: false,
             run_id,
             require_shell_approval: args.require_shell_approval,
             trace_sinks_extra: Vec::new(),
@@ -615,6 +627,10 @@ struct SessionParams {
     cwd: Option<PathBuf>,
     checkpoint_dir: Option<PathBuf>,
     checkpoint: Option<Checkpoint>,
+    /// ACP session/load restores mutable config saved by set_config_option.
+    /// The ordinary CLI resume path keeps explicit command-line flags in
+    /// control, preserving its historical override behavior.
+    restore_checkpoint_config: bool,
     run_id: String,
     require_shell_approval: bool,
     /// Extra sinks observing this runtime's trace events (the ACP bridge).
@@ -630,8 +646,18 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     let system_prompt =
         build_system_prompt(params.system_prompt_override, params.cwd.as_deref()).await?;
 
+    let restore_checkpoint_config = params.restore_checkpoint_config;
+    let requested_model = if restore_checkpoint_config {
+        params
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.model_alias.clone())
+            .or(params.requested_model.clone())
+    } else {
+        params.requested_model.clone()
+    };
     let (resolved_model, pricing_table, embedder) =
-        resolve_model(params.requested_model, provider_file.model.clone()).await?;
+        resolve_model(requested_model, provider_file.model.clone()).await?;
     let eval_cwd = params.cwd.clone().or_else(|| args.eval_cwd.clone());
     let eval_config = EvalConfig {
         cwd: eval_cwd.clone(),
@@ -699,10 +725,19 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         }
         registry
     };
-    let (history, checkpoint_sequence, resumed_discovered_budget) = match params.checkpoint {
-        Some(cp) => (cp.messages, cp.sequence, cp.discovered_budget),
-        None => (initial_history(system_prompt), 0, None),
-    };
+    let (history, checkpoint_sequence, resumed_discovered_budget, resumed_gc, resumed_gc_threshold) =
+        match params.checkpoint {
+            Some(cp) => (
+                cp.messages,
+                cp.sequence,
+                cp.discovered_budget,
+                restore_checkpoint_config.then_some(cp.gc).flatten(),
+                restore_checkpoint_config
+                    .then_some(cp.gc_threshold)
+                    .flatten(),
+            ),
+            None => (initial_history(system_prompt), 0, None, None, None),
+        };
     let config = SeqConfig {
         on_infer_delta: None,
         // No in-process approval hook in the CLI: gated effects pause
@@ -728,8 +763,8 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         replay: None,
         trace_full_prompt_ir: args.trace_full_prompt_ir,
         trace_full_payloads: args.trace_full_payloads,
-        gc: gc_mode_from_choice(args, args.gc, &embedder),
-        gc_threshold: args.gc_threshold,
+        gc: gc_mode_from_choice(args, resumed_gc.unwrap_or(args.gc), &embedder),
+        gc_threshold: resumed_gc_threshold.unwrap_or(args.gc_threshold),
         gc_log: args.gc_log,
         gc_timing: args.gc_timing,
         context_budget,
@@ -2606,6 +2641,17 @@ async fn persist_session(runtime: &mut Runtime) {
     }
 }
 
+fn gc_choice_from_mode(mode: &GcMode) -> GcArg {
+    match mode {
+        GcMode::None => GcArg::None,
+        GcMode::Ring(_) => GcArg::Ring,
+        GcMode::MarkSweep(_) => GcArg::MarkSweep,
+        GcMode::Stack(_) => GcArg::Stack,
+        GcMode::Semantic(_) => GcArg::Semantic,
+        GcMode::Generational(_) => GcArg::Generational,
+    }
+}
+
 fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoint> {
     if agent_core::has_pending_tool_calls(&runtime.history) {
         return None;
@@ -2614,11 +2660,14 @@ fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoin
         run_id: runtime.run_id.clone(),
         sequence,
         model: runtime.model.0.clone(),
+        model_alias: Some(runtime.resume_facts.model.clone()),
         provider_url: runtime.provider_url.clone(),
         messages: runtime.history.clone(),
         trace_path: runtime.trace_path.clone(),
         timestamp: Utc::now(),
         discovered_budget: runtime.gc_state.discovered_budget,
+        gc: Some(gc_choice_from_mode(&runtime.config.gc)),
+        gc_threshold: Some(runtime.config.gc_threshold),
     })
 }
 
@@ -3160,6 +3209,7 @@ mod tests {
             run_id: "run".into(),
             sequence: 7,
             model: "model".into(),
+            model_alias: None,
             provider_url: "https://chatgpt.com/backend-api".into(),
             messages: vec![
                 ChatMessage::system("system"),
@@ -3176,6 +3226,8 @@ mod tests {
             trace_path: path.with_extension("jsonl"),
             timestamp: Utc::now(),
             discovered_budget: None,
+            gc: None,
+            gc_threshold: None,
         };
         tokio::fs::write(&path, serde_json::to_vec_pretty(&checkpoint)?).await?;
 
@@ -3198,6 +3250,7 @@ mod tests {
             run_id: "run-resume".into(),
             sequence: 4,
             model: "model".into(),
+            model_alias: None,
             provider_url: "https://chatgpt.com/backend-api".into(),
             messages: vec![
                 ChatMessage::system("system"),
@@ -3207,6 +3260,8 @@ mod tests {
             trace_path: dir.join("trace.jsonl"),
             timestamp: Utc::now(),
             discovered_budget: Some(123_000),
+            gc: None,
+            gc_threshold: None,
         };
 
         let sink = ChatHistory::new(dir.clone());

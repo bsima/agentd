@@ -373,6 +373,164 @@ fn gc_config_options_are_advertised_and_switchable() {
 }
 
 #[test]
+fn gc_config_survives_session_load_without_an_intervening_turn() {
+    let root = temp_root("gc-config-load");
+    let port = spawn_mock_sse_server(vec![]);
+    let session_id;
+    {
+        let mut client = AcpClient::start(&root, port);
+        session_id = client.handshake_and_new_session(root.to_str().unwrap());
+        client.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"gc","value":"semantic"}}}}"#
+        ));
+        client.read_until_response(3, None);
+        client.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"gc-threshold","value":"0.7"}}}}"#
+        ));
+        client.read_until_response(4, None);
+    }
+
+    let port = spawn_mock_sse_server(vec![]);
+    let mut client = AcpClient::start(&root, port);
+    client.send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+    );
+    client.read_until_response(1, None);
+    let cwd = root.to_str().unwrap();
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{cwd}","mcpServers":[]}}}}"#
+    ));
+    let (response, _, _) = client.read_until_response(2, None);
+    let options = response["result"]["configOptions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no configOptions in {response}"));
+    let current = |id: &str| {
+        options
+            .iter()
+            .find(|option| option["id"] == id)
+            .and_then(|option| option["currentValue"].as_str())
+    };
+    assert_eq!(current("gc"), Some("semantic"), "{response}");
+    assert_eq!(current("gc-threshold"), Some("0.7"), "{response}");
+}
+
+#[test]
+fn model_switch_clears_the_discovered_gc_ceiling() {
+    let root = temp_root("model-gc-ceiling");
+    let config_dir = root.join("config/agent");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("models.yaml"),
+        r#"default_model: test-model
+models:
+  - name: test-model
+    provider: openai-compatible
+    api_id: test-model
+    context: 1000
+  - name: larger-model
+    provider: openai-compatible
+    api_id: larger-api-model
+    context: 2000
+"#,
+    )
+    .unwrap();
+
+    let port = spawn_mock_sse_server(vec![]);
+    let session_id;
+    {
+        let mut client = AcpClient::start(&root, port);
+        session_id = client.handshake_and_new_session(root.to_str().unwrap());
+        // Force an initial checkpoint without needing a provider turn.
+        client.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"gc-threshold","value":"0.7"}}}}"#
+        ));
+        client.read_until_response(3, None);
+    }
+    let checkpoint = root
+        .join(".local/share/agent/acp")
+        .join(&session_id)
+        .join("session-latest.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+    saved["discovered_budget"] = serde_json::json!(777);
+    std::fs::write(&checkpoint, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+
+    let port = spawn_mock_sse_server(vec![]);
+    let mut client = AcpClient::start(&root, port);
+    client.send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+    );
+    client.read_until_response(1, None);
+    let cwd = root.to_str().unwrap();
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{cwd}","mcpServers":[]}}}}"#
+    ));
+    client.read_until_response(2, None);
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{{"sessionId":"{session_id}","configId":"model","value":"larger-model"}}}}"#
+    ));
+    let (response, _, _) = client.read_until_response(3, None);
+    let model = response["result"]["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["id"] == "model"))
+        .unwrap_or_else(|| panic!("no model option in {response}"));
+    assert_eq!(model["currentValue"], "larger-model", "{response}");
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+    assert_eq!(saved["model"], "larger-api-model");
+    assert_eq!(saved["model_alias"], "larger-model");
+    assert!(saved["discovered_budget"].is_null(), "{saved}");
+    drop(client);
+
+    // A fresh ACP process must resolve the saved alias rather than reverting
+    // to its process-level `--model test-model` argument.
+    let port = spawn_mock_sse_server(vec![]);
+    let mut client = AcpClient::start(&root, port);
+    client.send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+    );
+    client.read_until_response(1, None);
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{cwd}","mcpServers":[]}}}}"#
+    ));
+    let (response, _, _) = client.read_until_response(2, None);
+    let model = response["result"]["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["id"] == "model"))
+        .unwrap_or_else(|| panic!("no model option in {response}"));
+    assert_eq!(model["currentValue"], "larger-model", "{response}");
+}
+
+#[test]
+fn unknown_mode_is_rejected_without_changing_the_current_mode() {
+    let root = temp_root("unknown-mode");
+    let port = spawn_mock_sse_server(vec![]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{{"sessionId":"{session_id}","modeId":"bogus"}}}}"#
+    ));
+    let (response, updates, _) = client.read_until_response(3, None);
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert!(
+        updates.is_empty(),
+        "rejection must emit no update: {updates:?}"
+    );
+
+    // Switching to the previous/default mode still succeeds, proving the
+    // actor remains in the advertised `ask` state after rejection.
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"session/set_mode","params":{{"sessionId":"{session_id}","modeId":"ask"}}}}"#
+    ));
+    let (response, updates, _) = client.read_until_response(4, None);
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(updates
+        .iter()
+        .any(|u| u["update"]["currentModeId"] == "ask"));
+}
+
+#[test]
 fn yolo_mode_runs_shell_without_permission_prompts() {
     let root = temp_root("yolo");
     let port = spawn_mock_sse_server(vec![SHELL_TURN, DONE_TURN]);
