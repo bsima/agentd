@@ -52,7 +52,7 @@ the wire.
 
 ## What is implemented
 
-- `initialize` — protocol v1, text-only prompts, `loadSession: true`.
+- `initialize` — protocol v1, text and image prompts, `loadSession: true`.
 - `session/new` — one fresh `Runtime` (agent loop, trace, checkpoints) per
   session. The request `cwd` becomes the shell tool's working directory and
   the system prompt's cwd line. Session state lives under

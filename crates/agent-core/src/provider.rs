@@ -132,6 +132,19 @@ impl Serialize for WireChatMessage<'_> {
             .as_ref()
             .filter(|calls| !calls.is_empty())
             .map(|calls| calls.iter().map(tool_call_to_openai_wire).collect());
+        let content = if message.images.is_empty() {
+            serde_json::to_value(&message.content).map_err(serde::ser::Error::custom)?
+        } else {
+            let mut blocks = Vec::new();
+            if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
+                blocks.push(json!({ "type": "text", "text": text }));
+            }
+            blocks.extend(message.images.iter().map(|image| json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{}", image.mime_type, image.data) }
+            })));
+            Value::Array(blocks)
+        };
         let mut fields = 2;
         if message.tool_call_id.is_some() {
             fields += 1;
@@ -141,7 +154,7 @@ impl Serialize for WireChatMessage<'_> {
         }
         let mut state = serializer.serialize_struct("ChatMessage", fields)?;
         state.serialize_field("role", &message.role)?;
-        state.serialize_field("content", &message.content)?;
+        state.serialize_field("content", &content)?;
         if let Some(tool_call_id) = &message.tool_call_id {
             state.serialize_field("tool_call_id", tool_call_id)?;
         }
@@ -1050,6 +1063,25 @@ mod tests {
             json!(r#"{"command":"pwd"}"#)
         );
         assert_eq!(wire[1]["tool_call_id"], json!("call_1"));
+    }
+
+    #[test]
+    fn wire_messages_adapt_images_to_data_urls() {
+        let message = ChatMessage::user_with_images(
+            Some("describe".into()),
+            vec![crate::op::ImageContent::new("image/png", "aGVsbG8=")],
+        );
+        let body = openai_chat_body(&model(), &[], &[message]);
+        assert_eq!(
+            body["messages"][0]["content"][0],
+            json!({"type":"text", "text":"describe"})
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1],
+            json!({
+                "type":"image_url", "image_url":{"url":"data:image/png;base64,aGVsbG8="}
+            })
+        );
     }
 
     #[test]

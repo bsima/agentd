@@ -70,8 +70,8 @@ pub use memory::MemorySource;
 pub use models::{EmbeddingsEntry, ModelEntry, ModelRegistry, PricingEntry, ResolvedModel};
 pub use op::{
     agent_loop, close_pending_tool_calls, emit, eval, eval_argv, has_pending_tool_calls, infer,
-    par, repair_trailing_pending_tool_calls, ChatMessage, EvalSpec, FinishReason, Model, Op, OpF,
-    Prompt, Response, ToolCall,
+    par, repair_trailing_pending_tool_calls, ChatMessage, EvalSpec, FinishReason, ImageContent,
+    Model, Op, OpF, Prompt, Response, ToolCall,
 };
 pub use output_contract::{
     output_contract_failure, validate as validate_output, OutputContract, OutputContractFailure,

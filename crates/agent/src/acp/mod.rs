@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, SessionConfigOption, SessionId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, SessionConfigOption, SessionId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest,
 };
 use agent_client_protocol::{
     on_receive_notification, on_receive_request, Agent, Client, ConnectionTo, Error, Stdio,
@@ -29,6 +30,8 @@ use agent_client_protocol::{
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use agent_core::{ChatMessage, ImageContent};
 
 use crate::{build_runtime, Args, Checkpoint, SessionParams, DEFAULT_MAX_TURNS};
 
@@ -67,23 +70,29 @@ fn warn_ignored_mcp_servers(count: usize) {
     }
 }
 
-/// Concatenate the prompt's text blocks. Image/audio/resource blocks are
-/// rejected: initialize advertised text-only prompt capabilities.
-fn prompt_text(request: &PromptRequest) -> std::result::Result<String, Error> {
+/// Convert ACP text and image blocks to the provider-neutral user message.
+fn prompt_message(request: &PromptRequest) -> std::result::Result<ChatMessage, Error> {
     let mut parts = Vec::new();
+    let mut images = Vec::new();
     for block in &request.prompt {
         match block {
             ContentBlock::Text(text) => parts.push(text.text.as_str()),
+            ContentBlock::Image(image) => images.push(ImageContent::new(
+                image.mime_type.clone(),
+                image.data.clone(),
+            )),
             _ => {
-                return Err(Error::invalid_params()
-                    .data(serde_json::json!("only text content blocks are supported")))
+                return Err(Error::invalid_params().data(serde_json::json!(
+                    "only text and image content blocks are supported"
+                )))
             }
         }
     }
-    if parts.is_empty() {
+    if parts.is_empty() && images.is_empty() {
         return Err(Error::invalid_params().data(serde_json::json!("empty prompt")));
     }
-    Ok(parts.join("\n\n"))
+    let text = (!parts.is_empty()).then(|| parts.join("\n\n"));
+    Ok(ChatMessage::user_with_images(text, images))
 }
 
 impl AcpServer {
@@ -268,7 +277,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             async move |initialize: InitializeRequest, responder, _cx| {
                 responder.respond(
                     InitializeResponse::new(initialize.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new().load_session(true))
+                        .agent_capabilities(
+                            AgentCapabilities::new()
+                                .load_session(true)
+                                .prompt_capabilities(PromptCapabilities::new().image(true)),
+                        )
                         .agent_info(Implementation::new("agentd", env!("CARGO_PKG_VERSION"))),
                 )
             },
@@ -296,7 +309,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, _cx| {
-                let text = match prompt_text(&request) {
+                let message = match prompt_message(&request) {
                     Ok(text) => text,
                     Err(err) => return responder.respond_with_error(err),
                 };
@@ -312,7 +325,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     ..
                 })) = handle
                     .cmd_tx
-                    .send(session::SessionCommand::Prompt { text, responder })
+                    .send(session::SessionCommand::Prompt { message, responder })
                 {
                     return responder.respond_with_error(internal_error("session is gone"));
                 }

@@ -42,6 +42,9 @@ pub struct ChatMessage {
     pub id: Uuid,
     pub role: String,
     pub content: Option<String>,
+    /// Provider-neutral images attached to this message. `data` is raw base64.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,8 +55,24 @@ impl PartialEq for ChatMessage {
     fn eq(&self, other: &Self) -> bool {
         self.role == other.role
             && self.content == other.content
+            && self.images == other.images
             && self.tool_call_id == other.tool_call_id
             && self.tool_calls == other.tool_calls
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub mime_type: String,
+    pub data: String,
+}
+
+impl ImageContent {
+    pub fn new(mime_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: data.into(),
+        }
     }
 }
 
@@ -63,6 +82,7 @@ impl ChatMessage {
             id: Uuid::new_v4(),
             role: "system".into(),
             content: Some(content.into()),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
         }
@@ -73,6 +93,18 @@ impl ChatMessage {
             id: Uuid::new_v4(),
             role: "user".into(),
             content: Some(content.into()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    pub fn user_with_images(content: Option<String>, images: Vec<ImageContent>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            role: "user".into(),
+            content,
+            images,
             tool_call_id: None,
             tool_calls: None,
         }
@@ -83,6 +115,7 @@ impl ChatMessage {
             id: Uuid::new_v4(),
             role: "assistant".into(),
             content,
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         }
@@ -93,6 +126,7 @@ impl ChatMessage {
             id: Uuid::new_v4(),
             role: "tool".into(),
             content: Some(content.into()),
+            images: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
         }

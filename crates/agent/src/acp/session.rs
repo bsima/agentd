@@ -21,7 +21,7 @@ use crate::{response_turn_budget_exhausted, Args, Runtime};
 
 pub(crate) enum SessionCommand {
     Prompt {
-        text: String,
+        message: agent_core::ChatMessage,
         responder: Responder<PromptResponse>,
     },
     SetMode {
@@ -70,13 +70,13 @@ pub(crate) async fn session_actor(
     } = ctx;
     while let Some(command) = cmd_rx.recv().await {
         match command {
-            SessionCommand::Prompt { text, responder } => {
+            SessionCommand::Prompt { message, responder } => {
                 // A cancel that raced in between turns applies to nothing:
                 // observe the current generation so only cancels arriving
                 // DURING this turn fire the select arm below.
                 cancel_rx.borrow_and_update();
                 tokio::select! {
-                    result = run_acp_turn(&mut runtime, text, &cx, &session_id) => {
+                    result = run_acp_turn(&mut runtime, message, &cx, &session_id) => {
                         // Turn barrier: ACP clients treat the prompt
                         // response as the turn boundary, so every update the
                         // turn enqueued must reach the connection first.

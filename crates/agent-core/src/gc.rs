@@ -1845,6 +1845,7 @@ fn marker_message(id: MsgId, content: String) -> ChatMessage {
         id,
         role: "assistant".into(),
         content: Some(content),
+        images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
     }
@@ -3692,6 +3693,15 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
             estimate_message_overhead_tokens()
                 .saturating_add(estimate_text_tokens(&message.role))
                 .saturating_add(message.content.as_deref().map_or(0, estimate_text_tokens))
+                .saturating_add(
+                    message
+                        .images
+                        .iter()
+                        // Image tokenization depends on decoded dimensions; avoid treating
+                        // base64 transport bytes as language tokens.
+                        .map(|image| estimate_text_tokens(&image.mime_type).saturating_add(1024))
+                        .sum(),
+                )
                 .saturating_add(
                     message
                         .tool_call_id

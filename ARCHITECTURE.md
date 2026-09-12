@@ -186,7 +186,7 @@ Checkpoints are written at turn completion through the `ChatHistory` sink — th
 
 The core message type (`ChatMessage`/`ToolCall`) is provider-neutral: tool calls are `{id, name, arguments: json}`, not any provider's wire shape. Each provider adapts at its serialization edge — the OpenAI-compatible client nests `function` objects and stringifies arguments, the Anthropic client emits `tool_use` content blocks. Persisted state (checkpoints, traces) uses the neutral shape; legacy OpenAI-shaped state still deserializes.
 
-Known limitation: `ChatMessage` is flat text-plus-tool-calls. Content blocks (e.g. provider thinking blocks) cannot round-trip through history yet.
+`ChatMessage` supports text, image attachments, and tool calls. Other content blocks (e.g. provider thinking blocks) cannot round-trip through history yet.
 
 ## Interpreters define execution
 

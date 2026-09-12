@@ -487,6 +487,23 @@ fn message_to_anthropic(message: &ChatMessage) -> Value {
             }
             json!({ "role": "assistant", "content": content })
         }
+        "user" => {
+            let mut content = Vec::new();
+            if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
+                content.push(json!({ "type": "text", "text": text }));
+            }
+            content.extend(message.images.iter().map(|image| {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.mime_type,
+                        "data": image.data,
+                    }
+                })
+            }));
+            json!({ "role": "user", "content": content })
+        }
         "tool" => json!({
             "role": "user",
             "content": [{
@@ -686,7 +703,10 @@ mod tests {
         let messages = vec![
             ChatMessage::system("system one"),
             ChatMessage::system("system two"),
-            ChatMessage::user("hello"),
+            ChatMessage::user_with_images(
+                Some("hello".into()),
+                vec![crate::op::ImageContent::new("image/png", "aGVsbG8=")],
+            ),
             ChatMessage::tool("toolu_123", "tool output"),
         ];
         let tools = vec![ToolSpec {
@@ -707,6 +727,11 @@ mod tests {
 
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(
+            body["messages"][0]["content"][1]["source"]["data"],
+            "aGVsbG8="
+        );
         assert_eq!(
             body["system"],
             json!([{
@@ -718,7 +743,10 @@ mod tests {
         assert_eq!(
             body["messages"],
             json!([
-                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+                ]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_123", "content": "tool output"}]}
             ])
         );

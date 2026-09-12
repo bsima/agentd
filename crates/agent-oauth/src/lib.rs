@@ -922,7 +922,7 @@ fn build_codex_request(model: &Model, tools: &[ToolSpec], messages: &[ChatMessag
 
 fn message_to_codex_input(message: &ChatMessage) -> Vec<Value> {
     match message.role.as_str() {
-        "user" => codex_message("user", message.content.as_deref().unwrap_or_default()),
+        "user" => codex_user_message(message),
         "assistant" => {
             let mut items =
                 codex_message("assistant", message.content.as_deref().unwrap_or_default());
@@ -948,6 +948,24 @@ fn message_to_codex_input(message: &ChatMessage) -> Vec<Value> {
             })
             .unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+fn codex_user_message(message: &ChatMessage) -> Vec<Value> {
+    let mut content = Vec::new();
+    if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
+        content.push(json!({ "type": "input_text", "text": text }));
+    }
+    content.extend(message.images.iter().map(|image| {
+        json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", image.mime_type, image.data),
+        })
+    }));
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "message", "role": "user", "content": content })]
     }
 }
 

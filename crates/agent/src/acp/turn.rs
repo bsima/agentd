@@ -27,7 +27,7 @@ pub(crate) enum TurnOutcome {
 
 pub(crate) async fn run_acp_turn(
     runtime: &mut Runtime,
-    message: String,
+    message: ChatMessage,
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
 ) -> Result<TurnOutcome> {
@@ -38,7 +38,7 @@ pub(crate) async fn run_acp_turn(
     // effect id its gated command had. A stale `allow-once` surviving here
     // would silently approve a different command without a prompt.
     runtime.config.approvals.resolutions.clear();
-    runtime.history.push(ChatMessage::user(message));
+    runtime.history.push(message);
     let prompt = runtime.history.clone();
     // Options are fixed for the whole turn: they shape the loop program and
     // therefore its effect ids, so approval resumes must re-enter with the

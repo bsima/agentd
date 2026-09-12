@@ -154,6 +154,10 @@ fn initialize_handshake_reports_capabilities() {
         "advertises session/load: {response}"
     );
     assert_eq!(
+        result["agentCapabilities"]["promptCapabilities"]["image"],
+        true
+    );
+    assert_eq!(
         result["agentInfo"]["name"], "agentd",
         "names the agent: {response}"
     );
@@ -202,7 +206,7 @@ fn prompt_turn_streams_message_and_ends_turn() {
     send_line(
         &mut child,
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{session_id}","prompt":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{session_id}","prompt":[{{"type":"text","text":"hello"}},{{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}}]}}}}"#
         ),
     );
     let (prompt_response, updates) = read_until_response(&mut reader, 3);
