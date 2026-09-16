@@ -52,6 +52,7 @@ pub(crate) struct SessionContext {
     pub(crate) cancel_rx: watch::Receiver<u64>,
     pub(crate) streamed: StreamedText,
     pub(crate) update_tx: mpsc::UnboundedSender<ForwarderMsg>,
+    pub(crate) context_budget: super::bridge::ContextBudget,
     pub(crate) args: Arc<Args>,
 }
 
@@ -66,6 +67,7 @@ pub(crate) async fn session_actor(
         mut cancel_rx,
         streamed,
         update_tx,
+        context_budget,
         args,
     } = ctx;
     while let Some(command) = cmd_rx.recv().await {
@@ -131,7 +133,9 @@ pub(crate) async fn session_actor(
                 responder,
             } => {
                 let result = match config_id.as_str() {
-                    registry::MODEL_CONFIG_ID => set_model(&mut runtime, &args, &value).await,
+                    registry::MODEL_CONFIG_ID => {
+                        set_model(&mut runtime, &args, &value, &context_budget).await
+                    }
                     registry::GC_CONFIG_ID => set_gc(&mut runtime, &args, &value).await,
                     registry::GC_THRESHOLD_CONFIG_ID => set_gc_threshold(&mut runtime, &value),
                     other => Err(anyhow::anyhow!("unknown config option: {other}")),
@@ -177,7 +181,12 @@ async fn flush_updates(update_tx: &mpsc::UnboundedSender<ForwarderMsg>) {
 /// Re-resolve the model alias against the registry and swap the runtime's
 /// provider, context budget, and pricing in place — the same helpers the
 /// approvals-resume path already drives, so this is pure plumbing.
-async fn set_model(runtime: &mut Runtime, args: &Args, alias: &str) -> Result<()> {
+async fn set_model(
+    runtime: &mut Runtime,
+    args: &Args,
+    alias: &str,
+    context_budget: &super::bridge::ContextBudget,
+) -> Result<()> {
     // Same url/key precedence as build_runtime: flags win, then the
     // --config file's provider block — a session that started against a
     // configured endpoint must not silently switch endpoints on a model
@@ -196,6 +205,10 @@ async fn set_model(runtime: &mut Runtime, args: &Args, alias: &str) -> Result<()
     // Preserve the rest of GcState (lifecycles, frames, hot-set history).
     runtime.gc_state.discovered_budget = None;
     runtime.config.context_budget = resolved.context;
+    context_budget.store(
+        resolved.context as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     runtime.config.pricing = pricing;
     runtime.model = agent_core::Model(resolved.api_id.clone());
     runtime.provider_url = provider_url;

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_core::Event;
 use anyhow::Result;
@@ -86,6 +86,11 @@ fn tool_kind(name: &str) -> ToolKind {
 /// by the suppression rule below. Shared between the tap closure and the
 /// sink.
 pub(crate) type StreamedText = Arc<Mutex<HashMap<u64, String>>>;
+
+/// The model context ceiling is mutable because ACP can switch models between
+/// turns. The trace sink reads it when converting provider-reported prompt
+/// usage into ACP `usage_update` notifications.
+pub(crate) type ContextBudget = Arc<std::sync::atomic::AtomicU64>;
 
 /// What flows to the per-session forwarder task. `Flush` is the turn
 /// barrier: the forwarder acks it only after every update enqueued before
@@ -354,16 +359,47 @@ pub(crate) struct AcpTraceSink {
     tx: UnboundedSender<ForwarderMsg>,
     ids: Mutex<ToolCallIds>,
     streamed: StreamedText,
+    context_budget: ContextBudget,
 }
 
 impl AcpTraceSink {
-    pub(crate) fn new(tx: UnboundedSender<ForwarderMsg>, streamed: StreamedText) -> Self {
+    pub(crate) fn new(
+        tx: UnboundedSender<ForwarderMsg>,
+        streamed: StreamedText,
+        context_budget: ContextBudget,
+    ) -> Self {
         Self {
             tx,
             ids: Mutex::new(ToolCallIds::default()),
             streamed,
+            context_budget,
         }
     }
+}
+
+fn usage_update(event: &Event, context_budget: u64) -> Option<SessionUpdate> {
+    if context_budget == 0 {
+        return None;
+    }
+    let used = match event {
+        // Emit an estimate before dispatch so the UI moves even when the
+        // provider fails; replace it with authoritative usage on success.
+        Event::InferCall {
+            parent_op_id: None,
+            prompt: Some(prompt),
+            ..
+        } => u64::try_from(agent_core::estimate_tokens(prompt)).unwrap_or(u64::MAX),
+        Event::InferResult {
+            parent_op_id: None,
+            total_tokens,
+            ..
+        } if *total_tokens > 0 => u64::from(*total_tokens),
+        _ => return None,
+    };
+    Some(SessionUpdate::UsageUpdate(UsageUpdate::new(
+        used,
+        context_budget,
+    )))
 }
 
 #[async_trait]
@@ -375,6 +411,15 @@ impl agent_core::TraceSink for AcpTraceSink {
             map_event(event, &mut ids, &mut streamed)
         };
         for update in updates {
+            let _ = self.tx.send(ForwarderMsg::update(update));
+        }
+        // ACP's `used` means tokens in the current context, not cumulative
+        // run usage. Root inferences describe the session window; child
+        // `infer` calls have isolated contexts and do not move this gauge.
+        let size = self
+            .context_budget
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(update) = usage_update(event, size) {
             let _ = self.tx.send(ForwarderMsg::update(update));
         }
         Ok(())
@@ -636,6 +681,42 @@ mod tests {
             executing.tool_call_id, pending_call.tool_call_id,
             "the executing eval reuses the pending approval's tool-call id"
         );
+    }
+
+    #[test]
+    fn usage_updates_report_estimate_then_authoritative_root_input() {
+        let call = Event::InferCall {
+            run_id: "r".into(),
+            op_id: 1,
+            parent_op_id: None,
+            model: "m".into(),
+            prompt: Some(vec![agent_core::ChatMessage::user("hello world")]),
+            prompt_preview: String::new(),
+            effect: None,
+            timestamp: Utc::now(),
+        };
+        let Some(SessionUpdate::UsageUpdate(estimated)) = usage_update(&call, 200_000) else {
+            panic!("expected usage update")
+        };
+        assert!(estimated.used > 0);
+        assert_eq!(estimated.size, 200_000);
+
+        let result = infer_result_event("hello");
+        let Some(SessionUpdate::UsageUpdate(authoritative)) = usage_update(&result, 200_000) else {
+            panic!("expected usage update")
+        };
+        assert_eq!(authoritative.used, 2);
+        assert_eq!(authoritative.size, 200_000);
+    }
+
+    #[test]
+    fn usage_updates_ignore_child_inferences_and_unknown_budgets() {
+        let mut child = infer_result_event("hello");
+        if let Event::InferResult { parent_op_id, .. } = &mut child {
+            *parent_op_id = Some(7);
+        }
+        assert!(usage_update(&child, 200_000).is_none());
+        assert!(usage_update(&infer_result_event("hello"), 0).is_none());
     }
 
     #[test]

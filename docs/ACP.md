@@ -106,9 +106,12 @@ Known wart: if a stream dies mid-response and the retry succeeds, the
 client may briefly see duplicated text; the final whole-message chunk
 carries the authoritative content.
 
-Usage/cost totals are recorded in the trace as usual (`agent cost`);
-per-turn `usage` on the ACP wire is not reported yet (the schema field is
-unstable upstream).
+Context-window usage is reported through ACP `usage_update` notifications. The
+`used` value is the assembled root context (provider-reported input plus output
+once available, with the runtime estimator reported at dispatch) and `size` is the
+selected model's context ceiling; Paseo renders this as its context gauge. Model
+switches update the ceiling immediately. Cumulative usage/cost totals remain in
+the trace (`agent cost`); ACP's optional cost field is not emitted yet.
 
 ## Manual smoke test
 
@@ -139,4 +142,4 @@ printf '%s\n' \
 - Thought/plan updates (no reasoning events exist in the runtime trace).
 - Deterministic mid-effect cancellation (cancel token through agent-core).
 - `session/list` / `session/delete`, MCP server passthrough, `fs/*`
-  client capabilities, wire-level `usage` reporting.
+  client capabilities, cumulative wire-level cost reporting.

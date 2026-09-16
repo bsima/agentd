@@ -110,9 +110,11 @@ impl AcpServer {
         let checkpoint_dir = acp_session_dir(&session_id)?;
         let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let streamed: bridge::StreamedText = Arc::new(Mutex::new(HashMap::new()));
+        let context_budget: bridge::ContextBudget = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sink = Arc::new(bridge::AcpTraceSink::new(
             update_tx.clone(),
             streamed.clone(),
+            context_budget.clone(),
         ));
         let require_shell_approval =
             self.args.require_shell_approval || self.args.acp_shell_approval;
@@ -131,6 +133,10 @@ impl AcpServer {
             otel_active: self.otel_active,
         };
         let mut runtime = build_runtime(&self.args, params).await?;
+        context_budget.store(
+            runtime.config.context_budget as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Streaming tap: text deltas go straight to the client as
         // agent_message_chunk updates AND accumulate per op so the bridge
         // can suppress the duplicate whole-message chunk at InferResult.
@@ -191,6 +197,7 @@ impl AcpServer {
                 cancel_rx,
                 streamed,
                 update_tx,
+                context_budget,
                 args: self.args.clone(),
             },
         ));
