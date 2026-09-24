@@ -1214,7 +1214,31 @@ async fn execute_instr(
                 site,
                 dynamic_path.clone(),
             )?;
-            let model = string_expr(&machine.env, &model, "Infer.model")?;
+            let mut model = string_expr(&machine.env, &model, "Infer.model")?;
+            // The loop's child site offers no tools. Resolve its model alias
+            // before calling the already-bound parent provider; a schema enum
+            // alone cannot be trusted (some APIs ignore it).
+            if policy.tools.as_deref() == Some(&[][..]) {
+                if let Some((registry, parent)) = &config.guidance.infer_models {
+                    match registry.resolve(Some(&model)).and_then(|resolved| {
+                        if resolved.provider != parent.provider || resolved.base_url != parent.base_url
+                            || registry.embeddings.as_ref().is_some_and(|e| e.model == model) {
+                            return Err(anyhow!(
+                                "infer model {:?} does not share the parent's provider and base_url",
+                                model
+                            ));
+                        }
+                        Ok(resolved.api_id)
+                    }) {
+                        Ok(api_id) => model = api_id,
+                        Err(err) if policy.on_error == EffectErrorMode::Bind => {
+                            machine.env.insert(out, effect_error_value(&err));
+                            return Ok(None);
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
             // The Infer site's policy owns the tool offer (t-1346): the
             // default is the loop's full toolset; an explicit list narrows
             // it to that subset — an empty list offers nothing, which is
@@ -2206,7 +2230,7 @@ fn run_has_gated_effects(config: &SeqConfig, program: &crate::ir::Program) -> bo
 /// exposure switch); native tools ride with their registry entries
 /// (t-1308.7 — same principle).
 fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
-    let mut specs = base_ir_tool_specs();
+    let mut specs = base_ir_tool_specs(config);
     if !config
         .hydration
         .sinks_of_kind(crate::hydration::SourceKind::Semantic)
@@ -2257,7 +2281,34 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
     specs
 }
 
-fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
+fn base_ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
+    let aliases: Vec<&str> =
+        config
+            .guidance
+            .infer_models
+            .as_ref()
+            .map_or_else(Vec::new, |(registry, parent)| {
+                let mut names: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|entry| {
+                        Some(entry.provider.as_str()) == parent.provider.as_deref()
+                            && entry.base_url == parent.base_url
+                            // Embeddings are not chat models.
+                            && registry.embeddings.as_ref().is_none_or(|e| e.model != entry.name)
+                    })
+                    .map(|entry| entry.name.as_str())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                names
+            });
+    let description = if config.guidance.infer_models.is_none() {
+        crate::guidance::INFER_TOOL_DESCRIPTION.to_string()
+    } else {
+        format!("{} Available model aliases for this provider: {}. Use one of these aliases, not a provider-native id.",
+            crate::guidance::INFER_TOOL_DESCRIPTION, aliases.join(", "))
+    };
     vec![
         crate::provider::ToolSpec {
             kind: "function".into(),
@@ -2275,11 +2326,16 @@ fn base_ir_tool_specs() -> Vec<crate::provider::ToolSpec> {
             kind: "function".into(),
             function: crate::provider::ToolFunctionSpec {
                 name: "infer".into(),
-                description: crate::guidance::INFER_TOOL_DESCRIPTION.into(),
+                description,
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "model": { "type": "string" },
+                        "model": if config.guidance.infer_models.is_none() {
+                            serde_json::json!({"type": "string"})
+                        } else {
+                            serde_json::json!({"type": "string", "enum": aliases,
+                                "description": "Registry alias for a chat model on the parent provider; use one of the listed aliases."})
+                        },
                         "prompt": { "type": "string" },
                         "context_refs": {
                             "type": "array",
@@ -3276,6 +3332,115 @@ mod tests {
             format!("{err:#}").contains("no sink \"memory\" registered"),
             "{err:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn infer_aliases_are_filtered_and_described_from_bound_registry() -> Result<()> {
+        let registry = crate::ModelRegistry::from_yaml_str(
+            r#"
+default_model: codex/main
+models:
+- name: codex/main
+  provider: openai-codex
+  api_id: native-main
+- name: codex/cheap
+  provider: openai-codex
+  api_id: native-cheap
+- name: other/cheap
+  provider: openai-codex
+  base_url: https://elsewhere.test
+  api_id: native-other
+- name: claude/cheap
+  provider: claude-code
+  api_id: native-claude
+"#,
+        )?;
+        let mut config = config(Arc::new(MockProvider::new(vec![])));
+        config.guidance.infer_models = Some((registry.clone(), registry.resolve(None)?));
+        let spec = ir_tool_specs(&config)
+            .into_iter()
+            .find(|s| s.function.name == "infer")
+            .unwrap();
+        assert_eq!(
+            spec.function.parameters["properties"]["model"]["enum"],
+            serde_json::json!(["codex/cheap", "codex/main"])
+        );
+        assert!(spec.function.description.contains("codex/cheap"));
+        assert!(!spec.function.description.contains("claude/cheap"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn infer_child_alias_resolves_and_invalid_alias_binds_without_provider_call() -> Result<()>
+    {
+        let registry = crate::ModelRegistry::from_yaml_str(
+            r#"
+default_model: codex/main
+models:
+- name: codex/main
+  provider: openai-codex
+  api_id: native-main
+- name: codex/cheap
+  provider: openai-codex
+  api_id: native-cheap
+- name: claude/cheap
+  provider: claude-code
+  api_id: native-claude
+"#,
+        )?;
+        let provider = Arc::new(MockProvider::new(vec![response("child")]));
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let mut config = config_with_trace(provider.clone(), trace);
+        config.guidance.infer_models = Some((registry.clone(), registry.resolve(None)?));
+        let make_machine = |alias: &str| {
+            let mut blocks = BTreeMap::new();
+            blocks.insert(
+                BlockId(0),
+                crate::ir::Block {
+                    params: vec![],
+                    instructions: vec![Instr::Infer {
+                        out: Var("child".into()),
+                        model: Expr::Value(Value::String(alias.into())),
+                        prompt: PromptRef::Inline(vec![ChatMessage::user("delegate")]),
+                        policy: crate::ir::InferPolicy {
+                            on_error: EffectErrorMode::Bind,
+                            tools: Some(vec![]),
+                        },
+                    }],
+                    terminator: Terminator::Return {
+                        value: Expr::Var(Var("child".into())),
+                    },
+                },
+            );
+            Machine {
+                program: crate::ir::Program {
+                    id: crate::ir::ProgramId("child-alias".into()),
+                    entry: BlockId(0),
+                    blocks,
+                },
+                block: BlockId(0),
+                pc: 0,
+                env: BTreeMap::new(),
+                effect_visits: BTreeMap::new(),
+                control_path: Default::default(),
+                continuation_stack: vec![],
+                budgets: Default::default(),
+            }
+        };
+        for alias in ["claude/cheap", "native-cheap", "missing"] {
+            let (value, _) = run_ir_sequential(&config, make_machine(alias)).await?;
+            assert_eq!(value["ok"], false, "{alias}: {value}");
+        }
+        assert_eq!(provider.prompt_count(), 0);
+        let (value, _) = run_ir_sequential(&config, make_machine("codex/cheap")).await?;
+        assert_eq!(value["content"], "child");
+        let events = crate::trace::TraceLogger::read_events(&trace_path).await?;
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::InferCall { model, .. } if model == "native-cheap")));
+        assert_eq!(provider.prompt_count(), 1);
         Ok(())
     }
 

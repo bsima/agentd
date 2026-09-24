@@ -342,6 +342,8 @@ pub struct RuntimeGuidance {
     /// model ids the run's provider resolves, so deployments that know
     /// (evals, fixed-provider setups) supply it explicitly.
     pub delegate_models: Vec<DelegateModel>,
+    /// Registry and bound parent for the infer tool; absent for raw or injected providers.
+    pub infer_models: Option<(crate::ModelRegistry, crate::ResolvedModel)>,
 }
 
 impl Default for RuntimeGuidance {
@@ -349,6 +351,7 @@ impl Default for RuntimeGuidance {
         Self {
             enabled: true,
             delegate_models: Vec::new(),
+            infer_models: None,
         }
     }
 }
@@ -360,6 +363,7 @@ impl RuntimeGuidance {
         Self {
             enabled: false,
             delegate_models: Vec::new(),
+            infer_models: None,
         }
     }
 }

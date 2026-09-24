@@ -656,7 +656,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     } else {
         params.requested_model.clone()
     };
-    let (resolved_model, pricing_table, embedder) =
+    let (resolved_model, pricing_table, embedder, infer_registry) =
         resolve_model(requested_model, provider_file.model.clone()).await?;
     let eval_cwd = params.cwd.clone().or_else(|| args.eval_cwd.clone());
     let eval_config = EvalConfig {
@@ -738,7 +738,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
             ),
             None => (initial_history(system_prompt), 0, None, None, None),
         };
-    let config = SeqConfig {
+    let mut config = SeqConfig {
         on_infer_delta: None,
         // No in-process approval hook in the CLI: gated effects pause
         // durably and resolve via `agent approvals` (t-1308.10). Resume
@@ -770,6 +770,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         context_budget,
         pricing: pricing_table,
     };
+    config.guidance.infer_models = infer_registry.map(|r| (r, resolved_model.clone()));
     if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
         return Err(anyhow!(
             "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, --gc mark-sweep, --gc semantic, or --gc generational",
@@ -1060,7 +1061,12 @@ fn build_provider(
 /// What model resolution yields: the chat model, the registry's pricing
 /// table (t-1334), and the optional memory embedder (t-1340; `None` =
 /// keyword-only retrieval).
-type ModelResolution = (ResolvedModel, PricingTable, Option<Arc<dyn Embedder>>);
+type ModelResolution = (
+    ResolvedModel,
+    PricingTable,
+    Option<Arc<dyn Embedder>>,
+    Option<ModelRegistry>,
+);
 
 async fn resolve_model(
     args_model: Option<String>,
@@ -1092,6 +1098,7 @@ fn resolve_model_from(
                 registry.resolve(requested.as_deref())?,
                 registry.pricing_table()?,
                 embedder,
+                Some(registry),
             ))
         }
         Err(_err) if requested.is_some() => {
@@ -1108,6 +1115,7 @@ fn resolve_model_from(
                     pricing: None,
                 },
                 PricingTable::default(),
+                None,
                 None,
             ))
         }
@@ -1709,7 +1717,7 @@ async fn resume_run(
     checkpoint: agent_core::IrCheckpoint,
     facts: ResumeFacts,
 ) -> Result<()> {
-    let (resolved_model, pricing_table, embedder) = resolve_model_from(
+    let (resolved_model, pricing_table, embedder, infer_registry) = resolve_model_from(
         ModelRegistry::load_default().await,
         Some(facts.model.clone()),
     )?;
@@ -1737,7 +1745,7 @@ async fn resume_run(
     approvals
         .resolutions
         .insert(record.effect_id.clone(), resolution);
-    let config = SeqConfig {
+    let mut config = SeqConfig {
         on_infer_delta: None,
         approvals,
         // Resume with the paused run's guidance setting (t-1359): the
@@ -1785,6 +1793,7 @@ async fn resume_run(
         context_budget: resolved_model.context,
         pricing: pricing_table,
     };
+    config.guidance.infer_models = infer_registry.map(|r| (r, resolved_model.clone()));
     let options = agent_core::AgentLoopOptions {
         memory_tools: facts.memory_tools,
         tool_names: vec![],
@@ -3161,9 +3170,10 @@ mod tests {
         // which races under parallel test execution.
         let missing_registry = Err(anyhow!("no registry on this machine"));
 
-        let (resolved, pricing, embedder) =
+        let (resolved, pricing, embedder, registry) =
             resolve_model_from(missing_registry, Some("openrouter/auto".into()))?;
         assert!(embedder.is_none(), "no registry, no embedder");
+        assert!(registry.is_none());
 
         assert_eq!(resolved.alias, "openrouter/auto");
         assert_eq!(resolved.api_id, "openrouter/auto");

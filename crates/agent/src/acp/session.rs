@@ -193,7 +193,8 @@ async fn set_model(
     // change.
     let file_config = crate::read_config(args.config.as_ref()).await?;
     let provider_file = file_config.provider.unwrap_or_default();
-    let (resolved, pricing, _embedder) = crate::resolve_model(Some(alias.to_owned()), None).await?;
+    let (resolved, pricing, _embedder, registry) =
+        crate::resolve_model(Some(alias.to_owned()), None).await?;
     let (provider, provider_url) = crate::build_provider(
         &resolved,
         args.provider.clone().or(provider_file.url),
@@ -210,6 +211,7 @@ async fn set_model(
         std::sync::atomic::Ordering::Relaxed,
     );
     runtime.config.pricing = pricing;
+    runtime.config.guidance.infer_models = registry.map(|r| (r, resolved.clone()));
     runtime.model = agent_core::Model(resolved.api_id.clone());
     runtime.provider_url = provider_url;
     runtime.resume_facts.model = resolved.alias.clone();
@@ -237,7 +239,7 @@ async fn set_gc(runtime: &mut Runtime, args: &Args, value: &str) -> Result<()> {
     // warning (same as the flags).
     let embedder = match crate::resolve_model(Some(runtime.resume_facts.model.clone()), None).await
     {
-        Ok((_, _, embedder)) => embedder,
+        Ok((_, _, embedder, _)) => embedder,
         Err(_) => None,
     };
     runtime.config.gc = crate::gc_mode_from_choice(args, choice, &embedder);

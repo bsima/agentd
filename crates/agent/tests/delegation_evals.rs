@@ -194,6 +194,7 @@ impl Arm {
         match self {
             Self::ToolGuided => agent_core::RuntimeGuidance {
                 enabled: true,
+                infer_models: None,
                 delegate_models: vec![agent_core::DelegateModel {
                     id: child_model.to_string(),
                     pricing: pricing_table().get(child_model).copied(),
