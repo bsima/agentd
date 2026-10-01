@@ -57,7 +57,8 @@ pub use ir::{
 pub use ir_agent::{
     agent_loop_ir, agent_loop_ir_for_options, agent_loop_ir_with_options,
     agent_loop_ir_with_policies, agent_loop_ir_with_tools, resume_agent_loop_outcome,
-    run_agent_loop, run_agent_loop_outcome, AgentLoopOptions, AgentLoopOutcome,
+    run_agent_loop, run_agent_loop_outcome, turn_budget, AgentLoopOptions, AgentLoopOutcome,
+    UNLIMITED_TURNS,
 };
 pub use ir_interpreter::{
     run_ir_sequential, run_ir_sequential_with_gc, run_ir_sequential_with_store,

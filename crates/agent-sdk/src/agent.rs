@@ -87,7 +87,7 @@ pub struct Agent {
     pub(crate) instructions: Option<String>,
     pub(crate) tools: ToolRegistry,
     pub(crate) output_contract: Option<OutputContract>,
-    pub(crate) max_turns: usize,
+    pub(crate) max_turns: Option<usize>,
     pub(crate) eval_timeout: Duration,
     pub(crate) eval_env: EnvPolicy,
     pub(crate) eval_cwd: Option<PathBuf>,
@@ -112,7 +112,7 @@ impl Agent {
             instructions: None,
             tools: Vec::new(),
             output_contract: None,
-            max_turns: DEFAULT_MAX_TURNS,
+            max_turns: None,
             eval_timeout: Duration::from_secs(120),
             eval_env: EnvPolicy::Inherit,
             eval_cwd: None,
@@ -140,9 +140,6 @@ impl Agent {
     }
 }
 
-/// Turn-budget safety ceiling, matching the `agent` CLI default.
-pub const DEFAULT_MAX_TURNS: usize = 100;
-
 /// Builder for [`Agent`]. All knobs map onto existing runtime policies —
 /// the SDK adds no configuration of its own.
 pub struct AgentBuilder {
@@ -151,7 +148,7 @@ pub struct AgentBuilder {
     instructions: Option<String>,
     tools: Vec<Tool>,
     output_contract: Option<OutputContract>,
-    max_turns: usize,
+    max_turns: Option<usize>,
     eval_timeout: Duration,
     eval_env: EnvPolicy,
     eval_cwd: Option<PathBuf>,
@@ -202,9 +199,9 @@ impl AgentBuilder {
         self
     }
 
-    /// Turn-budget safety ceiling (default 100, the CLI's default).
+    /// Turn-budget safety ceiling (default: none, like the CLI).
     pub fn max_turns(mut self, max_turns: usize) -> Self {
-        self.max_turns = max_turns;
+        self.max_turns = Some(max_turns);
         self
     }
 
@@ -323,7 +320,7 @@ impl AgentBuilder {
         if self.model.trim().is_empty() {
             return Err(SdkError::Config("model must be non-empty".into()));
         }
-        if self.max_turns == 0 {
+        if self.max_turns == Some(0) {
             return Err(SdkError::Config("max_turns must be at least 1".into()));
         }
         let mut registry = ToolRegistry::new();

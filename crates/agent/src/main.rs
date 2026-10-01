@@ -30,14 +30,6 @@ use uuid::Uuid;
 mod acp;
 mod frontmatter;
 
-/// Soft turn ceiling per session turn (Ben's decision on t-1133). Models like
-/// gpt-5.5 issue one tool call per assistant turn, so real inspect/edit loops
-/// burn turns fast; 100 is generous enough that no legitimate task dies one
-/// step from the line, while still bounding a runaway loop before it burns
-/// real spend or hits the context wall. Hitting it is reported (typed
-/// TurnBudgetExhausted event + non-empty terminal notice), not fatal-looking.
-const DEFAULT_MAX_TURNS: usize = 100;
-
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
@@ -98,7 +90,7 @@ struct Args {
     /// session's system message).
     #[arg(long, env = "AGENT_SYSTEM_PROMPT")]
     system_prompt: Option<String>,
-    /// Soft turn ceiling per session turn (default 100). Takes precedence
+    /// Soft turn ceiling per session turn (default: none). Takes precedence
     /// over prompt frontmatter `max_iterations`.
     #[arg(long, env = "AGENT_MAX_TURNS")]
     max_turns: Option<usize>,
@@ -542,10 +534,10 @@ async fn main() -> Result<()> {
         .provider
         .clone()
         .or_else(|| frontmatter.and_then(|meta| meta.provider.clone()));
-    let max_turns = args
-        .max_turns
-        .or_else(|| frontmatter.and_then(|meta| meta.max_iterations))
-        .unwrap_or(DEFAULT_MAX_TURNS);
+    let max_turns = agent_core::turn_budget(
+        args.max_turns
+            .or_else(|| frontmatter.and_then(|meta| meta.max_iterations)),
+    );
     let system_prompt_override = match (args.system_prompt.clone(), loaded_prompt.as_ref()) {
         // The explicit flag wins: it is how flag-only launches (sessions
         // spawned by agent-sdk or a supervisor) express instructions that

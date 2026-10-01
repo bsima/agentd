@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use agent_core::{ChatMessage, ImageContent};
 
-use crate::{build_runtime, Args, Checkpoint, SessionParams, DEFAULT_MAX_TURNS};
+use crate::{build_runtime, Args, Checkpoint, SessionParams};
 
 struct AcpServer {
     args: Arc<Args>,
@@ -121,7 +121,7 @@ impl AcpServer {
         let params = SessionParams {
             requested_model: self.args.model.clone(),
             requested_provider: self.args.provider.clone(),
-            max_turns: self.args.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+            max_turns: agent_core::turn_budget(self.args.max_turns),
             system_prompt_override: self.args.system_prompt.clone(),
             cwd: Some(cwd),
             checkpoint_dir: Some(checkpoint_dir),

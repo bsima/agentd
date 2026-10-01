@@ -443,7 +443,7 @@ async fn execute(
         &mut gc_state,
         Model(model),
         history,
-        agent.max_turns,
+        agent_core::turn_budget(agent.max_turns),
         &options,
         BTreeMap::new(),
     )

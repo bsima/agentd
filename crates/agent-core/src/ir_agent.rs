@@ -16,6 +16,17 @@ use chrono::Utc;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Turn budget meaning "no ceiling". The loop's `turns_left` counter is
+/// i64 AgentIR arithmetic, so this is the largest budget it can hold; it
+/// never reaches zero in practice. Hosts pass it when no cap is configured.
+pub const UNLIMITED_TURNS: usize = i64::MAX as usize;
+
+/// Resolve an optional configured turn cap to a loop budget: `None` is
+/// [`UNLIMITED_TURNS`].
+pub fn turn_budget(max_turns: Option<usize>) -> usize {
+    max_turns.unwrap_or(UNLIMITED_TURNS)
+}
+
 pub fn agent_loop_ir(model: Model, prompt: Prompt, max_turns: usize) -> Machine {
     agent_loop_ir_with_options(model, prompt, max_turns, false)
 }
@@ -2116,6 +2127,41 @@ mod tests {
         assert_eq!(
             decoded.metadata.get("stop_reason").and_then(Value::as_str),
             Some("turn_budget_exhausted")
+        );
+        Ok(())
+    }
+
+    // t-1584: with no configured cap the loop must outlast the old
+    // 100-turn default and stop only when the model does.
+    #[tokio::test]
+    async fn agent_loop_ir_unlimited_budget_runs_past_one_hundred_turns() -> Result<()> {
+        let mut responses: Vec<Response> = (0..150)
+            .map(|i| {
+                response(
+                    "",
+                    vec![ToolCall::new(
+                        format!("call-{i}"),
+                        "no_such_tool",
+                        serde_json::json!({}),
+                    )],
+                )
+            })
+            .collect();
+        responses.push(response("done", vec![]));
+        let provider = Arc::new(MockProvider::new(responses));
+        let machine = agent_loop_ir(
+            Model("mock".into()),
+            vec![ChatMessage::system("system"), ChatMessage::user("spin")],
+            turn_budget(None),
+        );
+
+        let (value, _machine) =
+            crate::ir_interpreter::run_ir_sequential(&config(provider), machine).await?;
+
+        assert_eq!(value["content"], Value::String("done".into()), "{value}");
+        assert!(
+            value["metadata"].get("stop_reason").is_none(),
+            "an unlimited run must end naturally: {value}"
         );
         Ok(())
     }

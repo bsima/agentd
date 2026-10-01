@@ -107,7 +107,7 @@ mod runner;
 mod session;
 pub mod testing;
 
-pub use agent::{Agent, AgentBuilder, Tool, ToolDef, DEFAULT_MAX_TURNS};
+pub use agent::{Agent, AgentBuilder, Tool, ToolDef};
 pub use error::SdkError;
 pub use runner::{EventStream, RunHandle, RunResult, Runner};
 pub use session::{

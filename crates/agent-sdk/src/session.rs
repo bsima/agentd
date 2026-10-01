@@ -668,10 +668,11 @@ async fn launch(
         .arg(&agent.model)
         .arg("--checkpoint-dir")
         .arg(&checkpoint_dir)
-        .arg("--max-turns")
-        .arg(agent.max_turns.to_string())
         .arg("--eval-timeout-seconds")
         .arg(agent.eval_timeout.as_secs().max(1).to_string());
+    if let Some(max_turns) = agent.max_turns {
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+    }
     if agent.require_shell_approval {
         cmd.arg("--require-shell-approval");
     }

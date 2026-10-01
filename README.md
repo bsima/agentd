@@ -199,7 +199,7 @@ system_prompt: ./system.md
 Inspect this repo and summarize it.
 ```
 
-`system_prompt` may be inline text or a path resolved relative to the markdown file.
+`system_prompt` may be inline text or a path resolved relative to the markdown file. `max_iterations` caps agent turns per session turn; `--max-turns` / `AGENT_MAX_TURNS` override it. With none of them set there is no turn ceiling.
 
 You can also skip the registry and pass a raw model id.
 Then the CLI uses `OPENROUTER_BASE_URL` or `https://openrouter.ai/api/v1`, and `AGENT_API_KEY` or `OPENROUTER_API_KEY`.
