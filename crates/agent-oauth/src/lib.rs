@@ -1,4 +1,4 @@
-use agent_core::provider::ToolSpec;
+use agent_core::provider::{chat_with_retries, retry_after_delay, ProviderError, ToolSpec};
 use agent_core::{ChatMessage, ChatProvider, FinishReason, Model, Response, ToolCall};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -529,35 +529,13 @@ impl OAuthChatProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
-        let account_id = extract_codex_account_id(token).ok_or_else(|| {
-            anyhow!("failed to extract chatgpt_account_id from OpenAI Codex token")
-        })?;
-        let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
-        let body = build_codex_request(model, tools, messages);
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .header("chatgpt-account-id", account_id)
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(anyhow!("Codex OAuth provider returned {status}: {text}"));
-        }
-        parse_codex_sse_response(&text)
+        self.chat_codex_with_retries(token, model, tools, messages, None)
+            .await
     }
 
-    /// Live-streamed variant of [`Self::chat_codex`]: the endpoint already
-    /// responds with SSE; this decodes it incrementally instead of
-    /// buffering, forwarding text deltas through the tap. Same accumulator,
-    /// same final [`Response`].
+    /// Live-streamed variant of [`Self::chat_codex`]: decodes the SSE
+    /// incrementally, forwarding text deltas through the tap. Same
+    /// accumulator, same final [`Response`].
     async fn chat_codex_streamed(
         &self,
         token: &str,
@@ -566,12 +544,44 @@ impl OAuthChatProvider {
         messages: &[ChatMessage],
         on_delta: &agent_core::TextDeltaFn,
     ) -> Result<Response> {
-        use futures::StreamExt;
+        self.chat_codex_with_retries(token, model, tools, messages, Some(on_delta))
+            .await
+    }
+
+    /// Drive Codex attempts through the shared bounded backoff, so a
+    /// dropped connection, truncated stream, 429, or 5xx retries exactly as
+    /// on the OpenAI-shaped paths instead of failing the turn (t-1583). A
+    /// retried attempt may re-emit deltas; see [`agent_core::TextDeltaFn`].
+    async fn chat_codex_with_retries(
+        &self,
+        token: &str,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: Option<&agent_core::TextDeltaFn>,
+    ) -> Result<Response> {
         let account_id = extract_codex_account_id(token).ok_or_else(|| {
             anyhow!("failed to extract chatgpt_account_id from OpenAI Codex token")
         })?;
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
-        let body = build_codex_request(model, tools, messages);
+        // Codex never yields an EmptyCompletion, so the nudge flag is unused.
+        chat_with_retries(
+            |_nudge| build_codex_request(model, tools, messages),
+            |body| self.codex_attempt(token, &account_id, &url, body, on_delta),
+        )
+        .await
+        .map_err(ProviderError::into_anyhow)
+    }
+
+    async fn codex_attempt(
+        &self,
+        token: &str,
+        account_id: &str,
+        url: &str,
+        body: Value,
+        on_delta: Option<&agent_core::TextDeltaFn>,
+    ) -> std::result::Result<Response, ProviderError> {
+        use futures::StreamExt;
         let response = self
             .client
             .post(url)
@@ -583,17 +593,28 @@ impl OAuthChatProvider {
             .header("chatgpt-account-id", account_id)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(ProviderError::transport)?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await?;
-            return Err(anyhow!("Codex OAuth provider returned {status}: {text}"));
+            let retry_after = retry_after_delay(&response);
+            let text = response
+                .text()
+                .await
+                .map_err(|source| ProviderError::Transport {
+                    source,
+                    context: "reading Codex error response",
+                })?;
+            return Err(ProviderError::from_http(status, text, retry_after));
         }
         let mut decoder = agent_core::sse::SseDecoder::new();
         let mut stream = response.bytes_stream();
         let mut accum = CodexStreamAccum::default();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("reading Codex stream")?;
+            let chunk = chunk.map_err(|source| ProviderError::Transport {
+                source,
+                context: "reading Codex stream",
+            })?;
             for event in decoder.feed(&chunk) {
                 if event.data.trim() == "[DONE]" {
                     continue;
@@ -601,10 +622,19 @@ impl OAuthChatProvider {
                 let Ok(parsed) = serde_json::from_str::<Value>(&event.data) else {
                     continue;
                 };
-                accum.on_event(&parsed, Some(on_delta))?;
+                // `error`/`response.failed` events are the backend's own
+                // verdict on the request, not a transport fault: terminal.
+                accum
+                    .on_event(&parsed, on_delta)
+                    .map_err(ProviderError::Other)?;
             }
         }
-        accum.into_response()
+        if !accum.completed {
+            return Err(ProviderError::TruncatedStream {
+                context: "Codex response stream ended before response.completed",
+            });
+        }
+        accum.into_response().map_err(ProviderError::Other)
     }
 }
 
@@ -995,6 +1025,9 @@ fn tool_spec_to_codex(tool: &ToolSpec) -> Value {
     })
 }
 
+/// Whole-body parse over the same accumulator; exercises the event
+/// handling in tests without a live stream.
+#[cfg(test)]
 fn parse_codex_sse_response(text: &str) -> Result<Response> {
     let mut accum = CodexStreamAccum::default();
     for event_text in parse_sse_events(text) {
@@ -1007,9 +1040,9 @@ fn parse_codex_sse_response(text: &str) -> Result<Response> {
 }
 
 /// Incremental accumulator over the codex Responses-API event stream.
-/// Drives both the buffered path ([`parse_codex_sse_response`]) and the
-/// live-streamed path (`chat_codex_streamed`), which additionally forwards
-/// `response.output_text.delta` fragments through the tap.
+/// Drives every Codex attempt (`codex_attempt`); the live-streamed path
+/// additionally forwards `response.output_text.delta` fragments through
+/// the tap.
 #[derive(Default)]
 struct CodexStreamAccum {
     /// `response.completed`/`response.done` arrived. EOF without it means
@@ -1195,10 +1228,12 @@ impl CodexToolAccum {
     }
 }
 
+#[cfg(test)]
 fn parse_sse_events(text: &str) -> impl Iterator<Item = &str> {
     text.split("\n\n")
 }
 
+#[cfg(test)]
 fn parse_sse_event_json(event_text: &str) -> Option<Value> {
     let json_text = event_text
         .lines()
@@ -1610,6 +1645,164 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
         assert!(response.tool_calls.is_empty());
         assert_eq!(response.finish_reason, Some(FinishReason::Stop));
         Ok(())
+    }
+
+    /// What the fake Codex endpoint does with one request.
+    #[derive(Clone, Copy)]
+    enum CodexReply {
+        /// Advertise a longer body than sent, then close: the client sees
+        /// a mid-stream transport error ("reading Codex stream").
+        DropMidStream,
+        /// A complete, well-formed response stream.
+        Complete,
+        /// A terminal 400 from the backend.
+        BadRequest,
+    }
+
+    /// Serve `replies` in order on a local socket, one per connection, and
+    /// return the base URL plus a counter of requests seen.
+    async fn fake_codex_server(
+        replies: Vec<CodexReply>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Read the full request (headers + Content-Length body) so
+                // the client never sees a reset before our reply.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let sse_ok = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n\
+                              data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+                let raw = match reply {
+                    CodexReply::DropMidStream => {
+                        let partial =
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lost\"}\n\n";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n{partial}"
+                        )
+                    }
+                    CodexReply::Complete => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_ok}",
+                        sse_ok.len()
+                    ),
+                    CodexReply::BadRequest => {
+                        let body = r#"{"error":{"message":"bad request"}}"#;
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                };
+                socket.write_all(raw.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                drop(socket);
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn codex_provider_at(base_url: String) -> OAuthChatProvider {
+        OAuthChatProvider {
+            kind: OAuthProviderKind::Codex,
+            client: Client::new(),
+            store: TokenStore::with_path(OAuthProviderKind::Codex, PathBuf::from("/nonexistent")),
+            base_url,
+        }
+    }
+
+    fn codex_token() -> String {
+        fake_jwt(json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct-1" }
+        }))
+    }
+
+    // t-1583: a connection dropped mid-stream used to fail the whole turn
+    // with "reading Codex stream" (-32603 under ACP). It must retry.
+    #[tokio::test]
+    async fn codex_streamed_retries_after_mid_stream_drop() -> Result<()> {
+        let (base_url, seen) =
+            fake_codex_server(vec![CodexReply::DropMidStream, CodexReply::Complete]).await;
+        let provider = codex_provider_at(base_url);
+        let deltas = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = deltas.clone();
+        let on_delta: agent_core::TextDeltaFn =
+            std::sync::Arc::new(move |text: &str| sink.lock().unwrap().push(text.into()));
+        let response = provider
+            .chat_codex_streamed(
+                &codex_token(),
+                &Model("gpt-5".into()),
+                &[],
+                &[ChatMessage::user("hi")],
+                &on_delta,
+            )
+            .await?;
+        assert_eq!(response.content, "recovered");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The dropped attempt's delta reached the tap before the retry;
+        // consumers reconcile against the final response.
+        assert_eq!(*deltas.lock().unwrap(), vec!["lost", "recovered"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_buffered_retries_after_mid_stream_drop() -> Result<()> {
+        let (base_url, seen) =
+            fake_codex_server(vec![CodexReply::DropMidStream, CodexReply::Complete]).await;
+        let response = codex_provider_at(base_url)
+            .chat_codex(
+                &codex_token(),
+                &Model("gpt-5".into()),
+                &[],
+                &[ChatMessage::user("hi")],
+            )
+            .await?;
+        assert_eq!(response.content, "recovered");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_bad_request_is_not_retried() {
+        let (base_url, seen) = fake_codex_server(vec![CodexReply::BadRequest]).await;
+        let err = codex_provider_at(base_url)
+            .chat_codex(
+                &codex_token(),
+                &Model("gpt-5".into()),
+                &[],
+                &[ChatMessage::user("hi")],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"), "unexpected error: {err}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

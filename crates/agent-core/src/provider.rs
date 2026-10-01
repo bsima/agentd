@@ -312,7 +312,10 @@ fn build_chat_body(
 /// resends have not recovered in observed gpt-5.5 cases — t-1071). If every
 /// attempt is exhausted the last error is returned so the run terminates
 /// with a descriptive message instead of a silent empty completion.
-pub(crate) async fn chat_with_retries<B, F, Fut>(
+///
+/// Public so out-of-crate transports (the Codex Responses API in
+/// `agent-oauth`) share the retry policy of the OpenAI-shaped paths.
+pub async fn chat_with_retries<B, F, Fut>(
     mut build_body: B,
     mut send: F,
 ) -> std::result::Result<Response, ProviderError>
@@ -366,17 +369,7 @@ async fn send_chat_request(
                 context: "reading provider response",
             })?;
         if !status.is_success() {
-            if is_context_overflow(status, &text) {
-                return Err(ProviderError::ContextOverflow { status, text });
-            }
-            if is_model_not_found(status, &text) {
-                return Err(ProviderError::ModelNotFound { status, text });
-            }
-            return Err(ProviderError::Http {
-                status,
-                text,
-                retry_after,
-            });
+            return Err(ProviderError::from_http(status, text, retry_after));
         }
 
         let completion: ChatCompletion = serde_json::from_str(&text)
@@ -474,17 +467,7 @@ async fn send_chat_request_streamed(
                 source,
                 context: "reading provider response",
             })?;
-        if is_context_overflow(status, &text) {
-            return Err(ProviderError::ContextOverflow { status, text });
-        }
-        if is_model_not_found(status, &text) {
-            return Err(ProviderError::ModelNotFound { status, text });
-        }
-        return Err(ProviderError::Http {
-            status,
-            text,
-            retry_after,
-        });
+        return Err(ProviderError::from_http(status, text, retry_after));
     }
 
     let mut decoder = crate::sse::SseDecoder::new();
@@ -664,8 +647,10 @@ struct StreamToolFunctionDelta {
     arguments: Option<String>,
 }
 
+/// Classified failure of one provider attempt; drives [`chat_with_retries`].
+/// Convert with [`ProviderError::into_anyhow`] once retries are exhausted.
 #[derive(Debug)]
-pub(crate) enum ProviderError {
+pub enum ProviderError {
     Transport {
         source: reqwest::Error,
         context: &'static str,
@@ -704,14 +689,31 @@ pub(crate) enum ProviderError {
 }
 
 impl ProviderError {
-    pub(crate) fn transport(source: reqwest::Error) -> Self {
+    pub fn transport(source: reqwest::Error) -> Self {
         Self::Transport {
             source,
             context: "provider request failed",
         }
     }
 
-    pub(crate) fn is_retryable(&self) -> bool {
+    /// Classify a non-2xx response: context overflow and unknown model are
+    /// terminal; anything else is [`ProviderError::Http`], retryable on
+    /// 429/5xx.
+    pub fn from_http(status: StatusCode, text: String, retry_after: Option<Duration>) -> Self {
+        if is_context_overflow(status, &text) {
+            return Self::ContextOverflow { status, text };
+        }
+        if is_model_not_found(status, &text) {
+            return Self::ModelNotFound { status, text };
+        }
+        Self::Http {
+            status,
+            text,
+            retry_after,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } => true,
             Self::Http { status, .. } => {
@@ -726,14 +728,14 @@ impl ProviderError {
         }
     }
 
-    pub(crate) fn retry_after(&self) -> Option<Duration> {
+    pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Http { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
 
-    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+    pub fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::Transport { source, context } => anyhow::Error::new(source).context(context),
             Self::Http { status, text, .. } => anyhow!("provider returned {status}: {text}"),
@@ -777,7 +779,7 @@ impl std::error::Error for ContextOverflowError {}
 
 /// Classify a provider error as a context overflow. Typed when the provider
 /// constructed [`ContextOverflowError`]; falls back to message heuristics for
-/// providers that surface raw backend text (the codex OAuth path returns
+/// providers that surface raw backend text (the codex OAuth path returned
 /// `anyhow!("Codex OAuth provider returned {status}: {text}")` unclassified,
 /// which is how smith's overflow escaped the t-1133 taxonomy entirely).
 pub fn is_context_overflow_anyhow(err: &anyhow::Error) -> bool {
@@ -833,7 +835,7 @@ pub(crate) fn is_model_not_found(status: StatusCode, text: &str) -> bool {
         || lower.contains("does not exist")
 }
 
-pub(crate) fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+pub fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
     let header = response.headers().get(RETRY_AFTER)?.to_str().ok()?;
     let seconds = header.parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
