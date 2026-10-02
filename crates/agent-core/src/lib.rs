@@ -1,3 +1,6 @@
+// async-trait generates a bare #[must_use] on boxed Future returns on Rust 1.99.
+// Those futures are already #[must_use]; suppress only this macro-induced lint.
+#![allow(clippy::double_must_use)]
 pub mod anthropic;
 pub mod approval;
 pub mod chat_history;
