@@ -15,8 +15,8 @@ acp = ["dep:agent-client-protocol"]
 
 [dependencies]
 libc = "0.2"
-agent-core = { path = "../agent-core", version = "0.5.1-rc.2" }
-agent-oauth = { path = "../agent-oauth", version = "0.5.1-rc.2", optional = true }
+agent-core = { path = "../agent-core", version = "0.5.1-rc.3" }
+agent-oauth = { path = "../agent-oauth", version = "0.5.1-rc.3", optional = true }
 agent-client-protocol = { version = "=2.0.0", optional = true }
 anyhow.workspace = true
 chrono.workspace = true

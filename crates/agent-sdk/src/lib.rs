@@ -1,3 +1,5 @@
+// async-trait on Rust 1.99 emits a bare #[must_use] for boxed futures.
+#![allow(clippy::double_must_use)]
 //! # agent-sdk
 //!
 //! Embed [agentd](https://github.com/bsima/agentd) agents in Rust — the

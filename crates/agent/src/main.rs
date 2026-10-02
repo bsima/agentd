@@ -1,3 +1,5 @@
+// async-trait on Rust 1.99 emits a bare #[must_use] for boxed futures.
+#![allow(clippy::double_must_use)]
 use agent_core::{
     format_micro_usd, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatHistory,
     ChatMessage, Embedder, EmbeddingClient, EnvPolicy, EvalConfig, Event, GcMode, GcTiming,

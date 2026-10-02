@@ -1,3 +1,5 @@
+// async-trait on Rust 1.99 emits a bare #[must_use] for boxed futures.
+#![allow(clippy::double_must_use)]
 use agent_core::provider::{chat_with_retries, retry_after_delay, ProviderError, ToolSpec};
 use agent_core::{ChatMessage, ChatProvider, FinishReason, Model, Response, ToolCall};
 use anyhow::{anyhow, Context, Result};
