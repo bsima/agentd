@@ -15,6 +15,9 @@ cargo test
 ./evals/trace-shape.sh
 ./evals/hydration.sh
 ./evals/replay-divergence.sh
+./evals/fixtures/durable-sessions/fork.sh
+./evals/fixtures/durable-sessions/suspend-resume.sh
+./evals/fixtures/durable-sessions/approval-fork.sh
 
 # Optional/gated evals. They skip unless their RUN_* env vars are set.
 ./evals/online-shell.sh

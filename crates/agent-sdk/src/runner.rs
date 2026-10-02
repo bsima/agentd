@@ -458,6 +458,11 @@ async fn execute(
     })?;
     let value = match outcome {
         AgentLoopOutcome::Complete { value, .. } => value,
+        AgentLoopOutcome::SignalSuspended { .. } => {
+            return Err(SdkError::Run(
+                "unexpected signal suspend in SDK runner".into(),
+            ));
+        }
         // Fail closed (DR-7): a gated effect with no on_approval hook does
         // not execute, and the in-process Runner has no durable pause to
         // resume in this wave — the run ends as a typed error. Never

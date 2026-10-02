@@ -61,6 +61,9 @@ pub(crate) async fn run_acp_turn(
     .await?;
     loop {
         match outcome {
+            agent_core::AgentLoopOutcome::SignalSuspended { .. } => {
+                return Err(anyhow::anyhow!("ACP does not support signal suspension"));
+            }
             agent_core::AgentLoopOutcome::Complete { value, machine } => {
                 return Ok(TurnOutcome::Done(Box::new(
                     finish_turn(runtime, value, machine, prompt).await?,

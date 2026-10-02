@@ -27,6 +27,8 @@
               cargo
               rustfmt
               clippy
+              jq
+              python3
               pkg-config
               openssl
               cacert

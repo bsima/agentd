@@ -918,10 +918,54 @@ impl JsonlTraceSink {
     }
 }
 
+/// Adds caller-provided lineage to the run's JSONL trace without changing
+/// any effect ids or the replay loader's event matching.
+pub struct SessionTraceSink {
+    inner: JsonlTraceSink,
+    session_id: String,
+    parent_session_id: Option<String>,
+}
+impl SessionTraceSink {
+    pub fn new(path: PathBuf, session_id: String, parent_session_id: Option<String>) -> Self {
+        Self {
+            inner: JsonlTraceSink::new(path),
+            session_id,
+            parent_session_id,
+        }
+    }
+    pub fn mirror_stdout(mut self, value: bool) -> Self {
+        self.inner = self.inner.mirror_stdout(value);
+        self
+    }
+}
+#[async_trait]
+impl TraceSink for SessionTraceSink {
+    async fn emit(&self, event: &Event) -> Result<()> {
+        let mut value = serde_json::to_value(event)?;
+        let object = value
+            .as_object_mut()
+            .expect("runtime events serialize to objects");
+        object.insert("session_id".into(), self.session_id.clone().into());
+        if let Some(parent) = &self.parent_session_id {
+            object.insert("parent_session_id".into(), parent.clone().into());
+        }
+        self.inner.emit_json(&value).await
+    }
+}
+
 #[async_trait]
 impl TraceSink for JsonlTraceSink {
     async fn emit(&self, event: &Event) -> Result<()> {
-        let line = serde_json::to_string(event)?;
+        self.emit_line(serde_json::to_string(event)?).await
+    }
+}
+
+impl JsonlTraceSink {
+    async fn emit_json(&self, event: &Value) -> Result<()> {
+        self.emit_line(serde_json::to_string(event)?).await
+    }
+
+    async fn emit_line(&self, line: String) -> Result<()> {
         let mut guard = self.file.lock().await;
         if guard.is_none() {
             if let Some(parent) = self.path.parent() {
@@ -1146,10 +1190,39 @@ impl TraceSink for OtelTraceSink {
     }
 }
 
+/// Process-wide cooperative suspend request, shared by CLI and AgentIR.
+/// A watch channel avoids lost wakeups between checking the flag and waiting.
+#[derive(Clone, Debug)]
+pub struct SuspendControl {
+    sender: tokio::sync::watch::Sender<Option<std::time::Instant>>,
+}
+impl Default for SuspendControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl SuspendControl {
+    pub fn new() -> Self {
+        Self {
+            sender: tokio::sync::watch::channel(None).0,
+        }
+    }
+    pub fn request(&self, deadline: std::time::Instant) {
+        self.sender.send_replace(Some(deadline));
+    }
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        *self.sender.borrow()
+    }
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<std::time::Instant>> {
+        self.sender.subscribe()
+    }
+}
+
 #[derive(Clone)]
 pub struct TraceLogger {
     run_id: String,
     path: PathBuf,
+    suspend: Option<SuspendControl>,
     next_op_id: Arc<AtomicU64>,
     sinks: Arc<Vec<Arc<dyn TraceSink>>>,
     context_env: TraceContextEnv,
@@ -1186,11 +1259,21 @@ impl TraceLogger {
         Self {
             run_id: run_id.into(),
             path,
+            suspend: None,
             next_op_id: Arc::new(AtomicU64::new(1)),
             sinks: Arc::new(sinks),
             context_env,
             usage: Arc::new(Mutex::new(crate::cost::RunUsage::default())),
         }
+    }
+
+    pub fn with_suspend(mut self, control: SuspendControl) -> Self {
+        self.suspend = Some(control);
+        self
+    }
+
+    pub fn suspend(&self) -> Option<&SuspendControl> {
+        self.suspend.as_ref()
     }
 
     pub fn mirror_stdout(mut self, mirror_stdout: bool) -> Self {
@@ -1209,6 +1292,38 @@ impl TraceLogger {
 
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Seed a resumed trace above every op id already recorded in its file.
+    pub fn seed_next_op_id(&self, next: u64) {
+        self.next_op_id.fetch_max(next.max(1), Ordering::Relaxed);
+    }
+
+    /// Restore usage from committed trace events on a mid-turn resume.
+    pub fn seed_usage(&self, events: &[Event]) {
+        let mut usage = self.usage.lock().unwrap();
+        for event in events {
+            match event {
+                Event::InferResult {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cached_input_tokens,
+                    cost_micro_usd,
+                    ..
+                } => {
+                    usage.observe_infer(
+                        *input_tokens,
+                        *output_tokens,
+                        *total_tokens,
+                        *cached_input_tokens,
+                        *cost_micro_usd,
+                    );
+                }
+                Event::InferError { .. } => usage.observe_infer_error(),
+                _ => {}
+            }
+        }
     }
 
     pub fn next_op_id(&self) -> u64 {
@@ -1597,6 +1712,34 @@ mod tests {
     /// infer-less run's AgentDone stays untouched (covered by
     /// `trace_logger_emits_to_all_sinks_and_preserves_jsonl_readback`,
     /// which asserts byte-equality for a bare AgentDone).
+    #[tokio::test]
+    async fn session_trace_sink_preserves_replay_events_and_lineage() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("agent-lineage-{}.jsonl", uuid::Uuid::new_v4()));
+        let run = "attachment";
+        let logger = TraceLogger::with_sinks(
+            run,
+            path.clone(),
+            vec![Arc::new(SessionTraceSink::new(
+                path.clone(),
+                "session".into(),
+                Some("parent".into()),
+            ))],
+        );
+        let original = Event::AgentDone {
+            run_id: run.into(),
+            usage: None,
+            timestamp: Utc::now(),
+        };
+        logger.emit(&original).await?;
+        let raw: Value = serde_json::from_str(&tokio::fs::read_to_string(&path).await?)?;
+        assert_eq!(raw["session_id"], "session");
+        assert_eq!(raw["parent_session_id"], "parent");
+        assert_eq!(TraceLogger::read_events(&path).await?, vec![original]);
+        tokio::fs::remove_file(path).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn trace_logger_stamps_run_usage_onto_agent_done() -> Result<()> {
         let recording = Arc::new(RecordingSink::default());

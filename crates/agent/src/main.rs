@@ -1,11 +1,11 @@
 use agent_core::{
-    agent_loop_ir, format_micro_usd, AgentIdGenerator, AnthropicConfig, AnthropicProvider,
-    ChatHistory, ChatMessage, Embedder, EmbeddingClient, EnvPolicy, EvalConfig, Event, GcMode,
-    GcTiming, HydrationSink, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink,
-    MarkSweepGc, MemorySource, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
+    format_micro_usd, AgentIdGenerator, AnthropicConfig, AnthropicProvider, ChatHistory,
+    ChatMessage, Embedder, EmbeddingClient, EnvPolicy, EvalConfig, Event, GcMode, GcTiming,
+    HydrationSink, HydrationSource, InMemoryStore, IrReplayTrace, JsonlTraceSink, MarkSweepGc,
+    MemorySource, ModelRegistry, OtelTraceSink, PassiveHydrationConfig, PassiveSource,
     PricingTable, ProviderClient, ProviderConfig, ReplayOnlyProvider, ResolvedModel, RingGc,
-    RunUsage, SeqConfig, SourceCapability, SourceKind, SourceParams, SourceRegistry, SourceResult,
-    StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
+    RunUsage, SeqConfig, SessionTraceSink, SourceCapability, SourceKind, SourceParams,
+    SourceRegistry, SourceResult, StackFrameGc, TemporalSource, TraceContextEnv, TraceLogger,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -46,6 +46,18 @@ struct Args {
     /// Stable run id used for traces/checkpoints.
     #[arg(long, env = "AGENT_RUN_ID")]
     run_id: Option<String>,
+    /// Durable session identity, stable across attachments.
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Source session identity; only set when forking.
+    #[arg(long, requires = "fork_from")]
+    parent_session: Option<Uuid>,
+    /// Fork a checkpoint into a new session (source is never modified).
+    #[arg(long, conflicts_with = "resume", requires_all = ["session_id", "parent_session"])]
+    fork_from: Option<PathBuf>,
+    /// Root for all non-credential session data. Individual directory flags override it.
+    #[arg(long, env = "AGENT_STATE_DIR")]
+    state_dir: Option<PathBuf>,
     /// Read NUL-terminated session turns from stdin.
     #[arg(long)]
     session: bool,
@@ -76,6 +88,17 @@ struct Args {
     /// Replay recorded Infer/Eval results from a trace JSONL instead of calling providers or shell.
     #[arg(long, env = "AGENT_REPLAY_TRACE")]
     replay_trace: Option<PathBuf>,
+    /// SIGTERM grace period in seconds; a successful exit requires a durable
+    /// checkpoint. Only supported for CLI sessions with a checkpoint root.
+    #[arg(long)]
+    signal_deadline: Option<u64>,
+    /// Offline test mode: use recorded Infer responses but execute Evals live.
+    /// Unlike strict --replay-trace, this can change the workspace.
+    #[arg(long, requires = "replay_trace")]
+    replay_live_eval: bool,
+    /// Offline test mode: replay inference but exercise the approval gate live.
+    #[arg(long, requires_all = ["replay_trace", "replay_live_eval"])]
+    replay_live_approval: bool,
     /// Path to a JSON Schema file constraining the final response: each
     /// turn's final answer must be a single JSON value conforming to it.
     /// Non-conforming answers get up to 2 repair turns, then the turn
@@ -313,6 +336,9 @@ enum Command {
         /// within-turn nudge retry) cannot be computed here — record them.
         #[arg(long, default_value_t = 0)]
         visit: u64,
+        /// Generate the effect site for a loop that gates shell Eval.
+        #[arg(long)]
+        require_shell_approval: bool,
     },
     #[cfg(feature = "oauth")]
     Auth {
@@ -351,7 +377,17 @@ struct FileProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Checkpoint {
     run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<Uuid>,
     sequence: u64,
+    /// Next user-turn ordinal; checkpoints may be written more than once per turn.
+    #[serde(default)]
+    next_turn_seq: Option<u64>,
+    /// Per-effect visit ordinals across completed turns.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ir_effect_visits: BTreeMap<String, u64>,
     model: String,
     /// Registry alias selected for this session. `model` remains the resolved
     /// provider API id for checkpoint compatibility and diagnostics.
@@ -365,6 +401,15 @@ struct Checkpoint {
     /// absent in checkpoints written before t-1162.
     #[serde(default)]
     discovered_budget: Option<usize>,
+    /// In-progress AgentIR machine, if this checkpoint was taken mid-turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine: Option<agent_core::IrCheckpoint>,
+    /// The current turn id when machine is present, for stable supervisor events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_turn_id: Option<String>,
+    /// Approval gate awaiting a durable decision. Never execute it on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_approval_id: Option<String>,
     /// Session-selected GC strategy and threshold. Optional for checkpoints
     /// written before ACP exposed these as mutable session configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,11 +483,19 @@ struct Runtime {
     config: SeqConfig,
     trace: TraceLogger,
     run_id: String,
+    session_id: Option<Uuid>,
+    parent_session_id: Option<Uuid>,
     model: agent_core::Model,
     provider_url: String,
     trace_path: PathBuf,
     checkpoint_dir: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     checkpoint_sequence: u64,
+    /// Ordinal of the next user turn, independent of checkpoint writes.
+    pending_machine: Option<agent_core::IrCheckpoint>,
+    pending_turn_id: Option<String>,
+    pending_approval_id: Option<String>,
+    suspend: Option<agent_core::SuspendControl>,
     /// 0-based ordinal of the next turn, used to mint turn ids for frames
     /// that don't carry one (t-1308.2). Seeded from the checkpoint sequence
     /// so resumed sessions keep minting fresh ids; increments on every turn,
@@ -511,9 +564,51 @@ fn default_runtime_guidance() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.signal_deadline.is_some() && args.replay_trace.is_some() && !args.replay_live_eval {
+        return Err(anyhow!("strict replay cannot be suspended"));
+    }
+    if args.signal_deadline == Some(0) {
+        return Err(anyhow!("--signal-deadline must be positive"));
+    }
+    if args.signal_deadline.is_some() && args.state_dir.is_none() {
+        return Err(anyhow!(
+            "--signal-deadline requires --state-dir so all durable state is snapshotted"
+        ));
+    }
+    #[cfg(feature = "acp")]
+    if args.acp && args.signal_deadline.is_some() {
+        return Err(anyhow!("--signal-deadline is not supported in ACP mode"));
+    }
+    if let Some(root) = args.state_dir.as_ref() {
+        if args.checkpoint_dir.is_none() {
+            args.checkpoint_dir = Some(root.join("checkpoints"));
+        }
+        // A state root does not enable optional memory tools by itself:
+        // doing so changes the IR program hash on resume. Use --memory-dir
+        // to opt in.
+    }
+    if let Some(root) = args.state_dir.as_ref() {
+        if let Some(checkpoints) = args.checkpoint_dir.as_ref() {
+            if !path_in_state_root(root, checkpoints)? {
+                return Err(anyhow!("--checkpoint-dir must be inside --state-dir"));
+            }
+        }
+    }
+    if let (Some(root), Some(memory)) = (args.state_dir.as_ref(), args.memory_dir.as_ref()) {
+        if !path_in_state_root(root, memory)? {
+            return Err(anyhow!(
+                "--memory-dir must be inside --state-dir so it survives suspend and fork"
+            ));
+        }
+    }
+    if args.signal_deadline.is_some() && args.command.is_some() {
+        return Err(anyhow!(
+            "--signal-deadline is only supported for CLI sessions"
+        ));
+    }
     if let Some(command) = args.command.as_ref() {
-        return run_command(command).await;
+        return run_command(command, args.state_dir.as_deref()).await;
     }
     #[cfg(feature = "acp")]
     if args.acp {
@@ -552,16 +647,129 @@ async fn main() -> Result<()> {
         }
         (None, None) => None,
     };
-    let checkpoint = match args.resume.as_ref() {
-        Some(path) => Some(load_checkpoint(path).await?),
+    if args.signal_deadline.is_some() && loaded_prompt.is_some() {
+        return Err(anyhow!(
+            "--signal-deadline requires --session or --fifo (not a one-shot prompt)"
+        ));
+    }
+    let mut checkpoint = match args.resume.as_ref().or(args.fork_from.as_ref()) {
+        Some(path) => Some(
+            load_checkpoint_with_repair(
+                path,
+                args.fork_from.is_none()
+                    && args.signal_deadline.is_none()
+                    && args.state_dir.is_none(),
+            )
+            .await?,
+        ),
         None => None,
     };
-    let run_id = checkpoint
+    let (session_id, parent_session_id) = session_lineage(&args, checkpoint.as_ref())?;
+    if checkpoint.as_ref().is_some_and(|cp| cp.machine.is_some())
+        && args.replay_trace.is_some()
+        && !args.replay_live_eval
+    {
+        return Err(anyhow!("strict replay cannot continue a suspended machine"));
+    }
+    if args.resume.is_some()
+        && checkpoint.as_ref().is_some_and(|cp| cp.machine.is_some())
+        && args
+            .run_id
+            .as_deref()
+            .is_some_and(|id| checkpoint.as_ref().is_some_and(|cp| cp.run_id != id))
+    {
+        return Err(anyhow!(
+            "mid-turn resume must keep its recorded run-id for trace continuity"
+        ));
+    }
+    if let (Some(source), Some(destination)) =
+        (args.fork_from.as_ref(), args.checkpoint_dir.as_ref())
+    {
+        // A fork must not mutate the source checkpoint, even if the caller
+        // accidentally points its destination at the original directory.
+        if std::fs::canonicalize(source.parent().unwrap_or(Path::new(".")))
+            .ok()
+            .zip(std::fs::canonicalize(destination).ok())
+            .is_some_and(|(a, b)| a == b)
+        {
+            return Err(anyhow!(
+                "fork checkpoint destination must differ from source"
+            ));
+        }
+    }
+    if let (Some(source), Some(root)) = (args.fork_from.as_ref(), args.state_dir.as_ref()) {
+        if std::fs::canonicalize(root)
+            .ok()
+            .zip(std::fs::canonicalize(source).ok())
+            .is_some_and(|(root, source)| source.starts_with(root))
+        {
+            return Err(anyhow!(
+                "fork destination state root must not contain the source checkpoint"
+            ));
+        }
+    }
+    if args.fork_from.is_some() && args.state_dir.is_none() {
+        return Err(anyhow!(
+            "fork requires --state-dir to isolate both traces and checkpoints"
+        ));
+    }
+    let run_id = if args.fork_from.is_some() {
+        args.run_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
+    } else {
+        args.run_id
+            .clone()
+            .or_else(|| checkpoint.as_ref().map(|cp| cp.run_id.clone()))
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
+    };
+    if args.fork_from.is_some() && checkpoint.as_ref().is_some_and(|cp| cp.run_id == run_id) {
+        return Err(anyhow!("fork requires a new --run-id"));
+    }
+    // An approval pause lives in a separate record and machine file. Give
+    // each branch its own pending id and record; the source is never renamed
+    // or mutated, even when the fork continues at the same effect site.
+    if let (Some(source), Some(cp), Some(root)) = (
+        args.fork_from.as_ref(),
+        checkpoint.as_mut(),
+        args.state_dir.as_ref(),
+    ) {
+        if let Some(old_pending_id) = cp.pending_approval_id.clone() {
+            let source_root = source
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| anyhow!("fork checkpoint has no state root"))?;
+            let source_store = agent_core::ApprovalStore::new(source_root.join("approvals"));
+            let mut record = source_store.load(&old_pending_id).await?;
+            if record.status != agent_core::PendingStatus::AwaitingApproval {
+                return Err(anyhow!("cannot fork resolved approval {old_pending_id}"));
+            }
+            let new_pending_id = agent_core::pending_id_for(&run_id, &record.effect_id);
+            record.pending_id = new_pending_id.clone();
+            record.run_id = run_id.clone();
+            record.turn_id = cp.pending_turn_id.clone();
+            record.runtime = None; // resume via the branch's authoritative checkpoint
+            let dest_store = agent_core::ApprovalStore::new(root.join("approvals"));
+            dest_store
+                .write_pending(
+                    &record,
+                    cp.machine
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("approval fork has no machine"))?,
+                )
+                .await?;
+            cp.pending_approval_id = Some(new_pending_id);
+        }
+    }
+    let fork_source_run_id = args
+        .fork_from
         .as_ref()
-        .map(|cp| cp.run_id.clone())
-        .or(args.run_id.clone())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .and(checkpoint.as_ref())
+        .map(|cp| cp.run_id.clone());
     let otel = init_otel(args.otel_endpoint.as_deref(), &run_id)?;
+    let suspend = args
+        .signal_deadline
+        .map(|_| agent_core::SuspendControl::new());
     let mut runtime = build_runtime(
         &args,
         SessionParams {
@@ -572,8 +780,12 @@ async fn main() -> Result<()> {
             cwd: None,
             checkpoint_dir: args.checkpoint_dir.clone(),
             checkpoint,
+            fork_source_run_id,
             restore_checkpoint_config: false,
+            suspend: suspend.clone(),
             run_id,
+            session_id,
+            parent_session_id,
             require_shell_approval: args.require_shell_approval,
             trace_sinks_extra: Vec::new(),
             otel_active: otel.is_some(),
@@ -581,6 +793,14 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    if let Some(session_id) = runtime.session_id {
+        runtime.trace.emit(&Event::Custom {
+            run_id: runtime.run_id.clone(),
+            name: "session_lineage".into(),
+            data: serde_json::json!({ "session_id": session_id, "parent_session_id": runtime.parent_session_id }),
+            timestamp: Utc::now(),
+        }).await?;
+    }
     tracing::info!(model = %runtime.model.0, trace = %runtime.trace_path.display(), run_id = %runtime.run_id, provider = %runtime.provider_url, "agent runtime starting");
     eprintln!("model: {}", runtime.model.0);
     eprintln!("trace: {}", runtime.trace_path.display());
@@ -590,6 +810,41 @@ async fn main() -> Result<()> {
         eprintln!("prompt: {}", prompt.body);
     }
 
+    if let (Some(control), Some(seconds)) = (suspend, args.signal_deadline) {
+        #[cfg(unix)]
+        {
+            // Register synchronously before any effect or stdin read; a
+            // spawned task that installs its handler later loses early TERM.
+            let mut signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::spawn(async move {
+                signal.recv().await;
+                let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+                control.request(deadline);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                std::process::exit(1);
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (control, seconds);
+            return Err(anyhow!("--signal-deadline requires Unix"));
+        }
+    }
+    if args.fork_from.is_some() && runtime.pending_machine.is_some() {
+        // A branch is durable before any continuation can execute. A crash
+        // or missing replay result cannot leave it with only the parent
+        // checkpoint as its resume point.
+        persist_durable_checkpoint(&mut runtime).await?;
+        if runtime.pending_approval_id.is_some() {
+            return Ok(());
+        }
+    }
+    if runtime.pending_machine.is_some() && loaded_prompt.is_some() {
+        return Err(anyhow!(
+            "mid-turn resume requires --session or --fifo (not a new prompt)"
+        ));
+    }
     let result = match (loaded_prompt, args.fifo, args.session) {
         (Some(prompt), None, false) => {
             let prompt = prompt_with_optional_stdin(prompt.body)?;
@@ -603,7 +858,10 @@ async fn main() -> Result<()> {
     if let Some(otel) = otel {
         otel.shutdown();
     }
-    result
+    match result {
+        Err(err) if err.is::<SuspendComplete>() || err.is::<ApprovalPaused>() => Ok(()),
+        other => other,
+    }
 }
 
 /// Per-session variation points for [`build_runtime`]. The CLI path derives
@@ -619,17 +877,40 @@ struct SessionParams {
     cwd: Option<PathBuf>,
     checkpoint_dir: Option<PathBuf>,
     checkpoint: Option<Checkpoint>,
+    fork_source_run_id: Option<String>,
     /// ACP session/load restores mutable config saved by set_config_option.
     /// The ordinary CLI resume path keeps explicit command-line flags in
     /// control, preserving its historical override behavior.
     restore_checkpoint_config: bool,
     run_id: String,
+    session_id: Option<Uuid>,
+    parent_session_id: Option<Uuid>,
     require_shell_approval: bool,
     /// Extra sinks observing this runtime's trace events (the ACP bridge).
     trace_sinks_extra: Vec<Arc<dyn agent_core::TraceSink>>,
     /// Whether the process-wide OTel provider is initialized (adds the OTel
     /// sink to this runtime's trace logger).
     otel_active: bool,
+    suspend: Option<agent_core::SuspendControl>,
+}
+
+fn trace_file_sink(
+    path: &Path,
+    debug: bool,
+    session_id: Option<Uuid>,
+    parent: Option<Uuid>,
+) -> Arc<dyn agent_core::TraceSink> {
+    match session_id {
+        Some(id) => Arc::new(
+            SessionTraceSink::new(
+                path.to_path_buf(),
+                id.to_string(),
+                parent.map(|p| p.to_string()),
+            )
+            .mirror_stdout(debug),
+        ),
+        None => Arc::new(JsonlTraceSink::new(path.to_path_buf()).mirror_stdout(debug)),
+    }
 }
 
 async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
@@ -667,7 +948,18 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     };
     let replay_enabled = args.replay_trace.is_some();
     let ir_replay = match args.replay_trace.as_ref() {
-        Some(path) => Some(IrReplayTrace::load(path).await?),
+        Some(path) => Some(if args.replay_live_eval {
+            if args.replay_live_approval {
+                IrReplayTrace::load(path)
+                    .await?
+                    .with_live_eval()
+                    .with_live_approval()
+            } else {
+                IrReplayTrace::load(path).await?.with_live_eval()
+            }
+        } else {
+            IrReplayTrace::load(path).await?
+        }),
         None => None,
     };
     let output_contract = match args.output_schema.as_ref() {
@@ -684,11 +976,23 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     )?;
 
     let run_id = params.run_id;
-    let trace_path = trace_path(&run_id)?;
+    let trace_path = trace_path(&run_id, args.state_dir.as_deref())?;
+    if params.fork_source_run_id.is_none()
+        && params
+            .checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.machine.is_some() && cp.trace_path != trace_path)
+    {
+        return Err(anyhow!("mid-turn checkpoint trace path does not match the active trace; mount the same state root before resuming"));
+    }
+
     let trace = if params.otel_active || !params.trace_sinks_extra.is_empty() {
         let context_env = TraceContextEnv::default();
-        let mut sinks: Vec<Arc<dyn agent_core::TraceSink>> = vec![Arc::new(
-            JsonlTraceSink::new(trace_path.clone()).mirror_stdout(args.debug),
+        let mut sinks: Vec<Arc<dyn agent_core::TraceSink>> = vec![trace_file_sink(
+            &trace_path,
+            args.debug,
+            params.session_id,
+            params.parent_session_id,
         )];
         if params.otel_active {
             sinks.push(Arc::new(OtelTraceSink::with_context_env(
@@ -698,8 +1002,50 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         sinks.extend(params.trace_sinks_extra);
         TraceLogger::with_sinks_and_context(run_id.clone(), trace_path.clone(), sinks, context_env)
     } else {
-        TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug)
+        match params.session_id {
+            Some(_) => TraceLogger::with_sinks(
+                run_id.clone(),
+                trace_path.clone(),
+                vec![trace_file_sink(
+                    &trace_path,
+                    args.debug,
+                    params.session_id,
+                    params.parent_session_id,
+                )],
+            ),
+            None => TraceLogger::new(run_id.clone(), trace_path.clone()).mirror_stdout(args.debug),
+        }
     };
+    let trace = match params.suspend.as_ref() {
+        Some(control) => trace.with_suspend(control.clone()),
+        None => trace,
+    };
+    if params.fork_source_run_id.is_none()
+        && params
+            .checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.machine.is_some())
+    {
+        let events = TraceLogger::read_events(&trace_path).await?;
+        if let Some(checkpoint) = params.checkpoint.as_ref() {
+            if !events
+                .iter()
+                .all(|event| event.run_id() == checkpoint.run_id)
+            {
+                return Err(anyhow!(
+                    "mid-turn trace contains events from a different run"
+                ));
+            }
+        }
+        let next = events
+            .iter()
+            .filter_map(Event::op_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        trace.seed_next_op_id(next);
+        trace.seed_usage(&events);
+    }
     let hydration = {
         let mut registry = SourceRegistry::new();
         if let Some(path) = args.hydration_dir.as_ref() {
@@ -717,6 +1063,24 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         }
         registry
     };
+    let pending_machine = params.checkpoint.as_ref().and_then(|cp| cp.machine.clone());
+    let resumed_turn_seq = params.checkpoint.as_ref().and_then(|cp| cp.next_turn_seq);
+    let resumed_visits = params
+        .checkpoint
+        .as_ref()
+        .map(|cp| cp.ir_effect_visits.clone())
+        .unwrap_or_default();
+    let pending_approval_id = params
+        .checkpoint
+        .as_ref()
+        .and_then(|cp| cp.pending_approval_id.clone());
+    let pending_turn_id = params
+        .checkpoint
+        .as_ref()
+        .and_then(|cp| cp.pending_turn_id.clone());
+    if pending_machine.is_some() && !args.session && args.fifo.is_none() {
+        return Err(anyhow!("mid-turn checkpoint requires --session or --fifo"));
+    }
     let (history, checkpoint_sequence, resumed_discovered_budget, resumed_gc, resumed_gc_threshold) =
         match params.checkpoint {
             Some(cp) => (
@@ -773,18 +1137,25 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         config,
         trace,
         run_id: run_id.clone(),
+        session_id: params.session_id,
+        parent_session_id: params.parent_session_id,
         model: agent_core::Model(model.clone()),
         provider_url: reported_provider_url.clone(),
         trace_path: trace_path.clone(),
         checkpoint_dir: params.checkpoint_dir,
+        state_dir: args.state_dir.clone(),
         checkpoint_sequence,
-        turn_seq: checkpoint_sequence,
+        pending_machine,
+        pending_turn_id,
+        pending_approval_id,
+        suspend: params.suspend,
+        turn_seq: resumed_turn_seq.unwrap_or(checkpoint_sequence),
         history,
         debug: args.debug,
         max_turns: params.max_turns,
         ir_store: InMemoryStore::new(),
         ir_replay,
-        ir_effect_visits: BTreeMap::new(),
+        ir_effect_visits: resumed_visits,
         output_contract,
         gc_state: agent_core::GcState {
             // The discovered ceiling is knowledge about the provider, not
@@ -1590,8 +1961,9 @@ async fn run_approvals_command(
     deny: Option<&str>,
     by: Option<String>,
     reason: Option<String>,
+    state_dir: Option<&Path>,
 ) -> Result<()> {
-    let store = agent_core::ApprovalStore::new(agent_core::ApprovalStore::default_dir()?);
+    let store = agent_core::ApprovalStore::new(approval_dir(state_dir)?);
     match (list, approve, deny) {
         (true, None, None) => {
             let records = store.list().await?;
@@ -1663,6 +2035,48 @@ async fn resolve_and_resume(
     reason: Option<String>,
 ) -> Result<()> {
     let record = store.load(pending_id).await?;
+    if record.runtime.is_none() {
+        let checkpoint_dir = store
+            .dir()
+            .parent()
+            .ok_or_else(|| anyhow!("approvals directory has no state root"))?
+            .join("checkpoints");
+        let checkpoint_path = checkpoint_dir.join("session-latest.json");
+        let checkpoint = load_checkpoint_with_repair(&checkpoint_path, false).await?;
+        if checkpoint.run_id != record.run_id
+            || checkpoint.pending_approval_id.as_deref() != Some(pending_id)
+        {
+            return Err(anyhow!(
+                "approval {pending_id} does not match the authoritative session checkpoint"
+            ));
+        }
+        let _ = if record.is_awaiting() {
+            store
+                .resolve(
+                    pending_id,
+                    decision,
+                    Some(by.unwrap_or_else(|| "agent-approvals".into())),
+                    reason,
+                )
+                .await?
+        } else {
+            let recorded = agent_core::ApprovalStore::resolution_of(&record)?;
+            if recorded.decision != decision {
+                return Err(anyhow!(
+                    "approval {pending_id} already has a different decision"
+                ));
+            }
+            record
+        };
+        // Do not claim the legacy machine file: this CLI resumes the
+        // authoritative session checkpoint, and repeated resumes are safe
+        // only if that checkpoint advances after the decided effect.
+        println!(
+            "approval {pending_id} resolved; resume the session from {}",
+            checkpoint_path.display()
+        );
+        return Ok(());
+    }
     let record = if record.is_awaiting() {
         store
             .resolve(
@@ -1832,6 +2246,9 @@ async fn resume_run(
             println!("{}", response.content);
             Ok(())
         }
+        agent_core::AgentLoopOutcome::SignalSuspended { .. } => Err(anyhow!(
+            "approval resolution cannot suspend without checkpoint driver"
+        )),
         agent_core::AgentLoopOutcome::AwaitingApproval {
             checkpoint,
             pending,
@@ -1959,7 +2376,7 @@ impl CalibrationReport {
     }
 }
 
-async fn run_command(command: &Command) -> Result<()> {
+async fn run_command(command: &Command, state_dir: Option<&Path>) -> Result<()> {
     match command {
         Command::GcStats { trace } => run_gc_stats_command(trace).await,
         Command::Cost { trace, json } => run_cost_command(trace, *json).await,
@@ -1978,11 +2395,23 @@ async fn run_command(command: &Command) -> Result<()> {
                 deny.as_deref(),
                 by.clone(),
                 reason.clone(),
+                state_dir,
             )
             .await
         }
-        Command::IrEffect { model, visit } => {
-            let machine = agent_loop_ir(agent_core::Model(model.clone()), vec![], 16);
+        Command::IrEffect {
+            model,
+            visit,
+            require_shell_approval,
+        } => {
+            let machine = agent_core::agent_loop_ir_with_policies(
+                agent_core::Model(model.clone()),
+                vec![],
+                16,
+                false,
+                &[],
+                *require_shell_approval,
+            );
             let hash = agent_core::program_hash(&machine.program)?;
             let site = agent_core::EffectSite {
                 block: agent_core::BlockId(0),
@@ -2106,11 +2535,29 @@ async fn run_fifo_session(runtime: &mut Runtime, path: PathBuf) -> Result<()> {
         // be stopped with SIGKILL once the signal handlers are installed.
         let mut open_options = tokio::fs::OpenOptions::new();
         open_options.read(true);
+        // With signal suspension enabled, a blocking FIFO open can leave a
+        // stuck Tokio worker after its future is cancelled. The supervisor
+        // protocol otherwise relies on a blocking reader being present.
+        #[cfg(unix)]
+        if runtime.suspend.is_some() {
+            open_options.custom_flags(libc::O_NONBLOCK);
+        }
         let file = tokio::select! {
             file = open_options.open(&path) => {
-                file.with_context(|| format!("opening fifo {}", path.display()))?
+                match file {
+                    Ok(file) => file,
+                    Err(err) if runtime.suspend.is_some() && err.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(err) => return Err(err).with_context(|| format!("opening fifo {}", path.display())),
+                }
             }
-            _ = shutdown_signal() => break,
+            _ = shutdown_signal(), if runtime.suspend.is_none() => break,
+            _ = wait_for_suspend(runtime.suspend.as_ref()), if runtime.suspend.is_some() => {
+                persist_signal_checkpoint(runtime).await?;
+                return Err(SuspendComplete.into());
+            },
         };
         let reader = BufReader::new(file);
         let (handled_messages, stop) = run_nul_delimited_prompt_loop(runtime, reader).await?;
@@ -2163,9 +2610,27 @@ where
 {
     let mut handled_messages = false;
     let stop = loop {
+        if runtime.pending_machine.is_some() {
+            if let Err(err) = write_session_response(runtime, String::new()).await {
+                if err.is::<SuspendComplete>() || err.is::<ApprovalPaused>() {
+                    return Err(err);
+                }
+                return Err(err.context("resuming mid-turn checkpoint"));
+            }
+            handled_messages = true;
+            continue;
+        }
         tokio::select! {
             frame = read_nul_frame(&mut reader) => {
-                match frame? {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(err) if runtime.suspend.is_some() && err.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                match frame {
                     Some(message) if message.is_empty() => break SessionStop::Eof,
                     Some(message) => {
                         handled_messages = true;
@@ -2174,13 +2639,22 @@ where
                         // a long-running session survives it and waits for
                         // the next turn instead of crashing.
                         if let Err(err) = write_session_response(runtime, message).await {
+                            if err.is::<ApprovalPaused>() {
+                                eprintln!("turn paused awaiting approval; resolve it with `agent approvals`");
+                                return Err(err);
+                            }
+                            if err.is::<SuspendComplete>() || runtime.suspend.as_ref().is_some_and(|c| c.deadline().is_some()) { return Err(err); }
                             eprintln!("turn failed: {err:#}");
                         }
                     }
                     None => break SessionStop::Eof,
                 }
             }
-            _ = shutdown_signal() => break SessionStop::Shutdown,
+            _ = shutdown_signal(), if runtime.suspend.is_none() => break SessionStop::Shutdown,
+            _ = wait_for_suspend(runtime.suspend.as_ref()), if runtime.suspend.is_some() => {
+                persist_signal_checkpoint(runtime).await?;
+                return Err(SuspendComplete.into());
+            },
         }
     };
     Ok((handled_messages, stop))
@@ -2208,10 +2682,22 @@ async fn run_turn_with_status(
     } = frame;
     // Every turn boundary carries a turn id, supplied or minted, so the
     // supervisor can correlate agent_complete/agent_error to its send.
-    let turn_id = turn_id.unwrap_or_else(|| mint_turn_id(&runtime.run_id, runtime.turn_seq));
-    runtime.turn_seq += 1;
+    let resuming = runtime.pending_machine.is_some();
+    let turn_id = if resuming {
+        runtime
+            .pending_turn_id
+            .clone()
+            .or(turn_id)
+            .unwrap_or_else(|| mint_turn_id(&runtime.run_id, runtime.turn_seq.saturating_sub(1)))
+    } else {
+        turn_id.unwrap_or_else(|| mint_turn_id(&runtime.run_id, runtime.turn_seq))
+    };
+    if !resuming {
+        runtime.turn_seq += 1;
+    }
     emit_agent_start(runtime, &turn_id).await?;
     match run_turn(runtime, input, &turn_id).await {
+        Err(err) if err.is::<SuspendComplete>() || err.is::<ApprovalPaused>() => Err(err),
         Ok(response) => {
             // A turn-budget stop with empty content must not look like a
             // crash: surface a clear terminal notice instead (t-1133).
@@ -2225,6 +2711,13 @@ async fn run_turn_with_status(
             Ok(response)
         }
         Err(err) => {
+            if runtime
+                .suspend
+                .as_ref()
+                .is_some_and(|c| c.deadline().is_some())
+            {
+                return Err(err);
+            }
             let message = err.to_string();
             tracing::error!(run_id = %runtime.run_id, %turn_id, error = %message, "agent turn failed");
             if is_context_overflow_error(&message) {
@@ -2241,27 +2734,73 @@ async fn run_turn(
     message: String,
     turn_id: &str,
 ) -> Result<agent_core::Response> {
-    runtime.history.push(ChatMessage::user(message));
+    if runtime.pending_machine.is_none() {
+        runtime.history.push(ChatMessage::user(message));
+    }
+    if let Some(id) = runtime.pending_approval_id.clone() {
+        let store = agent_core::ApprovalStore::new(approval_dir(runtime.state_dir.as_deref())?);
+        let record = store.load(&id).await?;
+        if record.is_awaiting() {
+            return Err(anyhow!("approval {id} is still pending"));
+        }
+        let resolution = agent_core::ApprovalStore::resolution_of(&record)?;
+        runtime
+            .config
+            .approvals
+            .resolutions
+            .insert(record.effect_id, resolution);
+    }
     let prompt = runtime.history.clone();
     let options = agent_loop_options(runtime);
-    let outcome = agent_core::run_agent_loop_outcome(
-        &runtime.config,
-        &mut runtime.ir_store,
-        runtime.ir_replay.as_ref(),
-        &mut runtime.gc_state,
-        runtime.model.clone(),
-        prompt.clone(),
-        runtime.max_turns,
-        &options,
-        runtime.ir_effect_visits.clone(),
-    )
-    .await?;
+    let outcome = if let Some(checkpoint) = runtime.pending_machine.as_ref() {
+        runtime.ir_store = checkpoint.store.clone();
+        agent_core::resume_agent_loop_outcome_with_replay(
+            &runtime.config,
+            &mut runtime.ir_store,
+            runtime.ir_replay.as_ref(),
+            &mut runtime.gc_state,
+            runtime.model.clone(),
+            runtime.max_turns,
+            &options,
+            checkpoint.machine.clone(),
+        )
+        .await?
+    } else {
+        agent_core::run_agent_loop_outcome(
+            &runtime.config,
+            &mut runtime.ir_store,
+            runtime.ir_replay.as_ref(),
+            &mut runtime.gc_state,
+            runtime.model.clone(),
+            prompt.clone(),
+            runtime.max_turns,
+            &options,
+            runtime.ir_effect_visits.clone(),
+        )
+        .await?
+    };
     let (value, machine) = match outcome {
         agent_core::AgentLoopOutcome::Complete { value, machine } => (value, machine),
+        agent_core::AgentLoopOutcome::SignalSuspended { checkpoint } => {
+            runtime.pending_machine = Some(checkpoint);
+            runtime.pending_turn_id = Some(turn_id.to_owned());
+            persist_signal_checkpoint(runtime).await?;
+            return Err(SuspendComplete.into());
+        }
         agent_core::AgentLoopOutcome::AwaitingApproval {
             checkpoint,
             pending,
         } => {
+            if runtime.state_dir.is_some() {
+                runtime.pending_machine = Some(checkpoint.clone());
+                runtime.pending_turn_id = Some(turn_id.to_owned());
+                runtime.pending_approval_id = Some(pending.pending_id.clone());
+                pause_turn(runtime, turn_id, checkpoint, pending).await?;
+                // Do not claim success until the pending record and authoritative
+                // machine checkpoint are both on disk.
+                persist_durable_checkpoint(runtime).await?;
+                return Err(ApprovalPaused.into());
+            }
             return Err(pause_turn(runtime, turn_id, checkpoint, pending).await?);
         }
     };
@@ -2287,6 +2826,101 @@ fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
     }
 }
 
+#[derive(Debug)]
+struct ApprovalPaused;
+impl std::fmt::Display for ApprovalPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "awaiting approval")
+    }
+}
+impl std::error::Error for ApprovalPaused {}
+
+#[derive(Debug)]
+struct SuspendComplete;
+impl std::fmt::Display for SuspendComplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "suspend checkpoint committed")
+    }
+}
+impl std::error::Error for SuspendComplete {}
+
+async fn persist_signal_checkpoint(runtime: &mut Runtime) -> Result<()> {
+    let deadline = runtime
+        .suspend
+        .as_ref()
+        .and_then(|c| c.deadline())
+        .ok_or_else(|| anyhow!("missing suspend deadline"))?;
+    persist_checkpoint_before(runtime, deadline).await
+}
+
+async fn persist_durable_checkpoint(runtime: &mut Runtime) -> Result<()> {
+    persist_checkpoint_before(runtime, std::time::Instant::now() + Duration::from_secs(10)).await
+}
+
+async fn persist_checkpoint_before(
+    runtime: &mut Runtime,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let dir = runtime
+        .checkpoint_dir
+        .as_ref()
+        .ok_or_else(|| anyhow!("durable checkpoint needs checkpoint directory"))?;
+    let checkpoint = checkpoint_from_runtime(runtime, runtime.checkpoint_sequence + 1)
+        .ok_or_else(|| anyhow!("cannot suspend with pending tool calls"))?;
+    // Serialization may be expensive for large histories. Do not let it
+    // consume an unbounded portion of the backend's grace window.
+    let bytes = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        tokio::task::spawn_blocking(move || serde_json::to_vec_pretty(&checkpoint)),
+    )
+    .await
+    .map_err(|_| anyhow!("suspend checkpoint serialization exceeded deadline"))???;
+    commit_checkpoint_bytes(dir, runtime.trace_path.clone(), bytes, deadline).await?;
+    runtime.checkpoint_sequence += 1;
+    Ok(())
+}
+
+async fn commit_checkpoint_bytes(
+    dir: &Path,
+    trace_path: PathBuf,
+    bytes: Vec<u8>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let dir = dir.to_path_buf();
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async move {
+        // Trace effects must be flushed before the authoritative checkpoint
+        // becomes visible. A partial trace cannot be mistaken for a commit.
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&trace_path)
+            .await
+        {
+            Ok(trace) => trace.sync_all().await?,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && !dir.join("session-latest.json").exists() =>
+            {
+                // Fresh idle session: no events were emitted. Never ignore
+                // a missing trace when replacing a prior checkpoint.
+            }
+            Err(err) => return Err(err.into()),
+        }
+        tokio::fs::create_dir_all(&dir).await?;
+        let temp = dir.join("session-latest.json.pending");
+        let dest = dir.join("session-latest.json");
+        let mut file = tokio::fs::File::create(&temp).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(temp, dest).await?;
+        tokio::fs::File::open(dir).await?.sync_all().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("checkpoint commit exceeded deadline"))??;
+    Ok(())
+}
+
 /// Post-outcome bookkeeping for a completed turn: decode the loop's value,
 /// fold the machine's history back into the runtime, close dangling tool
 /// calls, and persist the checkpoint. Shared by the CLI turn spine and the
@@ -2297,6 +2931,9 @@ async fn finish_turn(
     machine: agent_core::Machine,
     prompt: Vec<ChatMessage>,
 ) -> Result<agent_core::Response> {
+    runtime.pending_machine = None;
+    runtime.pending_turn_id = None;
+    runtime.pending_approval_id = None;
     runtime.ir_effect_visits = machine.effect_visits.clone();
     // Exhausted output-schema repairs come back as a typed value (the
     // loop's errors-as-values convention); surface them as a failed
@@ -2338,7 +2975,19 @@ async fn finish_turn(
         );
     }
     runtime.history = new_history;
-    persist_session(runtime).await;
+    if runtime.suspend.is_some() || runtime.state_dir.is_some() {
+        if runtime
+            .suspend
+            .as_ref()
+            .is_some_and(|c| c.deadline().is_some())
+        {
+            persist_signal_checkpoint(runtime).await?;
+            return Err(SuspendComplete.into());
+        }
+        persist_durable_checkpoint(runtime).await?;
+    } else {
+        persist_session(runtime).await;
+    }
     Ok(response)
 }
 
@@ -2358,7 +3007,11 @@ async fn pause_turn(
     // Replay reproduces a recorded pause as data (the gate already
     // re-emitted its events); persisting or waiting would make replay
     // side-effecting.
-    if runtime.ir_replay.is_some() {
+    if runtime
+        .ir_replay
+        .as_ref()
+        .is_some_and(|r| !r.live_approval())
+    {
         return Ok(anyhow!(
             "replay reproduced an approval pause: effect {} (pending {}) was recorded awaiting \
              approval and never resolved",
@@ -2366,7 +3019,7 @@ async fn pause_turn(
             pending.pending_id
         ));
     }
-    let store = agent_core::ApprovalStore::new(agent_core::ApprovalStore::default_dir()?);
+    let store = agent_core::ApprovalStore::new(approval_dir(runtime.state_dir.as_deref())?);
     let record = agent_core::PendingEffectRecord {
         pending_id: pending.pending_id.clone(),
         run_id: runtime.run_id.clone(),
@@ -2380,7 +3033,11 @@ async fn pause_turn(
         resolved_ts: None,
         resolved_by: None,
         reason: None,
-        runtime: Some(serde_json::to_value(&runtime.resume_facts)?),
+        runtime: if runtime.state_dir.is_some() {
+            None
+        } else {
+            Some(serde_json::to_value(&runtime.resume_facts)?)
+        },
     };
     store.write_pending(&record, &checkpoint).await?;
     tracing::info!(
@@ -2585,7 +3242,8 @@ async fn persist_session(runtime: &mut Runtime) {
     };
     // Replay re-runs a recorded session deterministically; writing would
     // clobber the real session's checkpoint with replayed state.
-    if runtime.ir_replay.is_some() || runtime.config.replay.is_some() {
+    if runtime.ir_replay.as_ref().is_some_and(|r| !r.live_eval()) || runtime.config.replay.is_some()
+    {
         return;
     }
     let sequence = runtime.checkpoint_sequence + 1;
@@ -2654,12 +3312,16 @@ fn gc_choice_from_mode(mode: &GcMode) -> GcArg {
 }
 
 fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoint> {
-    if agent_core::has_pending_tool_calls(&runtime.history) {
+    if runtime.pending_machine.is_none() && agent_core::has_pending_tool_calls(&runtime.history) {
         return None;
     }
     Some(Checkpoint {
         run_id: runtime.run_id.clone(),
+        session_id: runtime.session_id,
+        parent_session_id: runtime.parent_session_id,
         sequence,
+        next_turn_seq: Some(runtime.turn_seq),
+        ir_effect_visits: runtime.ir_effect_visits.clone(),
         model: runtime.model.0.clone(),
         model_alias: Some(runtime.resume_facts.model.clone()),
         provider_url: runtime.provider_url.clone(),
@@ -2669,6 +3331,9 @@ fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoin
         discovered_budget: runtime.gc_state.discovered_budget,
         gc: Some(gc_choice_from_mode(&runtime.config.gc)),
         gc_threshold: Some(runtime.config.gc_threshold),
+        machine: runtime.pending_machine.clone(),
+        pending_turn_id: runtime.pending_turn_id.clone(),
+        pending_approval_id: runtime.pending_approval_id.clone(),
     })
 }
 
@@ -2703,14 +3368,49 @@ fn parse_output_contract(text: &str) -> Result<agent_core::OutputContract> {
     Ok(agent_core::OutputContract::new(schema))
 }
 
+fn session_lineage(
+    args: &Args,
+    checkpoint: Option<&Checkpoint>,
+) -> Result<(Option<Uuid>, Option<Uuid>)> {
+    if args.fork_from.is_some() {
+        let source = checkpoint.ok_or_else(|| anyhow!("fork requires a checkpoint"))?;
+        let old = source
+            .session_id
+            .ok_or_else(|| anyhow!("cannot fork checkpoint without session_id"))?;
+        let new = args
+            .session_id
+            .ok_or_else(|| anyhow!("fork requires --session-id"))?;
+        if args.parent_session != Some(old) || new == old {
+            return Err(anyhow!(
+                "fork requires a distinct --session-id and --parent-session matching source"
+            ));
+        }
+        return Ok((Some(new), Some(old)));
+    }
+    if let Some(source) = checkpoint {
+        if args.session_id.is_some() && args.session_id != source.session_id {
+            return Err(anyhow!("--session-id does not match checkpoint"));
+        }
+        return Ok((source.session_id, source.parent_session_id));
+    }
+    Ok((args.session_id, None))
+}
+
 async fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
+    load_checkpoint_with_repair(path, true).await
+}
+
+async fn load_checkpoint_with_repair(path: &Path, repair: bool) -> Result<Checkpoint> {
     tracing::info!(checkpoint = %path.display(), "loading checkpoint");
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading checkpoint {}", path.display()))?;
     let mut checkpoint: Checkpoint = serde_json::from_str(&content)
         .with_context(|| format!("parsing checkpoint {}", path.display()))?;
-    if agent_core::has_pending_tool_calls(&checkpoint.messages) {
+    if repair
+        && checkpoint.machine.is_none()
+        && agent_core::has_pending_tool_calls(&checkpoint.messages)
+    {
         let original_len = checkpoint.messages.len();
         checkpoint.messages = agent_core::repair_trailing_pending_tool_calls(&checkpoint.messages);
         let repaired_len = checkpoint.messages.len();
@@ -2726,6 +3426,19 @@ async fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
             .with_context(|| format!("writing repaired checkpoint {}", path.display()))?;
     }
     Ok(checkpoint)
+}
+
+async fn wait_for_suspend(control: Option<&agent_core::SuspendControl>) {
+    let Some(control) = control else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let mut signal = control.subscribe();
+    while signal.borrow_and_update().is_none() {
+        if signal.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -2883,7 +3596,47 @@ async fn read_config(path: Option<&PathBuf>) -> Result<FileConfig> {
     }
 }
 
-fn trace_path(run_id: &str) -> Result<PathBuf> {
+fn path_in_state_root(root: &Path, path: &Path) -> Result<bool> {
+    let root = std::fs::canonicalize(root).or_else(|_| {
+        std::fs::create_dir_all(root)?;
+        std::fs::canonicalize(root)
+    })?;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Canonicalize an existing ancestor to prevent a symlink from escaping
+    // the durable root, even if the leaf directory does not exist yet.
+    let mut ancestor = path.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| anyhow!("memory path has no existing ancestor"))?;
+        missing.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| anyhow!("memory path has no existing ancestor"))?;
+    }
+    let mut resolved = std::fs::canonicalize(ancestor)?;
+    for part in missing.iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved.starts_with(root))
+}
+
+fn approval_dir(state_dir: Option<&Path>) -> Result<PathBuf> {
+    match state_dir {
+        Some(root) => Ok(root.join("approvals")),
+        None => agent_core::ApprovalStore::default_dir(),
+    }
+}
+
+fn trace_path(run_id: &str, state_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(root) = state_dir {
+        return Ok(root.join("traces").join(format!("{run_id}.jsonl")));
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
     Ok(home
         .join(".local/share/agent/traces")
@@ -3204,12 +3957,128 @@ mod tests {
         assert_eq!(round_tripped.discovered_budget, Some(120_000));
     }
 
+    #[test]
+    fn session_lineage_rejects_mismatched_resume_and_fork() -> Result<()> {
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let checkpoint: Checkpoint = serde_json::from_value(serde_json::json!({
+            "run_id": "source", "session_id": old, "sequence": 1,
+            "model": "test", "provider_url": "local", "messages": [],
+            "trace_path": "trace.jsonl", "timestamp": Utc::now(),
+        }))?;
+        let resume = Args::try_parse_from(["agent", "--session-id", &new.to_string()])?;
+        assert!(session_lineage(&resume, Some(&checkpoint)).is_err());
+        let fork = Args::try_parse_from([
+            "agent",
+            "--fork-from",
+            "source.json",
+            "--session-id",
+            &new.to_string(),
+            "--parent-session",
+            &old.to_string(),
+        ])?;
+        assert_eq!(
+            session_lineage(&fork, Some(&checkpoint))?,
+            (Some(new), Some(old))
+        );
+        let wrong = Args::try_parse_from([
+            "agent",
+            "--fork-from",
+            "source.json",
+            "--session-id",
+            &new.to_string(),
+            "--parent-session",
+            &new.to_string(),
+        ])?;
+        assert!(session_lineage(&wrong, Some(&checkpoint)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn state_root_directories() -> Result<()> {
+        let root = Path::new("/work/state");
+        assert_eq!(approval_dir(Some(root))?, root.join("approvals"));
+        assert_eq!(
+            trace_path("run", Some(root))?,
+            root.join("traces/run.jsonl")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_does_not_publish_checkpoint() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("durable-expired-{}", Uuid::new_v4()));
+        let dir = base.join("checkpoints");
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(dir.join("session-latest.json"), b"old").await?;
+        tokio::fs::write(base.join("trace.jsonl"), b"{}").await?;
+        commit_checkpoint_bytes(
+            &dir,
+            base.join("trace.jsonl"),
+            b"new".to_vec(),
+            std::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .expect_err("deadline expired");
+        assert_eq!(
+            tokio::fs::read(dir.join("session-latest.json")).await?,
+            b"old"
+        );
+        tokio::fs::remove_dir_all(base).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_commit_does_not_replace_authoritative_checkpoint() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("durable-commit-{}", Uuid::new_v4()));
+        let checkpoints = base.join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await?;
+        let previous = b"previous-safe-checkpoint";
+        tokio::fs::write(checkpoints.join("session-latest.json"), previous).await?;
+        commit_checkpoint_bytes(
+            &checkpoints,
+            base.join("missing-trace.jsonl"),
+            b"new".to_vec(),
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect_err("trace missing");
+        assert_eq!(
+            tokio::fs::read(checkpoints.join("session-latest.json")).await?,
+            previous
+        );
+        tokio::fs::remove_dir_all(base).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn state_root_rejects_memory_symlink_escape() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("agent-state-root-{}", Uuid::new_v4()));
+        let root = base.join("state");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&elsewhere)?;
+        assert!(path_in_state_root(&root, &root.join("memory"))?);
+        assert!(!path_in_state_root(&root, &elsewhere)?);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, root.join("linked"))?;
+            assert!(!path_in_state_root(&root, &root.join("linked/new-memory"))?);
+        }
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn load_checkpoint_repairs_trailing_tool_call() -> Result<()> {
         let path = std::env::temp_dir().join(format!("agent-checkpoint-{}.json", Uuid::new_v4()));
         let checkpoint = Checkpoint {
             run_id: "run".into(),
+            session_id: None,
+            parent_session_id: None,
             sequence: 7,
+            next_turn_seq: None,
+            ir_effect_visits: BTreeMap::new(),
             model: "model".into(),
             model_alias: None,
             provider_url: "https://chatgpt.com/backend-api".into(),
@@ -3230,6 +4099,9 @@ mod tests {
             discovered_budget: None,
             gc: None,
             gc_threshold: None,
+            machine: None,
+            pending_turn_id: None,
+            pending_approval_id: None,
         };
         tokio::fs::write(&path, serde_json::to_vec_pretty(&checkpoint)?).await?;
 
@@ -3250,7 +4122,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agent-resume-{}", Uuid::new_v4()));
         let checkpoint = Checkpoint {
             run_id: "run-resume".into(),
+            session_id: None,
+            parent_session_id: None,
             sequence: 4,
+            next_turn_seq: None,
+            ir_effect_visits: BTreeMap::new(),
             model: "model".into(),
             model_alias: None,
             provider_url: "https://chatgpt.com/backend-api".into(),
@@ -3264,6 +4140,9 @@ mod tests {
             discovered_budget: Some(123_000),
             gc: None,
             gc_threshold: None,
+            machine: None,
+            pending_turn_id: None,
+            pending_approval_id: None,
         };
 
         let sink = ChatHistory::new(dir.clone());

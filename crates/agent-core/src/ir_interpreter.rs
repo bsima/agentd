@@ -2,8 +2,9 @@ use crate::gc::GcState;
 use crate::interpreter::{
     annotate_overflow_failure, annotate_replayed_failure, bindable_effect_error,
     catch_overflow_active, collect_for_overflow, hydrate_infer_prompt, maybe_collect_prompt,
-    millis_u64, prompt_preview, response_preview, run_eval_argv_with_env, run_eval_with_env,
-    ReplayedEffectFailure, SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
+    millis_u64, prompt_preview, response_preview, run_eval_argv_with_env,
+    run_eval_argv_with_suspend, run_eval_with_env, run_eval_with_suspend, ReplayedEffectFailure,
+    SeqConfig, CATCH_OVERFLOW_MAX_CYCLES,
 };
 use crate::ir::{
     effect_location, program_hash, validate_program, BlockId, DynamicPath, EffectErrorMode,
@@ -25,6 +26,10 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IrReplayTrace {
+    /// Test-only hybrid execution: replay Infer, validate Eval call identity,
+    /// then run Eval live. Never enabled by strict replay.
+    live_eval: bool,
+    live_approval: bool,
     infer_calls: BTreeMap<String, IrInferCall>,
     infer_results: BTreeMap<String, crate::op::Response>,
     infer_errors: BTreeMap<String, String>,
@@ -124,6 +129,27 @@ struct IrEvalCall {
 }
 
 impl IrReplayTrace {
+    /// Opt in to live Eval for offline integration tests. Not audit replay.
+    pub fn with_live_eval(mut self) -> Self {
+        self.live_eval = true;
+        self
+    }
+
+    pub fn live_eval(&self) -> bool {
+        self.live_eval
+    }
+
+    /// Unsafe-for-audit fixture mode: drive an unrecorded approval gate live
+    /// while still validating every recorded Infer and Eval identity.
+    pub fn with_live_approval(mut self) -> Self {
+        self.live_approval = true;
+        self
+    }
+
+    pub fn live_approval(&self) -> bool {
+        self.live_approval
+    }
+
     pub async fn load(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let events = crate::trace::TraceLogger::read_events(path).await?;
         Self::from_events(&events)
@@ -391,6 +417,29 @@ impl IrReplayTrace {
             .ok_or_else(|| anyhow!("AgentIR replay missing InferResult for effect {effect_id}"))
     }
 
+    /// Validate the recorded call without consuming its result; live Eval
+    /// still rejects changed commands and unknown effect identities.
+    fn check_eval_call(
+        &self,
+        location: &EffectLocation,
+        command: &str,
+        argv: Option<&[String]>,
+    ) -> Result<()> {
+        let effect_id = &location.effect_id.0;
+        let call = self.eval_calls.get(effect_id).ok_or_else(|| {
+            anyhow!(
+                "AgentIR replay missing EvalCall for effect {} at {}",
+                effect_id,
+                location_desc(location)
+            )
+        })?;
+        if call.command != command || call.argv.as_deref() != argv {
+            return Err(anyhow!("AgentIR replay diverged at Eval effect {effect_id}: expected {:?} (argv {:?}), observed {:?} (argv {:?})",
+                call.command, call.argv, command, argv));
+        }
+        Ok(())
+    }
+
     fn eval_result(
         &self,
         location: &EffectLocation,
@@ -587,6 +636,11 @@ pub enum IrStepOutcome {
     Suspended {
         checkpoint: IrCheckpoint,
     },
+    /// SIGTERM requested a durable mid-turn pause. Unlike instruction-limit
+    /// checkpoints, the caller must persist this before exiting successfully.
+    SignalSuspended {
+        checkpoint: IrCheckpoint,
+    },
     /// A gated effect was reached with no decision available (t-1308.10,
     /// DR-7): the machine checkpointed mid-turn with the program counter
     /// still at the gated instruction (its visit counter rewound), so
@@ -651,7 +705,9 @@ pub async fn run_ir_sequential_with_store(
 ) -> Result<(Value, Machine)> {
     match run_ir_steps_with_store_and_replay(config, machine, store, None, None).await? {
         IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
-        IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
+        IrStepOutcome::Suspended { .. } | IrStepOutcome::SignalSuspended { .. } => Err(anyhow!(
+            "IR suspended in a driver that cannot persist a checkpoint"
+        )),
         IrStepOutcome::AwaitingApproval { pending, .. } => Err(awaiting_approval_error(&pending)),
     }
 }
@@ -683,6 +739,9 @@ pub async fn run_ir_sequential_with_gc(
     match run_ir_steps_with_gc(config, machine, store, ir_replay, None, gc_state).await? {
         IrStepOutcome::Complete { value, machine } => Ok((value, machine)),
         IrStepOutcome::Suspended { .. } => unreachable!("no instruction limit was set"),
+        IrStepOutcome::SignalSuspended { .. } => Err(anyhow!(
+            "suspend requested in driver without checkpoint persistence"
+        )),
         IrStepOutcome::AwaitingApproval { pending, .. } => Err(awaiting_approval_error(&pending)),
     }
 }
@@ -780,6 +839,21 @@ async fn run_ir_steps_inner(
     let mut last_turn_infer_op_id: Option<u64> = None;
 
     loop {
+        if config
+            .trace
+            .suspend()
+            .is_some_and(|control| control.deadline().is_some())
+        {
+            let store = store
+                .in_memory_snapshot()
+                .ok_or_else(|| anyhow!("signal suspend requires an in-memory store"))?;
+            return Ok((
+                IrStepOutcome::SignalSuspended {
+                    checkpoint: IrCheckpoint { machine, store },
+                },
+                instructions_executed,
+            ));
+        }
         if max_instructions.is_some_and(|max| instructions_executed >= max) {
             let store = store.in_memory_snapshot().ok_or_else(|| {
                 anyhow!("AgentIR instruction-limit checkpoints require an in-memory store snapshot")
@@ -806,7 +880,7 @@ async fn run_ir_steps_inner(
             let visit = next_visit(&mut machine, site);
             let dynamic_path = machine.control_path.at_visit(visit);
             let instr = block.instructions[machine.pc].clone();
-            if let Some(pending) = execute_instr(
+            let effect_outcome = execute_instr(
                 config,
                 &mut machine,
                 program_hash,
@@ -817,16 +891,28 @@ async fn run_ir_steps_inner(
                 gc_state,
                 &mut last_turn_infer_op_id,
             )
-            .await?
+            .await;
+            if effect_outcome
+                .as_ref()
+                .is_err_and(|e| e.is::<SuspendAtBoundary>())
             {
+                rewind_effect_visit(&mut machine, site);
+                let store = store
+                    .in_memory_snapshot()
+                    .ok_or_else(|| anyhow!("signal suspend requires an in-memory store"))?;
+                return Ok((
+                    IrStepOutcome::SignalSuspended {
+                        checkpoint: IrCheckpoint { machine, store },
+                    },
+                    instructions_executed,
+                ));
+            }
+            if let Some(pending) = effect_outcome? {
                 // Pause mid-turn without executing the gated effect: rewind
                 // this site's visit counter (taken above by next_visit) so
                 // re-entering the checkpoint recomputes the identical
                 // effect id, and leave pc pointing at the instruction.
-                let key = format!("{}:{}", site.block.0, site.instruction_index);
-                if let Some(visits) = machine.effect_visits.get_mut(&key) {
-                    *visits = visits.saturating_sub(1);
-                }
+                rewind_effect_visit(&mut machine, site);
                 let store = store.in_memory_snapshot().ok_or_else(|| {
                     anyhow!("AgentIR approval pauses require an in-memory store snapshot")
                 })?;
@@ -1028,12 +1114,32 @@ async fn run_ir_steps_inner(
                         index,
                     ));
                 }
+                // A Par fork cannot snapshot its sibling futures. An early
+                // suspend request stops before dispatch; a request arriving
+                // during join fails closed rather than committing a parent
+                // machine that would repeat already-run branch effects.
+                if config
+                    .trace
+                    .suspend()
+                    .is_some_and(|c| c.deadline().is_some())
+                {
+                    return Err(anyhow!("cannot suspend at a Par fork with live branches"));
+                }
                 // Actual concurrency: all branch futures progress together
                 // (their provider calls and Evals overlap); join_all yields
                 // outcomes in declaration order regardless of completion
                 // order, and never before ALL branches settle — no
                 // cancellation in v1.
                 let outcomes = futures::future::join_all(branch_runs).await;
+                if config
+                    .trace
+                    .suspend()
+                    .is_some_and(|c| c.deadline().is_some())
+                {
+                    return Err(anyhow!(
+                        "cannot suspend a Par join without serializing all branches"
+                    ));
+                }
 
                 let mut results = Vec::with_capacity(width);
                 let mut first_abort: Option<anyhow::Error> = None;
@@ -1173,6 +1279,13 @@ async fn run_par_branch(
             instructions_used: used,
             effect_visits: BTreeMap::new(),
         },
+        Ok((IrStepOutcome::SignalSuspended { .. }, _)) => ParBranchOutcome {
+            slot: Err(anyhow!(
+                "signal suspend inside Par cannot preserve sibling state"
+            )),
+            instructions_used: 0,
+            effect_visits: BTreeMap::new(),
+        },
         Err(err) => ParBranchOutcome {
             slot: Err(err.context(format!("AgentIR Par branch {index} aborted"))),
             instructions_used: 0,
@@ -1180,6 +1293,22 @@ async fn run_par_branch(
         },
     }
 }
+
+fn rewind_effect_visit(machine: &mut Machine, site: EffectSite) {
+    let key = format!("{}:{}", site.block.0, site.instruction_index);
+    if let Some(visits) = machine.effect_visits.get_mut(&key) {
+        *visits = visits.saturating_sub(1);
+    }
+}
+
+#[derive(Debug)]
+struct SuspendAtBoundary;
+impl std::fmt::Display for SuspendAtBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "suspend at effect boundary")
+    }
+}
+impl std::error::Error for SuspendAtBoundary {}
 
 /// Execute one instruction. `Ok(None)` means the instruction ran (or bound
 /// an error/denial value); `Ok(Some(pending))` means an approval-gated
@@ -1294,40 +1423,50 @@ async fn execute_instr(
             let live = ir_replay.is_none() && config.replay.is_none();
             let mut overflow_cycles = 0usize;
             let result = loop {
-                let attempt = match ir_replay {
-                    Some(replay) => replay.infer_result(&location, &model),
-                    None => match (&config.replay, &config.on_infer_delta) {
-                        (Some(replay), _) => replay.infer_result(op_id, &model),
-                        (None, Some(tap)) => {
-                            // Live streaming tap (ACP): forward text deltas
-                            // as they arrive; the accumulated Response flows
-                            // through cost stamping and the InferResult
-                            // event identically to the non-streamed path.
-                            let tap = tap.clone();
-                            let on_delta: crate::provider::TextDeltaFn =
-                                std::sync::Arc::new(move |text: &str| {
-                                    tap(crate::interpreter::InferDelta {
-                                        op_id,
-                                        text: text.to_owned(),
-                                    })
-                                });
-                            config
-                                .provider
-                                .chat_streamed(
-                                    &Model(model.clone()),
-                                    &tool_specs,
-                                    &prompt,
-                                    &on_delta,
-                                )
-                                .await
-                        }
-                        (None, None) => {
-                            config
-                                .provider
-                                .chat(&Model(model.clone()), &tool_specs, &prompt)
-                                .await
-                        }
-                    },
+                let call = async {
+                    match ir_replay {
+                        Some(replay) => replay.infer_result(&location, &model),
+                        None => match (&config.replay, &config.on_infer_delta) {
+                            (Some(replay), _) => replay.infer_result(op_id, &model),
+                            (None, Some(tap)) => {
+                                let tap = tap.clone();
+                                let on_delta: crate::provider::TextDeltaFn =
+                                    std::sync::Arc::new(move |text: &str| {
+                                        tap(crate::interpreter::InferDelta {
+                                            op_id,
+                                            text: text.to_owned(),
+                                        })
+                                    });
+                                config
+                                    .provider
+                                    .chat_streamed(
+                                        &Model(model.clone()),
+                                        &tool_specs,
+                                        &prompt,
+                                        &on_delta,
+                                    )
+                                    .await
+                            }
+                            (None, None) => {
+                                config
+                                    .provider
+                                    .chat(&Model(model.clone()), &tool_specs, &prompt)
+                                    .await
+                            }
+                        },
+                    }
+                };
+                let attempt = if let Some(control) = config.trace.suspend() {
+                    let mut signal = control.subscribe();
+                    tokio::select! {
+                        biased;
+                        _ = async { while signal.borrow_and_update().is_none() {
+                            if signal.changed().await.is_err() { std::future::pending::<()>().await; }
+                        }} => return Err(SuspendAtBoundary.into()),
+                        result = call => result,
+                    }
+                } else {
+                    call.await
                 };
                 match attempt {
                     Err(err)
@@ -1472,9 +1611,76 @@ async fn execute_instr(
                 .await?;
             let started = Instant::now();
             let result = match ir_replay {
+                Some(replay) if replay.live_eval() => {
+                    replay.check_eval_call(&location, &command, argv.as_deref())?;
+                    if let Some(control) = config.trace.suspend() {
+                        match &argv {
+                            Some(argv) => {
+                                run_eval_argv_with_suspend(
+                                    &config.eval,
+                                    argv,
+                                    config.trace.trace_context_env(),
+                                    control,
+                                )
+                                .await
+                            }
+                            None => {
+                                run_eval_with_suspend(
+                                    &config.eval,
+                                    &command,
+                                    config.trace.trace_context_env(),
+                                    control,
+                                )
+                                .await
+                            }
+                        }
+                    } else {
+                        match &argv {
+                            Some(argv) => {
+                                run_eval_argv_with_env(
+                                    &config.eval,
+                                    argv,
+                                    config.trace.trace_context_env(),
+                                )
+                                .await
+                            }
+                            None => {
+                                run_eval_with_env(
+                                    &config.eval,
+                                    &command,
+                                    config.trace.trace_context_env(),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                }
                 Some(replay) => replay.eval_result(&location, &command, argv.as_deref()),
                 None => match &config.replay {
                     Some(replay) => replay.eval_result(op_id, &command, argv.as_deref()),
+                    None if config.trace.suspend().is_some() => {
+                        let control = config.trace.suspend().expect("checked above");
+                        match &argv {
+                            Some(argv) => {
+                                run_eval_argv_with_suspend(
+                                    &config.eval,
+                                    argv,
+                                    config.trace.trace_context_env(),
+                                    control,
+                                )
+                                .await
+                            }
+                            None => {
+                                run_eval_with_suspend(
+                                    &config.eval,
+                                    &command,
+                                    config.trace.trace_context_env(),
+                                    control,
+                                )
+                                .await
+                            }
+                        }
+                    }
                     None => match &argv {
                         Some(argv) => {
                             run_eval_argv_with_env(
@@ -1914,6 +2120,12 @@ async fn approval_gate(
     let effect_id = &location.effect_id.0;
     let run_id: String = config.trace.run_id().into();
 
+    // Strict replay always treats the recording as the only authority. Only
+    // an explicitly opted-in fixture can replace a missing gate with a live
+    // pause; a recorded gate still goes through identity validation below.
+    let ir_replay = ir_replay.filter(|replay| {
+        !(replay.live_approval && gated && !replay.approval_requests.contains_key(effect_id))
+    });
     if let Some(replay) = ir_replay {
         let requested = replay.approval_requests.get(effect_id);
         let resolution = replay.approval_resolutions.get(effect_id);
@@ -4075,6 +4287,122 @@ models:
         Ok(())
     }
 
+    #[tokio::test]
+    async fn hybrid_replay_executes_eval_but_strict_replay_does_not() -> Result<()> {
+        let trace = test_trace();
+        let path = trace.path().clone();
+        let _ = run_ir_sequential(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), trace),
+            argv_eval_machine("live-payload"),
+        )
+        .await?;
+        let events: Vec<Event> = TraceLogger::read_events(path)
+            .await?
+            .into_iter()
+            .map(|e| match e {
+                Event::EvalResult {
+                    run_id,
+                    op_id,
+                    parent_op_id,
+                    command,
+                    duration_ms,
+                    truncated_stdout,
+                    truncated_stderr,
+                    timestamp,
+                    ..
+                } => Event::EvalResult {
+                    run_id,
+                    op_id,
+                    parent_op_id,
+                    command,
+                    duration_ms,
+                    truncated_stdout,
+                    truncated_stderr,
+                    timestamp,
+                    result: serde_json::json!({"stdout": "sentinel"}),
+                },
+                other => other,
+            })
+            .collect();
+        let strict = IrReplayTrace::from_events(&events)?;
+        let mut store = InMemoryStore::new();
+        let (recorded, _) = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            argv_eval_machine("live-payload"),
+            &mut store,
+            Some(&strict),
+        )
+        .await?;
+        assert_eq!(recorded["stdout"], "sentinel");
+        let mut store = InMemoryStore::new();
+        let (live, _) = run_ir_sequential_with_store_and_replay(
+            &config(Arc::new(MockProvider::new(vec![]))),
+            argv_eval_machine("live-payload"),
+            &mut store,
+            Some(&strict.with_live_eval()),
+        )
+        .await?;
+        assert_eq!(live["stdout"], "live-payload");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_suspends_live_eval_without_rerunning_it() -> Result<()> {
+        let file = std::env::temp_dir().join(format!("agent-ir-suspend-{}", uuid::Uuid::new_v4()));
+        let script = format!("printf x >> '{}'; sleep 20", file.display());
+        let mut machine = argv_eval_machine("unused");
+        let block = machine.program.blocks.get_mut(&BlockId(0)).unwrap();
+        let Instr::Eval { request, .. } = &mut block.instructions[0] else {
+            unreachable!()
+        };
+        *request = EvalRequest::Shell {
+            command: Expr::Value(Value::String(script)),
+        };
+        let control = crate::trace::SuspendControl::new();
+        let trace = test_trace().with_suspend(control.clone());
+        let config = config_with_trace(Arc::new(MockProvider::new(vec![])), trace);
+        let mut store = InMemoryStore::new();
+        let trigger = async {
+            for _ in 0..100 {
+                if file.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(file.exists(), "Eval did not start");
+            control.request(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        };
+        let mut gc = GcState::default();
+        let execution = run_ir_steps_with_gc(&config, machine, &mut store, None, None, &mut gc);
+        let ((), outcome) = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            tokio::join!(trigger, execution)
+        })
+        .await?;
+        let IrStepOutcome::SignalSuspended { checkpoint } = outcome? else {
+            panic!("expected signal suspend")
+        };
+        assert_eq!(checkpoint.machine.pc, 1, "interrupted Eval was consumed");
+        assert_eq!(
+            checkpoint.machine.env[&Var("result".into())]["status"],
+            "interrupted"
+        );
+        let before = tokio::fs::read(&file).await?;
+        let resumed = run_ir_steps_with_gc(
+            &config_with_trace(Arc::new(MockProvider::new(vec![])), test_trace()),
+            checkpoint.machine,
+            &mut store,
+            None,
+            None,
+            &mut GcState::default(),
+        )
+        .await?;
+        assert!(matches!(resumed, IrStepOutcome::Complete { .. }));
+        assert_eq!(tokio::fs::read(&file).await?, before);
+        tokio::fs::remove_file(file).await?;
+        Ok(())
+    }
+
     /// Argv Evals replay exactly like shell Evals: the recorded result is
     /// returned without executing, and a same-site call whose dynamic argv
     /// changed diverges loudly instead of replaying a stale result.
@@ -5161,7 +5489,9 @@ models:
         let outcome = run_ir_steps(&config(first_provider.clone()), machine, 1).await?;
         let checkpoint = match outcome {
             IrStepOutcome::Suspended { checkpoint } => checkpoint,
-            IrStepOutcome::Complete { .. } | IrStepOutcome::AwaitingApproval { .. } => {
+            IrStepOutcome::Complete { .. }
+            | IrStepOutcome::AwaitingApproval { .. }
+            | IrStepOutcome::SignalSuspended { .. } => {
                 panic!("expected suspension after one instruction")
             }
         };
@@ -5180,6 +5510,80 @@ models:
 
         assert_eq!(value, Value::String("second".into()));
         assert_eq!(second_provider.prompt_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_during_infer_rewinds_effect_without_result() -> Result<()> {
+        struct NeverProvider;
+        #[async_trait]
+        impl ChatProvider for NeverProvider {
+            async fn chat(&self, _: &Model, _: &[ToolSpec], _: &[ChatMessage]) -> Result<Response> {
+                std::future::pending().await
+            }
+        }
+        let control = crate::trace::SuspendControl::new();
+        let trace = test_trace().with_suspend(control.clone());
+        let path = trace.path().clone();
+        let config = config_with_trace(Arc::new(NeverProvider), trace);
+        let mut store = InMemoryStore::new();
+        let mut gc = GcState::default();
+        let run = run_ir_steps_with_gc(
+            &config,
+            infer_then_infer_machine(),
+            &mut store,
+            None,
+            None,
+            &mut gc,
+        );
+        let trigger = async {
+            for _ in 0..100 {
+                if std::fs::read_to_string(&path).is_ok_and(|text| text.contains("InferCall")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(std::fs::read_to_string(&path)?.contains("InferCall"));
+            control.request(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            Ok::<_, anyhow::Error>(())
+        };
+        let (trigger, outcome) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(trigger, run)
+        })
+        .await?;
+        trigger?;
+        let IrStepOutcome::SignalSuspended { checkpoint } = outcome? else {
+            panic!("expected suspend")
+        };
+        assert_eq!(checkpoint.machine.pc, 0);
+        assert!(!checkpoint.machine.env.contains_key(&Var("a".into())));
+        assert_eq!(checkpoint.machine.effect_visits["0:0"], 0);
+        let events = TraceLogger::read_events(&path).await?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::InferCall { .. }))
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::InferResult { .. })));
+        let provider = Arc::new(MockProvider::new(vec![
+            response("first"),
+            response("second"),
+        ]));
+        let resumed = run_ir_steps_with_gc(
+            &config_with_trace(provider.clone(), test_trace()),
+            checkpoint.machine,
+            &mut store,
+            None,
+            None,
+            &mut GcState::default(),
+        )
+        .await?;
+        assert!(matches!(resumed, IrStepOutcome::Complete { .. }));
+        assert_eq!(provider.prompt_count(), 2);
         Ok(())
     }
 

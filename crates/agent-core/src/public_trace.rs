@@ -90,10 +90,11 @@ pub struct PublicEvent {
     pub event: String,
     pub ts: DateTime<Utc>,
     pub run_id: String,
-    /// Currently always equal to `run_id`: the runtime does not yet
-    /// distinguish sessions from runs. Kept as a separate field so ingest
-    /// schemas do not have to migrate when it does.
+    /// Session identity, when provided by a caller; otherwise run_id.
     pub session_id: String,
+    /// Source session identity on a fork, when provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     /// Reserved. Turn ids exist today only on the supervisor-facing machine
     /// events (stdout); runtime trace events do not carry them yet.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +147,7 @@ fn base(
         ts,
         run_id: run_id.into(),
         session_id: run_id.into(),
+        parent_session_id: None,
         turn_id: None,
         op_id,
         parent_op_id,
@@ -157,6 +159,22 @@ fn base(
         payload_ref: None,
         attrs: BTreeMap::new(),
     }
+}
+
+/// Project events with caller-provided lineage without changing runtime effect
+/// identity. Plain public_event retains legacy run-id behavior.
+pub fn public_event_with_lineage(
+    event: &Event,
+    session_id: Option<&str>,
+    parent_session_id: Option<&str>,
+) -> Option<PublicEvent> {
+    public_event(event).map(|mut projected| {
+        if let Some(id) = session_id {
+            projected.session_id = id.to_owned();
+        }
+        projected.parent_session_id = parent_session_id.map(str::to_owned);
+        projected
+    })
 }
 
 /// Serialize a JSON value with object keys sorted, so previews are
@@ -344,6 +362,17 @@ pub fn public_event(event: &Event) -> Option<PublicEvent> {
                 .insert("command".into(), Value::String(command.clone()));
             out.attrs
                 .insert("duration_ms".into(), (*duration_ms).into());
+            if result.get("status").and_then(Value::as_str) == Some("interrupted") {
+                out.attrs.insert("interrupted".into(), Value::Bool(true));
+                if let Some(reason) = result.get("reason") {
+                    out.attrs.insert("reason".into(), reason.clone());
+                }
+                out.payload_preview = result
+                    .get("stdout_tail")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| preview(value, PAYLOAD_PREVIEW_MAX_CHARS));
+            }
             if let Some(ok) = result.get("ok").and_then(Value::as_bool) {
                 out.attrs.insert("ok".into(), Value::Bool(ok));
             }

@@ -1478,6 +1478,9 @@ pub async fn run_agent_loop(
         AgentLoopOutcome::Complete { value, machine } => Ok((value, machine)),
         // This entry point cannot suspend, so a pause with no resolver is
         // the fail-closed error: the gated effect did not execute (DR-7).
+        AgentLoopOutcome::SignalSuspended { .. } => Err(anyhow!(
+            "signal suspend requires a checkpoint-capable driver"
+        )),
         AgentLoopOutcome::AwaitingApproval { pending, .. } => {
             Err(crate::ir_interpreter::awaiting_approval_error(&pending))
         }
@@ -1489,11 +1492,13 @@ pub async fn run_agent_loop(
 pub enum AgentLoopOutcome {
     /// The loop ran to completion (including any output-contract repairs).
     Complete { value: Value, machine: Machine },
-    /// An approval-gated effect was reached with no decision available: the
-    /// machine checkpointed mid-turn without executing it. Persist the
-    /// checkpoint alongside a [`crate::approval::PendingEffectRecord`]
-    /// (see [`crate::approval::ApprovalStore`]) and, once resolved, re-enter
-    /// it with [`resume_agent_loop_outcome`].
+    /// Cooperative SIGTERM pause: the driver must durably commit the machine
+    /// and trace before reporting exit 0.
+    SignalSuspended {
+        checkpoint: crate::ir_interpreter::IrCheckpoint,
+    },
+    /// An approval gate was reached without a decision. Persist the machine
+    /// beside the pending approval and resume after a decision.
     AwaitingApproval {
         checkpoint: crate::ir_interpreter::IrCheckpoint,
         pending: crate::approval::ApprovalRequest,
@@ -1563,11 +1568,32 @@ pub async fn resume_agent_loop_outcome(
     options: &AgentLoopOptions,
     machine: Machine,
 ) -> Result<AgentLoopOutcome> {
-    // No replay: a resume is a live continuation of a live run. The
-    // output-contract identity event was already emitted by the run that
-    // paused, so the drive loop is entered directly.
-    drive_agent_loop(
+    resume_agent_loop_outcome_with_replay(
         config, store, None, gc_state, model, max_turns, options, machine,
+    )
+    .await
+}
+
+/// Resume a test fixture with recorded inference and live Eval. Strict replay
+/// is not a continuation: it cannot fill in missing effects after a suspend.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_agent_loop_outcome_with_replay(
+    config: &SeqConfig,
+    store: &mut dyn IrStore,
+    ir_replay: Option<&IrReplayTrace>,
+    gc_state: &mut GcState,
+    model: Model,
+    max_turns: usize,
+    options: &AgentLoopOptions,
+    machine: Machine,
+) -> Result<AgentLoopOutcome> {
+    if ir_replay.is_some_and(|replay| !replay.live_eval()) {
+        return Err(anyhow!("strict replay cannot continue a suspended machine"));
+    }
+    // The output-contract identity event was already emitted by the run
+    // that paused, so the drive loop is entered directly.
+    drive_agent_loop(
+        config, store, ir_replay, gc_state, model, max_turns, options, machine,
     )
     .await
 }
@@ -1603,6 +1629,9 @@ async fn drive_agent_loop(
                     checkpoint,
                     pending,
                 })
+            }
+            crate::ir_interpreter::IrStepOutcome::SignalSuspended { checkpoint } => {
+                return Ok(AgentLoopOutcome::SignalSuspended { checkpoint });
             }
             crate::ir_interpreter::IrStepOutcome::Suspended { .. } => {
                 unreachable!("no instruction limit was set")
@@ -3136,6 +3165,95 @@ mod tests {
             crate::ir::program_hash(&with_tools.program).unwrap(),
         );
         validate_program(&with_tools.program).expect("tool variant validates");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn suspended_shell_result_reaches_next_infer_on_resume() -> Result<()> {
+        let file = std::env::temp_dir().join(format!("agent-suspend-loop-{}", Uuid::new_v4()));
+        let command = format!("printf x >> '{}'; sleep 30", file.display());
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "running",
+                vec![ToolCall::new(
+                    "call-1",
+                    "shell",
+                    serde_json::json!({"command": command}),
+                )],
+            ),
+            response("done", vec![]),
+        ]));
+        let control = crate::trace::SuspendControl::new();
+        let trace = test_trace().with_suspend(control.clone());
+        let mut config = config_with_trace(provider.clone(), trace);
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let mut gc = GcState::default();
+        let options = AgentLoopOptions::default();
+        let trigger = async {
+            for _ in 0..200 {
+                if file.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(file.exists(), "Eval did not start");
+            control.request(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        };
+        let first = run_agent_loop_outcome(
+            &config,
+            &mut store,
+            None,
+            &mut gc,
+            Model("mock".into()),
+            vec![ChatMessage::user("run shell")],
+            4,
+            &options,
+            BTreeMap::new(),
+        );
+        let ((), outcome) = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            tokio::join!(trigger, first)
+        })
+        .await?;
+        let AgentLoopOutcome::SignalSuspended { checkpoint } = outcome? else {
+            panic!("expected suspend")
+        };
+        let saved: crate::ir_interpreter::IrCheckpoint =
+            serde_json::from_value(serde_json::to_value(checkpoint)?)?;
+        assert_eq!(
+            saved.machine.env[&crate::ir::Var("eval_result".into())]["status"],
+            "interrupted"
+        );
+        let before = tokio::fs::read(&file).await?;
+        config.trace = test_trace();
+        let outcome = resume_agent_loop_outcome(
+            &config,
+            &mut store,
+            &mut gc,
+            Model("mock".into()),
+            4,
+            &options,
+            saved.machine,
+        )
+        .await?;
+        let AgentLoopOutcome::Complete { value, .. } = outcome else {
+            panic!("resume did not complete")
+        };
+        assert_eq!(value["content"], "done");
+        assert_eq!(
+            tokio::fs::read(&file).await?,
+            before,
+            "Eval must not run twice"
+        );
+        {
+            let prompts = provider.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 2);
+            assert!(
+                serde_json::to_string(&prompts[1])?.contains("interrupted"),
+                "model must see typed interruption"
+            );
+        }
+        tokio::fs::remove_file(file).await?;
+        Ok(())
     }
 
     #[tokio::test]

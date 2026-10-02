@@ -44,7 +44,10 @@ struct AcpServer {
 /// Session state lives beside the other agent data:
 /// `~/.local/share/agent/acp/<session_id>/` holds the checkpoints that back
 /// `session/load`.
-fn acp_session_dir(session_id: &str) -> Result<PathBuf> {
+fn acp_session_dir(session_id: &str, state_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    if let Some(root) = state_dir {
+        return Ok(root.join("acp").join(session_id));
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
     Ok(home.join(".local/share/agent/acp").join(session_id))
 }
@@ -107,7 +110,7 @@ impl AcpServer {
         checkpoint: Option<Checkpoint>,
         cx: &ConnectionTo<Client>,
     ) -> Result<(SessionModeState, Vec<SessionConfigOption>)> {
-        let checkpoint_dir = acp_session_dir(&session_id)?;
+        let checkpoint_dir = acp_session_dir(&session_id, self.args.state_dir.as_deref())?;
         let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let streamed: bridge::StreamedText = Arc::new(Mutex::new(HashMap::new()));
         let context_budget: bridge::ContextBudget = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -126,8 +129,12 @@ impl AcpServer {
             cwd: Some(cwd),
             checkpoint_dir: Some(checkpoint_dir),
             checkpoint,
+            fork_source_run_id: None,
             restore_checkpoint_config: true,
+            suspend: None,
             run_id: session_id.clone(),
+            session_id: Some(Uuid::parse_str(&session_id)?),
+            parent_session_id: None,
             require_shell_approval,
             trace_sinks_extra: vec![sink],
             otel_active: self.otel_active,
@@ -232,7 +239,8 @@ impl AcpServer {
     ) -> Result<LoadSessionResponse> {
         warn_ignored_mcp_servers(request.mcp_servers.len());
         let session_id = request.session_id.0.to_string();
-        let checkpoint_path = acp_session_dir(&session_id)?.join("session-latest.json");
+        let checkpoint_path = acp_session_dir(&session_id, self.args.state_dir.as_deref())?
+            .join("session-latest.json");
         let checkpoint = crate::load_checkpoint(&checkpoint_path).await?;
         // Per protocol, the conversation replays as session/update
         // notifications before the load response. Text-only in v1: tool

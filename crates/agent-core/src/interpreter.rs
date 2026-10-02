@@ -11,6 +11,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -881,6 +883,139 @@ pub(crate) async fn run_eval_request(
         crate::op::EvalSpec::Shell(command) => run_eval_with_env(config, command, extra_env).await,
         crate::op::EvalSpec::Argv(argv) => run_eval_argv_with_env(config, argv, extra_env).await,
     }
+}
+
+pub(crate) async fn run_eval_with_suspend(
+    config: &EvalConfig,
+    command: &str,
+    extra_env: BTreeMap<String, String>,
+    suspend: &crate::trace::SuspendControl,
+) -> Result<Value> {
+    let mut process = Command::new(&config.shell);
+    process.arg("-c").arg(command);
+    run_eval_process_with_suspend(config, process, extra_env, suspend).await
+}
+
+pub(crate) async fn run_eval_argv_with_suspend(
+    config: &EvalConfig,
+    argv: &[String],
+    extra_env: BTreeMap<String, String>,
+    suspend: &crate::trace::SuspendControl,
+) -> Result<Value> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("Eval argv must not be empty"))?;
+    let mut process = Command::new(program);
+    process.args(args);
+    run_eval_process_with_suspend(config, process, extra_env, suspend).await
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: libc::c_int) -> Result<()> {
+    // SAFETY: pid is obtained from a child launched with process_group(0).
+    // Negative pid targets that child's group, never agentd's own group.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err.into())
+        }
+    }
+}
+
+async fn run_eval_process_with_suspend(
+    config: &EvalConfig,
+    mut process: Command,
+    extra_env: BTreeMap<String, String>,
+    suspend: &crate::trace::SuspendControl,
+) -> Result<Value> {
+    let started = Instant::now();
+    if let Some(cwd) = &config.cwd {
+        process.current_dir(cwd);
+    }
+    config.env.apply(&mut process);
+    process.envs(extra_env);
+    process.stdin(Stdio::null());
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    process.kill_on_drop(true);
+    #[cfg(unix)]
+    process.as_std_mut().process_group(0);
+    // A request racing with spawn is still handled by the subscribed
+    // process owner below, which terminates the newly created group.
+    let child = process.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("Eval child has no process id"))?;
+    let mut output = Box::pin(child.wait_with_output());
+    let mut signal = suspend.subscribe();
+    let normal = tokio::select! {
+        biased;
+        _ = async { while signal.borrow_and_update().is_none() {
+            if signal.changed().await.is_err() { std::future::pending::<()>().await; }
+        }} => None,
+        result = tokio::time::timeout(config.timeout, &mut output) => Some(result),
+    };
+    if let Some(result) = normal {
+        return match result {
+            Ok(result) => {
+                let result = result?;
+                let (stdout, stdout_truncated) =
+                    decode_capped(&result.stdout, config.max_stdout_bytes);
+                let (stderr, stderr_truncated) =
+                    decode_capped(&result.stderr, config.max_stderr_bytes);
+                Ok(
+                    serde_json::json!({"ok": result.status.success(), "status": result.status.code(),
+                    "timed_out": false, "stdout": stdout, "stderr": stderr,
+                    "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+                    "duration_ms": millis_u64(started.elapsed()) }),
+                )
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                signal_group(pid, libc::SIGKILL)?;
+                // Do not return until the child has been reaped.
+                output.await?;
+                Ok(
+                    serde_json::json!({"ok": false, "status": null, "timed_out": true,
+                    "stdout": "", "stderr": "", "stdout_truncated": false,
+                    "stderr_truncated": false, "duration_ms": millis_u64(started.elapsed()) }),
+                )
+            }
+        };
+    }
+    let deadline = suspend
+        .deadline()
+        .ok_or_else(|| anyhow!("lost suspend deadline"))?;
+    #[cfg(unix)]
+    signal_group(pid, libc::SIGTERM)?;
+    #[cfg(not(unix))]
+    return Err(anyhow!("process-group suspension requires Unix"));
+    // Leave at least half the remaining grace for SIGKILL, trace sync, and
+    // the checkpoint fsync. In particular, never wait until the deadline
+    // merely for the command to acknowledge SIGTERM.
+    let grace = deadline.saturating_duration_since(Instant::now()) / 2;
+    let result = tokio::time::timeout(grace, &mut output).await;
+    // Terminate the process group even when the shell itself has already
+    // exited: descendants may still hold stdout/stderr pipes open.
+    #[cfg(unix)]
+    signal_group(pid, libc::SIGKILL)?;
+    let result = match result {
+        Ok(result) => result?,
+        Err(_) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut output)
+            .await
+            .map_err(|_| anyhow!("Eval group did not terminate before suspend deadline"))??,
+    };
+    // The group has been signalled and the captured pipes have reached EOF.
+    let (stdout, _) = decode_capped(&result.stdout, config.max_stdout_bytes);
+    let (stderr, _) = decode_capped(&result.stderr, config.max_stderr_bytes);
+    Ok(
+        serde_json::json!({"ok": false, "status": "interrupted", "reason": "suspend",
+        "ran_ms": millis_u64(started.elapsed()), "stdout_tail": stdout, "stderr_tail": stderr }),
+    )
 }
 
 pub(crate) async fn run_eval_with_env(

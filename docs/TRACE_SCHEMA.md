@@ -1,6 +1,6 @@
 # Public Trace Event Schema
 
-`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.5**, see the version history at the end)
+`schema_version: 1` (wire major; this document tracks minor revisions — current: **1.6**, see the version history at the end)
 
 This document is the contract for consumers of agentd trace data: the SDK
 trace adapter, dashboard ingest, and any external tooling. It defines a
@@ -76,7 +76,8 @@ order (the golden conformance test pins the ordering):
 | `event` | string | always | dotted lifecycle name (catalog below) |
 | `ts` | string (RFC 3339 UTC) | always | runtime event timestamp |
 | `run_id` | string | always | the run this event belongs to |
-| `session_id` | string | always | currently **equal to `run_id`**; the runtime does not yet distinguish sessions from runs. Separate field so ingest schemas won't migrate when it does. |
+| `session_id` | string | always | equal to `run_id` for legacy runs; caller-managed sessions can project their session identity with `public_event_with_lineage`. |
+| `parent_session_id` | string | optional | source session ID, set only on a fork |
 | `turn_id` | string | **reserved** (never emitted in v1) | turn correlation id. Today turn ids exist only on stdout machine events (t-1308.2); once the runtime threads them into trace events this field is populated. |
 | `op_id` | integer | when the runtime event has one | runtime operation id; pairs `*.started` with its `*.completed`/`*.failed`, and addresses the full payload in the runtime trace |
 | `parent_op_id` | integer | optional | runtime op lineage (e.g. work inside a Par branch) |
@@ -117,7 +118,8 @@ See docs/AGENT_IR.md "Effect identity".
 - `completed` — the effect ran to completion (`*Result`). Note: an Eval
   whose command exited nonzero is still `completed` — the process ran; its
   outcome is in `attrs.ok` / `attrs.exit_code`. This mirrors runtime
-  semantics (an `EvalResult` with `ok: false`).
+  semantics (an `EvalResult` with `ok: false`). An interrupted Eval is also
+  `completed` as a typed result (`attrs.interrupted: true`), not a failure.
 - `failed` — terminal effect failure (`*Error`: provider error after
   retries, spawn failure, sink/policy error, replay divergence). `error`
   carries the message.
@@ -133,7 +135,7 @@ file:
   runtime records it (`trace_full_payloads`, off by default — full prompts
   make traces O(n²) in session length). Full responses are recorded in the
   runtime trace (replay identity).
-- **Eval**: `payload_preview` on `eval.completed` is a preview of stdout.
+- **Eval**: `payload_preview` on `eval.completed` is a preview of stdout (or `stdout_tail` for an interrupted Eval). A suspended Eval closes with `EvalResult` carrying `status: "interrupted"`, `reason: "suspend"`, `ran_ms`, `stdout_tail`, and `stderr_tail`; `attrs.interrupted` is true.
   Full stdout/stderr (capped by the eval byte limits, with `truncated_*`
   flags) live in the runtime `EvalResult.result`. For argv Evals the exact
   argv is the replay identity and is carried in full in both layers
@@ -166,7 +168,7 @@ same `run_id`/`op_id`.
 | `infer.completed` | `InferResult` | `completed` | response preview | `duration_ms`, `input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens`?, `cost_micro_usd`?, `pricing`? |
 | `infer.failed` | `InferError` | `failed` | — | `duration_ms` |
 | `eval.started` | `EvalCall` | `started` | display command | `argv`? (string[], direct-exec only), `cwd`?, `env_policy`, `timeout_ms` |
-| `eval.completed` | `EvalResult` | `completed` | stdout preview | `command`, `duration_ms`, `ok`?, `exit_code`?, `timed_out`?, `truncated_stdout`, `truncated_stderr` |
+| `eval.completed` | `EvalResult` | `completed` | stdout preview | `command`, `duration_ms`, `ok`?, `exit_code`?, `timed_out`?, `interrupted`?, `reason`?, `truncated_stdout`, `truncated_stderr` |
 | `eval.failed` | `EvalError` | `failed` | — | `command`, `duration_ms` |
 | `retrieve.started` | `RetrieveCall` | `started` | query | `kind`?, `max_bytes`? |
 | `retrieve.completed` | `RetrieveResult` | `completed` | result preview | `bytes`, `duration_ms`, `source_count` |
@@ -280,10 +282,10 @@ the runtime trace, and may change without notice:
 ## Correlation semantics
 
 - **run_id** — one agent process run. Every event carries it.
-- **session_id** — reserved distinction; **equals `run_id`** in v1. A
-  session (persisted conversation identity across process restarts, see
-  docs/MEMORY.md) may later span multiple runs; when the runtime records
-  that, `session_id` diverges from `run_id` (additive change).
+- **session_id / parent_session_id** — `public_event` defaults to `run_id`
+  for legacy traces; `public_event_with_lineage` projects caller-provided
+  session identity and optional fork parent without altering effect ids.
+  CLI trace JSONL also records these IDs when provided.
 - **turn_id** — one send/response exchange within a session. Today it is
   minted (or echoed from the caller's envelope) per turn and carried only on
   stdout machine events (`agent_start`/`agent_complete`/`agent_error`,
@@ -320,6 +322,11 @@ neither constrains the other today.
 
 ## Version history
 
+- **1.6** — additive: optional `parent_session_id` and caller-provided
+  `session_id` in lineage-aware projections, and `eval.completed` gains
+  `attrs.interrupted` / `attrs.reason` for an Eval cut off by suspend.
+  Strict replay still reads the recorded typed result and never runs Eval.
+  Wire `schema_version` remains `1`.
 - **1.5** (t-1347) — additive: sub-infer attribution. `run.completed`
   gains `failed_infer_calls` (present only when nonzero) counting Infer
   attempts that ended in `InferError`; failed attempts carry no usage or

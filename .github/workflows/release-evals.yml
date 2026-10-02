@@ -18,6 +18,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install fixture dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
       - run: ./evals/release.sh
       - run: ./evals/release-online.sh "${{ inputs.models_file }}"
         env:
