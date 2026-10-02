@@ -716,8 +716,13 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } => true,
+            // 408: the server gave up reading our request body (observed
+            // on ~2 MB Codex prompts, t-1585); RFC 9110 allows a retry on
+            // a fresh connection.
             Self::Http { status, .. } => {
-                *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                *status == StatusCode::REQUEST_TIMEOUT
+                    || *status == StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
             }
             Self::ContextOverflow { .. } => false,
             // A non-existent model never becomes existent on retry.
@@ -1104,12 +1109,13 @@ mod tests {
     }
 
     #[test]
-    fn http_429_and_5xx_are_retryable_but_4xx_is_not() {
+    fn http_408_429_and_5xx_are_retryable_but_other_4xx_is_not() {
         let make = |status| ProviderError::Http {
             status,
             text: String::new(),
             retry_after: None,
         };
+        assert!(make(StatusCode::REQUEST_TIMEOUT).is_retryable());
         assert!(make(StatusCode::TOO_MANY_REQUESTS).is_retryable());
         assert!(make(StatusCode::INTERNAL_SERVER_ERROR).is_retryable());
         assert!(!make(StatusCode::BAD_REQUEST).is_retryable());

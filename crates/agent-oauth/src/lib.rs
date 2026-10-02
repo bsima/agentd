@@ -260,6 +260,23 @@ impl ClaudeCodeOAuthProvider {
     }
 }
 
+/// HTTP client for OAuth chat providers. No total timeout: streamed
+/// responses legitimately run for minutes. Instead the socket fails fast
+/// when the network stalls, so the retry loop reconnects: an upload that
+/// stalled used to wait out the server's 15-minute body-read timeout and
+/// end in a 408 (t-1585).
+fn oauth_http_client() -> Result<Client> {
+    let builder = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(30));
+    // Unacknowledged sent data for this long closes the connection.
+    #[cfg(target_os = "linux")]
+    let builder = builder.tcp_user_timeout(std::time::Duration::from_secs(60));
+    builder
+        .build()
+        .context("building OAuth provider HTTP client")
+}
+
 #[derive(Clone)]
 struct OAuthChatProvider {
     kind: OAuthProviderKind,
@@ -276,7 +293,7 @@ impl OAuthChatProvider {
         };
         Ok(Self {
             kind,
-            client: Client::new(),
+            client: oauth_http_client()?,
             store: TokenStore::new(kind)?,
             base_url: base_url.into(),
         })
@@ -1659,6 +1676,8 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
         Complete,
         /// A terminal 400 from the backend.
         BadRequest,
+        /// The backend gave up reading the request body (t-1585).
+        RequestTimeout,
     }
 
     /// Serve `replies` in order on a local socket, one per connection, and
@@ -1722,6 +1741,13 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
                             body.len()
                         )
                     }
+                    CodexReply::RequestTimeout => {
+                        let body = r#"{"detail":"Request body read timed out"}"#;
+                        format!(
+                            "HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
                 };
                 socket.write_all(raw.as_bytes()).await.unwrap();
                 socket.flush().await.unwrap();
@@ -1734,7 +1760,7 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
     fn codex_provider_at(base_url: String) -> OAuthChatProvider {
         OAuthChatProvider {
             kind: OAuthProviderKind::Codex,
-            client: Client::new(),
+            client: oauth_http_client().unwrap(),
             store: TokenStore::with_path(OAuthProviderKind::Codex, PathBuf::from("/nonexistent")),
             base_url,
         }
@@ -1778,6 +1804,24 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
     async fn codex_buffered_retries_after_mid_stream_drop() -> Result<()> {
         let (base_url, seen) =
             fake_codex_server(vec![CodexReply::DropMidStream, CodexReply::Complete]).await;
+        let response = codex_provider_at(base_url)
+            .chat_codex(
+                &codex_token(),
+                &Model("gpt-5".into()),
+                &[],
+                &[ChatMessage::user("hi")],
+            )
+            .await?;
+        assert_eq!(response.content, "recovered");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    // t-1585: a 408 used to fail the turn on the first attempt.
+    #[tokio::test]
+    async fn codex_request_timeout_is_retried() -> Result<()> {
+        let (base_url, seen) =
+            fake_codex_server(vec![CodexReply::RequestTimeout, CodexReply::Complete]).await;
         let response = codex_provider_at(base_url)
             .chat_codex(
                 &codex_token(),
