@@ -7,9 +7,9 @@ source, with a file:line), or **inferred/guessed**.
 
 ## Recommendation
 
-1. **Build zoomable eviction now.** agentd's message log is already
+1. **Build zoomable eviction now (opt-in).** agentd's message log is already
    append-only and complete; GC only shapes a per-call view of it (read,
-   below). A `recall_evicted` tool can return an evicted tool result
+   below). A zoom tool can return any evicted message
    verbatim from history: exact, free, deterministic, and replay-safe,
    with no re-execution. The primitive already exists
    (`Expr::SelectToolResults`). This is the one UniiChat idea agentd can
@@ -22,9 +22,10 @@ source, with a file:line), or **inferred/guessed**.
    batching: collect rarely and deeply. agentd's threshold timing
    collects to the trigger itself (read), so a long session trims a few
    percent on every call (inferred from traces). Add a low-water target.
-4. **Defer item 3 (LLM compaction) until item 1 ships.** Summaries only
-   lose safely if the original is recoverable; without zoom, a vague
-   summary loses the decision.
+4. **Build item 3 (LLM summaries) as an opt-in GC strategy, after
+   zoom.** Summaries only lose safely if the original is recoverable;
+   without zoom, a vague summary loses the decision. See "Design
+   decisions" below.
 5. **Rescope item 4.** The task's premise that agentd GC is per-turn is
    wrong: a session's every turn carries the full log, and GC collects
    across turns already (read). The real cross-turn gap is unbounded log
@@ -226,6 +227,80 @@ checkpoint, mid-turn checkpoints carry a second copy, and
 bodies to a content-addressed store referenced by id. Design this when
 log size becomes a measured problem; no trace here shows it yet.
 
+## Design decisions (2026-10-08)
+
+Principle: like every existing GC strategy and modifier, zoom and LLM
+summarization are opt-in. They must not constrain future context
+management, so with them off, the agent loop's program hash, the replay
+fixtures, and the marker text are unchanged.
+
+### Layering
+
+- **GC strategies shape the view and mint addresses.** A marker names
+  what was dropped; a summary line names the messages it covers.
+- **Zoom resolves an address to the original.** It is a read over the
+  log, not a strategy. For bodies in the live `history` it is a pure
+  read. A future backend can resolve bodies that left `history` (a
+  spill store, if the log is ever bounded) through a `Retrieve` against a
+  log-store hydration source. The model sees one tool either way.
+- **Not a hydration source today.** Hydration sources are external
+  stores behind the `Retrieve` effect and cannot see the machine's
+  `history`. `TemporalSource` already declines to serve the running
+  session's own checkpoints for the same reason: "the live history
+  already contains those messages" (`temporal.rs`).
+
+### Zoom (`--gc-zoom`, opt-in modifier)
+
+- A modifier like `hot-keep` and `cited-keep`, combinable with any
+  strategy. Off by default.
+- **Addresses are log positions**: the message's index in the
+  append-only `history`. Positions are unique and cover every message
+  kind; tool-call ids are accepted as an alias, resolving a duplicate to
+  the most recent match. Provider ids are not rewritten.
+- **Any message is zoomable** (decided): tool results, assistant turns,
+  and user turns. Exact recall of what the user said replaces today's
+  "ask the user again" for evicted user turns.
+- **Markers take their recovery affordances from the enabled tools.**
+  Strategies never learn that zoom exists; with zoom off the marker text
+  is byte-identical to today's.
+- Built-in IR arm appended after existing blocks (the `ask_user`
+  pattern), paged for large bodies, registered with the write-barrier as
+  a recall tool.
+
+### LLM summary strategy (opt-in GC strategy)
+
+This is the `stack-smart` variant docs/GC.md deferred "for after the eval
+harness exists"; the harness exists. UniiChat's tree and compaction
+prompt are the starting design.
+
+- **Summarizer calls are agent effects** (decided): AgentIR child Infer
+  effects, traced, costed, replayable, and shown in ACP clients as
+  `infer` cards. Proposed shape: an opt-in block in the agent loop,
+  before the turn Infer, that summarizes messages not yet summarized.
+- **Summaries live in a machine env variable**, so checkpoints carry them
+  without making `GcState` persistent, and other strategies are
+  untouched. UniiChat's rule applies: never rebuild the view from
+  scratch, or every cache entry dies.
+- **`collect()` stays pure.** The strategy reads summaries through the
+  async pre-pass, the cache-consuming pattern docs/GC.md sanctions for
+  semantic embeddings.
+- **Requires zoom.** Summaries lose detail; the original must stay
+  recoverable. The strategy should refuse to start without `--gc-zoom`
+  or enable it.
+- Open in design: summary unit (per message, per tool frame, or
+  UniiChat's binary tree), size budget, which model summarizes, and
+  whether a turn waits for pending summaries.
+
+### Switches
+
+- **CLI flags only** (decided), like every GC option today. No prompt
+  frontmatter, `agent.md` spec, or SDK builder surface.
+- **GC telemetry on by default** (decided). `--gc-log` adds trace events
+  and never changes what the model sees.
+- **The low-water target is an option** (`--gc-low-water`), not a new
+  default.
+- **Eval budget**: none set; providers are mostly flat-rate.
+
 ## The open questions
 
 - **Where does the recall store live for subagents?** In the parent's
@@ -254,12 +329,13 @@ log size becomes a measured problem; no trace here shows it yet.
   runs `maybe_collect_prompt` with it, bumping `infer_calls` and possibly
   eviction counts (read; impact not measured).
 
-## Proposed follow-up tasks
+## Follow-up tasks (filed 2026-10-08)
 
-1. GC telemetry on by default: emit `gc_collect`/`gc_truncate` events in
-   every mode, including ACP. Prerequisite for every measurement above.
-2. `recall_evicted`: built-in IR arm, paging, marker wording, eval arms.
-3. Threshold hysteresis: low-water collection target, cache-hit eval.
-4. Investigate Anthropic cache-hit accounting.
-5. Later: LLM-compaction elide arm (after 2); log-size bound (when
-   measured).
+| Task | Priority | What | Blocked by |
+|---|---|---|---|
+| t-1608 | P2 | GC telemetry on by default | — |
+| t-1609 | P2 | Zoom: opt-in exact recall of any evicted message (`--gc-zoom`) | — |
+| t-1612 | P2 | Opt-in LLM-summary GC strategy (`stack-smart`, UniiChat-style) | t-1609 |
+| t-1611 | P2 | Investigate Anthropic prompt-cache hit rate | — |
+| t-1610 | P3 | Opt-in low-water collection target (`--gc-low-water`) | t-1608 |
+| t-1613 | P4 | Bound session log growth | — |
