@@ -69,6 +69,16 @@ pub const RECALL_TOOL_DESCRIPTION: &str =
      you need something you saw earlier and it is no longer in view, \
      recall it instead of re-running commands or guessing.";
 
+/// Shipped `ask_user` tool description (t-1594, docs/GUIDANCE.md §4). Only
+/// offered when the host can put a question to a user (ACP sessions).
+pub const ASK_USER_TOOL_DESCRIPTION: &str =
+    "Ask the user a multiple-choice question and wait for the answer; the \
+     result is the option they chose. Ask only when a decision needs the \
+     user (a preference, or an ambiguous or irreversible choice) and the \
+     context cannot settle it. Offer 2-8 short, concrete options. If the \
+     user dismisses the question, proceed on your best judgment or stop \
+     and explain.";
+
 // --- the runtime-guidance fragment (docs/GUIDANCE.md §4 step 2) -----------
 //
 // Cross-tool workflow text, assembled at prompt build from live

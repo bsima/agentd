@@ -754,6 +754,22 @@ as the unguided failure mode):
 > need something you saw earlier and it is no longer in view, recall it
 > instead of re-running commands or guessing.
 
+`ask_user` (t-1594 — offered only when the host can answer, i.e. ACP
+sessions):
+
+> Ask the user a multiple-choice question and wait for the answer; the
+> result is the option they chose. Ask only when a decision needs the user
+> (a preference, or an ambiguous or irreversible choice) and the context
+> cannot settle it. Offer 2-8 short, concrete options. If the user
+> dismisses the question, proceed on your best judgment or stop and
+> explain.
+
+Unlike the other descriptions, `ask_user`'s *exposure* is program-shaped:
+the loop grows its dispatch arm only under
+`AgentLoopOptions::ask_user`, and the offer follows the arm. The
+description text itself still never enters the hash. The text has not
+been A/B'd behaviorally (§5).
+
 None of this text enters the program hash or effect identity (tool
 descriptions are provider-offer material assembled from config at
 dispatch, not program content), so wording is tunable without breaking

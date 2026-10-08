@@ -28,9 +28,9 @@ pub mod trace;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use approval::{
-    denial_value, is_denial_value, pending_id_for, ApprovalConfig, ApprovalDecision,
-    ApprovalHookFn, ApprovalKind, ApprovalRequest, ApprovalResolution, ApprovalStore,
-    PendingEffectRecord, PendingStatus,
+    denial_value, dismissal_value, is_denial_value, pending_id_for, ApprovalConfig,
+    ApprovalDecision, ApprovalHookFn, ApprovalKind, ApprovalRequest, ApprovalResolution,
+    ApprovalStore, PendingEffectRecord, PendingStatus,
 };
 pub use chat_history::ChatHistory;
 pub use cost::{format_micro_usd, Pricing, PricingTable, RunUsage};
@@ -97,7 +97,10 @@ pub use public_trace::{
     PUBLIC_SCHEMA_VERSION,
 };
 pub use temporal::TemporalSource;
-pub use tool::{NativeTool, ToolHandler, ToolRegistry, RESERVED_TOOL_NAMES};
+pub use tool::{
+    ask_user_tool_spec, AskUserRequest, NativeTool, ToolHandler, ToolRegistry, ASK_USER_TOOL,
+    RESERVED_TOOL_NAMES,
+};
 pub use trace::{
     AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, SessionTraceSink, SuspendControl,
     TraceContextEnv, TraceLogger, TraceSink, TraceSummary,

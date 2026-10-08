@@ -52,6 +52,12 @@ use std::sync::Arc;
 pub enum ApprovalKind {
     Eval,
     Store,
+    /// The `ask_user` tool (t-1594): a multiple-choice question for the
+    /// user. The request payload is `{question, options}`; `Approve`
+    /// means "answered" and must carry [`ApprovalResolution::answer`] (one
+    /// of the options), `Deny` means "dismissed". The in-process hook is
+    /// never consulted — it can approve or deny but cannot answer.
+    Question,
 }
 
 impl ApprovalKind {
@@ -59,6 +65,7 @@ impl ApprovalKind {
         match self {
             Self::Eval => "eval",
             Self::Store => "store",
+            Self::Question => "question",
         }
     }
 }
@@ -100,6 +107,10 @@ pub struct ApprovalResolution {
     pub resolved_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The chosen option for an approved [`ApprovalKind::Question`]; it
+    /// becomes the `ask_user` tool result. Ignored for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
 }
 
 /// What the interpreter hands the driver (and the in-process hook) when a
@@ -218,8 +229,39 @@ pub fn denial_value(pending_id: &str, resolved_by: Option<&str>, reason: Option<
     })
 }
 
+/// The value bound to a dismissed [`ApprovalKind::Question`] — the
+/// `ask_user` tool result when the user closes the question without
+/// choosing. Same `approval` envelope as [`denial_value`] (so
+/// [`is_denial_value`] detects it), worded for a question.
+pub fn dismissal_value(pending_id: &str, resolved_by: Option<&str>) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "error": "the user dismissed the question without choosing an option",
+        "approval": {
+            "pending_id": pending_id,
+            "status": "denied",
+            "resolved_by": resolved_by,
+            "reason": null,
+        }
+    })
+}
+
+/// The value a denied gate binds, by kind: [`dismissal_value`] for a
+/// question, [`denial_value`] otherwise.
+pub(crate) fn denied_value_for(
+    kind: ApprovalKind,
+    pending_id: &str,
+    resolved_by: Option<&str>,
+    reason: Option<&str>,
+) -> Value {
+    match kind {
+        ApprovalKind::Question => dismissal_value(pending_id, resolved_by),
+        ApprovalKind::Eval | ApprovalKind::Store => denial_value(pending_id, resolved_by, reason),
+    }
+}
+
 /// True when `value` is a typed approval denial produced by
-/// [`denial_value`].
+/// [`denial_value`] or [`dismissal_value`].
 pub fn is_denial_value(value: &Value) -> bool {
     value
         .get("approval")
@@ -442,6 +484,7 @@ impl ApprovalStore {
             decision,
             resolved_by: record.resolved_by.clone(),
             reason: record.reason.clone(),
+            answer: None,
         })
     }
 }

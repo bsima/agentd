@@ -88,6 +88,7 @@ pub fn agent_loop_ir_with_policies(
         native_tools,
         shell_requires_approval,
         None,
+        false,
     )
 }
 
@@ -109,9 +110,11 @@ pub fn agent_loop_ir_for_options(
         &options.tool_names,
         options.shell_requires_approval,
         options.infer_system_prompt.as_deref(),
+        options.ask_user,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per program-shaping AgentLoopOptions knob
 fn build_agent_loop_ir(
     model: Model,
     prompt: Prompt,
@@ -120,7 +123,17 @@ fn build_agent_loop_ir(
     native_tools: &[String],
     shell_requires_approval: bool,
     infer_system_prompt: Option<&str>,
+    ask_user: bool,
 ) -> Machine {
+    // `ask_user` (t-1594) dispatches like a native tool — an Instr::Tool
+    // arm after the registered ones — but the interpreter answers it via
+    // the approval gate instead of a registry handler. Appending it last
+    // keeps every block id of the ask_user-free program unchanged.
+    let mut arm_tools = native_tools.to_vec();
+    if ask_user {
+        arm_tools.push(crate::tool::ASK_USER_TOOL.to_owned());
+    }
+    let native_tools = arm_tools.as_slice();
     let entry = BlockId(0);
     let done = BlockId(1);
     let prepare_tools = BlockId(2);
@@ -1426,6 +1439,12 @@ pub struct AgentLoopOptions {
     /// Owned by the dispatch site (loop configuration), never the model,
     /// and part of the program — setting it changes the program hash.
     pub infer_system_prompt: Option<String>,
+    /// Offer the `ask_user` multiple-choice question tool (t-1594). Set it
+    /// only when the driver can answer an [`crate::approval::ApprovalKind::Question`]
+    /// pause (the ACP turn driver puts it to the client); the dispatch arm
+    /// is part of the program, so enabling it changes the program hash and
+    /// the default (off) program is unchanged.
+    pub ask_user: bool,
 }
 
 /// Run the agent loop with loop-level post-processing (t-1308.4): build the
@@ -3359,6 +3378,7 @@ mod tests {
             output_contract: contract,
             shell_requires_approval: false,
             infer_system_prompt: None,
+            ask_user: false,
         };
         let (value, machine) = run_agent_loop(
             &config,
@@ -3562,6 +3582,7 @@ mod tests {
                 output_contract: Some(contract_a.clone()),
                 shell_requires_approval: false,
                 infer_system_prompt: None,
+                ask_user: false,
             };
             let (value, _machine) = run_agent_loop(
                 &config,
@@ -3598,6 +3619,7 @@ mod tests {
                     output_contract: contract,
                     shell_requires_approval: false,
                     infer_system_prompt: None,
+                    ask_user: false,
                 };
                 run_agent_loop(
                     &config,
@@ -3628,6 +3650,306 @@ mod tests {
         let err = run_replay(None).await.unwrap_err();
         assert!(err.to_string().contains("schema_hash"), "{err:#}");
 
+        let _ = std::fs::remove_file(&trace_path);
+        Ok(())
+    }
+
+    // ---- ask_user (t-1594) ----
+
+    fn ask_user_options() -> AgentLoopOptions {
+        AgentLoopOptions {
+            ask_user: true,
+            ..Default::default()
+        }
+    }
+
+    fn ask_call(arguments: Value) -> Response {
+        response("", vec![ToolCall::new("call-ask", "ask_user", arguments)])
+    }
+
+    fn db_question() -> Value {
+        serde_json::json!({
+            "question": "Which database?",
+            "options": ["Postgres", "SQLite"]
+        })
+    }
+
+    /// The content of the tool message answering `call-ask` in the prompt
+    /// the provider saw last.
+    fn ask_tool_result(provider: &MockProvider) -> String {
+        let prompts = provider.prompts();
+        let last = prompts.last().expect("provider was called");
+        last.iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-ask"))
+            .and_then(|message| message.content.clone())
+            .unwrap_or_else(|| panic!("no ask_user tool result in {last:?}"))
+    }
+
+    /// Run one ask_user turn to its pause, resolve it, and resume.
+    async fn ask_and_resolve(
+        config: &mut SeqConfig,
+        resolution: Option<crate::approval::ApprovalResolution>,
+    ) -> Result<(crate::approval::ApprovalRequest, AgentLoopOutcome)> {
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let mut gc_state = GcState::default();
+        let outcome = run_agent_loop_outcome(
+            config,
+            &mut store,
+            None,
+            &mut gc_state,
+            Model("mock".into()),
+            vec![ChatMessage::user("set up the service")],
+            4,
+            &ask_user_options(),
+            BTreeMap::new(),
+        )
+        .await?;
+        let AgentLoopOutcome::AwaitingApproval {
+            checkpoint,
+            pending,
+        } = outcome
+        else {
+            panic!("expected the question to pause the turn, got {outcome:?}");
+        };
+        if let Some(resolution) = resolution {
+            config
+                .approvals
+                .resolutions
+                .insert(pending.effect.effect_id.0.clone(), resolution);
+        }
+        let mut store = checkpoint.store.clone();
+        let resumed = resume_agent_loop_outcome(
+            config,
+            &mut store,
+            &mut gc_state,
+            Model("mock".into()),
+            4,
+            &ask_user_options(),
+            checkpoint.machine,
+        )
+        .await?;
+        Ok((pending, resumed))
+    }
+
+    fn answered(answer: &str) -> crate::approval::ApprovalResolution {
+        crate::approval::ApprovalResolution {
+            decision: crate::approval::ApprovalDecision::Approve,
+            resolved_by: Some("test".into()),
+            reason: None,
+            answer: Some(answer.into()),
+        }
+    }
+
+    /// The option is program: off leaves the default program (and so every
+    /// recorded fixture's hash) untouched; on adds a validated dispatch arm.
+    #[test]
+    fn ask_user_option_shapes_the_program_only_when_set() {
+        let build = |options: &AgentLoopOptions| {
+            agent_loop_ir_for_options(
+                Model("mock".into()),
+                vec![ChatMessage::user("hello")],
+                4,
+                options,
+            )
+            .program
+        };
+        let default_program = build(&AgentLoopOptions::default());
+        let with_ask = build(&ask_user_options());
+        validate_program(&with_ask).unwrap();
+        assert_eq!(
+            crate::ir::program_hash(&default_program).unwrap(),
+            crate::ir::program_hash(
+                &agent_loop_ir(Model("mock".into()), vec![ChatMessage::user("hello")], 4).program
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            crate::ir::program_hash(&default_program).unwrap(),
+            crate::ir::program_hash(&with_ask).unwrap()
+        );
+        let has_ask_site = |program: &crate::ir::Program| {
+            program.blocks.values().any(|block| {
+                block.instructions.iter().any(|instr| {
+                    matches!(instr, Instr::Tool { name, .. } if name == crate::tool::ASK_USER_TOOL)
+                })
+            })
+        };
+        assert!(!has_ask_site(&default_program));
+        assert!(has_ask_site(&with_ask));
+    }
+
+    #[tokio::test]
+    async fn ask_user_pauses_with_the_question_and_resumes_with_the_answer() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            ask_call(db_question()),
+            response("using SQLite", vec![]),
+        ]));
+        let mut config = config(provider.clone());
+        // An in-process hook cannot answer a question: it must not be
+        // consulted, and the question still pauses.
+        config.approvals.hook = Some(Arc::new(|_| crate::approval::ApprovalDecision::Approve));
+        let (pending, resumed) = ask_and_resolve(&mut config, Some(answered("SQLite"))).await?;
+
+        assert_eq!(pending.kind, crate::approval::ApprovalKind::Question);
+        assert_eq!(
+            pending.request,
+            serde_json::json!({ "question": "Which database?", "options": ["Postgres", "SQLite"] })
+        );
+        let AgentLoopOutcome::Complete { value, .. } = resumed else {
+            panic!("expected completion, got {resumed:?}");
+        };
+        assert_eq!(value["content"], "using SQLite");
+        assert_eq!(ask_tool_result(&provider), "SQLite");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_user_dismissal_is_a_readable_tool_result() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            ask_call(db_question()),
+            response("ok, defaulting", vec![]),
+        ]));
+        let mut config = config(provider.clone());
+        let dismissed = crate::approval::ApprovalResolution {
+            decision: crate::approval::ApprovalDecision::Deny,
+            resolved_by: Some("test".into()),
+            reason: None,
+            answer: None,
+        };
+        let (_, resumed) = ask_and_resolve(&mut config, Some(dismissed)).await?;
+        assert!(matches!(resumed, AgentLoopOutcome::Complete { .. }));
+        let result: Value = serde_json::from_str(&ask_tool_result(&provider))?;
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("dismissed the question")),
+            "{result}"
+        );
+        assert!(crate::approval::is_denial_value(&result));
+        Ok(())
+    }
+
+    /// A host bug (an answer outside the offered options) reaches the
+    /// model as a tool error, never as the user's choice.
+    #[tokio::test]
+    async fn ask_user_rejects_an_answer_outside_the_options() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            ask_call(db_question()),
+            response("hm", vec![]),
+        ]));
+        let mut config = config(provider.clone());
+        let (_, resumed) = ask_and_resolve(&mut config, Some(answered("MySQL"))).await?;
+        assert!(matches!(resumed, AgentLoopOutcome::Complete { .. }));
+        let result: Value = serde_json::from_str(&ask_tool_result(&provider))?;
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not one of the offered options")),
+            "{result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_user_invalid_arguments_are_a_tool_error_without_a_pause() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            ask_call(serde_json::json!({ "question": "Proceed?", "options": ["yes"] })),
+            response("asking properly next time", vec![]),
+        ]));
+        let config = config(provider.clone());
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let mut gc_state = GcState::default();
+        let outcome = run_agent_loop_outcome(
+            &config,
+            &mut store,
+            None,
+            &mut gc_state,
+            Model("mock".into()),
+            vec![ChatMessage::user("go")],
+            4,
+            &ask_user_options(),
+            BTreeMap::new(),
+        )
+        .await?;
+        assert!(
+            matches!(outcome, AgentLoopOutcome::Complete { .. }),
+            "invalid arguments never pause: {outcome:?}"
+        );
+        let result: Value = serde_json::from_str(&ask_tool_result(&provider))?;
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("2 to 8 options")),
+            "{result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_user_without_the_option_is_an_unknown_tool() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            ask_call(db_question()),
+            response("fine", vec![]),
+        ]));
+        let (value, _machine) = run_agent_loop(
+            &config(provider.clone()),
+            &mut crate::ir_interpreter::InMemoryStore::new(),
+            None,
+            &mut GcState::default(),
+            Model("mock".into()),
+            vec![ChatMessage::user("go")],
+            4,
+            &AgentLoopOptions::default(),
+            BTreeMap::new(),
+        )
+        .await?;
+        assert_eq!(value["content"], "fine");
+        assert!(
+            ask_tool_result(&provider).contains("unknown_tool"),
+            "hosts that cannot answer never dispatch ask_user"
+        );
+        Ok(())
+    }
+
+    /// A turn that paused on a question and resumed with an answer replays
+    /// from its trace alone: the recorded pause/resolution reproduce as
+    /// data and the answer comes back from the recorded ToolResult.
+    #[tokio::test]
+    async fn ask_user_turn_replays_from_the_trace() -> Result<()> {
+        let trace = test_trace();
+        let trace_path = trace.path().clone();
+        let provider = Arc::new(MockProvider::new(vec![
+            ask_call(db_question()),
+            response("using Postgres", vec![]),
+        ]));
+        let mut live_config = config_with_trace(provider, trace);
+        let (_, resumed) = ask_and_resolve(&mut live_config, Some(answered("Postgres"))).await?;
+        let AgentLoopOutcome::Complete {
+            value: recorded, ..
+        } = resumed
+        else {
+            panic!("expected completion, got {resumed:?}");
+        };
+
+        let replay = IrReplayTrace::load(&trace_path).await?;
+        let replay_provider = Arc::new(MockProvider::new(vec![]));
+        let (replayed, _machine) = run_agent_loop(
+            &config(replay_provider.clone()),
+            &mut crate::ir_interpreter::InMemoryStore::new(),
+            Some(&replay),
+            &mut GcState::default(),
+            Model("mock".into()),
+            vec![ChatMessage::user("set up the service")],
+            4,
+            &ask_user_options(),
+            BTreeMap::new(),
+        )
+        .await?;
+        assert_eq!(replayed, recorded);
+        assert!(replay_provider.prompts().is_empty(), "replay never infers");
         let _ = std::fs::remove_file(&trace_path);
         Ok(())
     }

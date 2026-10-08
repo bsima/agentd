@@ -1375,8 +1375,8 @@ async fn execute_instr(
             // completion instead of being teased with tools whose calls
             // would never be dispatched.
             let tool_specs = match &policy.tools {
-                None => ir_tool_specs(config),
-                Some(names) => ir_tool_specs(config)
+                None => ir_tool_specs(config, &machine.program),
+                Some(names) => ir_tool_specs(config, &machine.program)
                     .into_iter()
                     .filter(|spec| names.contains(&spec.function.name))
                     .collect(),
@@ -1990,6 +1990,39 @@ async fn execute_instr(
                 dynamic_path.clone(),
             )?;
             let arguments = eval_expr(&machine.env, &arguments)?;
+            // `ask_user` (t-1594) is answered by the host, not a handler:
+            // valid arguments go through the approval gate as a Question
+            // pause, ahead of the ToolCall event exactly like a gated Eval
+            // (a pending or dismissed question never dispatches). The
+            // resolution's answer becomes the tool result. Invalid
+            // arguments skip the gate and fail as a tool error.
+            let mut host_answer = None;
+            if name == crate::tool::ASK_USER_TOOL {
+                match crate::tool::AskUserRequest::parse(&arguments) {
+                    Ok(question) => {
+                        match approval_gate(
+                            config,
+                            ir_replay,
+                            &location,
+                            crate::approval::ApprovalKind::Question,
+                            question.request_value(),
+                            true,
+                        )
+                        .await?
+                        {
+                            GateOutcome::Proceed => {
+                                host_answer = Some(question_answer(config, &location, &question))
+                            }
+                            GateOutcome::Deny(dismissal) => {
+                                machine.env.insert(out, dismissal);
+                                return Ok(None);
+                            }
+                            GateOutcome::Pause(pending) => return Ok(Some(pending)),
+                        }
+                    }
+                    Err(err) => host_answer = Some(Err(err)),
+                }
+            }
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -2013,9 +2046,10 @@ async fn execute_instr(
                     "op-layer replay traces do not carry native tool results; \
                      replay this run with an IR replay trace"
                 )),
-                None => match config.tools.get(&name) {
-                    Some(tool) => tool.handler.call(arguments.clone()).await,
-                    None => Err(anyhow!(
+                None => match (host_answer, config.tools.get(&name)) {
+                    (Some(answer), _) => answer,
+                    (None, Some(tool)) => tool.handler.call(arguments.clone()).await,
+                    (None, None) => Err(anyhow!(
                         "no native tool {name:?} is registered with the runtime"
                     )),
                 },
@@ -2116,7 +2150,9 @@ async fn approval_gate(
     request: Value,
     gated: bool,
 ) -> Result<GateOutcome> {
-    use crate::approval::{denial_value, pending_id_for, ApprovalDecision, ApprovalRequest};
+    use crate::approval::{
+        denial_value, denied_value_for, pending_id_for, ApprovalDecision, ApprovalRequest,
+    };
 
     let effect_id = &location.effect_id.0;
     let run_id: String = config.trace.run_id().into();
@@ -2188,7 +2224,8 @@ async fn approval_gate(
             })
             .await?;
         return Ok(if resolution.decision == "denied" {
-            GateOutcome::Deny(denial_value(
+            GateOutcome::Deny(denied_value_for(
+                kind,
                 &pending_id,
                 resolution.resolved_by.as_deref(),
                 resolution.reason.as_deref(),
@@ -2221,7 +2258,8 @@ async fn approval_gate(
             .await?;
         return Ok(match resolution.decision {
             ApprovalDecision::Approve => GateOutcome::Proceed,
-            ApprovalDecision::Deny => GateOutcome::Deny(denial_value(
+            ApprovalDecision::Deny => GateOutcome::Deny(denied_value_for(
+                kind,
                 &pending_id,
                 resolution.resolved_by.as_deref(),
                 resolution.reason.as_deref(),
@@ -2245,7 +2283,14 @@ async fn approval_gate(
         kind,
         request,
     };
-    if let Some(hook) = &config.approvals.hook {
+    // A question needs an answer, which the hook's approve/deny verdict
+    // cannot carry: questions always pause for a host that can ask.
+    let hook = config
+        .approvals
+        .hook
+        .as_ref()
+        .filter(|_| kind != crate::approval::ApprovalKind::Question);
+    if let Some(hook) = hook {
         let decision = hook(&pending);
         config
             .trace
@@ -2270,6 +2315,29 @@ async fn approval_gate(
     // Fail closed: no resolution and no hook means the effect does not
     // execute — the machine suspends for a durable, out-of-process decision.
     Ok(GateOutcome::Pause(pending))
+}
+
+/// The live `ask_user` result after the gate approved the question: the
+/// resolution's answer, which must be one of the offered options (the host
+/// maps a chosen button back to its text; anything else is a host bug the
+/// model should not be told was the user's choice).
+fn question_answer(
+    config: &SeqConfig,
+    location: &EffectLocation,
+    question: &crate::tool::AskUserRequest,
+) -> Result<Value> {
+    let answer = config
+        .approvals
+        .resolutions
+        .get(&location.effect_id.0)
+        .and_then(|resolution| resolution.answer.as_deref())
+        .ok_or_else(|| anyhow!("the question was resolved without an answer"))?;
+    if !question.options.iter().any(|option| option == answer) {
+        return Err(anyhow!(
+            "the question was resolved with {answer:?}, which is not one of the offered options"
+        ));
+    }
+    Ok(Value::String(answer.to_owned()))
 }
 
 /// Execute a live Store against the registry: resolve the sink, enforce its
@@ -2441,8 +2509,14 @@ fn run_has_gated_effects(config: &SeqConfig, program: &crate::ir::Program) -> bo
 /// appear automatically whenever a memory backend is registered (settled
 /// question 6 — an unreachable sink is a trap, so registration IS the
 /// exposure switch); native tools ride with their registry entries
-/// (t-1308.7 — same principle).
-fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
+/// (t-1308.7 — same principle). `ask_user` (t-1594) is offered exactly when
+/// the program has an `ask_user` dispatch site: the host opted in by
+/// building the loop with [`crate::ir_agent::AgentLoopOptions::ask_user`],
+/// so the program, not the config, is the exposure switch.
+fn ir_tool_specs(
+    config: &SeqConfig,
+    program: &crate::ir::Program,
+) -> Vec<crate::provider::ToolSpec> {
     let mut specs = base_ir_tool_specs(config);
     if !config
         .hydration
@@ -2491,7 +2565,19 @@ fn ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
         });
     }
     specs.extend(config.tools.specs());
+    if program_dispatches_ask_user(program) {
+        specs.push(crate::tool::ask_user_tool_spec());
+    }
     specs
+}
+
+/// Whether the program contains an `ask_user` Tool site (t-1594).
+fn program_dispatches_ask_user(program: &crate::ir::Program) -> bool {
+    program.blocks.values().any(|block| {
+        block.instructions.iter().any(
+            |instr| matches!(instr, Instr::Tool { name, .. } if name == crate::tool::ASK_USER_TOOL),
+        )
+    })
 }
 
 fn base_ir_tool_specs(config: &SeqConfig) -> Vec<crate::provider::ToolSpec> {
@@ -3571,7 +3657,8 @@ models:
         )?;
         let mut config = config(Arc::new(MockProvider::new(vec![])));
         config.guidance.infer_models = Some((registry.clone(), registry.resolve(None)?));
-        let spec = ir_tool_specs(&config)
+        let program = crate::ir_agent::agent_loop_ir(Model("m".into()), vec![], 1).program;
+        let spec = ir_tool_specs(&config, &program)
             .into_iter()
             .find(|s| s.function.name == "infer")
             .unwrap();
@@ -3659,8 +3746,9 @@ models:
 
     #[test]
     fn memory_tools_ride_with_backend_registration() {
+        let program = crate::ir_agent::agent_loop_ir(Model("m".into()), vec![], 1).program;
         let bare = config(Arc::new(MockProvider::new(vec![])));
-        let names: Vec<String> = ir_tool_specs(&bare)
+        let names: Vec<String> = ir_tool_specs(&bare, &program)
             .iter()
             .map(|spec| spec.function.name.clone())
             .collect();
@@ -3669,11 +3757,35 @@ models:
         let mut with_memory = config(Arc::new(MockProvider::new(vec![])));
         with_memory.hydration =
             SourceRegistry::new().register_backend(crate::memory::MemorySource::new(memory_dir()));
-        let names: Vec<String> = ir_tool_specs(&with_memory)
+        let names: Vec<String> = ir_tool_specs(&with_memory, &program)
             .iter()
             .map(|spec| spec.function.name.clone())
             .collect();
         assert_eq!(names, vec!["shell", "infer", "remember", "recall"]);
+    }
+
+    /// `ask_user` (t-1594) is offered exactly when the loop program has
+    /// its dispatch site — the host's opt-in via `AgentLoopOptions`.
+    #[test]
+    fn ask_user_is_offered_only_when_the_program_dispatches_it() {
+        let config = config(Arc::new(MockProvider::new(vec![])));
+        let names = |options: &crate::ir_agent::AgentLoopOptions| -> Vec<String> {
+            let program =
+                crate::ir_agent::agent_loop_ir_for_options(Model("m".into()), vec![], 1, options)
+                    .program;
+            ir_tool_specs(&config, &program)
+                .iter()
+                .map(|spec| spec.function.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&Default::default()), vec!["shell", "infer"]);
+        assert_eq!(
+            names(&crate::ir_agent::AgentLoopOptions {
+                ask_user: true,
+                ..Default::default()
+            }),
+            vec!["shell", "infer", "ask_user"]
+        );
     }
 
     /// The Infer site's policy owns the provider tool offer (t-1346):

@@ -61,6 +61,7 @@ fn write_replay_fixture(root: &std::path::Path, content: &str) -> std::path::Pat
         output_contract: None,
         shell_requires_approval: true,
         infer_system_prompt: None,
+        ask_user: false,
     };
     let machine = agent_loop_ir_for_options(Model("test-model".into()), vec![], 16, &options);
     let hash = program_hash(&machine.program).unwrap();

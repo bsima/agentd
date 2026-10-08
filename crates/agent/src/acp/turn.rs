@@ -93,6 +93,7 @@ pub(crate) async fn run_acp_turn(
                         decision,
                         resolved_by: Some("acp-client".into()),
                         reason: None,
+                        answer: None,
                     },
                 );
                 runtime.ir_store = checkpoint.store.clone();

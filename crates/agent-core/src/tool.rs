@@ -25,8 +25,108 @@ use std::sync::Arc;
 
 /// Tool names owned by the built-in loop dispatch arms. A native tool may
 /// not shadow them: the built-ins are matched first, so a same-named
-/// registration would silently never fire.
-pub const RESERVED_TOOL_NAMES: &[&str] = &["shell", "infer", "remember", "recall"];
+/// registration would silently never fire (or, for `ask_user`, would be
+/// answered by the host instead of the handler).
+pub const RESERVED_TOOL_NAMES: &[&str] = &["shell", "infer", "remember", "recall", ASK_USER_TOOL];
+
+/// The host-answered multiple-choice question tool (t-1594). Not a
+/// registry tool: the loop grows its dispatch arm only when the host can
+/// put a question to a user ([`crate::ir_agent::AgentLoopOptions::ask_user`]),
+/// and the interpreter runs it through the approval gate as an
+/// [`crate::approval::ApprovalKind::Question`] pause whose resolution
+/// carries the chosen answer.
+pub const ASK_USER_TOOL: &str = "ask_user";
+
+/// Answer-count bounds for `ask_user`: a choice needs two options; past
+/// eight, a row of buttons stops being a quick decision.
+pub const ASK_USER_MIN_OPTIONS: usize = 2;
+pub const ASK_USER_MAX_OPTIONS: usize = 8;
+
+/// Validated `ask_user` arguments: a non-empty question and 2..=8
+/// distinct, non-empty answer options (all trimmed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskUserRequest {
+    pub question: String,
+    pub options: Vec<String>,
+}
+
+impl AskUserRequest {
+    /// Validate model-supplied arguments, or the approval-request payload
+    /// [`Self::request_value`] produced. The error text is model-facing: at
+    /// the loop's Bind site it becomes the tool result.
+    pub fn parse(arguments: &Value) -> Result<Self> {
+        let question = arguments
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if question.is_empty() {
+            return Err(anyhow!("ask_user requires a non-empty string `question`"));
+        }
+        let Some(raw_options) = arguments.get("options").and_then(Value::as_array) else {
+            return Err(anyhow!(
+                "ask_user requires `options`: an array of {ASK_USER_MIN_OPTIONS} to \
+                 {ASK_USER_MAX_OPTIONS} answer strings"
+            ));
+        };
+        let mut options: Vec<String> = Vec::with_capacity(raw_options.len());
+        for option in raw_options {
+            let option = option.as_str().map(str::trim).unwrap_or_default();
+            if option.is_empty() {
+                return Err(anyhow!("ask_user options must be non-empty strings"));
+            }
+            if options.iter().any(|seen| seen == option) {
+                return Err(anyhow!(
+                    "ask_user options must be distinct; {option:?} repeats"
+                ));
+            }
+            options.push(option.to_owned());
+        }
+        if !(ASK_USER_MIN_OPTIONS..=ASK_USER_MAX_OPTIONS).contains(&options.len()) {
+            return Err(anyhow!(
+                "ask_user takes {ASK_USER_MIN_OPTIONS} to {ASK_USER_MAX_OPTIONS} options, got {}",
+                options.len()
+            ));
+        }
+        Ok(Self {
+            question: question.to_owned(),
+            options,
+        })
+    }
+
+    /// The approval-request payload hosts render and replay compares.
+    pub fn request_value(&self) -> Value {
+        serde_json::json!({ "question": self.question, "options": self.options })
+    }
+}
+
+/// Provider-facing spec for `ask_user`.
+pub fn ask_user_tool_spec() -> ToolSpec {
+    ToolSpec {
+        kind: "function".into(),
+        function: ToolFunctionSpec {
+            name: ASK_USER_TOOL.into(),
+            description: crate::guidance::ASK_USER_TOOL_DESCRIPTION.into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "the decision to put to the user, in one or two sentences"
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": ASK_USER_MIN_OPTIONS,
+                        "maxItems": ASK_USER_MAX_OPTIONS,
+                        "description": "distinct, concrete answers; each becomes one button"
+                    }
+                },
+                "required": ["question", "options"]
+            }),
+        },
+    }
+}
 
 /// An async native tool handler: JSON arguments in, JSON result out. Errors
 /// follow the runtime's errors-as-values convention at Bind sites (the agent
@@ -194,6 +294,56 @@ mod tests {
         registry.register(tool("lookup")).unwrap();
         let err = registry.register(tool("lookup")).unwrap_err().to_string();
         assert!(err.contains("already registered"), "{err}");
+    }
+
+    #[test]
+    fn ask_user_arguments_validate() {
+        let ok = AskUserRequest::parse(&serde_json::json!({
+            "question": " Which database? ",
+            "options": ["Postgres", " SQLite "]
+        }))
+        .unwrap();
+        assert_eq!(ok.question, "Which database?");
+        assert_eq!(ok.options, ["Postgres", "SQLite"]);
+        assert_eq!(AskUserRequest::parse(&ok.request_value()).unwrap(), ok);
+
+        let nine: Vec<String> = (1..=9).map(|n| n.to_string()).collect();
+        let cases = [
+            (serde_json::json!({ "options": ["a", "b"] }), "question"),
+            (
+                serde_json::json!({ "question": "  ", "options": ["a", "b"] }),
+                "question",
+            ),
+            (serde_json::json!({ "question": "q" }), "options"),
+            (
+                serde_json::json!({ "question": "q", "options": "a,b" }),
+                "options",
+            ),
+            (
+                serde_json::json!({ "question": "q", "options": ["a"] }),
+                "2 to 8",
+            ),
+            (
+                serde_json::json!({ "question": "q", "options": nine }),
+                "2 to 8",
+            ),
+            (
+                serde_json::json!({ "question": "q", "options": ["a", ""] }),
+                "non-empty",
+            ),
+            (
+                serde_json::json!({ "question": "q", "options": ["a", 2] }),
+                "non-empty",
+            ),
+            (
+                serde_json::json!({ "question": "q", "options": ["a", "a "] }),
+                "distinct",
+            ),
+        ];
+        for (arguments, needle) in cases {
+            let err = AskUserRequest::parse(&arguments).unwrap_err().to_string();
+            assert!(err.contains(needle), "{arguments}: {err}");
+        }
     }
 
     #[tokio::test]

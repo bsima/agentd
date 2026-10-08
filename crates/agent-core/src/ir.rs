@@ -668,6 +668,16 @@ fn validate_par_body(program: &Program, par_block: BlockId, body: BlockId) -> Re
                         body
                     ));
                 }
+                Instr::Tool { name, .. } if name == crate::tool::ASK_USER_TOOL => {
+                    return Err(anyhow!(
+                        "AgentIR Par at block {:?}: ask_user in block {:?} is reachable from \
+                         the Par body {:?}; a question pauses for the user, and approval \
+                         gates are not allowed inside Par branches (v1, t-1358)",
+                        par_block,
+                        block_id,
+                        body
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1612,6 +1622,21 @@ mod tests {
             err.contains("approval gates are not allowed inside Par branches"),
             "{err}"
         );
+
+        // ask_user (t-1594) pauses for the user, so it is a gate too; an
+        // ordinary native tool is fine.
+        let tool = |name: &str| Instr::Tool {
+            out: Var("gated".into()),
+            name: name.into(),
+            arguments: Expr::Value(serde_json::json!({})),
+            policy: ToolPolicy::default(),
+        };
+        with_gate.blocks.get_mut(&BlockId(1)).unwrap().instructions[0] = tool("lookup");
+        validate_program(&with_gate).unwrap();
+        with_gate.blocks.get_mut(&BlockId(1)).unwrap().instructions[0] =
+            tool(crate::tool::ASK_USER_TOOL);
+        let err = validate_program(&with_gate).unwrap_err().to_string();
+        assert!(err.contains("ask_user"), "{err}");
     }
 
     /// Body and join declare one implicit leading param (element / results)
