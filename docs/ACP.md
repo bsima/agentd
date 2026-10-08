@@ -61,6 +61,15 @@ the wire.
   as `agent_message_chunk` updates (see Streaming below); shell, memory,
   and native tool effects surface as `tool_call` / `tool_call_update` with
   full untruncated payloads in `rawInput`/`rawOutput`.
+  A delegation through the `infer` tool is one `tool_call` card (kind
+  `other`, titled `infer (<model>): <task first line>`): the child
+  Infer's call opens it, and its result completes it with the child's
+  answer as card content (or fails it with the error). The child's text
+  never reaches the assistant reply, and its deltas are not streamed — the
+  answer lands in the card when the child finishes. Child Infers are
+  recognized by trace lineage (`parent_op_id`); a child dispatched after
+  an approval resume in the same turn has no lineage and renders as
+  assistant text.
 - `session/request_permission` — shell commands are approval-gated by
   default in ACP mode: each gated command round-trips to the client with
   allow-once / allow-always / reject-once options. A rejection is a typed

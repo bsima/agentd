@@ -346,10 +346,13 @@ pub struct SeqConfig {
 
 /// One streamed text fragment from a live Infer. `op_id` matches the
 /// eventual `InferResult` trace event, so consumers can reconcile streamed
-/// text against the authoritative response.
+/// text against the authoritative response. `parent_op_id` mirrors the
+/// trace lineage (t-1347): `Some` marks a dispatched child Infer, so a
+/// consumer can keep delegated output apart from the turn's own answer.
 #[derive(Debug, Clone)]
 pub struct InferDelta {
     pub op_id: u64,
+    pub parent_op_id: Option<u64>,
     pub text: String,
 }
 

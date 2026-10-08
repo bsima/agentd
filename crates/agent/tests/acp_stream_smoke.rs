@@ -24,6 +24,18 @@ const DONE_TURN: &str =
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
+/// Parent turn delegating to a child model via the `infer` tool.
+const INFER_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"infer\",\"arguments\":\"{\\\"model\\\":\\\"test-model\\\",\\\"prompt\\\":\\\"summarize the logs\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+
+/// The delegated child's streamed answer.
+const CHILD_TURN: &str =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"child \"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
 /// Marker body: read the request, then stall without answering (the turn
 /// hangs until the client cancels and the agent drops the connection).
 const STALL: &str = "<stall>";
@@ -271,6 +283,45 @@ fn session_cancel_mid_turn_returns_cancelled() {
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
         "cancel mid-turn resolves the prompt with the cancelled stop reason: {response}"
+    );
+}
+
+#[test]
+fn infer_delegation_output_stays_in_its_tool_card() {
+    let root = temp_root("infer-card");
+    let port = spawn_mock_sse_server(vec![INFER_TURN, CHILD_TURN, DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+
+    client.prompt(3, &session_id, "delegate it");
+    let (response, updates, _) = client.read_until_response(3, None);
+
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(
+        chunk_texts(&updates).concat(),
+        "done",
+        "only the root answer reaches the assistant reply: {updates:?}"
+    );
+    let card = updates
+        .iter()
+        .find(|update| update["update"]["sessionUpdate"] == "tool_call")
+        .unwrap_or_else(|| panic!("the delegation opens a tool card: {updates:?}"));
+    let card_id = &card["update"]["toolCallId"];
+    assert!(
+        card["update"]["title"].as_str().is_some_and(
+            |title| title.contains("test-model") && title.contains("summarize the logs")
+        ),
+        "the card names the child model and task: {card}"
+    );
+    let completed = updates.iter().any(|update| {
+        update["update"]["sessionUpdate"] == "tool_call_update"
+            && &update["update"]["toolCallId"] == card_id
+            && update["update"]["status"] == "completed"
+            && update["update"]["content"][0]["content"]["text"] == "child answer"
+    });
+    assert!(
+        completed,
+        "the child's answer completes the card: {updates:?}"
     );
 }
 

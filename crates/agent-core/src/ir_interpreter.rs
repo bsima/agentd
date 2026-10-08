@@ -1434,6 +1434,7 @@ async fn execute_instr(
                                     std::sync::Arc::new(move |text: &str| {
                                         tap(crate::interpreter::InferDelta {
                                             op_id,
+                                            parent_op_id,
                                             text: text.to_owned(),
                                         })
                                     });

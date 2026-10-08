@@ -148,9 +148,15 @@ impl AcpServer {
         // Streaming tap: text deltas go straight to the client as
         // agent_message_chunk updates AND accumulate per op so the bridge
         // can suppress the duplicate whole-message chunk at InferResult.
+        // Delegated child Infers are not the assistant's reply: the bridge
+        // renders their answer inside the `infer` tool card at InferResult,
+        // so their deltas are dropped here.
         let tap_tx = update_tx.clone();
         let tap_streamed = streamed.clone();
         runtime.config.on_infer_delta = Some(Arc::new(move |delta: agent_core::InferDelta| {
+            if delta.parent_op_id.is_some() {
+                return;
+            }
             let _ = tap_tx.send(bridge::ForwarderMsg::update(
                 SessionUpdate::AgentMessageChunk(bridge::text_chunk(delta.text.clone())),
             ));

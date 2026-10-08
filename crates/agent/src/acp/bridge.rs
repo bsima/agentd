@@ -81,6 +81,51 @@ fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
+/// The task a delegated child Infer was given: its final user message. ACP
+/// sessions trace without full payloads by default, so this usually reads
+/// the head-truncated `prompt_preview` (`role: content` lines); a truncated
+/// preview may have cut the task off, so it yields nothing rather than a
+/// misleading earlier message.
+fn delegated_task(prompt: Option<&agent_core::Prompt>, prompt_preview: &str) -> Option<String> {
+    let task = match prompt {
+        Some(prompt) => prompt
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")?
+            .content
+            .clone()?,
+        None => {
+            if prompt_preview.ends_with("...") {
+                return None;
+            }
+            let start = match prompt_preview.rfind("\nuser: ") {
+                Some(index) => index + "\nuser: ".len(),
+                None => prompt_preview
+                    .strip_prefix("user: ")
+                    .map(|_| "user: ".len())?,
+            };
+            prompt_preview[start..].to_owned()
+        }
+    };
+    let task = task.trim();
+    (!task.is_empty()).then(|| task.to_owned())
+}
+
+/// Card title for a delegated child Infer: the child model plus a one-line
+/// preview of its task.
+fn infer_card_title(model: &str, task: Option<&str>) -> String {
+    const MAX_TASK_CHARS: usize = 80;
+    let Some(task) = task else {
+        return format!("infer ({model})");
+    };
+    let line = task.lines().next().unwrap_or_default();
+    let mut preview: String = line.chars().take(MAX_TASK_CHARS).collect();
+    if line.chars().count() > MAX_TASK_CHARS || task.lines().nth(1).is_some() {
+        preview.push('…');
+    }
+    format!("infer ({model}): {preview}")
+}
+
 /// Streamed text per live Infer op, appended by the session's
 /// `on_infer_delta` tap and reconciled (and removed) at `InferResult` time
 /// by the suppression rule below. Shared between the tap closure and the
@@ -117,7 +162,62 @@ pub(crate) fn map_event(
     streamed: &mut HashMap<u64, String>,
 ) -> Vec<SessionUpdate> {
     match event {
-        // Whole-message assistant text: every completed inference with
+        // A delegated child Infer (dispatched by the `infer` tool, so it
+        // carries the turn Infer's op as parent_op_id) is a tool card, not
+        // assistant text: the call opens the card, the result completes it
+        // with the child's answer. The child's deltas never reach the
+        // client (the session's tap drops them), so there is nothing to
+        // reconcile.
+        Event::InferCall {
+            op_id,
+            parent_op_id: Some(_),
+            model,
+            prompt,
+            prompt_preview,
+            effect,
+            ..
+        } => {
+            let id = ids.for_call(effect_id(effect), *op_id);
+            let task = delegated_task(prompt.as_ref(), prompt_preview);
+            vec![SessionUpdate::ToolCall(
+                ToolCall::new(id, infer_card_title(model, task.as_deref()))
+                    .kind(ToolKind::Other)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!({ "model": model, "prompt": task })),
+            )]
+        }
+        Event::InferResult {
+            op_id,
+            parent_op_id: Some(_),
+            response,
+            ..
+        } => {
+            streamed.remove(op_id);
+            let id = ids.for_result(*op_id);
+            let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+            if let Some(response) = response.as_ref().filter(|r| !r.content.is_empty()) {
+                fields = fields.content(vec![tool_text(response.content.clone())]);
+            }
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                id, fields,
+            ))]
+        }
+        Event::InferError {
+            op_id,
+            parent_op_id: Some(_),
+            error,
+            ..
+        } => {
+            streamed.remove(op_id);
+            let id = ids.for_result(*op_id);
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Failed)
+                    .content(vec![tool_text(error.clone())]),
+            ))]
+        }
+        // Whole-message assistant text: every completed root inference with
         // content is a message chunk. `PromptResponse` carries no content in
         // ACP, so this is the only channel delivering the answer itself.
         // Suppression rule when the streaming tap already delivered deltas
@@ -338,7 +438,8 @@ pub(crate) fn map_event(
             notice.push(']');
             vec![SessionUpdate::AgentMessageChunk(text_chunk(notice))]
         }
-        // Runtime-internal: never surfaced to ACP clients.
+        // Runtime-internal: never surfaced to ACP clients. Root InferCall /
+        // InferError land here; child ones matched above.
         Event::InferCall { .. }
         | Event::InferError { .. }
         | Event::HydrationStart { .. }
@@ -739,6 +840,135 @@ mod tests {
         }
         assert!(usage_update(&child, 200_000).is_none());
         assert!(usage_update(&infer_result_event("hello"), 0).is_none());
+    }
+
+    fn child(mut event: Event) -> Event {
+        match &mut event {
+            Event::InferCall { parent_op_id, .. }
+            | Event::InferResult { parent_op_id, .. }
+            | Event::InferError { parent_op_id, .. } => *parent_op_id = Some(1),
+            _ => unreachable!("not an infer event"),
+        }
+        event
+    }
+
+    #[test]
+    fn child_infer_result_does_not_leak_into_the_assistant_reply() {
+        let mut ids = ToolCallIds::default();
+        let updates = map_event(
+            &child(infer_result_event("child answer")),
+            &mut ids,
+            &mut HashMap::new(),
+        );
+        assert!(
+            !update_names(&updates).contains(&"agent_message_chunk"),
+            "child output belongs in its tool card: {updates:?}"
+        );
+    }
+
+    fn infer_call_event(prompt_preview: &str) -> Event {
+        Event::InferCall {
+            run_id: "r".into(),
+            op_id: 2,
+            parent_op_id: None,
+            model: "fast".into(),
+            prompt: None,
+            prompt_preview: prompt_preview.into(),
+            effect: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn root_infer_call_maps_to_nothing() {
+        let mut ids = ToolCallIds::default();
+        let call = infer_call_event("user: hi");
+        assert!(map_event(&call, &mut ids, &mut HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn child_infer_opens_and_completes_one_tool_card() {
+        let mut ids = ToolCallIds::default();
+        let mut streamed = HashMap::new();
+        let call = child(infer_call_event(
+            "system: guidance\nuser: summarize the logs\nthen list errors",
+        ));
+        let updates = map_event(&call, &mut ids, &mut streamed);
+        assert_eq!(update_names(&updates), ["tool_call"]);
+        let SessionUpdate::ToolCall(card) = &updates[0] else {
+            unreachable!()
+        };
+        assert_eq!(card.title, "infer (fast): summarize the logs…");
+        assert_eq!(card.kind, ToolKind::Other);
+        assert_eq!(card.status, ToolCallStatus::InProgress);
+        assert_eq!(
+            card.raw_input,
+            Some(serde_json::json!({
+                "model": "fast",
+                "prompt": "summarize the logs\nthen list errors",
+            }))
+        );
+
+        let result = child(infer_result_event("child answer"));
+        let updates = map_event(&result, &mut ids, &mut streamed);
+        assert_eq!(update_names(&updates), ["tool_call_update"]);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            unreachable!()
+        };
+        assert_eq!(update.tool_call_id, card.tool_call_id, "same card");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(
+            update.fields.content,
+            Some(vec![tool_text("child answer")]),
+            "the child's answer fills the card"
+        );
+    }
+
+    #[test]
+    fn child_infer_error_fails_its_card() {
+        let mut ids = ToolCallIds::default();
+        let call = child(infer_call_event("user: go"));
+        let updates = map_event(&call, &mut ids, &mut HashMap::new());
+        let SessionUpdate::ToolCall(card) = &updates[0] else {
+            panic!("expected tool_call, got {updates:?}")
+        };
+        let error = child(Event::InferError {
+            run_id: "r".into(),
+            op_id: 2,
+            parent_op_id: None,
+            error: "unknown model".into(),
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        });
+        let updates = map_event(&error, &mut ids, &mut HashMap::new());
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected tool_call_update, got {updates:?}")
+        };
+        assert_eq!(update.tool_call_id, card.tool_call_id);
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            update.fields.content,
+            Some(vec![tool_text("unknown model")])
+        );
+    }
+
+    #[test]
+    fn delegated_task_prefers_the_full_prompt_and_distrusts_truncated_previews() {
+        let prompt = vec![
+            agent_core::ChatMessage::user("referenced material"),
+            agent_core::ChatMessage::user("the task"),
+        ];
+        assert_eq!(
+            delegated_task(Some(&prompt), "ignored").as_deref(),
+            Some("the task")
+        );
+        assert_eq!(
+            delegated_task(None, "user: short").as_deref(),
+            Some("short")
+        );
+        assert_eq!(delegated_task(None, "user: cut off..."), None);
+        assert_eq!(delegated_task(None, "system: no user turn"), None);
+        assert_eq!(infer_card_title("fast", None), "infer (fast)");
     }
 
     #[test]
