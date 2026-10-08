@@ -289,7 +289,7 @@ Implemented and tested, at v0.2.0:
 - context GC: five strategies (`stack` default), hard guards, eviction markers, escalation, and the progress ledger — behaviorally evaluated on recorded sessions (see [evals/gc/](./evals/gc/README.md))
 - model-visible sub-inference (`infer` tool) with pass-by-reference `context_refs` and trace lineage
 - runtime operations guidance: per-tool descriptions plus a capability-keyed, budget-aware prompt fragment (`--no-runtime-guidance` to opt out)
-- human-in-the-loop approvals: durable pauses resolved by `agent approvals`, in-process hooks in the SDK
+- human-in-the-loop approvals: durable pauses resolved by `agent approvals`, in-process hooks in the SDK, and in-process `session/request_permission` round-trips under `agent --acp` — including the ACP-only `ask_user` tool, which puts a multiple-choice question to the user mid-turn (see [docs/ACP.md](./docs/ACP.md))
 - cost accounting: per-call and per-run token/cost rollups in traces, `agent cost` to inspect them
 - output contracts (`--output-schema`): JSON Schema-constrained final answers with bounded repair turns
 - structured traces with a versioned public event schema, plus optional OpenTelemetry export

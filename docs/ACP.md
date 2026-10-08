@@ -76,6 +76,10 @@ the wire.
   denial the model sees and recovers from — the turn continues. Disable
   gating with `--acp-shell-approval=false` or per session via the `yolo`
   mode. Approvals resolve fully in-process (no `agent approvals` records).
+- `ask_user` — ACP sessions offer the model a native multiple-choice
+  question tool, `ask_user {question, options}` (2-8 distinct non-empty
+  options). CLI one-shot/FIFO/stdin sessions and the `agentd` supervisor do
+  not offer it: they have no way to answer. See "Questions" below.
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already
@@ -100,6 +104,51 @@ the wire.
     switching to `none` is rejected when `--gc-timing` needs a strategy.
   - `gc-threshold`: the collection trigger as a fraction of the context
     budget (discrete steps; defaults to `--gc-threshold`).
+
+## Questions (`ask_user`)
+
+The model calls `ask_user` when a decision needs the user. The runtime
+treats the call as an approval-gated effect of kind `question`: the turn
+pauses exactly like a gated shell command (same checkpoint, same
+`AwaitingApproval` → resolution → resume path), and the request payload is
+`{question, options}`.
+
+On the wire, the pause becomes:
+
+- a `tool_call` (status `pending`) titled with the question, with the
+  question as its text content;
+- a `session/request_permission` with one `allow_once` option per answer
+  (`optionId` = the answer's index, `name` = its text) plus one
+  `reject_once` option, `dismiss`.
+
+Paseo (verified against 0.9.2) treats a request with two or more
+same-kind allow options as a chooser: it renders the tool call's text
+content as the prompt, one button per answer, and the reject option as a
+deny button. Paseo never auto-accepts a chooser, so the question always
+reaches the user. Paseo has no free-text answer path for generic ACP
+agents, so answers are always one of the offered options.
+
+Outcomes:
+
+- **selected** — the chosen option's text is the tool result the model
+  reads; the tool call completes with the answer as its content.
+- **dismiss** — the tool result is
+  `{"ok": false, "error": "the user dismissed the question without choosing an option", ...}`;
+  the turn continues and the model decides what to do.
+- **cancelled** — the turn ends with `stopReason: "cancelled"`, as for a
+  cancelled shell approval.
+
+The `yolo` mode and "allow for this session" silence shell approvals
+only; questions always prompt. Invalid arguments (missing question, fewer
+than 2 or more than 8 options, duplicates) never pause: the model gets a
+tool error and can retry.
+
+Replay: the question's `ApprovalRequested`/`ApprovalResolved` events and
+the answer's `ToolCall`/`ToolResult` events land in the session trace, so
+IR replay of that trace reproduces an answered turn without asking again
+(pinned by agent-core's `ask_user_turn_replays_from_the_trace`).
+Offering the tool adds a dispatch arm to the loop program, so ACP turns
+hash differently from CLI turns; the CLI's program is unchanged.
 
 ## Streaming
 
@@ -140,6 +189,9 @@ optional cost field is not emitted yet.
      command runs and its output renders; reject → the agent explains and
      continues;
    - "allow always" stops further prompts; the `yolo` mode does the same;
+   - a prompt like "ask me which of two databases to use" raises a
+     chooser with one button per answer; picking one feeds the answer
+     back, and the agent continues with it;
    - cancel mid-turn returns the session to idle;
    - restarting Paseo and reopening the session replays the conversation;
    - the model picker lists your `models.yaml` aliases and switching one
