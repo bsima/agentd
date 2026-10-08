@@ -40,8 +40,27 @@ data: [DONE]\n\n";
 /// hangs until the client cancels and the agent drops the connection).
 const STALL: &str = "<stall>";
 
+/// An `ask_user` call (t-1594) with two options.
+const ASK_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ask\",\"function\":{\"name\":\"ask_user\",\"arguments\":\"{\\\"question\\\":\\\"Which database?\\\",\\\"options\\\":[\\\"Postgres\\\",\\\"SQLite\\\"]}\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+
+/// Permission-option marker: answer the request with the `cancelled`
+/// outcome instead of selecting an option.
+const CANCEL_PERMISSION: &str = "<cancelled>";
+
+/// Request bodies the mock provider received, in arrival order.
+type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Mock provider serving one canned SSE body per request, in order.
 fn spawn_mock_sse_server(bodies: Vec<&'static str>) -> u16 {
+    spawn_recording_mock_sse_server(bodies).0
+}
+
+/// [`spawn_mock_sse_server`] that also records every request body.
+fn spawn_recording_mock_sse_server(bodies: Vec<&'static str>) -> (u16, RecordedRequests) {
+    let recorded = RecordedRequests::default();
+    let sink = recorded.clone();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -78,6 +97,7 @@ fn spawn_mock_sse_server(bodies: Vec<&'static str>) -> u16 {
                 request_body.contains("\"stream\":true"),
                 "provider request must ask for streaming: {request_body}"
             );
+            sink.lock().unwrap().push(request_body.to_string());
             if body == STALL {
                 // Hold the socket open until the peer goes away.
                 let mut probe = [0u8; 1];
@@ -91,7 +111,7 @@ fn spawn_mock_sse_server(bodies: Vec<&'static str>) -> u16 {
             socket.flush().ok();
         }
     });
-    port
+    (port, recorded)
 }
 
 fn spawn_acp_agent(root: &std::path::Path, port: u16) -> Child {
@@ -162,6 +182,12 @@ impl AcpClient {
                     let option = permission_option
                         .unwrap_or_else(|| panic!("unexpected permission request: {frame}"));
                     permissions.push(frame["params"].clone());
+                    if option == CANCEL_PERMISSION {
+                        self.send(&format!(
+                            r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{"outcome":{{"outcome":"cancelled"}}}}}}"#
+                        ));
+                        continue;
+                    }
                     self.send(&format!(
                         r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{"outcome":{{"outcome":"selected","optionId":"{option}"}}}}}}"#
                     ));
@@ -804,5 +830,132 @@ fn shell_approval_reject_denies_without_running() {
     assert!(
         denied,
         "the denial surfaces as a failed tool_call_update: {updates:?}"
+    );
+}
+
+/// The `ask_user` tool message the model received in provider request
+/// `index`, parsed from the recorded request body.
+fn ask_user_tool_result(requests: &RecordedRequests, index: usize) -> String {
+    let requests = requests.lock().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[index]).unwrap();
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "call_ask")
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_else(|| panic!("no ask_user tool result in request {index}: {body}"))
+        .to_owned()
+}
+
+#[test]
+fn ask_user_is_a_paseo_chooser_and_the_answer_reaches_the_model() {
+    let root = temp_root("ask-answer");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![ASK_TURN, DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+
+    client.prompt(3, &session_id, "set up the service");
+    let (response, updates, permissions) = client.read_until_response(3, Some("1"));
+
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(
+        requests.lock().unwrap()[0].contains("\"ask_user\""),
+        "ACP sessions advertise ask_user to the model"
+    );
+    assert_eq!(permissions.len(), 1, "one question, one prompt");
+    let request = &permissions[0];
+    assert_eq!(request["toolCall"]["title"], "Which database?", "{request}");
+    assert_eq!(
+        request["toolCall"]["content"][0]["content"]["text"], "Which database?",
+        "{request}"
+    );
+    let options: Vec<(&str, &str, &str)> = request["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| {
+            (
+                option["optionId"].as_str().unwrap(),
+                option["name"].as_str().unwrap(),
+                option["kind"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        options,
+        [
+            ("0", "Postgres", "allow_once"),
+            ("1", "SQLite", "allow_once"),
+            ("dismiss", "Dismiss", "reject_once"),
+        ],
+        "same-kind allow options make Paseo render a chooser: {request}"
+    );
+    assert_eq!(ask_user_tool_result(&requests, 1), "SQLite");
+    assert!(
+        updates.iter().any(|update| {
+            update["update"]["sessionUpdate"] == "tool_call_update"
+                && update["update"]["status"] == "completed"
+                && update["update"]["rawOutput"] == "SQLite"
+        }),
+        "the answered question completes its tool call: {updates:?}"
+    );
+}
+
+#[test]
+fn ask_user_dismissal_reaches_the_model_and_the_turn_continues() {
+    let root = temp_root("ask-dismiss");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![ASK_TURN, DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+
+    client.prompt(3, &session_id, "set up the service");
+    let (response, _, permissions) = client.read_until_response(3, Some("dismiss"));
+
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(permissions.len(), 1);
+    let result = ask_user_tool_result(&requests, 1);
+    assert!(
+        result.contains("dismissed the question"),
+        "the model reads the dismissal: {result}"
+    );
+}
+
+/// yolo silences shell approvals, never questions: a question needs an
+/// answer only the user can give.
+#[test]
+fn ask_user_still_asks_in_yolo_mode() {
+    let root = temp_root("ask-yolo");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![ASK_TURN, DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{{"sessionId":"{session_id}","modeId":"yolo"}}}}"#
+    ));
+    client.read_until_response(3, None);
+
+    client.prompt(4, &session_id, "set up the service");
+    let (response, _, permissions) = client.read_until_response(4, Some("0"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(permissions.len(), 1, "the question still reaches the user");
+    assert_eq!(ask_user_tool_result(&requests, 1), "Postgres");
+}
+
+#[test]
+fn ask_user_cancelled_permission_cancels_the_turn() {
+    let root = temp_root("ask-cancel");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![ASK_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+
+    client.prompt(3, &session_id, "set up the service");
+    let (response, _, permissions) = client.read_until_response(3, Some(CANCEL_PERMISSION));
+
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "a cancelled question never resumes the loop"
     );
 }

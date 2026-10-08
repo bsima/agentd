@@ -54,14 +54,15 @@ fn write_replay_fixture(root: &std::path::Path, content: &str) -> std::path::Pat
     };
     // ACP mode gates shell Evals behind approval by default, and the gate is
     // part of the loop program — the fixture's effect ids must be computed
-    // under the same program identity.
+    // under the same program identity. ACP sessions also offer ask_user,
+    // whose dispatch arm is program too.
     let options = AgentLoopOptions {
         memory_tools: false,
         tool_names: vec![],
         output_contract: None,
         shell_requires_approval: true,
         infer_system_prompt: None,
-        ask_user: false,
+        ask_user: true,
     };
     let machine = agent_loop_ir_for_options(Model("test-model".into()), vec![], 16, &options);
     let hash = program_hash(&machine.program).unwrap();

@@ -518,6 +518,10 @@ struct Runtime {
     gc_state: agent_core::GcState,
     /// Gate the shell tool's Eval behind the approval protocol (t-1308.10).
     shell_requires_approval: bool,
+    /// Offer the `ask_user` question tool (t-1594). Only drivers that can
+    /// answer a question pause set it: the ACP turn driver does; the CLI's
+    /// one-shot/FIFO/stdin paths and the supervisor leave it off.
+    ask_user_tool: bool,
     /// Driver-owned facts persisted onto every pending-approval record
     /// (`PendingEffectRecord.runtime`) so `agent approvals` can rebuild
     /// this runtime after a full process restart.
@@ -1166,6 +1170,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
             ..Default::default()
         },
         shell_requires_approval: params.require_shell_approval,
+        ask_user_tool: false,
         resume_facts: ResumeFacts {
             model: resolved_model.alias.clone(),
             trace_path: trace_path.clone(),
@@ -2826,7 +2831,7 @@ fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
         output_contract: runtime.output_contract.clone(),
         shell_requires_approval: runtime.shell_requires_approval,
         infer_system_prompt: None,
-        ask_user: false,
+        ask_user: runtime.ask_user_tool,
     }
 }
 

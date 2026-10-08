@@ -126,6 +126,14 @@ fn infer_card_title(model: &str, task: Option<&str>) -> String {
     format!("infer ({model}): {preview}")
 }
 
+/// The question text of an `ask_user` approval request (kind `question`).
+fn question_text<'a>(kind: &str, request: &'a serde_json::Value) -> Option<&'a str> {
+    if kind != "question" {
+        return None;
+    }
+    request.get("question").and_then(|value| value.as_str())
+}
+
 /// Streamed text per live Infer op, appended by the session's
 /// `on_infer_delta` tap and reconciled (and removed) at `InferResult` time
 /// by the suppression rule below. Shared between the tap closure and the
@@ -293,20 +301,38 @@ pub(crate) fn map_event(
             ..
         } => {
             let id = ids.for_call(effect_id(effect), *op_id);
+            // The answered question keeps the title its pending call had.
+            let title = if name == agent_core::ASK_USER_TOOL {
+                arguments
+                    .get("question")
+                    .and_then(|value| value.as_str())
+                    .map_or_else(|| name.clone(), |question| question.trim().to_owned())
+            } else {
+                name.clone()
+            };
             vec![SessionUpdate::ToolCall(
-                ToolCall::new(id, name.clone())
+                ToolCall::new(id, title)
                     .kind(tool_kind(name))
                     .status(ToolCallStatus::InProgress)
                     .raw_input(arguments.clone()),
             )]
         }
-        Event::ToolResult { op_id, result, .. } => {
+        Event::ToolResult {
+            op_id,
+            name,
+            result,
+            ..
+        } => {
             let id = ids.for_result(*op_id);
+            let mut fields = ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .raw_output(result.clone());
+            // Show the user's chosen answer under the question.
+            if let (true, Some(answer)) = (name == agent_core::ASK_USER_TOOL, result.as_str()) {
+                fields = fields.content(vec![tool_text(answer)]);
+            }
             vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                id,
-                ToolCallUpdateFields::new()
-                    .status(ToolCallStatus::Completed)
-                    .raw_output(result.clone()),
+                id, fields,
             ))]
         }
         Event::ToolError { op_id, error, .. } => {
@@ -396,6 +422,17 @@ pub(crate) fn map_event(
             ..
         } => {
             let id = ids.for_effect(effect.effect_id.0.as_str());
+            // An ask_user question (t-1594) titles the call with the
+            // question itself; gated Evals with their command.
+            if let Some(question) = question_text(kind, request) {
+                return vec![SessionUpdate::ToolCall(
+                    ToolCall::new(id, question.to_owned())
+                        .kind(ToolKind::Other)
+                        .status(ToolCallStatus::Pending)
+                        .content(vec![tool_text(question)])
+                        .raw_input(request.clone()),
+                )];
+            }
             let title = request
                 .get("command")
                 .and_then(|value| value.as_str())
@@ -410,18 +447,24 @@ pub(crate) fn map_event(
         }
         Event::ApprovalResolved {
             effect_id,
+            kind,
             decision,
             ..
         } => {
             let id = ids.for_effect(effect_id.as_str());
-            let status = if decision == "approve" {
-                ToolCallStatus::InProgress
+            // Decisions are recorded as "approved"/"denied"
+            // (`ApprovalDecision::as_status_str`).
+            let mut fields = ToolCallUpdateFields::new();
+            if decision == "approved" {
+                fields = fields.status(ToolCallStatus::InProgress);
             } else {
-                ToolCallStatus::Failed
-            };
+                fields = fields.status(ToolCallStatus::Failed);
+                if kind == "question" {
+                    fields = fields.content(vec![tool_text("Dismissed")]);
+                }
+            }
             vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                id,
-                ToolCallUpdateFields::new().status(status),
+                id, fields,
             ))]
         }
         Event::TurnBudgetExhausted {
@@ -772,7 +815,7 @@ mod tests {
             pending_id: "pa-1".into(),
             effect_id: effect.effect_id.0.clone(),
             kind: "eval".into(),
-            decision: "approve".into(),
+            decision: "approved".into(),
             resolved_by: Some("paseo".into()),
             reason: None,
             timestamp: Utc::now(),
@@ -804,6 +847,82 @@ mod tests {
             executing.tool_call_id, pending_call.tool_call_id,
             "the executing eval reuses the pending approval's tool-call id"
         );
+    }
+
+    #[test]
+    fn question_surfaces_as_titled_call_then_answer_or_dismissal() {
+        let mut ids = ToolCallIds::default();
+        let effect = test_effect();
+        let request = serde_json::json!({
+            "question": "Which database?",
+            "options": ["Postgres", "SQLite"]
+        });
+        let requested = Event::ApprovalRequested {
+            run_id: "r".into(),
+            pending_id: "pa-1".into(),
+            kind: "question".into(),
+            request: request.clone(),
+            effect: Box::new(effect.clone()),
+            timestamp: Utc::now(),
+        };
+        let updates = map_event(&requested, &mut ids, &mut HashMap::new());
+        let SessionUpdate::ToolCall(pending_call) = &updates[0] else {
+            panic!("expected tool_call, got {updates:?}")
+        };
+        assert_eq!(pending_call.title, "Which database?");
+        assert_eq!(pending_call.status, ToolCallStatus::Pending);
+        assert_eq!(pending_call.content.len(), 1, "the question is the content");
+
+        let call = Event::ToolCall {
+            run_id: "r".into(),
+            op_id: 4,
+            parent_op_id: None,
+            name: "ask_user".into(),
+            arguments: request,
+            effect: Some(Box::new(effect.clone())),
+            timestamp: Utc::now(),
+        };
+        let updates = map_event(&call, &mut ids, &mut HashMap::new());
+        let SessionUpdate::ToolCall(answered) = &updates[0] else {
+            panic!("expected tool_call, got {updates:?}")
+        };
+        assert_eq!(answered.tool_call_id, pending_call.tool_call_id);
+        assert_eq!(answered.title, "Which database?");
+
+        let result = Event::ToolResult {
+            run_id: "r".into(),
+            op_id: 4,
+            parent_op_id: None,
+            name: "ask_user".into(),
+            result: serde_json::json!("SQLite"),
+            result_preview: "\"SQLite\"".into(),
+            duration_ms: 1,
+            timestamp: Utc::now(),
+        };
+        let updates = map_event(&result, &mut ids, &mut HashMap::new());
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected tool_call_update, got {updates:?}")
+        };
+        assert_eq!(update.tool_call_id, pending_call.tool_call_id);
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(update.fields.content.as_ref().map(Vec::len), Some(1));
+
+        let dismissed = Event::ApprovalResolved {
+            run_id: "r".into(),
+            pending_id: "pa-1".into(),
+            effect_id: effect.effect_id.0.clone(),
+            kind: "question".into(),
+            decision: "denied".into(),
+            resolved_by: Some("acp-client".into()),
+            reason: None,
+            timestamp: Utc::now(),
+        };
+        let updates = map_event(&dismissed, &mut ids, &mut HashMap::new());
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected tool_call_update, got {updates:?}")
+        };
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        assert!(update.fields.content.is_some(), "dismissal is labeled");
     }
 
     #[test]

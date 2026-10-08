@@ -7,13 +7,19 @@
 //! round-trip to the ACP client, the decision lands in
 //! `ApprovalConfig::resolutions`, and `resume_agent_loop_outcome` re-enters
 //! the checkpoint — the same tested resume path the approvals CLI drives.
+//!
+//! An `ask_user` question (t-1594) is the same pause with kind `question`:
+//! it becomes a chooser-shaped permission request (one option per answer
+//! plus a dismiss), and the chosen answer rides the resolution back into
+//! the machine as the tool result.
 
 use agent_client_protocol::schema::v1::{
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionId, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ContentBlock, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, TextContent, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use agent_core::{ApprovalDecision, ApprovalResolution, ChatMessage};
+use agent_core::{ApprovalDecision, ApprovalKind, ApprovalResolution, AskUserRequest, ChatMessage};
 use anyhow::{anyhow, Result};
 
 use crate::{agent_loop_options, finish_turn, Runtime};
@@ -73,17 +79,25 @@ pub(crate) async fn run_acp_turn(
                 checkpoint,
                 pending,
             } => {
-                let decision = if allow_all {
-                    ApprovalDecision::Approve
+                // A question always reaches the user: `allow always` is a
+                // verdict on shell commands and cannot pick an answer.
+                let (decision, answer) = if pending.kind == ApprovalKind::Question {
+                    match ask_question(cx, session_id, &pending).await? {
+                        QuestionReply::Answer(answer) => (ApprovalDecision::Approve, Some(answer)),
+                        QuestionReply::Dismissed => (ApprovalDecision::Deny, None),
+                        QuestionReply::Cancelled => return Ok(TurnOutcome::Cancelled),
+                    }
+                } else if allow_all {
+                    (ApprovalDecision::Approve, None)
                 } else {
                     match request_permission(cx, session_id, &pending).await? {
-                        PermissionReply::AllowOnce => ApprovalDecision::Approve,
+                        PermissionReply::AllowOnce => (ApprovalDecision::Approve, None),
                         PermissionReply::AllowAlways => {
                             allow_all = true;
                             runtime.shell_requires_approval = false;
-                            ApprovalDecision::Approve
+                            (ApprovalDecision::Approve, None)
                         }
-                        PermissionReply::Reject => ApprovalDecision::Deny,
+                        PermissionReply::Reject => (ApprovalDecision::Deny, None),
                         PermissionReply::Cancelled => return Ok(TurnOutcome::Cancelled),
                     }
                 };
@@ -93,7 +107,7 @@ pub(crate) async fn run_acp_turn(
                         decision,
                         resolved_by: Some("acp-client".into()),
                         reason: None,
-                        answer: None,
+                        answer,
                     },
                 );
                 runtime.ir_store = checkpoint.store.clone();
@@ -170,4 +184,186 @@ async fn request_permission(
         // Non-exhaustive enum: any future outcome fails safe.
         _ => PermissionReply::Reject,
     })
+}
+
+enum QuestionReply {
+    Answer(String),
+    Dismissed,
+    Cancelled,
+}
+
+/// Option id of the chooser's dismiss button. Answer options use their
+/// index ("0", "1", ...), which can never collide with it.
+const DISMISS_OPTION_ID: &str = "dismiss";
+
+/// The `session/request_permission` for an `ask_user` question (t-1594),
+/// shaped for Paseo's chooser path: one `allow_once` option per answer
+/// (two or more same-kind allow options make Paseo render a chooser, and
+/// it never auto-accepts choosers), plus one `reject_once` dismiss. Paseo
+/// shows the tool call's text content as the prompt under its title.
+fn question_permission_request(
+    session_id: &SessionId,
+    pending: &agent_core::ApprovalRequest,
+    question: &AskUserRequest,
+) -> RequestPermissionRequest {
+    let tool_call = ToolCallUpdate::new(
+        ToolCallId::new(pending.effect.effect_id.0.clone()),
+        ToolCallUpdateFields::new()
+            .kind(ToolKind::Other)
+            .status(ToolCallStatus::Pending)
+            .title(question.question.clone())
+            .content(vec![ToolCallContent::from(ContentBlock::Text(
+                TextContent::new(question.question.clone()),
+            ))])
+            .raw_input(pending.request.clone()),
+    );
+    let mut options: Vec<PermissionOption> = question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            PermissionOption::new(
+                index.to_string(),
+                answer.clone(),
+                PermissionOptionKind::AllowOnce,
+            )
+        })
+        .collect();
+    options.push(PermissionOption::new(
+        DISMISS_OPTION_ID,
+        "Dismiss",
+        PermissionOptionKind::RejectOnce,
+    ));
+    RequestPermissionRequest::new(session_id.clone(), tool_call, options)
+}
+
+/// Map the client's choice back to an answer. An unknown option id is a
+/// dismissal, never a guessed answer.
+fn question_reply(question: &AskUserRequest, outcome: RequestPermissionOutcome) -> QuestionReply {
+    match outcome {
+        RequestPermissionOutcome::Selected(selected) => selected
+            .option_id
+            .0
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| question.options.get(index))
+            .map_or(QuestionReply::Dismissed, |answer| {
+                QuestionReply::Answer(answer.clone())
+            }),
+        RequestPermissionOutcome::Cancelled => QuestionReply::Cancelled,
+        // Non-exhaustive enum: any future outcome is a dismissal.
+        _ => QuestionReply::Dismissed,
+    }
+}
+
+async fn ask_question(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    pending: &agent_core::ApprovalRequest,
+) -> Result<QuestionReply> {
+    let question = AskUserRequest::parse(&pending.request)
+        .map_err(|err| anyhow!("malformed ask_user question payload: {err}"))?;
+    let request = question_permission_request(session_id, pending, &question);
+    let response = cx
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|err| anyhow!("session/request_permission failed: {err}"))?;
+    Ok(question_reply(&question, response.outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
+    use agent_core::{
+        effect_location, program_hash, BlockId, DynamicPath, EffectKind, EffectSite, Model,
+    };
+
+    fn pending_question() -> (agent_core::ApprovalRequest, AskUserRequest) {
+        let machine = agent_core::agent_loop_ir(Model("test-model".into()), vec![], 4);
+        let hash = program_hash(&machine.program).unwrap();
+        let site = EffectSite {
+            block: BlockId(0),
+            instruction_index: 0,
+        };
+        let effect =
+            effect_location(hash, EffectKind::Tool, site, DynamicPath::at_entry(0)).unwrap();
+        let question = AskUserRequest::parse(&serde_json::json!({
+            "question": "Which database should the service use?",
+            "options": ["Postgres", "SQLite", "Keep both"]
+        }))
+        .unwrap();
+        let pending = agent_core::ApprovalRequest {
+            pending_id: "pa-1".into(),
+            effect,
+            kind: ApprovalKind::Question,
+            request: question.request_value(),
+        };
+        (pending, question)
+    }
+
+    #[test]
+    fn question_request_is_a_paseo_chooser() {
+        let (pending, question) = pending_question();
+        let request = question_permission_request(&SessionId::new("s-1"), &pending, &question);
+        let wire = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            wire["toolCall"]["toolCallId"],
+            pending.effect.effect_id.0.as_str()
+        );
+        assert_eq!(
+            wire["toolCall"]["title"],
+            "Which database should the service use?"
+        );
+        assert_eq!(
+            wire["toolCall"]["content"][0]["content"]["text"],
+            "Which database should the service use?",
+            "Paseo renders the text content as the prompt: {wire}"
+        );
+        let summary: Vec<(&str, &str, &str)> = wire["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| {
+                (
+                    option["optionId"].as_str().unwrap(),
+                    option["name"].as_str().unwrap(),
+                    option["kind"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("0", "Postgres", "allow_once"),
+                ("1", "SQLite", "allow_once"),
+                ("2", "Keep both", "allow_once"),
+                ("dismiss", "Dismiss", "reject_once"),
+            ],
+            "two or more same-kind allow options make Paseo render a chooser"
+        );
+    }
+
+    #[test]
+    fn question_outcomes_map_to_answer_dismissal_and_cancel() {
+        let (_, question) = pending_question();
+        let selected = |id: &str| {
+            question_reply(
+                &question,
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id.to_owned())),
+            )
+        };
+        assert!(matches!(selected("1"), QuestionReply::Answer(answer) if answer == "SQLite"));
+        assert!(matches!(selected("dismiss"), QuestionReply::Dismissed));
+        assert!(
+            matches!(selected("7"), QuestionReply::Dismissed),
+            "an out-of-range id is never a guessed answer"
+        );
+        assert!(matches!(
+            question_reply(&question, RequestPermissionOutcome::Cancelled),
+            QuestionReply::Cancelled
+        ));
+    }
 }

@@ -141,6 +141,9 @@ impl AcpServer {
             otel_active: self.otel_active,
         };
         let mut runtime = build_runtime(&self.args, params).await?;
+        // ACP clients can answer questions (session/request_permission
+        // choosers), so the loop offers `ask_user` here and nowhere else.
+        runtime.ask_user_tool = true;
         context_budget.store(
             runtime.config.context_budget as u64,
             std::sync::atomic::Ordering::Relaxed,
