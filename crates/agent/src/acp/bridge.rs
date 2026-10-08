@@ -360,6 +360,7 @@ pub(crate) struct AcpTraceSink {
     ids: Mutex<ToolCallIds>,
     streamed: StreamedText,
     context_budget: ContextBudget,
+    pub(crate) usage: Arc<Mutex<agent_core::RunUsage>>,
 }
 
 impl AcpTraceSink {
@@ -373,6 +374,7 @@ impl AcpTraceSink {
             ids: Mutex::new(ToolCallIds::default()),
             streamed,
             context_budget,
+            usage: Arc::new(Mutex::new(agent_core::RunUsage::default())),
         }
     }
 }
@@ -412,6 +414,26 @@ impl agent_core::TraceSink for AcpTraceSink {
         };
         for update in updates {
             let _ = self.tx.send(ForwarderMsg::update(update));
+        }
+        if let Event::InferResult {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_input_tokens,
+            cost_micro_usd,
+            ..
+        } = event
+        {
+            self.usage
+                .lock()
+                .expect("ACP usage poisoned")
+                .observe_infer(
+                    *input_tokens,
+                    *output_tokens,
+                    *total_tokens,
+                    *cached_input_tokens,
+                    *cost_micro_usd,
+                );
         }
         // ACP's `used` means tokens in the current context, not cumulative
         // run usage. Root inferences describe the session window; child

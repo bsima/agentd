@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     CurrentModeUpdate, PromptResponse, SessionId, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionResponse, SetSessionModeResponse, StopReason,
+    SessionUpdate, SetSessionConfigOptionResponse, SetSessionModeResponse, StopReason, Usage,
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
 use anyhow::Result;
@@ -53,6 +53,7 @@ pub(crate) struct SessionContext {
     pub(crate) streamed: StreamedText,
     pub(crate) update_tx: mpsc::UnboundedSender<ForwarderMsg>,
     pub(crate) context_budget: super::bridge::ContextBudget,
+    pub(crate) usage: Arc<std::sync::Mutex<agent_core::RunUsage>>,
     pub(crate) args: Arc<Args>,
 }
 
@@ -68,6 +69,7 @@ pub(crate) async fn session_actor(
         streamed,
         update_tx,
         context_budget,
+        usage,
         args,
     } = ctx;
     while let Some(command) = cmd_rx.recv().await {
@@ -90,7 +92,12 @@ pub(crate) async fn session_actor(
                                 } else {
                                     StopReason::EndTurn
                                 };
-                                let _ = responder.respond(PromptResponse::new(stop_reason));
+                                let totals = usage.lock().expect("ACP usage poisoned");
+                                let reply = PromptResponse::new(stop_reason).usage(
+                                    Usage::new(totals.total_tokens, totals.input_tokens, totals.output_tokens)
+                                        .cached_read_tokens(totals.cached_input_tokens),
+                                );
+                                let _ = responder.respond(reply);
                             }
                             Ok(TurnOutcome::Cancelled) => {
                                 let _ = responder

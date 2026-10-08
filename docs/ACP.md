@@ -109,9 +109,16 @@ carries the authoritative content.
 Context-window usage is reported through ACP `usage_update` notifications. The
 `used` value is the assembled root context (provider-reported input plus output
 once available, with the runtime estimator reported at dispatch) and `size` is the
-selected model's context ceiling; Paseo renders this as its context gauge. Model
-switches update the ceiling immediately. Cumulative usage/cost totals remain in
-the trace (`agent cost`); ACP's optional cost field is not emitted yet.
+selected model's context ceiling. Model switches update the ceiling immediately.
+Paseo's ACP adapter (inspected in 0.2.3 and 0.9.2) ignores `usage_update`
+notifications, so its context gauge does **not** respond to these values.
+As a compatibility path, completed `session/prompt` responses also include
+ACP's optional (unstable) cumulative token usage (`inputTokens`, `outputTokens`,
+`totalTokens`, and `cachedReadTokens` when available); Paseo consumes those
+for its token totals. Paseo's ACP adapter does not map response usage to its
+context-window fields, so this cannot restore the gauge in that version.
+Cumulative usage/cost totals remain in the trace (`agent cost`); ACP's
+optional cost field is not emitted yet.
 
 ## Manual smoke test
 

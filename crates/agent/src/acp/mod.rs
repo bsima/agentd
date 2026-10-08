@@ -119,6 +119,7 @@ impl AcpServer {
             streamed.clone(),
             context_budget.clone(),
         ));
+        let usage = sink.usage.clone();
         let require_shell_approval =
             self.args.require_shell_approval || self.args.acp_shell_approval;
         let params = SessionParams {
@@ -205,6 +206,7 @@ impl AcpServer {
                 streamed,
                 update_tx,
                 context_budget,
+                usage,
                 args: self.args.clone(),
             },
         ));

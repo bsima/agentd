@@ -230,6 +230,31 @@ fn prompt_turn_streams_deltas_before_the_response() {
 }
 
 #[test]
+fn prompt_response_reports_cumulative_token_usage_for_paseo() {
+    let root = temp_root("usage");
+    let port = spawn_mock_sse_server(vec![TEXT_TURN, TEXT_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+
+    for (id, multiplier) in [(3, 1), (4, 2)] {
+        client.prompt(id, &session_id, "greet");
+        let (response, updates, _) = client.read_until_response(id, None);
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        let usage = &response["result"]["usage"];
+        assert_eq!(usage["inputTokens"], 3 * multiplier, "{response}");
+        assert_eq!(usage["outputTokens"], 4 * multiplier, "{response}");
+        assert_eq!(usage["totalTokens"], 7 * multiplier, "{response}");
+        assert!(
+            updates.iter().any(|update| {
+                update["update"]["sessionUpdate"] == "usage_update"
+                    && update["update"]["size"].as_u64().unwrap_or(0) > 0
+            }),
+            "standard ACP context updates still arrive: {updates:?}"
+        );
+    }
+}
+
+#[test]
 fn session_cancel_mid_turn_returns_cancelled() {
     let root = temp_root("cancel");
     let port = spawn_mock_sse_server(vec![STALL]);
