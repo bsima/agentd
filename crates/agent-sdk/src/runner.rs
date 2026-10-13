@@ -413,7 +413,9 @@ async fn execute(
         // In-process runs do no GC by design (deterministic, no collection
         // noise). Note this differs from Session runs, which spawn the
         // `agent` CLI and therefore inherit its defaults — now
-        // `--gc stack` + `--gc-cache preserve` (t-1348).
+        // `--gc stack` + `--gc-cache preserve` (t-1348) with GC telemetry
+        // on (t-1608). With GC off no collection runs, so `gc_log` here
+        // has nothing to report.
         gc: GcMode::None,
         gc_threshold: 0.85,
         gc_log: false,

@@ -114,8 +114,8 @@ Corpus: 3,751 traces, 2026-05-20 to 2026-10-08, 64,456 Infer calls,
 about 20 models (measured).
 
 - **No GC telemetry exists.** Zero `gc_collect`, `gc_truncate`, or
-  `context_overflow` events. `--gc-log` defaults to off, and Paseo
-  launches `agent --acp` without it. Only 4.3% of InferCalls carry a
+  `context_overflow` events. `--gc-log` defaulted to off, and Paseo
+  launched `agent --acp` without it (on by default since t-1608). Only 4.3% of InferCalls carry a
   full prompt. Strategy, drop counts, marker and hot-keep counters, and
   `prefix_invalidated` are therefore unmeasurable (measured).
 - **GC fired in about 17 of 3,525 runs** (inferred: a >2% drop in
@@ -295,8 +295,9 @@ prompt are the starting design.
 
 - **CLI flags only** (decided), like every GC option today. No prompt
   frontmatter, `agent.md` spec, or SDK builder surface.
-- **GC telemetry on by default** (decided). `--gc-log` adds trace events
-  and never changes what the model sees.
+- **GC telemetry on by default** (decided; shipped in t-1608). `--gc-log`
+  adds trace events and never changes what the model sees;
+  `--gc-log=false` opts out.
 - **The low-water target is an option** (`--gc-low-water`), not a new
   default.
 - **Eval budget**: none set; providers are mostly flat-rate.

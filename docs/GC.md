@@ -128,7 +128,7 @@ timings x 3 strategies x 2 cache policies):
 agent --gc <strategy>          # none | ring | mark-sweep | stack | semantic | generational (default: stack)
 agent --gc-threshold <0.0-1.0> # trigger GC at this fraction of budget (default: 0.85)
 agent --gc none                # disable GC entirely (hard overflow = error)
-agent --gc-log                 # emit gc_collect trace events (for debugging)
+agent --gc-log=<bool>          # emit gc_collect/gc_truncate trace events (default: true; bare --gc-log = true)
 agent --gc-cache <mode>        # prefix-cache policy: preserve | ignore (default: preserve)
 agent --gc-timing <when>       # threshold | catch-overflow | eager | every:N (default: threshold)
 agent --gc-semantic-window <N> # semantic: recent-window size (centroid + recency floor; default: 8)
@@ -153,6 +153,23 @@ don't need it at all.
 ```
 This is essential for debugging task failures — you want to know which messages
 were dropped or summarized.
+
+GC telemetry is on by default (t-1608): the events add trace output and
+never change what the model sees. Pass `--gc-log=false` to turn it off;
+bare `--gc-log` still means on, so older launch scripts keep working. The
+default covers one-shot runs, NUL/FIFO sessions, `agent --acp` sessions,
+and runs resumed with `agent approvals`.
+
+Where the events land: every run writes them as `Custom` events (`name`
+`gc_collect`, `gc_truncate`, or `gc_semantic_embed`) to the run's trace
+file, `~/.local/share/agent/traces/<run-id>.jsonl` (or
+`<state-dir>/traces/<run-id>.jsonl` under `--state-dir`; `XDG_DATA_HOME`
+is not consulted). With `--json` (alias of `--debug`) stdout mirrors every
+trace line, GC events included, plus the `agent_start` / `agent_complete`
+envelopes; the `agent_start` envelope carries `data.config.trace_path`,
+and stderr prints `trace: <path>`. No GC event goes to stderr. ACP
+clients see none of them: the bridge maps `Custom` events to no session
+update.
 
 `--gc-cache` selects the prompt-caching policy (see the Prompt Caching section
 for the full guide):

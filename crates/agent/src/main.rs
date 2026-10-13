@@ -167,8 +167,18 @@ struct Args {
     /// Trigger GC at this fraction of the model context budget.
     #[arg(long, default_value_t = 0.85)]
     gc_threshold: f32,
-    /// Emit gc_collect trace events.
-    #[arg(long)]
+    /// Emit gc_collect / gc_truncate / gc_semantic_embed trace events
+    /// (default: on, t-1608). Trace output only; never changes what the
+    /// model sees. Bare `--gc-log` still means on; pass `--gc-log=false`
+    /// to turn it off.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     gc_log: bool,
     /// When GC runs: `threshold` (default) collects past the estimated
     /// budget fraction; `catch-overflow` trusts the provider instead of the
@@ -2194,14 +2204,15 @@ async fn resume_run(
         replay: None,
         trace_full_prompt_ir: false,
         trace_full_payloads: false,
-        // Mirrors the CLI defaults (--gc stack, --gc-cache preserve): the
-        // resumed run should collect the way a fresh run would.
+        // Mirrors the CLI defaults (--gc stack, --gc-cache preserve,
+        // --gc-log on): the resumed run should collect and report the way a
+        // fresh run would.
         gc: GcMode::Stack(StackFrameGc {
             hot_keep: true,
             preserve_prefix: true,
         }),
         gc_threshold: 0.85,
-        gc_log: false,
+        gc_log: true,
         gc_timing: GcTiming::Threshold,
         context_budget: resolved_model.context,
         pricing: pricing_table,
@@ -3964,6 +3975,20 @@ mod tests {
         let round_tripped: Checkpoint =
             serde_json::from_str(&serde_json::to_string(&with_budget).unwrap()).unwrap();
         assert_eq!(round_tripped.discovered_budget, Some(120_000));
+    }
+
+    /// t-1608: GC telemetry is on by default. Bare `--gc-log` (the old
+    /// opt-in spelling) still parses as on and never swallows the prompt;
+    /// `--gc-log=false` turns it off.
+    #[test]
+    fn gc_log_defaults_on_and_keeps_bare_flag() -> Result<()> {
+        assert!(Args::try_parse_from(["agent", "hi"])?.gc_log);
+        let bare = Args::try_parse_from(["agent", "--gc-log", "hi"])?;
+        assert!(bare.gc_log);
+        assert_eq!(bare.prompt.as_deref(), Some("hi"));
+        assert!(Args::try_parse_from(["agent", "--gc-log=true"])?.gc_log);
+        assert!(!Args::try_parse_from(["agent", "--gc-log=false", "hi"])?.gc_log);
+        Ok(())
     }
 
     #[test]

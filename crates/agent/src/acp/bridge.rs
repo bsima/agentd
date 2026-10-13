@@ -742,6 +742,24 @@ mod tests {
         assert!(map_event(&event, &mut ids, &mut HashMap::new()).is_empty());
     }
 
+    /// t-1608: GC telemetry is on by default, so ACP sessions now emit
+    /// gc_collect / gc_truncate trace events. They stay trace-only: ACP
+    /// clients see no session update and the usage gauge does not move.
+    #[test]
+    fn gc_telemetry_events_map_to_nothing() {
+        let mut ids = ToolCallIds::default();
+        for name in ["gc_collect", "gc_truncate", "gc_semantic_embed"] {
+            let event = Event::Custom {
+                run_id: "r".into(),
+                name: name.into(),
+                data: serde_json::json!({ "type": name, "tokens_before": 9, "tokens_after": 3 }),
+                timestamp: Utc::now(),
+            };
+            assert!(map_event(&event, &mut ids, &mut HashMap::new()).is_empty());
+            assert!(usage_update(&event, 1000).is_none());
+        }
+    }
+
     #[test]
     fn eval_call_and_result_correlate_by_op() {
         let mut ids = ToolCallIds::default();
