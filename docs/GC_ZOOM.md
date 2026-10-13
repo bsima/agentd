@@ -1,6 +1,8 @@
 # Zoomable eviction and UniiChat: an assessment (t-1597)
 
-Status: assessment, 2026-10-08. No code changed. This document answers
+Status: assessment, 2026-10-08; item 1 (zoom) **implemented** as t-1609
+(`--gc-zoom`) — see "Implemented: zoom (t-1609)" below for what shipped
+and where it deviates from this sketch. This document answers
 t-1597's questions with evidence and recommends what to build. Each claim
 is marked **measured** (a command or test was run), **read** (verified in
 source, with a file:line), or **inferred/guessed**.
@@ -301,6 +303,118 @@ prompt are the starting design.
 - **The low-water target is an option** (`--gc-low-water`), not a new
   default.
 - **Eval budget**: none set; providers are mostly flat-rate.
+
+## Implemented: zoom (t-1609)
+
+`agent --gc-zoom` (CLI only; any strategy; an error with `--gc none`,
+where nothing is evicted and the tool would only cost tokens).
+
+**What shipped (read against the code):**
+
+- **The arm.** `AgentLoopOptions::zoom: Option<ZoomOptions>` appends one
+  dispatch/body block pair after every native arm (ask_user included), so
+  the zoom-free program keeps every block id. The body is one `Let` of a
+  new pure expression, `Expr::Zoom { history, arguments, page_chars }`
+  (`ir.rs`; semantics `zoom::zoom_history`), then `Goto append_tool`. No
+  effect, no trace event, no replay record. The offer follows the
+  program (`program_dispatches_zoom`, the `ask_user` pattern).
+- **Schema.** `{address: string, page?: integer}`. `address` is `#N` (a
+  position in the append-only `history`, `#0` first), `#A-#B` (a
+  consecutive range, rendered message by message), or a tool-call id
+  (alias for its result; on duplicates the most recent, with a `note:`
+  naming the others). A bare digit string is a position unless it is a
+  call id; the empty id is rejected as a handle and never printed as one.
+  A JSON integer is accepted as a position. `address` stays a string so a
+  summary strategy (t-1612) can add tree addresses without a schema
+  break.
+- **Result.** One header line (`#7 tool result of shell call-3:`,
+  `#1 user message:`, `#4 assistant message:` with its tool calls as
+  `tool call <id>: <name> <args JSON>` lines; images noted, not inlined),
+  then the content exactly as it entered history. Bad addresses and pages
+  are `{"ok":false,"error":...}` tool results (errors-as-values).
+- **Paging.** `page_chars = clamp(context_budget / 8 × 3, 1 KiB, 16 KiB)`:
+  one page costs at most an eighth of the window under the GC estimator
+  (3 chars/token) — room for the task, the working set, and the 15%
+  headroom above the 0.85 trigger — and at most 16 KiB, the `recall`
+  retrieval cap. Pages are char slices that reassemble exactly; each
+  carries `[zoom #7 page p/P]` and a next-page instruction. The page size
+  is program (budget-dependent hash when zoom is on).
+- **Markers.** The interpreter records `GcState.zoom` (a `ZoomBook`:
+  decoded message id → history position, call id → latest result
+  position) before every Infer that offers `zoom` and whose prompt is a
+  history var; every other call clears it. The shared renderers in
+  `gc.rs` read it; strategies never do. Wording on, by artifact:
+  run markers `[gc: N evicted — shell call-3 #7, user #1, assistant #4;
+  recover: zoom #1-#7 (exact) — do not guess; re-run a call only if its
+  result may have changed]` (the re-run clause only when the run held a
+  tool result); frames `[frame call-3 #7: shell(args) -> preview —
+  evicted; recover: zoom #7 (exact); re-run only if the result may have
+  changed]` (`[zoom #6]` / `[call: #6]` when the narration or arguments
+  preview was truncated); elisions `[gc: result elided — cat x (call-3,
+  #7); recover: zoom #7 (exact) — …]`; the coalesced line `recover: zoom
+  #2-#44 (exact) …`; the ledger `[evicted — zoom #7]` and footer
+  `evicted results are recoverable exactly: zoom the #address — do not
+  guess; re-run a call only if its result may have changed.` Escalation
+  stays (demoted): `[gc: 'call-7' evicted 3 times — this content cannot
+  stay in context: zoom #12 for only the part you need and restate it in
+  your reply, summarize it into memory (remember), or ask the user — do
+  not re-fetch it again]`. Off, every byte is the historical text.
+- **Write-barrier.** `zoom` results are recall sources while zoom is
+  offered (not unconditionally: a hallucinated `zoom` call on a zoom-free
+  run is an unknown-tool error and must not move the hot set). They match
+  through their decoded page, and a match marks the page's own chunks
+  hot, so hot-keep protects the page the model asked for.
+- **Guidance.** The `zoom` tool description, a §2.4 zoom line appended to
+  the GC block, and a minimal-variant zoom sentence — all keyed on the
+  call offering `zoom` (docs/GUIDANCE.md).
+- **ACP.** A zoom has no effect events, so the bridge renders each
+  requested `zoom` from the turn's `InferResult` as a completed `Read`
+  card titled `zoom #7` (page noted when > 1).
+- **Approvals resume.** `ResumeFacts.gc_zoom` keeps the arm through an
+  output-contract repair after an approval resume (the resumed program
+  itself comes from the checkpoint).
+
+**Deviations from the sketch above, and why:**
+
+- Tool name `zoom`, not `recall_evicted`: it matches UniiChat and Ava and
+  collides with nothing; it is now reserved (`RESERVED_TOOL_NAMES`).
+- Arguments `{address, page?}`, not `{call_id, page?}`: positions address
+  every message kind (decided); call ids are an alias.
+- A new `Expr::Zoom` instead of reusing `SelectToolResults`: that
+  expression resolves only tool-result ids, drops duplicates to the
+  first occurrence, and wraps results as user messages; zoom needs
+  positions, ranges, most-recent duplicates, raw content, and paging.
+- Ranges (`#A-#B`) are implemented now, not deferred: markers name each
+  run's span, so the span had to be zoomable.
+- The tool is offered only when `--gc-zoom` is set, not whenever GC is
+  enabled (the 2026-10-08 opt-in decision supersedes "advertise it only
+  when GC is enabled").
+
+**Verified (offline):** zoom off, the cell program hashes to the
+`program_hash` the recorded behavioral corpus carries
+(`zoom_off_program_matches_the_recorded_corpus`) and every existing
+recording replays strictly; the default loop program equals the
+zoom-free builder's (`zoom_option_shapes_the_program_only_when_set`);
+every evicted message is addressed under every strategy and cache policy
+(`every_evicted_message_is_addressed_under_every_strategy`); zoom-off
+annotations never mention zoom; a scripted stack session recovers an
+evicted result by address, the page is write-barrier hot, no effect
+event names the zoom, and the session replays byte-identically from its
+trace (`plumbing_zoom_recovers_by_address_and_replays`).
+
+**Behavioral eval:** arms {stack, generational} × {re-run markers, zoom}
+in `gc_behavior_evals.rs`, a `zoom` column (zoom-call count), and a
+`counter-drift` fixture whose early call issues a new ticket on every
+run, so re-running cannot recover the value and `rot` flags an answer
+carrying a re-issued ticket. Recording status: evals/gc/README.md
+"Zoom (t-1609)".
+
+**Observed while building (not changed here):** per-content eviction
+counts grow by one per collection that removes the content, and every
+Infer re-collects the full history, so a message evicted in three
+consecutive collections escalates without any re-fetch. Escalated lines
+therefore appear sooner than the t-1370 rationale ("the third eviction
+is the observed loop signature") suggests. Worth its own look.
 
 ## The open questions
 

@@ -13,7 +13,8 @@ Status: **all five strategies are implemented** — `ring`, `mark-sweep`,
 t-1348), `semantic`, and `generational` — along with the hard guards,
 eviction markers with escalation, the progress ledger, the write-barrier
 `hot-keep` and citation `cited-keep` modifiers, cache-prefix
-preservation, and the collect-on-overflow backstop. Everything is
+preservation, the collect-on-overflow backstop, and the opt-in `zoom`
+modifier (exact recall of evicted messages, t-1609). Everything is
 exercised by an offline eval matrix plus recorded behavioral evals
 (`evals/gc/README.md`).
 
@@ -37,6 +38,7 @@ Current defaults: `--gc stack --gc-cache preserve --gc-timing threshold
 | `generational` | Tiers the window from live signals (nursery/hot/warm/cold) and elides cold bodies before evicting anything | The synthesis strategy — candidate future default; its first online round matched mark-sweep's wins on 3/4 canon fixtures (default stays `stack`) | `--gc generational` |
 | `cited-keep` (default on; flag applies to `semantic` — `generational`'s warm tier bakes citations in) | Messages cited by later ones (id mentions, `context_refs`) join the protected set | A recent turn builds on an old, off-topic tool result | `--gc-cited-keep false` to disable |
 | `hot-keep` (default on, every strategy) | Content the model re-fetched or recalled after eviction (write-barrier hot set, t-1362) joins the protected set | Breaks the evict → re-fetch → re-evict loss loop (t-1369 finding 3) | `--gc-hot-keep false` to disable |
+| `zoom` (opt-in, every strategy) | Offers the `zoom` tool, which reads any evicted message back exactly from the append-only session log; every marker names its messages by `#N` address (t-1609, [GC_ZOOM.md](GC_ZOOM.md)) | Results that cannot be re-run safely or identically (counters, clocks, side effects); exact recall of evicted user and assistant turns | `--gc-zoom` |
 | `none` | No GC; overflow is a hard error | Deterministic evals | `--gc none` |
 | cache `preserve` (default) | Pins system prompt + oldest ~25% of budget; evicts interior | Cached providers: zero prefix invalidations | `--gc-cache preserve` |
 | cache `ignore` | Front-drop allowed; maximal reclaim | No prompt caching in use | `--gc-cache ignore` |
@@ -137,7 +139,15 @@ agent --gc-cited-keep <bool>   # semantic: protect messages cited by later ones 
 agent --gc-hot-keep <bool>     # every strategy: protect re-fetched/recalled content (default: true)
 agent --gc-nursery <N>         # generational: nursery size (recency floor; default: 8)
 agent --gc-warm-floor <f>      # generational: warm similarity floor when an embedder is configured (default: 0.25)
+agent --gc-zoom                # every strategy: offer the zoom tool + #N-addressed markers (default: off; error with --gc none)
 ```
+
+`--gc-zoom` (t-1609) is a modifier, not a strategy: it changes how markers
+tell the model to recover, never what a strategy evicts. It requires an
+active strategy — with `--gc none` nothing is ever evicted, so the flag
+errors like `--gc-timing` does instead of offering a tool with nothing to
+recover. Off, the loop program, its hash, every replay fixture, and every
+marker byte are unchanged. See [GC_ZOOM.md](GC_ZOOM.md) for the design.
 
 `--gc none` disables collection entirely (overflow becomes a hard error) and
 is important for deterministic evals that must not have GC noise in their
@@ -233,6 +243,7 @@ Cross-strategy modifier:
 |--------------|----------------------------------------------------------------|-------------|
 | `cited-keep` | Messages cited by later ones join the protected set (t-1351)   | implemented for `semantic` (`--gc-cited-keep`, default on) |
 | `hot-keep`   | Re-acquired-after-eviction content joins the protected set (t-1362) | implemented for every strategy (`--gc-hot-keep`, default on) |
+| `zoom`       | Exact recall of any evicted message by its history address; markers carry `#N` (t-1609) | implemented for every strategy (`--gc-zoom`, default off) |
 
 ## What the model sees: markers, frames, the ledger, escalation
 
@@ -264,6 +275,19 @@ you and the model will see:
   auto-maintained "you are here" — the fix for the restart loop, where a
   post-collection model concluded it was at step 1 and re-ran finished
   work.
+- **With `--gc-zoom`** (t-1609): every annotation above names what it
+  stands for by address — `#N` is the message's position in the
+  session's append-only log — and recovery leads with the `zoom` tool,
+  which returns the original exactly, paged, without re-running
+  anything: `[gc: 2 evicted — shell call-3 #7, user #1; recover: zoom
+  #1-#7 (exact) — do not guess; re-run a call only if its result may have
+  changed]`, `[frame call-3 #7: shell(cat logs/x.log) -> first line... —
+  evicted; recover: zoom #7 (exact); re-run only if the result may have
+  changed]`, ledger entries `[evicted — zoom #7]`. Escalation stays as the
+  honest exit, demoted behind zoom: `[gc: 'call-7' evicted 3 times — this
+  content cannot stay in context: zoom #12 for only the part you need and
+  restate it in your reply, summarize it into memory (remember), or ask
+  the user — do not re-fetch it again]`.
 - **Protection you don't see**: the system prompt and the last user
   message always survive; content the model re-fetched or recalled after
   eviction stops being evictable (`hot-keep`); results cited by later
@@ -663,6 +687,11 @@ re-run tool call is a fresh JSON ENVELOPE (differing only in
   checked against the corpus (a re-run call returning an evicted payload —
   t-1369's re-fetch loop); `recall` results additionally match every other
   window message's chunks (a memory hit re-injecting live content).
+  `zoom` results (t-1609, only while the call offers zoom) are recall
+  sources too, matched through their decoded page — a zoomed JSON tool
+  envelope arrives as one escaped line inside the page frame — and a
+  match also marks the zoom page's own chunks hot, so hot-keep protects
+  the page the model asked for.
   Matches land in `GcState.recall_hot`, reported on the `gc_collect`
   event as `recall_overlap_events` (this pass) and `recall_hot`
   (cumulative set size). Both sets are runtime-only — `GcState` never
@@ -715,6 +744,25 @@ the cited-keep interplay). Strategy integration is honest, not
 duplicated: a stack frame pop's surviving `[frame call-id: ...]`
 annotation IS the marker for its results (never double-marked), and
 mark-sweep's in-place elision annotation is the same `[gc: ...]` family.
+
+**Recovery follows the tools offered (t-1609).** The recovery clause is
+not the strategy's choice: the shared renderers (`build_eviction_markers`,
+the frame summary, the elision line, the escalation line, the coalesced
+line, the ledger) read the call's tool offer through `GcState.zoom`, an
+address book the interpreter builds before each Infer that offers the
+`zoom` tool (message id → position in the append-only `history`). With
+it, every evicted message is named by its `#N` address — tool-result
+items carry theirs, user and assistant turns render as `user #N` /
+`assistant #N` instead of window ordinals, each run's clause names the
+run's `#A-#B` span, fused markers widen the surviving span, a dropped
+older marker's zoom targets join the absorbing run, and the coalesced
+line spans every eviction — and recovery reads `recover: zoom <span>
+(exact) — do not guess`, plus `; re-run a call only if its result may
+have changed` when the run held a tool result. Without the book (zoom
+off, sub-infer children, the Op runtime) every byte is the historical
+text above. Pinned by `gc_zoom_tests.rs`: every evicted message is
+addressed under every strategy and cache policy; zoom off, no annotation
+mentions zoom; zoom changes no byte outside GC's own annotations.
 
 **Marker economics (all enforced by the offline matrix):**
 
@@ -1236,6 +1284,7 @@ eval set. This also lets us tune `--gc-threshold` empirically.
 
 - `crates/agent-core/src/gc.rs` — the `ContextGc` trait, all strategy impls, `GcState` (owned by the runtime, threaded into `collect`), the `truncate_oversized_message` pre-pass, citation/write-barrier machinery, markers, and the ledger
 - `crates/agent-core/src/interpreter.rs` — `ContextGc` wired into the turn loop (`collect_prompt`/`maybe_collect_prompt`), the embedding pre-pass, the overflow backstop, `gc_collect` trace events
+- `crates/agent-core/src/zoom.rs` — GC zoom (t-1609): address parsing, paging, the `Expr::Zoom` read over `history`, and the `ZoomBook` markers read; the loop arm is in `ir_agent.rs`
 - `crates/agent/src/main.rs` — the `--gc*` CLI flags; constructs `GcMode` and passes it to the runtime
 - `crates/agent-core/src/prompt_ir.rs` — `ChatMessage.id` (stable UUID, assigned on construction), the canonical key into `GcState`
 - `crates/agent-core/tests/gc_evals.rs` — the offline matrix; `evals/gc/` — recorded fixtures and the behavioral eval rounds
