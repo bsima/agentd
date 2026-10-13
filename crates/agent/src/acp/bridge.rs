@@ -126,6 +126,42 @@ fn infer_card_title(model: &str, task: Option<&str>) -> String {
     format!("infer ({model}): {preview}")
 }
 
+/// Cards for the GC `zoom` calls a turn requested (t-1609). A zoom is a
+/// pure read of the session log — no effect, so no call/result events to
+/// drive a card — so the card comes from the request itself: a completed
+/// Read titled with the address. The page it returned goes to the model
+/// only; the client already saw the original message when it happened.
+fn zoom_cards(op_id: u64, tool_calls: &[agent_core::ToolCall]) -> Vec<SessionUpdate> {
+    tool_calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.name == agent_core::ZOOM_TOOL)
+        .map(|(index, call)| {
+            let address = match call.arguments.get("address") {
+                Some(serde_json::Value::String(address)) => address.trim().to_owned(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            let page = call
+                .arguments
+                .get("page")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|page| *page > 1)
+                .map(|page| format!(" (page {page})"))
+                .unwrap_or_default();
+            SessionUpdate::ToolCall(
+                ToolCall::new(
+                    ToolCallId::new(format!("zoom-{op_id}-{index}")),
+                    format!("zoom {address}{page}").trim_end().to_owned(),
+                )
+                .kind(ToolKind::Read)
+                .status(ToolCallStatus::Completed)
+                .raw_input(call.arguments.clone()),
+            )
+        })
+        .collect()
+}
+
 /// The question text of an `ask_user` approval request (kind `question`).
 fn question_text<'a>(kind: &str, request: &'a serde_json::Value) -> Option<&'a str> {
     if kind != "question" {
@@ -243,15 +279,18 @@ pub(crate) fn map_event(
             let Some(response) = response else {
                 return Vec::new();
             };
-            if response.content.is_empty() {
-                return Vec::new();
-            }
-            match streamed_text {
-                Some(text) if text == response.content => Vec::new(),
-                _ => vec![SessionUpdate::AgentMessageChunk(text_chunk(
-                    response.content.clone(),
-                ))],
-            }
+            let mut updates = if response.content.is_empty() {
+                Vec::new()
+            } else {
+                match streamed_text {
+                    Some(text) if text == response.content => Vec::new(),
+                    _ => vec![SessionUpdate::AgentMessageChunk(text_chunk(
+                        response.content.clone(),
+                    ))],
+                }
+            };
+            updates.extend(zoom_cards(*op_id, &response.tool_calls));
+            updates
         }
         Event::EvalCall {
             op_id,
@@ -690,6 +729,54 @@ mod tests {
             panic!("expected text chunk")
         };
         assert_eq!(text.text, "hello", "the authoritative content wins");
+    }
+
+    /// A turn that requests GC zoom reads (t-1609) shows each as a completed
+    /// Read card titled with its address; other tool calls keep their own
+    /// event-driven cards, and the text chunk still comes first.
+    #[test]
+    fn zoom_requests_render_as_completed_read_cards() {
+        let mut ids = ToolCallIds::default();
+        let mut streamed = HashMap::new();
+        let mut event = infer_result_event("checking the evicted result");
+        let Event::InferResult {
+            response: Some(response),
+            ..
+        } = &mut event
+        else {
+            unreachable!()
+        };
+        response.tool_calls = vec![
+            agent_core::ToolCall::new(
+                "call-1",
+                agent_core::ZOOM_TOOL,
+                serde_json::json!({ "address": "#7" }),
+            ),
+            agent_core::ToolCall::new("call-2", "shell", serde_json::json!({ "command": "ls" })),
+            agent_core::ToolCall::new(
+                "call-3",
+                agent_core::ZOOM_TOOL,
+                serde_json::json!({ "address": "#9", "page": 2 }),
+            ),
+        ];
+        let updates = map_event(&event, &mut ids, &mut streamed);
+        assert_eq!(
+            update_names(&updates),
+            ["agent_message_chunk", "tool_call", "tool_call"]
+        );
+        let cards: Vec<&ToolCall> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::ToolCall(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards[0].title, "zoom #7");
+        assert_eq!(cards[1].title, "zoom #9 (page 2)");
+        for card in cards {
+            assert_eq!(card.kind, ToolKind::Read);
+            assert_eq!(card.status, ToolCallStatus::Completed);
+        }
     }
 
     fn infer_result_event(content: &str) -> Event {

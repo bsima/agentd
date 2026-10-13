@@ -234,6 +234,15 @@ struct Args {
     /// entry; without one the warm tier is citation-only.
     #[arg(long = "gc-warm-floor", default_value_t = agent_core::gc::DEFAULT_WARM_SIMILARITY_FLOOR)]
     gc_warm_floor: f32,
+    /// GC zoom (t-1609, docs/GC_ZOOM.md): offer the `zoom` tool, which
+    /// reads any message GC evicted back from the append-only session log,
+    /// exactly and without re-running anything, and give every eviction
+    /// marker the `#N` address to zoom. Works with every GC strategy;
+    /// requires one (an error with `--gc none`, where nothing is evicted).
+    /// Off by default: without it the loop program and marker text are
+    /// unchanged.
+    #[arg(long)]
+    gc_zoom: bool,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -532,6 +541,10 @@ struct Runtime {
     /// answer a question pause set it: the ACP turn driver does; the CLI's
     /// one-shot/FIFO/stdin paths and the supervisor leave it off.
     ask_user_tool: bool,
+    /// Offer the GC `zoom` tool (t-1609, `--gc-zoom`). Each turn's program
+    /// carries the arm only while a GC strategy is active (ACP can switch
+    /// strategies between turns).
+    gc_zoom: bool,
     /// Driver-owned facts persisted onto every pending-approval record
     /// (`PendingEffectRecord.runtime`) so `agent approvals` can rebuild
     /// this runtime after a full process restart.
@@ -572,6 +585,11 @@ struct ResumeFacts {
     eval_env: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     eval_max_output_bytes: Option<usize>,
+    /// Whether the paused run offered GC zoom (t-1609). An output-contract
+    /// repair after the resume rebuilds the loop program from options, so
+    /// the arm must survive the pause; absent (false) on older records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    gc_zoom: bool,
 }
 
 fn default_runtime_guidance() -> bool {
@@ -1149,6 +1167,14 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
             args.gc_timing.name()
         ));
     }
+    if !config.gc.enabled() && args.gc_zoom {
+        // Zoom recovers what GC evicted; with no strategy nothing is ever
+        // evicted, so the tool would only cost tokens. Fail like
+        // --gc-timing does rather than silently ignore the flag.
+        return Err(anyhow!(
+            "--gc-zoom requires a GC strategy; pass --gc stack, --gc ring, --gc mark-sweep, --gc semantic, or --gc generational"
+        ));
+    }
     Ok(Runtime {
         config,
         trace,
@@ -1181,6 +1207,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         },
         shell_requires_approval: params.require_shell_approval,
         ask_user_tool: false,
+        gc_zoom: args.gc_zoom,
         resume_facts: ResumeFacts {
             model: resolved_model.alias.clone(),
             trace_path: trace_path.clone(),
@@ -1200,6 +1227,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
                 EvalEnvMode::Clean => "clean".into(),
             },
             eval_max_output_bytes: args.eval_max_output_bytes,
+            gc_zoom: args.gc_zoom,
         },
     })
 }
@@ -2225,7 +2253,12 @@ async fn resume_run(
         shell_requires_approval: facts.shell_requires_approval,
         infer_system_prompt: None,
         ask_user: false,
-        zoom: None,
+        // The resumed program comes from the checkpointed machine; these
+        // options rebuild it only for an output-contract repair, which
+        // must keep the paused run's zoom arm.
+        zoom: facts
+            .gc_zoom
+            .then(|| agent_core::ZoomOptions::for_context_budget(resolved_model.context)),
     };
     let mut ir_store = checkpoint.store.clone();
     let mut gc_state = agent_core::GcState::default();
@@ -2844,7 +2877,8 @@ fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
         shell_requires_approval: runtime.shell_requires_approval,
         infer_system_prompt: None,
         ask_user: runtime.ask_user_tool,
-        zoom: None,
+        zoom: (runtime.gc_zoom && runtime.config.gc.enabled())
+            .then(|| agent_core::ZoomOptions::for_context_budget(runtime.config.context_budget)),
     }
 }
 
