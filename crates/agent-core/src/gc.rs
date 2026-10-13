@@ -136,6 +136,15 @@ pub struct GcState {
     /// (left at default by every other strategy); read for the gc_collect
     /// trace event's `tiers` object.
     pub tier_report: GenerationalReport,
+    /// GC zoom address book (t-1609): each prompt message's position in
+    /// the append-only history. Written by the interpreter before every
+    /// Infer — present only when that call offers the `zoom` tool — and
+    /// read by the shared marker renderers, which then name every evicted
+    /// message by its `#N` address and lead their recovery advice with
+    /// zoom. `None` leaves every marker, frame annotation, and ledger
+    /// byte-identical to the zoom-free runtime: strategies never consult
+    /// it themselves. Runtime-only, never serialized.
+    pub zoom: Option<crate::zoom::ZoomBook>,
 }
 
 /// When GC runs, independent of which strategy reclaims tokens (t-1151).
@@ -1071,6 +1080,7 @@ impl GenerationalGc {
                 &tier_mask(GcTier::Cold),
                 boundary,
                 &state.eviction_counts,
+                state.zoom.as_ref(),
             );
             // Phase 2: whole cold groups evict, oldest first (deletion is
             // the cold tier's last resort, and it feeds markers + ledger
@@ -1092,6 +1102,7 @@ impl GenerationalGc {
                     &tier_mask(GcTier::Warm),
                     boundary,
                     &state.eviction_counts,
+                    state.zoom.as_ref(),
                 );
             }
             // Degrade rung a: warm evicts (cited-keep strength relaxes).
@@ -1117,6 +1128,7 @@ impl GenerationalGc {
                     &tier_mask(GcTier::Hot),
                     boundary,
                     &state.eviction_counts,
+                    state.zoom.as_ref(),
                 );
                 if over(&messages, &keep, budget) {
                     let mut protected = protected_with_prefix(&messages, boundary);
@@ -1190,6 +1202,7 @@ fn elide_tool_results(
     eligible: &[bool],
     boundary: usize,
     counts: &BTreeMap<String, u32>,
+    zoom: Option<&crate::zoom::ZoomBook>,
 ) -> usize {
     let summaries = tool_call_summaries(messages);
     let mut elided = 0usize;
@@ -1221,7 +1234,8 @@ fn elide_tool_results(
             .get(call_id.as_str())
             .cloned()
             .unwrap_or_else(|| call_id.clone());
-        let annotation = elision_annotation(&content, &call_id, &summary, counts);
+        let address = zoom.and_then(|book| book.position(&messages[index].id));
+        let annotation = elision_annotation(&content, &call_id, &summary, counts, address);
         if annotation.chars().count() >= content.chars().count() {
             continue;
         }
@@ -1446,6 +1460,13 @@ pub struct HotKeepReport {
 /// sources. Today just the agent loop's `recall` tool (ir_agent.rs).
 const RECALL_TOOL_NAMES: [&str; 1] = ["recall"];
 
+/// The GC `zoom` tool (t-1609): a write-barrier source whenever the call
+/// offers it ([`record_reinjection_overlaps`]). Kept apart from
+/// [`RECALL_TOOL_NAMES`] because markers name evicted recalls by their
+/// memory query — a zoom has none — and because membership is
+/// conditional on zoom being offered.
+const ZOOM_RECALL_TOOL: &str = crate::zoom::ZOOM_TOOL;
+
 // --- Re-injection chunk matching (t-1362) -----------------------------------
 //
 // t-1351's write-barrier matched by exact content hash and fired 0/15 in
@@ -1548,6 +1569,32 @@ pub fn reinjection_chunk_keys(content: &str) -> BTreeSet<String> {
     keys
 }
 
+/// Chunk keys of the history a zoom result (t-1609) quotes: each line of
+/// the page that is a whole JSON document contributes its string leaves
+/// (a one-page tool envelope keys exactly like the original), and any
+/// other line is JSON-unescaped first (a page cut from the middle of an
+/// envelope yields the original's stdout lines). Keys the zoom page with
+/// the same normalization the write-barrier corpus used for the original.
+fn zoom_result_chunk_keys(content: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for line in content.lines() {
+        let decoded = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+                let mut leaves = Vec::new();
+                collect_string_leaves(&value, &mut leaves);
+                leaves.join("\n")
+            }
+            _ => line
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\"),
+        };
+        keys.extend(reinjection_chunk_keys(&decoded));
+    }
+    keys
+}
+
 /// Stable identity for "the same content" across re-fetches (t-1370):
 /// the hash of a message's chunk-key set, so the same payload under a
 /// different call id or a different envelope (duration_ms) fingerprints
@@ -1618,12 +1665,17 @@ pub fn record_reinjection_overlaps(
         }
     }
     let is_tool_result = |message: &ChatMessage| message.role == "tool";
+    // `zoom` (t-1609) re-injects evicted history verbatim, so it is a
+    // write-barrier source like `recall` — but only while the call offers
+    // it: a hallucinated `zoom` call on a zoom-free run is an unknown-tool
+    // error, and must not change hot-set membership.
+    let zoom_on = state.zoom.is_some();
     let is_recall_result = |message: &ChatMessage| {
         is_tool_result(message)
             && message.tool_call_id.as_deref().is_some_and(|id| {
-                call_names
-                    .get(id)
-                    .is_some_and(|name| RECALL_TOOL_NAMES.contains(name))
+                call_names.get(id).is_some_and(|name| {
+                    RECALL_TOOL_NAMES.contains(name) || (zoom_on && *name == ZOOM_RECALL_TOOL)
+                })
             })
     };
 
@@ -1648,6 +1700,31 @@ pub fn record_reinjection_overlaps(
             continue;
         };
         let recall = is_recall_result(message);
+        let zoomed = zoom_on
+            && message.tool_call_id.as_deref().is_some_and(|id| {
+                call_names
+                    .get(id)
+                    .is_some_and(|name| *name == ZOOM_RECALL_TOOL)
+            });
+        if zoomed {
+            // A zoom result (t-1609) quotes history verbatim inside a
+            // page frame, so a JSON tool envelope arrives as ONE escaped
+            // line: match on the decoded payload instead, and when it
+            // re-injects anything, mark the zoom message's own keys hot
+            // too, so hot-keep protects the page the model asked for.
+            let mut matched = false;
+            for key in zoom_result_chunk_keys(content) {
+                if state.collected_hashes.contains(&key) || window_keys.contains(&key) {
+                    state.recall_hot.insert(key);
+                    report.overlap_events += 1;
+                    matched = true;
+                }
+            }
+            if matched {
+                state.recall_hot.extend(reinjection_chunk_keys(content));
+            }
+            continue;
+        }
         for key in reinjection_chunk_keys(content) {
             let collected = state.collected_hashes.contains(&key);
             let live = recall && window_keys.contains(&key);
@@ -1722,6 +1799,54 @@ fn escalation_marker_content(handle: &str, evictions: u32) -> String {
         "[gc: '{handle}' evicted {evictions} times — this content cannot \
 stay in context: summarize what you need into memory (remember) or ask \
 the user — do not re-fetch again]"
+    )
+}
+
+// --- Recovery affordances follow the enabled tools (t-1609) -----------------
+//
+// Strategies decide WHAT to evict; the shared renderers below decide how a
+// marker tells the model to get it back, from the tools this Infer call
+// actually offers. Today that is one switch: the `zoom` address book on
+// `GcState` (present only when the call offers `zoom`). Without it every
+// function here returns the historical text byte-for-byte.
+
+/// The zoom address of a window message, when the call offers zoom and the
+/// message came from history.
+fn zoom_address(state: &GcState, message: &ChatMessage) -> Option<usize> {
+    state.zoom.as_ref()?.position(&message.id)
+}
+
+/// Zoom-on recovery clause: exact recall leads; re-running a call is the
+/// fallback for results that may have changed (docs/GC_ZOOM.md).
+fn zoom_recover_clause(span: &str, has_tool: bool) -> String {
+    if has_tool {
+        format!(
+            "recover: zoom {span} (exact) — do not guess; re-run a call only if its result may have changed"
+        )
+    } else {
+        format!("recover: zoom {span} (exact) — do not guess")
+    }
+}
+
+/// The escalated marker (t-1370), zoom-aware: with an address the honest
+/// exit keeps zoom as a bounded way back (read only the part you need, once)
+/// ahead of memory and the user; without one it is the historical text.
+/// Escalation stays — demoted behind zoom, not removed (docs/GC_ZOOM.md).
+fn escalation_marker_for(handle: &str, evictions: u32, address: Option<usize>) -> String {
+    let Some(position) = address else {
+        return escalation_marker_content(handle, evictions);
+    };
+    let at = crate::zoom::address(position);
+    let handle = if handle.is_empty() {
+        at.as_str()
+    } else {
+        handle
+    };
+    format!(
+        "[gc: '{handle}' evicted {evictions} times — this content cannot \
+stay in context: zoom {at} for only the part you need and restate it in \
+your reply, summarize it into memory (remember), or ask the user — do not \
+re-fetch it again]"
     )
 }
 
@@ -1867,6 +1992,10 @@ struct MarkerRun {
     has_tool: bool,
     has_recall: bool,
     has_user: bool,
+    /// Zoom addresses (t-1609) of everything this run stands for —
+    /// dropped messages and the zoom targets of absorbed older markers.
+    /// Empty unless the call offers zoom.
+    addresses: BTreeSet<usize>,
 }
 
 struct MarkerBuild {
@@ -1878,6 +2007,9 @@ struct MarkerBuild {
     total_evicted: usize,
     /// Original index of the first dropped message (coalesced placement).
     first_drop: Option<usize>,
+    /// Zoom addresses of every eviction this build represents (t-1609) —
+    /// the coalesced line's span. Empty unless the call offers zoom.
+    addresses: BTreeSet<usize>,
 }
 
 /// Build the marker lines for one collection, from the pre-collection
@@ -1886,12 +2018,24 @@ struct MarkerBuild {
 /// collection's own increments happen afterwards, in the wrapper's
 /// finish). Pure text analysis over exactly the inputs collect() already
 /// has — stateless, deterministic, LLM-free.
+///
+/// `zoom` (t-1609) is the call's address book when it offers the `zoom`
+/// tool: every item then carries its `#N` address and the recovery clause
+/// leads with zoom. `None` renders the historical text byte-for-byte.
 fn build_eviction_markers(
     original: &[ChatMessage],
     collected: &[ChatMessage],
     counts: &BTreeMap<String, u32>,
+    zoom: Option<&crate::zoom::ZoomBook>,
 ) -> MarkerBuild {
     let kept: BTreeSet<MsgId> = collected.iter().map(|message| message.id).collect();
+    let address_of = |message: &ChatMessage| zoom.and_then(|book| book.position(&message.id));
+    // Item suffix: " #N" with zoom on, nothing otherwise.
+    let at = |message: &ChatMessage| {
+        address_of(message)
+            .map(|position| format!(" {}", crate::zoom::address(position)))
+            .unwrap_or_default()
+    };
     // Every call id minted in the pre-collection window: tool name,
     // arguments, and the issuing assistant message (frame-covered check).
     let mut call_info: HashMap<&str, (&str, &serde_json::Value, MsgId)> = HashMap::new();
@@ -1926,6 +2070,7 @@ fn build_eviction_markers(
         summary: EvictionMarkerSummary::default(),
         total_evicted: 0,
         first_drop: None,
+        addresses: BTreeSet::new(),
     };
     // Call ids already itemized (a dropped pair yields one item, and a call
     // split across two runs by a kept message is still itemized once).
@@ -1942,6 +2087,7 @@ fn build_eviction_markers(
             return;
         };
         build.total_evicted += total;
+        build.addresses.extend(taken.addresses.iter().copied());
         let listing = if taken.items.is_empty() {
             "earlier context".to_string()
         } else {
@@ -1969,7 +2115,12 @@ fn build_eviction_markers(
         if taken.has_user {
             affordances.push("ask the user again");
         }
-        let tail = if affordances.is_empty() {
+        let span = zoom.and_then(|_| crate::zoom::address_span(taken.addresses.iter().copied()));
+        let tail = if let Some(span) = span {
+            // Zoom on (t-1609): every message this run stands for is
+            // recoverable exactly — user and assistant turns included.
+            zoom_recover_clause(&span, taken.has_tool)
+        } else if affordances.is_empty() {
             "unrecoverable — do not guess".to_string()
         } else {
             format!("recover: {} — do not guess", affordances.join(", "))
@@ -1992,23 +2143,42 @@ fn build_eviction_markers(
         run.ids.push(message.id);
         if is_eviction_marker(message) {
             // A dropped older marker: absorb its count instead of letting
-            // it vanish silently.
+            // it vanish silently — and, with zoom, its addresses.
             run.absorbed += marker_evicted_count(message);
+            if zoom.is_some() {
+                run.addresses.extend(crate::zoom::zoom_targets_in(
+                    message.content.as_deref().unwrap_or(""),
+                ));
+            }
             continue;
         }
         run.dropped += 1;
+        let address = address_of(message);
+        run.addresses.extend(address);
         match message.role.as_str() {
             "tool" => {
                 let Some(call_id) = message.tool_call_id.as_deref() else {
                     build.summary.evicted_assistant_turns += 1;
-                    run.items.push(format!("turn {}", index + 1));
+                    run.items.push(match address {
+                        Some(position) => crate::zoom::address(position),
+                        None => format!("turn {}", index + 1),
+                    });
                     continue;
+                };
+                // With zoom on, the address is the handle and an empty
+                // provider id is never shown as one (t-1609).
+                let shown_id = |name: &str| {
+                    if zoom.is_some() && call_id.is_empty() {
+                        format!("{name}{}", at(message))
+                    } else {
+                        format!("{name} {call_id}{}", at(message))
+                    }
                 };
                 let Some((name, arguments, issuer)) = call_info.get(call_id) else {
                     build.summary.evicted_tool_results += 1;
                     run.has_tool = true;
                     run.items
-                        .push(format!("tool {call_id}{}", cited_suffix(message)));
+                        .push(format!("{}{}", shown_id("tool"), cited_suffix(message)));
                     continue;
                 };
                 // Escalation (t-1370): this content's Nth eviction stops
@@ -2037,15 +2207,20 @@ fn build_eviction_markers(
                     // termination affordance).
                     run.dropped -= 1;
                     run.ids.pop();
+                    if let Some(position) = address {
+                        // The frame annotation carries this address.
+                        run.addresses.remove(&position);
+                    }
                     flush(&mut run, &mut build);
                     if let Some(evictions) = escalated {
                         if itemized_calls.insert(call_id.to_string()) {
                             build.summary.escalated += 1;
+                            build.addresses.extend(address);
                             build.markers.push((
                                 index,
                                 marker_message(
                                     marker_id(&[message.id]),
-                                    escalation_marker_content(call_id, evictions),
+                                    escalation_marker_for(call_id, evictions, address),
                                 ),
                             ));
                         }
@@ -2062,15 +2237,19 @@ fn build_eviction_markers(
                     // buried in a listing.
                     run.dropped -= 1;
                     run.ids.pop();
+                    if let Some(position) = address {
+                        run.addresses.remove(&position);
+                    }
                     flush(&mut run, &mut build);
                     build.total_evicted += 1;
                     build.summary.evicted_tool_results += 1;
                     build.summary.escalated += 1;
+                    build.addresses.extend(address);
                     build.markers.push((
                         index,
                         marker_message(
                             marker_id(&[message.id]),
-                            escalation_marker_content(call_id, evictions),
+                            escalation_marker_for(call_id, evictions, address),
                         ),
                     ));
                     continue;
@@ -2083,26 +2262,33 @@ fn build_eviction_markers(
                     build.summary.evicted_recalls += 1;
                     run.has_recall = true;
                     run.items.push(format!(
-                        "recall '{}'{}",
+                        "recall '{}'{}{}",
                         preview_chars(query, 40),
+                        at(message),
                         cited_suffix(message)
                     ));
                 } else {
                     build.summary.evicted_tool_results += 1;
                     run.has_tool = true;
                     run.items
-                        .push(format!("{name} {call_id}{}", cited_suffix(message)));
+                        .push(format!("{}{}", shown_id(name), cited_suffix(message)));
                 }
             }
             "assistant" => {
                 let calls = message.tool_calls.as_deref().unwrap_or_default();
                 if calls.is_empty() {
                     build.summary.evicted_assistant_turns += 1;
-                    run.items.push(format!(
-                        "assistant turn {}{}",
-                        index + 1,
-                        cited_suffix(message)
-                    ));
+                    run.items.push(match address {
+                        // Zoom on: the address replaces the window ordinal
+                        // ("turn 4" and "#7" side by side would invite
+                        // zooming the wrong number).
+                        Some(position) => format!(
+                            "assistant {}{}",
+                            crate::zoom::address(position),
+                            cited_suffix(message)
+                        ),
+                        None => format!("assistant turn {}{}", index + 1, cited_suffix(message)),
+                    });
                 } else {
                     // A dropped call message: pair atomicity means its
                     // results are dropped too and carry the items; only a
@@ -2115,7 +2301,11 @@ fn build_eviction_markers(
                         if !has_result && itemized_calls.insert(call.id.clone()) {
                             build.summary.evicted_tool_results += 1;
                             run.has_tool = true;
-                            run.items.push(format!("{} {}", call.name, call.id));
+                            run.items.push(if zoom.is_some() && call.id.is_empty() {
+                                format!("{}{}", call.name, at(message))
+                            } else {
+                                format!("{} {}{}", call.name, call.id, at(message))
+                            });
                         }
                     }
                 }
@@ -2123,12 +2313,18 @@ fn build_eviction_markers(
             "user" => {
                 build.summary.evicted_user_turns += 1;
                 run.has_user = true;
-                run.items.push(format!("user turn {}", index + 1));
+                run.items.push(match address {
+                    Some(position) => format!("user {}", crate::zoom::address(position)),
+                    None => format!("user turn {}", index + 1),
+                });
             }
             // System messages are hard-protected and never reach here;
             // anything unexpected still counts toward the run total.
             _ => {
-                run.items.push(format!("turn {}", index + 1));
+                run.items.push(match address {
+                    Some(position) => crate::zoom::address(position),
+                    None => format!("turn {}", index + 1),
+                });
             }
         }
     }
@@ -2139,11 +2335,13 @@ fn build_eviction_markers(
 /// Splice marker lines into a collected window at their runs' positions.
 /// A marker is never inserted immediately before a tool-result message
 /// (results must stay adjacent to their call), and adjacent marker lines
-/// fuse into one (counts summed) so markers never accumulate.
+/// fuse into one (counts summed) so markers never accumulate. `zoom`: the
+/// call offers zoom, so fusion must keep every address (t-1609).
 fn merge_eviction_markers(
     original: &[ChatMessage],
     collected: &[ChatMessage],
     markers: &[(usize, ChatMessage)],
+    zoom: bool,
 ) -> Vec<ChatMessage> {
     let index_of: HashMap<MsgId, usize> = original
         .iter()
@@ -2170,23 +2368,48 @@ fn merge_eviction_markers(
     for (_, marker) in pending {
         out.push(marker.clone());
     }
-    fuse_adjacent_markers(out)
+    fuse_adjacent_markers(out, zoom)
+}
+
+/// Widen a zoom-on marker's recovery span (`recover: zoom <span> (exact)`)
+/// to cover `positions` too: a fused marker keeps the later marker's text
+/// but must still address everything both stood for (t-1609).
+fn widen_zoom_span(content: &str, positions: &[usize]) -> String {
+    const LEAD: &str = "recover: zoom ";
+    let Some(start) = content.find(LEAD).map(|index| index + LEAD.len()) else {
+        return content.to_string();
+    };
+    let end = content[start..]
+        .find(' ')
+        .map_or(content.len(), |offset| start + offset);
+    let mut all = crate::zoom::addresses_in(&content[start..end]);
+    all.extend_from_slice(positions);
+    match crate::zoom::address_span(all) {
+        Some(span) => format!("{}{span}{}", &content[..start], &content[end..]),
+        None => content.to_string(),
+    }
 }
 
 /// Fuse directly adjacent marker lines into one: counts sum, the later
 /// (most recent) marker's text wins. Keeps repeated collections from
-/// stacking marker upon marker.
-fn fuse_adjacent_markers(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+/// stacking marker upon marker. With `zoom`, the surviving text's span
+/// widens to cover the absorbed marker's addresses.
+fn fuse_adjacent_markers(messages: Vec<ChatMessage>, zoom: bool) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for message in messages {
         if is_eviction_marker(&message) && !is_escalation_marker(&message) {
             if let Some(last) = out.last_mut() {
                 if is_eviction_marker(last) && !is_escalation_marker(last) {
                     let combined = marker_evicted_count(last) + marker_evicted_count(&message);
-                    let content = replace_marker_count(
+                    let mut content = replace_marker_count(
                         message.content.as_deref().unwrap_or(EVICTION_MARKER_PREFIX),
                         combined,
                     );
+                    if zoom {
+                        let earlier =
+                            crate::zoom::zoom_targets_in(last.content.as_deref().unwrap_or(""));
+                        content = widen_zoom_span(&content, &earlier);
+                    }
                     let fused_id = marker_id(&[last.id, message.id]);
                     *last = marker_message(fused_id, content);
                     continue;
@@ -2199,11 +2422,19 @@ fn fuse_adjacent_markers(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 }
 
 /// The degrade form: one line standing in for every marker in the window.
-fn coalesced_marker_content(total: usize) -> String {
-    format!(
-        "[gc: earlier context compacted — {total} messages evicted; \
-         recover: re-run tool calls, recall memories, or ask the user — do not guess]"
-    )
+/// `span` (t-1609): with zoom on, the address span covering every eviction
+/// the line stands for; recovery then leads with zoom.
+fn coalesced_marker_content(total: usize, span: Option<&str>) -> String {
+    match span {
+        None => format!(
+            "[gc: earlier context compacted — {total} messages evicted; \
+             recover: re-run tool calls, recall memories, or ask the user — do not guess]"
+        ),
+        Some(span) => format!(
+            "[gc: earlier context compacted — {total} messages evicted; {}]",
+            zoom_recover_clause(span, true)
+        ),
+    }
 }
 
 /// Extra tokens reserved beyond the rendered markers' own estimate when
@@ -2218,15 +2449,22 @@ fn coalesce_markers(
     original: &[ChatMessage],
     collected: &[ChatMessage],
     build: &MarkerBuild,
+    zoom: bool,
 ) -> Vec<ChatMessage> {
     let mut total = build.total_evicted;
     let mut first_position = build.first_drop.unwrap_or(0);
     let mut contributing: Vec<MsgId> = Vec::new();
     let mut stripped: Vec<ChatMessage> = Vec::with_capacity(collected.len());
+    let mut addresses = build.addresses.clone();
     for message in collected {
         if is_eviction_marker(message) {
             total += marker_evicted_count(message);
             contributing.push(message.id);
+            if zoom {
+                addresses.extend(crate::zoom::zoom_targets_in(
+                    message.content.as_deref().unwrap_or(""),
+                ));
+            }
             if let Some(position) = original.iter().position(|m| m.id == message.id) {
                 first_position = first_position.min(position);
             }
@@ -2235,8 +2473,12 @@ fn coalesce_markers(
         stripped.push(message.clone());
     }
     contributing.extend(build.markers.iter().map(|(_, marker)| marker.id));
-    let coalesced = marker_message(marker_id(&contributing), coalesced_marker_content(total));
-    merge_eviction_markers(original, &stripped, &[(first_position, coalesced)])
+    let span = zoom.then(|| crate::zoom::address_span(addresses)).flatten();
+    let coalesced = marker_message(
+        marker_id(&contributing),
+        coalesced_marker_content(total, span.as_deref()),
+    );
+    merge_eviction_markers(original, &stripped, &[(first_position, coalesced)], zoom)
 }
 
 // --- Progress ledger (t-1373) -------------------------------------------------
@@ -2403,10 +2645,22 @@ fn update_ledger_journal(window: &[ChatMessage], state: &mut GcState) {
         let content = message.content.as_deref().unwrap_or("");
         let annotated = content.trim_start().starts_with(EVICTION_MARKER_PREFIX)
             || content.trim_start().starts_with(GC_LEDGER_PREFIX);
+        let args_preview = if state.zoom.is_some() && *tool == crate::zoom::ZOOM_TOOL {
+            // A zoom entry previews the address it read (t-1609).
+            arguments
+                .get("address")
+                .map(|address| match address {
+                    serde_json::Value::String(text) => preview_chars(text, 60),
+                    other => preview_chars(&other.to_string(), 60),
+                })
+                .unwrap_or_default()
+        } else {
+            ledger_args_preview(arguments)
+        };
         state.ledger.push(LedgerEntry {
             call_id: call_id.to_string(),
             tool: (*tool).to_string(),
-            args_preview: ledger_args_preview(arguments),
+            args_preview,
             outcome_preview: if annotated {
                 String::new()
             } else {
@@ -2450,10 +2704,19 @@ fn ledger_entry_state(entry: &LedgerEntry, window: &[ChatMessage], state: &GcSta
         .get(&entry.fingerprint)
         .copied()
         .unwrap_or(0);
-    if evictions >= EVICTION_ESCALATION_AFTER {
-        format!("evicted {evictions}x — do not re-fetch")
-    } else {
-        "evicted".into()
+    // Zoom on (t-1609): an evicted entry carries its result's address.
+    let zoom_at = state
+        .zoom
+        .as_ref()
+        .and_then(|book| book.result_position(&entry.call_id))
+        .map(crate::zoom::address);
+    match (evictions >= EVICTION_ESCALATION_AFTER, zoom_at) {
+        (true, None) => format!("evicted {evictions}x — do not re-fetch"),
+        (true, Some(at)) => {
+            format!("evicted {evictions}x — do not re-fetch; zoom {at} for only the part you need")
+        }
+        (false, None) => "evicted".into(),
+        (false, Some(at)) => format!("evicted — zoom {at}"),
     }
 }
 
@@ -2516,9 +2779,12 @@ call{} done this session; consult it before re-running work, these steps are DON
         content.insert_str(header_end, &line);
     }
     if any_evicted {
-        content.push_str(
-            "\nevicted results are recoverable: re-run the call or recall the memory — do not guess.",
-        );
+        content.push_str(if state.zoom.is_some() {
+            "\nevicted results are recoverable exactly: zoom the #address — do not guess; \
+re-run a call only if its result may have changed."
+        } else {
+            "\nevicted results are recoverable: re-run the call or recall the memory — do not guess."
+        });
     }
     LedgerRender {
         content,
@@ -2619,8 +2885,18 @@ where
     let original = messages.clone();
     let full_boundary = cache_prefix_boundary(&original, budget).min(original.len());
     let prefix_snapshot: Vec<ChatMessage> = original[..full_boundary].to_vec();
+    // Recovery affordances follow the call's tools (t-1609): the zoom
+    // address book, when the call offers zoom. Cloned once: the core and
+    // re-collections take `state` mutably.
+    let zoom_book = state.zoom.clone();
+    let zoom = zoom_book.is_some();
     let collected = core(messages, budget, state);
-    let build = build_eviction_markers(&original, &collected, &state.eviction_counts);
+    let build = build_eviction_markers(
+        &original,
+        &collected,
+        &state.eviction_counts,
+        zoom_book.as_ref(),
+    );
     let count_markers =
         |window: &[ChatMessage]| window.iter().filter(|m| is_eviction_marker(m)).count();
     let attach_ledger = |mut window: Vec<ChatMessage>, state: &mut GcState| -> Vec<ChatMessage> {
@@ -2741,7 +3017,7 @@ where
     // perturbs the core's content decisions (cited-keep, hot-keep, the
     // preserve boundary) — the ledger coalesces down to the slack the
     // sweep left, and records its own suppression when there is none.
-    let merged = merge_eviction_markers(&original, &collected, &build.markers);
+    let merged = merge_eviction_markers(&original, &collected, &build.markers, zoom);
     if estimate_tokens(&merged) <= budget {
         return finish(merged, build.summary, state);
     }
@@ -2763,7 +3039,12 @@ where
                 return None;
             }
             scratch.prefix_invalidated = prefix_changed(&prefix_snapshot, &recollected);
-            let rebuild = build_eviction_markers(&original, &recollected, &scratch.eviction_counts);
+            let rebuild = build_eviction_markers(
+                &original,
+                &recollected,
+                &scratch.eviction_counts,
+                zoom_book.as_ref(),
+            );
             Some((recollected, rebuild))
         };
 
@@ -2789,7 +3070,7 @@ where
     if reserve <= budget / 4 {
         let mut scratch = state.clone();
         if let Some((recollected, rebuild)) = recollect(reserve, &mut scratch) {
-            let remerged = merge_eviction_markers(&original, &recollected, &rebuild.markers);
+            let remerged = merge_eviction_markers(&original, &recollected, &rebuild.markers, zoom);
             if estimate_tokens(&remerged) <= budget {
                 *state = scratch;
                 return finish(remerged, rebuild.summary, state);
@@ -2799,18 +3080,24 @@ where
 
     // Rung 3: one coalesced line, into the core's collection or (when even
     // that does not fit) a re-collection reserving its cost.
-    let with_line = coalesce_markers(&original, &collected, &build);
+    let with_line = coalesce_markers(&original, &collected, &build, zoom);
     if estimate_tokens(&with_line) <= budget {
         let mut summary = build.summary;
         summary.coalesced = true;
         return finish(with_line, summary, state);
     }
-    let line_reserve = estimate_text_tokens(&coalesced_marker_content(build.total_evicted))
-        .saturating_add(estimate_message_overhead_tokens() + MARKER_RESERVE_PAD);
+    let line_span = zoom
+        .then(|| crate::zoom::address_span(build.addresses.iter().copied()))
+        .flatten();
+    let line_reserve = estimate_text_tokens(&coalesced_marker_content(
+        build.total_evicted,
+        line_span.as_deref(),
+    ))
+    .saturating_add(estimate_message_overhead_tokens() + MARKER_RESERVE_PAD);
     if line_reserve <= budget / 2 {
         let mut scratch = state.clone();
         if let Some((recollected, rebuild)) = recollect(line_reserve, &mut scratch) {
-            let with_line = coalesce_markers(&original, &recollected, &rebuild);
+            let with_line = coalesce_markers(&original, &recollected, &rebuild, zoom);
             if estimate_tokens(&with_line) <= budget {
                 *state = scratch;
                 let mut summary = rebuild.summary;
@@ -3070,6 +3357,7 @@ fn elision_annotation(
     tool_call_id: &str,
     summary: &str,
     counts: &BTreeMap<String, u32>,
+    address: Option<usize>,
 ) -> String {
     let evictions = counts
         .get(&content_fingerprint(content))
@@ -3077,11 +3365,31 @@ fn elision_annotation(
         .unwrap_or(0)
         + 1;
     if evictions >= EVICTION_ESCALATION_AFTER {
-        escalation_marker_content(tool_call_id, evictions)
+        escalation_marker_for(tool_call_id, evictions, address)
     } else {
-        format!(
+        elided_result_content(summary, tool_call_id, address)
+    }
+}
+
+/// The non-escalated elision line: the historical re-run text, or with a
+/// zoom address (t-1609) the exact-recall lead.
+fn elided_result_content(summary: &str, tool_call_id: &str, address: Option<usize>) -> String {
+    match address {
+        None => format!(
             "[gc: result elided — {summary} ({tool_call_id}); recover: re-run the call — do not guess]"
-        )
+        ),
+        Some(position) => {
+            let at = crate::zoom::address(position);
+            let handle = if tool_call_id.is_empty() {
+                at.clone()
+            } else {
+                format!("{tool_call_id}, {at}")
+            };
+            format!(
+                "[gc: result elided — {summary} ({handle}); {}]",
+                zoom_recover_clause(&at, true)
+            )
+        }
     }
 }
 
@@ -3122,17 +3430,16 @@ fn annotate_evictable_tool_results(
                 + 1;
             (evictions >= EVICTION_ESCALATION_AFTER).then_some(evictions)
         });
+        let address = zoom_address(state, message);
         if let Some(evictions) = escalated {
-            message.content = Some(escalation_marker_content(tool_call_id, evictions));
+            message.content = Some(escalation_marker_for(tool_call_id, evictions, address));
             continue;
         }
         // The `[gc: ...]` marker family (t-1360): the old "result
         // incorporated" wording reported the call happened while silently
         // withholding its body — the confabulation-inviting shape. Name
         // the eviction and the recovery affordance instead.
-        message.content = Some(format!(
-            "[gc: result elided — {summary} ({tool_call_id}); recover: re-run the call — do not guess]"
-        ));
+        message.content = Some(elided_result_content(&summary, tool_call_id, address));
     }
 }
 
@@ -3477,7 +3784,7 @@ fn oldest_completed_frame(
 /// summary annotation (stable id preserved — no fresh UUIDs, so repeated
 /// collections stay deterministic) and drop the result messages.
 fn pop_frame(messages: &mut [ChatMessage], keep: &mut [bool], frame: &Frame, state: &mut GcState) {
-    let summary = frame_summary(messages, frame);
+    let summary = frame_summary(messages, frame, state.zoom.as_ref());
     for call in messages[frame.assistant]
         .tool_calls
         .as_deref()
@@ -3501,7 +3808,20 @@ fn pop_frame(messages: &mut [ChatMessage], keep: &mut [bool], frame: &Frame, sta
 /// one that names the eviction and the affordance invites recovery. Pure
 /// heuristics by design — an LLM summarization call here would spend
 /// tokens to save tokens (docs/GC.md reserves that for `stack-smart`).
-fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
+///
+/// With a zoom address book (t-1609) the annotation IS the frame's zoom
+/// marker: each call line names its result's `#N` address, a truncated
+/// result leads its recovery with zoom, and a truncated narration or
+/// argument preview names the call message's address. Without one the
+/// text is the historical format byte-for-byte.
+fn frame_summary(
+    messages: &[ChatMessage],
+    frame: &Frame,
+    zoom: Option<&crate::zoom::ZoomBook>,
+) -> String {
+    if let Some(book) = zoom {
+        return zoom_frame_summary(messages, frame, book);
+    }
     let assistant = &messages[frame.assistant];
     let mut lines = Vec::new();
     if let Some(content) = assistant.content.as_deref() {
@@ -3510,20 +3830,8 @@ fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
         }
     }
     for call in assistant.tool_calls.as_deref().unwrap_or_default() {
-        let args = call
-            .arguments
-            .get("path")
-            .or_else(|| call.arguments.get("file"))
-            .or_else(|| call.arguments.get("command"))
-            .or_else(|| call.arguments.get("prompt"))
-            .and_then(serde_json::Value::as_str)
-            .map(|value| preview_chars(value, 80))
-            .unwrap_or_default();
-        let full_result = frame
-            .results
-            .iter()
-            .map(|idx| &messages[*idx])
-            .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+        let args = frame_args_preview(&call.arguments);
+        let full_result = frame_result(messages, frame, &call.id)
             .and_then(|message| message.content.as_deref())
             .map(str::trim)
             .unwrap_or_default();
@@ -3540,6 +3848,108 @@ fn frame_summary(messages: &[ChatMessage], frame: &Frame) -> String {
             lines.push(format!(
                 "[frame {}: {}({args}) -> {full_result}]",
                 call.id, call.name
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The frame annotation's argument preview: the first of the usual keys,
+/// capped at 80 chars.
+fn frame_args_preview(arguments: &serde_json::Value) -> String {
+    frame_args_raw(arguments)
+        .map(|value| preview_chars(value, 80))
+        .unwrap_or_default()
+}
+
+fn frame_args_raw(arguments: &serde_json::Value) -> Option<&str> {
+    arguments
+        .get("path")
+        .or_else(|| arguments.get("file"))
+        .or_else(|| arguments.get("command"))
+        .or_else(|| arguments.get("prompt"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// The frame's result message for a call id.
+fn frame_result<'a>(
+    messages: &'a [ChatMessage],
+    frame: &Frame,
+    call_id: &str,
+) -> Option<&'a ChatMessage> {
+    frame
+        .results
+        .iter()
+        .map(|idx| &messages[*idx])
+        .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+}
+
+/// Zoom-on frame annotation (t-1609): see [`frame_summary`].
+fn zoom_frame_summary(
+    messages: &[ChatMessage],
+    frame: &Frame,
+    book: &crate::zoom::ZoomBook,
+) -> String {
+    let assistant = &messages[frame.assistant];
+    let call_at = book.position(&assistant.id).map(crate::zoom::address);
+    let mut lines = Vec::new();
+    if let Some(content) = assistant.content.as_deref() {
+        let content = content.trim();
+        if !content.is_empty() {
+            let mut line = preview_chars(content, 120);
+            if let (true, Some(at)) = (content.chars().count() > 120, &call_at) {
+                line.push_str(&format!(" [zoom {at}]"));
+            }
+            lines.push(line);
+        }
+    }
+    for call in assistant.tool_calls.as_deref().unwrap_or_default() {
+        let args = if call.name == crate::zoom::ZOOM_TOOL {
+            call.arguments
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| preview_chars(value, 80))
+                .unwrap_or_default()
+        } else {
+            let mut args = frame_args_preview(&call.arguments);
+            if let (true, Some(at)) = (
+                frame_args_raw(&call.arguments).is_some_and(|raw| raw.chars().count() > 80),
+                &call_at,
+            ) {
+                args.push_str(&format!(" [call: {at}]"));
+            }
+            args
+        };
+        let result = frame_result(messages, frame, &call.id);
+        let result_at = result
+            .and_then(|message| book.position(&message.id))
+            .map(crate::zoom::address);
+        let full_result = result
+            .and_then(|message| message.content.as_deref())
+            .map(str::trim)
+            .unwrap_or_default();
+        let head = match (call.id.is_empty(), &result_at) {
+            (false, Some(at)) => format!("{} {at}", call.id),
+            (false, None) => call.id.clone(),
+            (true, Some(at)) => at.clone(),
+            (true, None) => String::new(),
+        };
+        if full_result.chars().count() > 120 {
+            let preview = preview_chars(full_result, 80);
+            let recover = match &result_at {
+                Some(at) => format!(
+                    "recover: zoom {at} (exact); re-run only if the result may have changed"
+                ),
+                None => "re-run to recover".to_string(),
+            };
+            lines.push(format!(
+                "[frame {head}: {}({args}) -> {preview} — evicted; {recover}]",
+                call.name
+            ));
+        } else {
+            lines.push(format!(
+                "[frame {head}: {}({args}) -> {full_result}]",
+                call.name
             ));
         }
     }
@@ -5268,9 +5678,9 @@ mod tests {
             Uuid::from_u128(2),
             "[gc: 2 evicted — shell call-9; recover: re-run the call — do not guess]".into(),
         );
-        let fused = fuse_adjacent_markers(vec![escalated.clone(), normal.clone()]);
+        let fused = fuse_adjacent_markers(vec![escalated.clone(), normal.clone()], false);
         assert_eq!(fused.len(), 2, "escalation marker must survive: {fused:?}");
-        let fused = fuse_adjacent_markers(vec![normal, escalated]);
+        let fused = fuse_adjacent_markers(vec![normal, escalated], false);
         assert_eq!(fused.len(), 2);
     }
 
@@ -5800,6 +6210,7 @@ mod tests {
             &messages,
             &[messages[0].clone(), messages[4].clone()],
             &BTreeMap::new(),
+            None,
         );
         let text: String = build
             .markers
@@ -6448,3 +6859,9 @@ mod tests {
         assert_eq!(warm.len(), 1, "citation-only warm tier without vectors");
     }
 }
+
+/// GC zoom markers (t-1609): addressed eviction with the book, no zoom
+/// text without it.
+#[cfg(test)]
+#[path = "gc_zoom_tests.rs"]
+mod zoom_marker_tests;

@@ -310,6 +310,24 @@ membership, t-1167):
 >   the output of call-12") marks that result as load-bearing and
 >   protects it from eviction.
 
+And, **only** where the call offers the GC `zoom` tool (`--gc-zoom`,
+t-1609; docs/GC_ZOOM.md), whose markers carry `#N` addresses:
+
+> - With `zoom`, evicted content is not lost: a marker's `#N` is the
+>   evicted message's address. Zoom it to read the original exactly
+>   before you act on it — instead of guessing, re-running the call, or
+>   asking the user again. Re-run a call only if its result may have
+>   changed.
+
+The zoom line is appended, not substituted: the re-run/ask-again bullet
+stays as the fallback for anything without an address, matching the
+marker wording (zoom leads, re-run follows). Without zoom the fragment
+is byte-identical to the zoom-free text (pinned by
+`guidance::tests::zoom_line_ships_only_with_the_zoom_tool`). Not yet
+A/B'd behaviorally; the t-1609 marker-variant arms in
+`gc_behavior_evals.rs` measure the zoom mechanism, whose text this line
+describes.
+
 (Shipped variant, t-1359: when GC is active but the memory tools are
 *not* offered, the `remember`/`recall` cross-references drop out — "into
 your reply, or into memory with `remember`" becomes "into your reply",
@@ -764,6 +782,18 @@ sessions):
 > dismisses the question, proceed on your best judgment or stop and
 > explain.
 
+`zoom` (t-1609 — offered only under `--gc-zoom` with an active GC
+strategy; constant `ZOOM_TOOL_DESCRIPTION`):
+
+> Read back, exactly, a message that was evicted from your context. GC
+> markers (`[gc: ...]`, `[frame ...]`, `[gc-ledger]`) name each evicted
+> message by its address `#N`; zoom it before you act on that content,
+> instead of guessing or re-running the call. Long messages come in pages.
+> Re-run a call only if its result may have changed since.
+
+Like `ask_user`, `zoom`'s exposure follows its program arm
+(`AgentLoopOptions::zoom`); the description text never enters the hash.
+
 Unlike the other descriptions, `ask_user`'s *exposure* is program-shaped:
 the loop grows its dispatch arm only under
 `AgentLoopOptions::ask_user`, and the offer follows the arm. The
@@ -801,6 +831,7 @@ gates):
 | memory discipline (§2.2) | **never — demoted to draft (t-1368)** after its t-1364 A/B moved nothing; the remember/recall tool descriptions remain shipped |
 | GC awareness (§2.4; with/without-memory variant) | a GC strategy is active |
 | cited-keep line (§2.4) | strategy is `semantic` with `cited-keep` on, or `generational` (citation-membership warm tier) — strategy-honest per gap 6 |
+| zoom line (§2.4, t-1609) | a GC strategy is active AND `zoom` is in the call's tool offer (`--gc-zoom`) |
 | approval awareness (§2.6) | any effect in the run's config is gated (an Eval site with `require_approval`, or a sink whose writes require approval) |
 | cost awareness (§2.5) | unconditional within a delivered fragment |
 
@@ -839,6 +870,11 @@ when neither applies):
 > Save load-bearing values with `remember` as you produce them — the
 > distilled fact, not raw output — and `recall` them instead of re-running
 > commands or guessing.
+
+With zoom offered (t-1609), the GC core is followed by `MINIMAL_ZOOM_CORE`:
+
+> With `zoom`, read an evicted message back exactly by the `#N` address
+> its marker names, instead of re-running the call or guessing.
 
 Prompt bytes never affect effect identity or replay (recorded Infer
 results match by effect id) — pinned by

@@ -79,6 +79,15 @@ pub const ASK_USER_TOOL_DESCRIPTION: &str =
      user dismisses the question, proceed on your best judgment or stop \
      and explain.";
 
+/// Shipped `zoom` tool description (t-1609, docs/GUIDANCE.md §4). Only
+/// offered under `--gc-zoom` with an active GC strategy.
+pub const ZOOM_TOOL_DESCRIPTION: &str =
+    "Read back, exactly, a message that was evicted from your context. GC \
+     markers (`[gc: ...]`, `[frame ...]`, `[gc-ledger]`) name each evicted \
+     message by its address `#N`; zoom it before you act on that content, \
+     instead of guessing or re-running the call. Long messages come in \
+     pages. Re-run a call only if its result may have changed since.";
+
 // --- the runtime-guidance fragment (docs/GUIDANCE.md §4 step 2) -----------
 //
 // Cross-tool workflow text, assembled at prompt build from live
@@ -198,6 +207,22 @@ pub const GC_CITED_KEEP_LINE: &str = "\
 output of call-12\") marks that result as load-bearing and protects it \
 from eviction.";
 
+/// §2.4 zoom line (t-1609). Delivered only when the call offers the GC
+/// `zoom` tool (`--gc-zoom`); appended to the GC block, where it outranks
+/// the block's re-run/ask-again recovery bullet for anything with an
+/// address.
+pub const GC_ZOOM_LINE: &str = "\
+- With `zoom`, evicted content is not lost: a marker's `#N` is the \
+evicted message's address. Zoom it to read the original exactly before \
+you act on it — instead of guessing, re-running the call, or asking the \
+user again. Re-run a call only if its result may have changed.";
+
+/// Minimal-variant zoom core (t-1609): ships beside [`MINIMAL_GC_CORE`]
+/// when the call offers `zoom` and the full fragment does not fit.
+pub const MINIMAL_ZOOM_CORE: &str = "\
+With `zoom`, read an evicted message back exactly by the `#N` address \
+its marker names, instead of re-running the call or guessing.";
+
 /// §2.6 approval-awareness block. Delivered only when some effect in the
 /// run's config is gated.
 pub const APPROVAL_BLOCK: &str = "\
@@ -300,6 +325,9 @@ pub fn minimal_runtime_guidance_fragment(caps: &GuidanceCapabilities) -> String 
     let mut blocks: Vec<&str> = Vec::new();
     if caps.gc {
         blocks.push(MINIMAL_GC_CORE);
+        if caps.zoom {
+            blocks.push(MINIMAL_ZOOM_CORE);
+        }
     }
     if caps.memory {
         blocks.push(MINIMAL_MEMORY_CORE);
@@ -401,6 +429,9 @@ pub struct GuidanceCapabilities {
     /// t-1167): the only configurations where the citation-protection
     /// line is true.
     pub cited_keep: bool,
+    /// The GC `zoom` tool is in this call's tool offer (t-1609): eviction
+    /// markers carry `#N` addresses, and the zoom line ships.
+    pub zoom: bool,
     /// Some effect in the run's config is gated behind approval.
     pub approvals: bool,
     /// Interim delegate catalog (only rendered when `infer` is set).
@@ -437,6 +468,10 @@ pub fn runtime_guidance_fragment(caps: &GuidanceCapabilities) -> String {
         if caps.cited_keep {
             block.push('\n');
             block.push_str(GC_CITED_KEEP_LINE);
+        }
+        if caps.zoom {
+            block.push('\n');
+            block.push_str(GC_ZOOM_LINE);
         }
         blocks.push(block);
     }
@@ -595,6 +630,39 @@ mod tests {
             ..Default::default()
         });
         assert!(!no_gc.contains("marks that result as load-bearing"));
+    }
+
+    /// The zoom line (t-1609) ships only where the call offers zoom, in
+    /// both variants; without zoom the fragment is the pre-zoom text.
+    #[test]
+    fn zoom_line_ships_only_with_the_zoom_tool() {
+        let with_zoom = runtime_guidance_fragment(&GuidanceCapabilities {
+            gc: true,
+            zoom: true,
+            ..Default::default()
+        });
+        assert!(with_zoom.contains(GC_ZOOM_LINE));
+        let without = runtime_guidance_fragment(&GuidanceCapabilities {
+            gc: true,
+            ..Default::default()
+        });
+        assert!(!without.contains("zoom"));
+        assert_eq!(
+            with_zoom.replace(&format!("\n{GC_ZOOM_LINE}"), ""),
+            without,
+            "zoom only appends its line"
+        );
+        let minimal = minimal_runtime_guidance_fragment(&GuidanceCapabilities {
+            gc: true,
+            zoom: true,
+            ..Default::default()
+        });
+        assert!(minimal.contains(MINIMAL_ZOOM_CORE));
+        assert!(!minimal_runtime_guidance_fragment(&GuidanceCapabilities {
+            gc: true,
+            ..Default::default()
+        })
+        .contains("zoom"));
     }
 
     /// The §2.2 "retained preferentially" claim stays out of both the

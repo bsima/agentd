@@ -89,6 +89,7 @@ pub fn agent_loop_ir_with_policies(
         shell_requires_approval,
         None,
         false,
+        None,
     )
 }
 
@@ -111,6 +112,7 @@ pub fn agent_loop_ir_for_options(
         options.shell_requires_approval,
         options.infer_system_prompt.as_deref(),
         options.ask_user,
+        options.zoom,
     )
 }
 
@@ -124,6 +126,7 @@ fn build_agent_loop_ir(
     shell_requires_approval: bool,
     infer_system_prompt: Option<&str>,
     ask_user: bool,
+    zoom: Option<crate::zoom::ZoomOptions>,
 ) -> Machine {
     // `ask_user` (t-1594) dispatches like a native tool — an Instr::Tool
     // arm after the registered ones — but the interpreter answers it via
@@ -168,11 +171,22 @@ fn build_agent_loop_ir(
     let native_base = 26u32;
     let native_dispatch = |index: usize| BlockId(native_base + 2 * index as u32);
     let native_body = |index: usize| BlockId(native_base + 2 * index as u32 + 1);
+    // GC zoom (t-1609): one dispatch/body pair after every native arm
+    // (ask_user included), so the zoom-free program keeps every block id.
+    let zoom_dispatch = BlockId(native_base + 2 * native_tools.len() as u32);
+    let zoom_body = BlockId(native_base + 2 * native_tools.len() as u32 + 1);
+    // Where an unmatched name falls through to after the native arms: the
+    // zoom arm when offered, else the unknown-tool response.
+    let after_natives = if zoom.is_some() {
+        zoom_dispatch
+    } else {
+        invalid_tool
+    };
     // Where an unmatched name falls through to after the built-in arms:
     // the first native dispatch arm when tools are registered, else the
-    // unknown-tool response.
+    // unknown-tool response (or the zoom arm).
     let first_native_or_invalid = if native_tools.is_empty() {
-        invalid_tool
+        after_natives
     } else {
         native_dispatch(0)
     };
@@ -985,6 +999,9 @@ fn build_agent_loop_ir(
             names.push("recall");
         }
         names.extend(native_tools.iter().map(String::as_str));
+        if zoom.is_some() {
+            names.push(crate::zoom::ZOOM_TOOL);
+        }
         names.join(", ")
     };
     blocks.insert(
@@ -1327,7 +1344,7 @@ fn build_agent_loop_ir(
         let fallthrough = if index + 1 < native_tools.len() {
             native_dispatch(index + 1)
         } else {
-            invalid_tool
+            after_natives
         };
         blocks.insert(
             native_dispatch(index),
@@ -1385,6 +1402,52 @@ fn build_agent_loop_ir(
         );
     }
     let _ = (is_native_tool, native_tool_result);
+
+    // GC zoom (t-1609): a pure read over the append-only `history` — the
+    // log GC never mutates — answered as an ordinary tool result. No
+    // effect: nothing to trace, approve, or replay, and the same history
+    // yields the same bytes every run.
+    if let Some(zoom) = zoom {
+        let is_zoom_tool = Var("is_zoom_tool".into());
+        blocks.insert(
+            zoom_dispatch,
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Let {
+                    out: is_zoom_tool.clone(),
+                    expr: Expr::Eq {
+                        left: Box::new(Expr::Var(function_name.clone())),
+                        right: Box::new(Expr::Value(Value::String(crate::zoom::ZOOM_TOOL.into()))),
+                    },
+                }],
+                terminator: Terminator::If {
+                    cond: Expr::Var(is_zoom_tool),
+                    then_block: zoom_body,
+                    then_args: vec![],
+                    else_block: invalid_tool,
+                    else_args: vec![],
+                },
+            },
+        );
+        blocks.insert(
+            zoom_body,
+            Block {
+                params: vec![],
+                instructions: vec![Instr::Let {
+                    out: tool_content.clone(),
+                    expr: Expr::Zoom {
+                        history: Var("history".into()),
+                        arguments: Box::new(Expr::Var(arguments.clone())),
+                        page_chars: zoom.page_chars,
+                    },
+                }],
+                terminator: Terminator::Goto {
+                    block: append_tool,
+                    args: vec![Expr::Var(tool_content.clone())],
+                },
+            },
+        );
+    }
 
     Machine {
         program: Program {
@@ -1445,6 +1508,12 @@ pub struct AgentLoopOptions {
     /// is part of the program, so enabling it changes the program hash and
     /// the default (off) program is unchanged.
     pub ask_user: bool,
+    /// Offer the GC `zoom` tool (t-1609, docs/GC_ZOOM.md): exact recall of
+    /// any message GC evicted, read from the append-only `history`. The
+    /// dispatch arm is part of the program — `None` (the default) leaves
+    /// the program, its hash, and every GC marker unchanged; hosts enable
+    /// it only with an active GC strategy (`agent --gc-zoom`).
+    pub zoom: Option<crate::zoom::ZoomOptions>,
 }
 
 /// Run the agent loop with loop-level post-processing (t-1308.4): build the
@@ -1781,6 +1850,10 @@ fn check_output_schema_hash(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "ir_agent_zoom_tests.rs"]
+mod zoom_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3379,6 +3452,7 @@ mod tests {
             shell_requires_approval: false,
             infer_system_prompt: None,
             ask_user: false,
+            zoom: None,
         };
         let (value, machine) = run_agent_loop(
             &config,
@@ -3583,6 +3657,7 @@ mod tests {
                 shell_requires_approval: false,
                 infer_system_prompt: None,
                 ask_user: false,
+                zoom: None,
             };
             let (value, _machine) = run_agent_loop(
                 &config,
@@ -3620,6 +3695,7 @@ mod tests {
                     shell_requires_approval: false,
                     infer_system_prompt: None,
                     ask_user: false,
+                    zoom: None,
                 };
                 run_agent_loop(
                     &config,

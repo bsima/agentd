@@ -27,7 +27,14 @@ use std::sync::Arc;
 /// not shadow them: the built-ins are matched first, so a same-named
 /// registration would silently never fire (or, for `ask_user`, would be
 /// answered by the host instead of the handler).
-pub const RESERVED_TOOL_NAMES: &[&str] = &["shell", "infer", "remember", "recall", ASK_USER_TOOL];
+pub const RESERVED_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "infer",
+    "remember",
+    "recall",
+    ASK_USER_TOOL,
+    crate::zoom::ZOOM_TOOL,
+];
 
 /// The host-answered multiple-choice question tool (t-1594). Not a
 /// registry tool: the loop grows its dispatch arm only when the host can

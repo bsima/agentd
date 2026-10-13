@@ -430,6 +430,9 @@ async fn execute(
         shell_requires_approval: agent.require_shell_approval,
         infer_system_prompt: None,
         ask_user: false,
+        // GC zoom is a CLI-only switch (docs/GC_ZOOM.md "Switches"), and
+        // the in-process Runner runs no GC.
+        zoom: None,
     };
     let mut history = Vec::new();
     if let Some(instructions) = &agent.instructions {

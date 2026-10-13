@@ -25,6 +25,7 @@ pub mod sse;
 pub mod temporal;
 pub mod tool;
 pub mod trace;
+pub mod zoom;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use approval::{
@@ -105,3 +106,4 @@ pub use trace::{
     AgentIdGenerator, Event, JsonlTraceSink, OtelTraceSink, SessionTraceSink, SuspendControl,
     TraceContextEnv, TraceLogger, TraceSink, TraceSummary,
 };
+pub use zoom::{zoom_tool_spec, ZoomBook, ZoomOptions, ZOOM_TOOL};

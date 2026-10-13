@@ -1381,7 +1381,20 @@ async fn execute_instr(
                     .filter(|spec| names.contains(&spec.function.name))
                     .collect(),
             };
+            let prompt_is_var = matches!(prompt, PromptRef::Var(_));
             let prompt = resolve_prompt(config, &machine.env, prompt)?;
+            // GC zoom (t-1609): when this call offers `zoom`, record each
+            // history message's address so eviction markers can name it.
+            // Only a prompt decoded straight from a history var has
+            // addresses; any other call (a sub-infer child, which is
+            // offered no tools) clears the book, and its markers keep the
+            // zoom-free text.
+            gc_state.zoom = (config.gc.enabled()
+                && prompt_is_var
+                && tool_specs
+                    .iter()
+                    .any(|spec| spec.function.name == crate::zoom::ZOOM_TOOL))
+            .then(|| crate::zoom::ZoomBook::from_history(&prompt));
             // Runtime guidance rides ahead of hydration so the fragment
             // lands in the prefix-stable region of the system message,
             // before any per-turn hydrated context.
@@ -2465,6 +2478,9 @@ async fn apply_runtime_guidance(
         // tier IS citation membership (t-1167).
         cited_keep: matches!(&config.gc, crate::gc::GcMode::Semantic(gc) if gc.cited_keep)
             || matches!(&config.gc, crate::gc::GcMode::Generational(_)),
+        // Zoom-addressed markers exist only where GC runs and the call
+        // offers zoom (the same condition that builds the address book).
+        zoom: config.gc.enabled() && offered(crate::zoom::ZOOM_TOOL),
         approvals: run_has_gated_effects(config, program),
         delegate_models: config.guidance.delegate_models.clone(),
     };
@@ -2568,7 +2584,27 @@ fn ir_tool_specs(
     if program_dispatches_ask_user(program) {
         specs.push(crate::tool::ask_user_tool_spec());
     }
+    if program_dispatches_zoom(program) {
+        specs.push(crate::zoom::zoom_tool_spec());
+    }
     specs
+}
+
+/// Whether the program contains a GC zoom read (t-1609): the agent loop's
+/// opt-in `zoom` arm. Like `ask_user`, the offer follows the program, so a
+/// zoom-free program offers exactly the tools it always did.
+fn program_dispatches_zoom(program: &crate::ir::Program) -> bool {
+    program.blocks.values().any(|block| {
+        block.instructions.iter().any(|instr| {
+            matches!(
+                instr,
+                Instr::Let {
+                    expr: Expr::Zoom { .. },
+                    ..
+                }
+            )
+        })
+    })
 }
 
 /// Whether the program contains an `ask_user` Tool site (t-1594).
@@ -2817,6 +2853,20 @@ fn eval_expr(env: &BTreeMap<Var, Value>, expr: &Expr) -> Result<Value> {
             })?;
             let ids = eval_expr(env, ids)?;
             Ok(select_tool_results(messages, &ids))
+        }
+        Expr::Zoom {
+            history,
+            arguments,
+            page_chars,
+        } => {
+            let history = env
+                .get(history)
+                .ok_or_else(|| anyhow!("unknown AgentIR var {:?}", history))?;
+            let messages = history
+                .as_array()
+                .ok_or_else(|| anyhow!("AgentIR Zoom expected array, got {history}"))?;
+            let arguments = eval_expr(env, arguments)?;
+            Ok(crate::zoom::zoom_history(messages, &arguments, *page_chars))
         }
     }
 }

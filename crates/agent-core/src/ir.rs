@@ -441,6 +441,19 @@ pub enum Expr {
         history: Var,
         ids: Box<Expr>,
     },
+    /// GC zoom (t-1609, docs/GC_ZOOM.md): read one history message (or a
+    /// range) back exactly. `history` is the append-only chat-message log;
+    /// `arguments` evaluates to the model's `{address, page?}` tool
+    /// arguments. Evaluates to the tool-result text: the addressed
+    /// message(s) verbatim under a one-line header, paged at `page_chars`
+    /// chars. Total and pure — bad addresses and pages become readable
+    /// error results, never interpreter errors — so a zoom is no effect and
+    /// leaves no replay record. Semantics: [`crate::zoom::zoom_history`].
+    Zoom {
+        history: Var,
+        arguments: Box<Expr>,
+        page_chars: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1091,6 +1104,12 @@ fn validate_expr_vars(
             validate_var(history, defined, block_id)?;
             validate_expr_vars(ids, defined, block_id)
         }
+        Expr::Zoom {
+            history, arguments, ..
+        } => {
+            validate_var(history, defined, block_id)?;
+            validate_expr_vars(arguments, defined, block_id)
+        }
         Expr::Push { base, value } => {
             validate_var(base, defined, block_id)?;
             validate_expr_vars(value, defined, block_id)
@@ -1226,6 +1245,11 @@ mod tests {
             Expr::SelectToolResults {
                 history: Var("history".into()),
                 ids: Box::new(Expr::Var(Var("refs".into()))),
+            },
+            Expr::Zoom {
+                history: Var("history".into()),
+                arguments: Box::new(Expr::Var(Var("arguments".into()))),
+                page_chars: 1024,
             },
         ] {
             let encoded = serde_json::to_string(&expr).unwrap();

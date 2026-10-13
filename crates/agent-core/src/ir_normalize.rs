@@ -178,6 +178,7 @@ fn canonicalize_expr_json(expr: &mut Expr) {
         Expr::Array(items) => items.iter_mut().for_each(canonicalize_expr_json),
         Expr::Object(map) => map.values_mut().for_each(canonicalize_expr_json),
         Expr::SelectToolResults { ids, .. } => canonicalize_expr_json(ids),
+        Expr::Zoom { arguments, .. } => canonicalize_expr_json(arguments),
     }
 }
 
@@ -861,6 +862,12 @@ fn collect_expr_vars(expr: &Expr, out: &mut BTreeSet<Var>) {
             out.insert(history.clone());
             collect_expr_vars(ids, out);
         }
+        Expr::Zoom {
+            history, arguments, ..
+        } => {
+            out.insert(history.clone());
+            collect_expr_vars(arguments, out);
+        }
         Expr::Push { base, value } => {
             out.insert(base.clone());
             collect_expr_vars(value, out);
@@ -1111,6 +1118,15 @@ fn rename_expr(expr: &Expr, env: &BTreeMap<Var, Var>) -> Result<Expr> {
         Expr::SelectToolResults { history, ids } => Expr::SelectToolResults {
             history: rename_var(history, env)?,
             ids: Box::new(rename_expr(ids, env)?),
+        },
+        Expr::Zoom {
+            history,
+            arguments,
+            page_chars,
+        } => Expr::Zoom {
+            history: rename_var(history, env)?,
+            arguments: Box::new(rename_expr(arguments, env)?),
+            page_chars: *page_chars,
         },
         Expr::Push { base, value } => Expr::Push {
             base: rename_var(base, env)?,

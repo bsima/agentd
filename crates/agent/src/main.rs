@@ -2225,6 +2225,7 @@ async fn resume_run(
         shell_requires_approval: facts.shell_requires_approval,
         infer_system_prompt: None,
         ask_user: false,
+        zoom: None,
     };
     let mut ir_store = checkpoint.store.clone();
     let mut gc_state = agent_core::GcState::default();
@@ -2843,6 +2844,7 @@ fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
         shell_requires_approval: runtime.shell_requires_approval,
         infer_system_prompt: None,
         ask_user: runtime.ask_user_tool,
+        zoom: None,
     }
 }
 
