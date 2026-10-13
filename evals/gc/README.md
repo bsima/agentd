@@ -134,6 +134,7 @@ firing is asserted per cell from the gc_collect events.
 |---|---|---|
 | `early-needle` | 9 steps; an early tool result (an access code) is needed again in the final answer, with bulky ballast before and after | 2000 |
 | `tangent-return` | log analysis, then a deliberate bulky tangent (two poems, distinct vocabulary), then return to the log thread | 1600 |
+| `counter-drift` (t-1609) | early-needle's shape, but the early value is a ticket that a re-run re-issues differently — only exact recall answers it (see "Zoom (t-1609)" below) | 2000 |
 | `memory-discipline` | read a token, `remember` it, bulk work, `recall` it late — memory tools across GC pressure | 1700 |
 
 **Scoring, all from traces:** programmatic needles on the final answer
@@ -1775,3 +1776,60 @@ candidate-future-default case now reads generational >= mark-sweep on
 behavior breadth, mark-sweep still ahead on per-cell cost, with
 steady-state evidence at realistic budgets still the missing piece for
 any promotion.
+
+## Zoom (t-1609): re-run markers vs exact recall — arms ready, recording pending
+
+The question: when every marker names its messages by `#N` address and
+the model has a `zoom` tool that reads the original back exactly from
+the session log (docs/GC_ZOOM.md), does recovery stop costing re-runs —
+and does it stop failing where re-running cannot recover the value at
+all?
+
+**Arms** — the marker-variant axis on the default and the candidate
+default: {stack, generational} × {re-run markers (zoom off), zoom
+markers (`--gc-zoom`)}. Zoom cells build the loop with the zoom arm
+(`AgentLoopOptions::zoom`, page size from the cell budget) and record at
+`<fixture>--<arm>--guided--zoom-s<N>.jsonl`; zoom-off paths are
+unchanged. `CellMeta.zoom` (serde default false) carries the axis, so
+replay rebuilds the right program; every pre-zoom recording replays
+strictly (the zoom-off program hashes to the corpus's recorded
+`program_hash`, pinned by `zoom_off_program_matches_the_recorded_corpus`).
+
+**New fixture — `counter-drift`** (budget 2000): early-needle's shape,
+but the early value comes from `sh ticket.sh`, which increments a counter
+file and prints a NEW ticket on every run (`TKT-4101` first, `TKT-4102`
+on a re-run, ...). The task says so. After eviction, exact recall is the
+only way back: `rot` flags a final line carrying a re-issued ticket
+(drift — the re-run answer), `refx` counts re-runs of the issuer, and
+`ok` needs `TKT-4101` plus the OK-line sum 21. `fixture_arithmetic_is_honest`
+pins the counts and that the ticket is in no file;
+`counter_drift_reissues_on_every_run` runs the real script twice.
+
+**Columns** — the existing set plus `zoom` (zoom calls in the cell; `-`
+on zoom-off cells).
+
+**Planned cells** (`planned_cells`, first in priority so the spend cap
+cannot cut them; all guided — suppressed at these budgets, so markers
+and the tool description are the whole intervention):
+
+| fixture | arms | marker variant | n |
+|---|---|---|---|
+| counter-drift | stack, generational | zoom, re-run | 2 each (8 cells) |
+| early-needle | stack, generational | zoom | 2 each (4 cells); the zoom-off baselines are the existing guided s1/s2 recordings |
+
+**Status: not recorded.** This environment had no OpenRouter/Anthropic
+key and `RUN_AGENT_ONLINE_EVAL` unset when t-1609 landed, so the 12
+cells are planned, not recorded; offline, `gc_behavior_matrix` lists them
+as `planned cell not recorded`. Record with
+`RUN_AGENT_ONLINE_EVAL=1 AGENT_API_KEY=... cargo test -p agent-core
+--test gc_behavior_evals gc_behavior_matrix -- --nocapture` (the model
+defaults to `anthropic/claude-haiku-4.5` via OpenRouter, matching every
+baseline). Expected spend, guessed from the generational round's $0.33
+for 6 cells: about $0.70.
+
+**Offline plumbing** (`plumbing_zoom_recovers_by_address_and_replays`,
+scripted, says nothing about model behavior): a stack session at a tiny
+budget evicts a bulky result, a marker names `#5` with `zoom #`, a zoom
+of `#5` returns the exact original as page 1, the last `gc_collect`
+reports a non-empty hot set, no effect event names the zoom, and the
+session replays from its trace with byte-identical windows.

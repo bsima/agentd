@@ -139,14 +139,25 @@
 //! the updated one is absent (context-rot failure made programmatic; the
 //! success needles score the updated value, the rot needles the stale
 //! one, so every cell is scoreable both ways).
+//!
+//! Zoom axis (t-1609): the marker variant. Zoom cells run the loop with
+//! the GC `zoom` arm (`--gc-zoom`): every marker names its messages by
+//! `#N` history address and the model can read any of them back exactly,
+//! paged, without re-running anything. Arms {stack, generational} x
+//! {re-run markers, zoom markers}; new column `zoom` (zoom calls). New
+//! fixture `counter-drift`: the early value comes from a ticket issuer
+//! that hands out a NEW number on every run, so re-running the evicted
+//! call cannot recover it — `rot` there flags an answer carrying a
+//! re-issued ticket (drift), the re-run answer made programmatic.
 
 use agent_core::gc::SemanticGc;
 use agent_core::{
-    agent_loop_ir_with_options, run_ir_sequential_with_store_and_replay, ChatMessage, ChatProvider,
-    Embedder, EnvPolicy, EvalConfig, Event, GcMode, GcTiming, GenerationalGc, GenerationalReport,
-    InMemoryStore, IrReplayTrace, MarkSweepGc, MemorySource, Model, PassiveHydrationConfig,
-    Pricing, PricingTable, ProviderClient, ProviderConfig, ReplayOnlyProvider, Response, RingGc,
-    RunUsage, RuntimeGuidance, SeqConfig, SourceRegistry, StackFrameGc, ToolCall, TraceLogger,
+    agent_loop_ir_for_options, agent_loop_ir_with_options, run_ir_sequential_with_store_and_replay,
+    AgentLoopOptions, ChatMessage, ChatProvider, Embedder, EnvPolicy, EvalConfig, Event, GcMode,
+    GcTiming, GenerationalGc, GenerationalReport, InMemoryStore, IrReplayTrace, MarkSweepGc,
+    MemorySource, Model, PassiveHydrationConfig, Pricing, PricingTable, ProviderClient,
+    ProviderConfig, ReplayOnlyProvider, Response, RingGc, RunUsage, RuntimeGuidance, SeqConfig,
+    SourceRegistry, StackFrameGc, ToolCall, TraceLogger, ZoomOptions,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -484,6 +495,20 @@ const DEPLOY_TOKEN: &str = "TOKEN-9QX-RAVEN-7734";
 /// t-1371 distractor-update values: the stale price and the update.
 const STALE_UNIT_PRICE: &str = "42";
 const CURRENT_UNIT_PRICE: &str = "57";
+/// t-1609 counter-drift values: `ticket.sh` issues TKT-4101 on its first
+/// run and a NEW number on every re-run — the fixture where re-running a
+/// call returns a different answer, so exact recall (zoom) and re-running
+/// are distinguishable from the final line alone.
+const TICKET_START: u32 = 4100;
+const FIRST_TICKET: &str = "TKT-4101";
+const REISSUED_TICKETS: [&str; 4] = ["TKT-4102", "TKT-4103", "TKT-4104", "TKT-4105"];
+
+/// The counter-drift ticket issuer: increments `.counter` and prints the
+/// new ticket. Deterministic per fresh workdir, different per re-run.
+const TICKET_SCRIPT: &str = "n=$(cat .counter)\n\
+n=$((n + 1))\n\
+echo \"$n\" > .counter\n\
+echo \"ticket TKT-$n issued for this batch run\"\n";
 
 /// Batch log `index` with exactly `ok_lines` lines reading exactly
 /// "STATUS: OK" amid bulky deterministic filler. The OK line is the WHOLE
@@ -705,6 +730,48 @@ fn fixtures() -> Vec<Fixture> {
                 ("build/step-2.log", build_log(2, 0)),
                 ("build/step-3.log", build_log(3, 3)),
                 ("build/step-4.log", build_log(4, 1)),
+            ],
+        },
+        // Fixture 4 — counter-drift (t-1609): early-needle's shape, but the
+        // early value comes from a command whose output CHANGES on every
+        // run (a ticket issuer backed by a counter file). After eviction,
+        // re-running cannot recover the value — it issues a new ticket —
+        // so the zoom arms (exact recall from history) and the re-run arms
+        // separate on the final line: `rot` here flags an answer carrying
+        // a RE-ISSUED ticket (drift), `refx` counts re-runs of the issuer.
+        // OK counts reuse early-needle's logs: 3+5+2+6+4+1 = 21.
+        Fixture {
+            name: "counter-drift",
+            task: "Complete these steps strictly in order, one shell command per step, \
+                   with at most one short sentence of commentary each:\n\
+                   1. Run `cat manual.txt` (the operations manual; no action needed).\n\
+                   2. Run `sh ticket.sh` — it issues this run's ticket number. Every \
+                   run of the script issues a NEW number, so the ticket for this task \
+                   is the one it prints now.\n\
+                   3-8. For each of logs/batch-1.log through logs/batch-6.log in order, \
+                   run `cat <file>` and count the lines that read exactly `STATUS: OK`.\n\
+                   9. Finish with one line exactly of the form: \
+                   `TICKET <ticket> TOTAL <sum>` — the ticket issued in step 2 and the \
+                   sum of the six OK-line counts."
+                .into(),
+            context_budget: 2000,
+            needles: vec![FIRST_TICKET, "21"],
+            ordered_needles: vec![],
+            rot_needles: REISSUED_TICKETS.to_vec(),
+            claim_marker: "TICKET",
+            probe: "ticket.sh",
+            probe_allowance: 1,
+            scripted_recalls: 0,
+            files: vec![
+                ("manual.txt", filler_lines(&MANUAL_WORDS, 1, 36, "manual: ")),
+                ("ticket.sh", TICKET_SCRIPT.into()),
+                (".counter", format!("{TICKET_START}\n")),
+                ("logs/batch-1.log", batch_log(1, 3)),
+                ("logs/batch-2.log", batch_log(2, 5)),
+                ("logs/batch-3.log", batch_log(3, 2)),
+                ("logs/batch-4.log", batch_log(4, 6)),
+                ("logs/batch-5.log", batch_log(5, 4)),
+                ("logs/batch-6.log", batch_log(6, 1)),
             ],
         },
     ]
@@ -1067,6 +1134,36 @@ struct CellSpec {
     /// ledger named a call at the moment it was repeated). Recorded cells
     /// keep this OFF (prompt payloads grow O(n^2)).
     full_payloads: bool,
+    /// Offer the GC `zoom` tool (t-1609): the loop program gains the zoom
+    /// arm (page size from the cell's budget) and markers carry `#N`
+    /// addresses. Off = the exact program every earlier recording ran.
+    zoom: bool,
+}
+
+/// The cell's loop program: the memory-enabled agent loop, plus the zoom
+/// arm on zoom cells (t-1609). Zoom-off cells build exactly the program
+/// every earlier recording ran (pinned by
+/// `zoom_off_program_matches_the_recorded_corpus`).
+fn cell_machine(
+    model: String,
+    prompt: Vec<ChatMessage>,
+    zoom: bool,
+    context_budget: usize,
+) -> agent_core::Machine {
+    if zoom {
+        agent_loop_ir_for_options(
+            Model(model),
+            prompt,
+            MAX_TURNS,
+            &AgentLoopOptions {
+                memory_tools: true,
+                zoom: Some(ZoomOptions::for_context_budget(context_budget)),
+                ..Default::default()
+            },
+        )
+    } else {
+        agent_loop_ir_with_options(Model(model), prompt, MAX_TURNS, true)
+    }
 }
 
 fn cell_guidance(guided: bool) -> RuntimeGuidance {
@@ -1128,7 +1225,7 @@ async fn run_cell(
         context_budget: spec.context_budget,
         pricing: pricing_table(),
     };
-    let machine = agent_loop_ir_with_options(Model(spec.model), spec.prompt, MAX_TURNS, true);
+    let machine = cell_machine(spec.model, spec.prompt, spec.zoom, spec.context_budget);
     let started = Instant::now();
     let mut store = InMemoryStore::new();
     let (value, _machine) =
@@ -1170,6 +1267,9 @@ struct CellMetrics {
     /// remember is trivially proactive.
     proactive_remembers: usize,
     recall_calls: usize,
+    /// GC `zoom` calls (t-1609): exact recalls of evicted history. Always
+    /// 0 on zoom-off cells (the tool is not offered).
+    zoom_calls: usize,
     /// gc_collect events: how many collections actually fired.
     collections: usize,
     /// gc_collect reason distribution (scheduled / backstop / overflow).
@@ -1259,6 +1359,7 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
         remember_calls: 0,
         proactive_remembers: 0,
         recall_calls: 0,
+        zoom_calls: 0,
         collections: 0,
         reasons: BTreeMap::new(),
         dropped_total: 0,
@@ -1312,6 +1413,11 @@ fn metrics_from_events(events: &[Event], content: &str, fixture: &Fixture) -> Re
                 if mentions_marker(&response.content) {
                     metrics.marker_mentions += 1;
                 }
+                metrics.zoom_calls += response
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call.name == agent_core::ZOOM_TOOL)
+                    .count();
                 // t-1373: map shell commands to the call ids that ran
                 // them, so a later repeat can be checked against the
                 // ledger's itemized call ids.
@@ -1466,6 +1572,10 @@ struct CellMeta {
     /// Sample index within the cell (n=2 on the hypothesis-deciding cells).
     #[serde(default = "default_sample")]
     sample: u32,
+    /// The t-1609 zoom axis (defaults false: every earlier recording ran
+    /// without the zoom tool). Replay must rebuild the same loop program.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    zoom: bool,
     /// Online wall time — replays report this, not their own.
     wall_ms: u64,
     /// The online run's final answer; replay must reproduce it.
@@ -1485,12 +1595,21 @@ fn legacy_cell_path(dir: &Path, fixture: &str, arm: Arm) -> PathBuf {
 }
 
 /// t-1364 cell path: the guidance axis and sample index are part of the
-/// cell identity.
-fn cell_path(dir: &Path, fixture: &str, arm: Arm, guided: bool, sample: u32) -> PathBuf {
+/// cell identity. Zoom cells (t-1609) add a `--zoom` segment; zoom-off
+/// paths are unchanged, so every earlier recording keeps its identity.
+fn cell_path(
+    dir: &Path,
+    fixture: &str,
+    arm: Arm,
+    guided: bool,
+    sample: u32,
+    zoom: bool,
+) -> PathBuf {
     dir.join(format!(
-        "{fixture}--{}--{}-s{sample}.jsonl",
+        "{fixture}--{}--{}{}-s{sample}.jsonl",
         arm.label(),
-        if guided { "guided" } else { "unguided" }
+        if guided { "guided" } else { "unguided" },
+        if zoom { "--zoom" } else { "" }
     ))
 }
 
@@ -1501,6 +1620,9 @@ struct CellId {
     arm: Arm,
     guided: bool,
     sample: u32,
+    /// The t-1609 marker-variant axis: the loop offers the GC `zoom` tool
+    /// and markers carry `#N` addresses (on) vs re-run markers (off).
+    zoom: bool,
 }
 
 /// The recording plan, in SPEND-PRIORITY order. Five generations:
@@ -1588,6 +1710,42 @@ struct CellId {
 /// Then the t-1364 unguided coverage and `none` baselines, all recorded.
 fn planned_cells() -> Vec<CellId> {
     let mut cells = Vec::new();
+    // t-1609 zoom round (first, so the spend cap can never cut it): the
+    // marker-variant axis — re-run markers (zoom off) vs zoom markers
+    // (`#N` addresses + the `zoom` tool) — on {stack (the default),
+    // generational (the candidate default)}. counter-drift is the deciding
+    // fixture: re-running its early call issues a DIFFERENT ticket, so
+    // only exact recall can answer it; both marker variants are recorded
+    // fresh, n=2. early-needle measures zoom against the existing
+    // zoom-off recordings of the same cells (stack and generational
+    // guided s1/s2, made on a runtime whose zoom-off behavior is
+    // byte-identical — the program-hash pin below proves it). All guided:
+    // the shipped default, suppressed at these starvation budgets, so the
+    // markers and the tool description are the whole intervention.
+    for arm in [Arm::Stack, Arm::Generational] {
+        for zoom in [true, false] {
+            for sample in [1, 2] {
+                cells.push(CellId {
+                    fixture: "counter-drift",
+                    arm,
+                    guided: true,
+                    sample,
+                    zoom,
+                });
+            }
+        }
+    }
+    for arm in [Arm::Stack, Arm::Generational] {
+        for sample in [1, 2] {
+            cells.push(CellId {
+                fixture: "early-needle",
+                arm,
+                guided: true,
+                sample,
+                zoom: true,
+            });
+        }
+    }
     // t-1167 generational round, priority order (first, so the spend cap
     // can never cut the deciding cells): the behavioral canon vs the
     // existing baselines — does generational match mark-sweep's
@@ -1607,6 +1765,7 @@ fn planned_cells() -> Vec<CellId> {
                 arm: Arm::Generational,
                 guided: true,
                 sample,
+                zoom: false,
             });
         }
     }
@@ -1616,6 +1775,7 @@ fn planned_cells() -> Vec<CellId> {
             arm: Arm::Generational,
             guided: true,
             sample: 1,
+            zoom: false,
         });
     }
     // t-1374 ledger round, priority order (see the doc comment above).
@@ -1625,6 +1785,7 @@ fn planned_cells() -> Vec<CellId> {
             arm: Arm::Stack,
             guided: true,
             sample,
+            zoom: false,
         });
     }
     for sample in [1, 2] {
@@ -1633,6 +1794,7 @@ fn planned_cells() -> Vec<CellId> {
             arm: Arm::Semantic,
             guided: true,
             sample,
+            zoom: false,
         });
     }
     for (fixture, arm) in [
@@ -1649,6 +1811,7 @@ fn planned_cells() -> Vec<CellId> {
             arm,
             guided: true,
             sample: 1,
+            zoom: false,
         });
     }
     // t-1371 curation-regime cells, in pre-registered priority order.
@@ -1660,6 +1823,7 @@ fn planned_cells() -> Vec<CellId> {
                     arm,
                     guided: true,
                     sample,
+                    zoom: false,
                 });
             }
         }
@@ -1671,6 +1835,7 @@ fn planned_cells() -> Vec<CellId> {
                 arm,
                 guided: true,
                 sample: 1,
+                zoom: false,
             });
         }
     }
@@ -1679,6 +1844,7 @@ fn planned_cells() -> Vec<CellId> {
         arm: Arm::Semantic,
         guided: true,
         sample: 1,
+        zoom: false,
     });
     // t-1369 marker-era cells, in deciding-question-first order.
     for arm in [Arm::Ring, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
@@ -1688,6 +1854,7 @@ fn planned_cells() -> Vec<CellId> {
                 arm,
                 guided: true,
                 sample,
+                zoom: false,
             });
         }
     }
@@ -1697,6 +1864,7 @@ fn planned_cells() -> Vec<CellId> {
             arm: Arm::Stack,
             guided: false,
             sample,
+            zoom: false,
         });
     }
     for arm in [Arm::Stack, Arm::MarkSweep] {
@@ -1705,6 +1873,7 @@ fn planned_cells() -> Vec<CellId> {
             arm,
             guided: true,
             sample: 1,
+            zoom: false,
         });
     }
     for arm in [Arm::Ring, Arm::Stack] {
@@ -1713,6 +1882,7 @@ fn planned_cells() -> Vec<CellId> {
             arm,
             guided: true,
             sample: 1,
+            zoom: false,
         });
     }
     // t-1367 re-run: the deciding guided ring/stack cells.
@@ -1723,6 +1893,7 @@ fn planned_cells() -> Vec<CellId> {
                 arm,
                 guided: true,
                 sample: 1,
+                zoom: false,
             });
             // Stack — the shipped default on trial — keeps its n=2 on the
             // fixtures where t-1364 saw the deciding failures.
@@ -1732,6 +1903,7 @@ fn planned_cells() -> Vec<CellId> {
                     arm,
                     guided: true,
                     sample: 2,
+                    zoom: false,
                 });
             }
         }
@@ -1745,6 +1917,7 @@ fn planned_cells() -> Vec<CellId> {
                     arm,
                     guided: false,
                     sample,
+                    zoom: false,
                 });
             }
         }
@@ -1755,6 +1928,7 @@ fn planned_cells() -> Vec<CellId> {
             arm: Arm::NoGc,
             guided: false,
             sample: 1,
+            zoom: false,
         });
         for arm in [Arm::Ring, Arm::Stack, Arm::MarkSweep, Arm::Semantic] {
             let cell = CellId {
@@ -1762,6 +1936,7 @@ fn planned_cells() -> Vec<CellId> {
                 arm,
                 guided: false,
                 sample: 1,
+                zoom: false,
             };
             if !cells.contains(&cell) {
                 cells.push(cell);
@@ -2070,7 +2245,7 @@ impl JudgeBook {
 
 fn print_header() {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         "fixture",
         "arm",
         "guid",
@@ -2085,6 +2260,7 @@ fn print_header() {
         "rem",
         "prem",
         "rec",
+        "zoom",
         "coll",
         "reasons",
         "drop",
@@ -2121,7 +2297,7 @@ fn reasons_label(reasons: &BTreeMap<String, usize>) -> String {
 
 fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, judge: &str) {
     println!(
-        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
+        "{:<18} {:<10} {:<4} {:>1} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>4} {:>3} {:>4} {:>3} {:>4} {:>4} {:<11} {:>4} {:>3} {:>3} {:>4} {:>3} {:>3} {:>5} {:>3} {:>8} {:>8} {:>10} {:>6.1} {:>3} {:>4} {:>3} {:>4} {:>4} {:>5}",
         fixture,
         arm.label(),
         if meta.guided { "on" } else { "off" },
@@ -2136,6 +2312,11 @@ fn print_row(fixture: &str, arm: Arm, metrics: &CellMetrics, meta: &CellMeta, ju
         metrics.remember_calls,
         metrics.proactive_remembers,
         metrics.recall_calls,
+        if meta.zoom {
+            metrics.zoom_calls.to_string()
+        } else {
+            "-".into()
+        },
         metrics.collections,
         reasons_label(&metrics.reasons),
         metrics.dropped_total,
@@ -2231,6 +2412,10 @@ async fn gc_behavior_matrix() -> Result<()> {
     println!("== t-1349 legacy cells (pre-guidance tool descriptions) ==");
     print_header();
     for fixture in &fixtures {
+        // counter-drift (t-1609) postdates the legacy era too.
+        if fixture.name == "counter-drift" {
+            continue;
+        }
         // Generational (t-1167) postdates the legacy era; no legacy cell
         // ever existed for it.
         for arm in Arm::ALL.into_iter().filter(|arm| *arm != Arm::Generational) {
@@ -2244,7 +2429,7 @@ async fn gc_behavior_matrix() -> Result<()> {
                 );
                 continue;
             }
-            replay_and_print(&path, fixture, arm, false, &mut judge).await?;
+            replay_and_print(&path, fixture, arm, false, false, &mut judge).await?;
         }
     }
 
@@ -2256,30 +2441,37 @@ async fn gc_behavior_matrix() -> Result<()> {
     println!("== t-1364 guidance x strategy (current tool descriptions) ==");
     print_header();
     let planned = planned_cells();
+    // The t-1609 zoom cells (marker-variant axis) sit beside their
+    // zoom-off twins: the `zoom` column reads `-` for re-run markers and
+    // the zoom-call count for zoom cells.
     for fixture in &fixtures {
         for arm in Arm::ALL {
             for guided in [false, true] {
-                for sample in [1, 2] {
-                    let path = cell_path(&dir, fixture.name, arm, guided, sample);
-                    if !path.exists() {
-                        let cell = CellId {
-                            fixture: fixture.name,
-                            arm,
-                            guided,
-                            sample,
-                        };
-                        if planned.contains(&cell) {
-                            println!(
-                                "{:<18} {:<10} {:<4} {} skipped: planned cell not recorded",
-                                fixture.name,
-                                arm.label(),
-                                if guided { "on" } else { "off" },
+                for zoom in [false, true] {
+                    for sample in [1, 2] {
+                        let path = cell_path(&dir, fixture.name, arm, guided, sample, zoom);
+                        if !path.exists() {
+                            let cell = CellId {
+                                fixture: fixture.name,
+                                arm,
+                                guided,
                                 sample,
-                            );
+                                zoom,
+                            };
+                            if planned.contains(&cell) {
+                                println!(
+                                    "{:<18} {:<10} {:<4} {} {}skipped: planned cell not recorded",
+                                    fixture.name,
+                                    arm.label(),
+                                    if guided { "on" } else { "off" },
+                                    sample,
+                                    if zoom { "zoom " } else { "" },
+                                );
+                            }
+                            continue;
                         }
-                        continue;
+                        replay_and_print(&path, fixture, arm, guided, zoom, &mut judge).await?;
                     }
-                    replay_and_print(&path, fixture, arm, guided, &mut judge).await?;
                 }
             }
         }
@@ -2302,13 +2494,14 @@ async fn gc_behavior_matrix() -> Result<()> {
             Arm::Generational,
         ] {
             for sample in [1, 2] {
-                let path = cell_path(&dir, fixture.name, arm, true, sample);
+                let path = cell_path(&dir, fixture.name, arm, true, sample, false);
                 if !path.exists() {
                     let cell = CellId {
                         fixture: fixture.name,
                         arm,
                         guided: true,
                         sample,
+                        zoom: false,
                     };
                     if planned.contains(&cell) {
                         println!(
@@ -2320,7 +2513,7 @@ async fn gc_behavior_matrix() -> Result<()> {
                     }
                     continue;
                 }
-                replay_and_print(&path, fixture, arm, true, &mut judge).await?;
+                replay_and_print(&path, fixture, arm, true, false, &mut judge).await?;
             }
         }
     }
@@ -2333,9 +2526,10 @@ async fn replay_and_print(
     fixture: &Fixture,
     arm: Arm,
     guided: bool,
+    zoom: bool,
     judge: &mut JudgeBook,
 ) -> Result<()> {
-    let (meta, metrics, events) = replay_cell(path, fixture, guided).await?;
+    let (meta, metrics, events) = replay_cell(path, fixture, guided, zoom).await?;
     // The point of the small budget: collections must actually have fired
     // in the recorded session, or the cell measures nothing.
     if arm.collects() {
@@ -2359,7 +2553,7 @@ async fn replay_and_print(
         arm.label(),
         if meta.guided { "guided" } else { "unguided" },
         meta.sample
-    );
+    ) + if meta.zoom { "|zoom" } else { "" };
     let verdict = judge
         .verdict(&cell, &fixture.task, &events, &meta.final_content)
         .await?
@@ -2383,8 +2577,16 @@ async fn replay_cell(
     path: &Path,
     fixture: &Fixture,
     expect_guided: bool,
+    expect_zoom: bool,
 ) -> Result<(CellMeta, CellMetrics, Vec<Event>)> {
     let (meta, recorded_events) = load_cell_recording(path)?;
+    anyhow::ensure!(
+        meta.zoom == expect_zoom,
+        "{}: recording's zoom setting ({}) does not match its cell ({})",
+        path.display(),
+        meta.zoom,
+        expect_zoom
+    );
     anyhow::ensure!(
         meta.fixture == fixture.name,
         "{}: recording is for fixture {}",
@@ -2418,6 +2620,7 @@ async fn replay_cell(
             prompt,
             guidance: cell_guidance(meta.guided),
             full_payloads: false,
+            zoom: meta.zoom,
         },
         &workdir,
         &memory_dir,
@@ -2620,7 +2823,14 @@ async fn record_missing_cells(dir: &Path) -> Result<()> {
     let fixtures = all_fixtures();
 
     for cell in planned_cells() {
-        let path = cell_path(dir, cell.fixture, cell.arm, cell.guided, cell.sample);
+        let path = cell_path(
+            dir,
+            cell.fixture,
+            cell.arm,
+            cell.guided,
+            cell.sample,
+            cell.zoom,
+        );
         if path.exists() {
             continue;
         }
@@ -2657,6 +2867,7 @@ async fn record_missing_cells(dir: &Path) -> Result<()> {
                 prompt,
                 guidance: cell_guidance(cell.guided),
                 full_payloads: false,
+                zoom: cell.zoom,
             },
             &workdir,
             &memory_dir,
@@ -2691,6 +2902,7 @@ async fn record_missing_cells(dir: &Path) -> Result<()> {
             context_budget: fixture.context_budget,
             guided: cell.guided,
             sample: cell.sample,
+            zoom: cell.zoom,
             wall_ms: run.wall_ms,
             final_content: run.content.clone(),
             recorded_at: Utc::now().to_rfc3339(),
@@ -2825,6 +3037,7 @@ async fn plumbing_gc_fires_and_metrics_count() -> Result<()> {
             // shipped fragment (the t-1364 guided arms' configuration).
             guidance: cell_guidance(true),
             full_payloads: false,
+            zoom: false,
         },
         &workdir,
         &memory_dir,
@@ -2963,6 +3176,7 @@ async fn plumbing_ledger_names_the_repeated_call_at_the_moment_of_repetition() -
             ],
             guidance: cell_guidance(false),
             full_payloads: true,
+            zoom: false,
         },
         &workdir,
         &memory_dir,
@@ -3012,6 +3226,253 @@ async fn plumbing_ledger_names_the_repeated_call_at_the_moment_of_repetition() -
     Ok(())
 }
 
+/// The full prompts a run's parent turns sent (needs `full_payloads`).
+fn parent_prompts(events: &[Event]) -> Vec<&Vec<ChatMessage>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::InferCall {
+                parent_op_id: None,
+                prompt: Some(prompt),
+                ..
+            } => Some(prompt),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A scripted zoom session (t-1609, plumbing-only) on the stack arm at a
+/// tiny budget: a bulky result (history #5) is evicted, the marker
+/// names it by address, a `zoom` of that address re-injects it exactly
+/// (paged), the write-barrier marks it hot, the zoom leaves no effect in
+/// the trace, and the whole session replays from its trace alone.
+#[tokio::test]
+async fn plumbing_zoom_recovers_by_address_and_replays() -> Result<()> {
+    let needle_line = "ticket TKT-4101 issued for this batch run";
+    let fixture = Fixture {
+        name: "plumbing-zoom",
+        task: "plumbing".into(),
+        context_budget: 2000,
+        needles: vec![FIRST_TICKET],
+        ordered_needles: vec![],
+        rot_needles: vec![],
+        claim_marker: "TICKET",
+        probe: "needle.txt",
+        probe_allowance: 1,
+        scripted_recalls: 0,
+        files: vec![
+            (
+                "needle.txt",
+                format!(
+                    "{}\n{needle_line}\n{}\n",
+                    filler_lines(&MANUAL_WORDS, 3, 14, "manual: "),
+                    filler_lines(&MANUAL_WORDS, 40, 14, "manual: ")
+                ),
+            ),
+            ("fat-1.txt", filler_lines(&INGEST_WORDS, 5, 40, "ingest: ")),
+            ("fat-2.txt", filler_lines(&BUILD_WORDS, 7, 40, "build: ")),
+        ],
+    };
+    let script = || {
+        vec![
+            ScriptedProvider::calls(vec![ToolCall::new(
+                "call-1",
+                "shell",
+                serde_json::json!({ "command": "cat needle.txt" }),
+            )]),
+            ScriptedProvider::calls(vec![ToolCall::new(
+                "call-2",
+                "shell",
+                serde_json::json!({ "command": "cat fat-1.txt" }),
+            )]),
+            ScriptedProvider::calls(vec![ToolCall::new(
+                "call-3",
+                "shell",
+                serde_json::json!({ "command": "cat fat-2.txt" }),
+            )]),
+            // History: #0 system, #1 user, #2 call-1, #3 its result,
+            // #4 call-2, #5 its result (fat-1.txt).
+            ScriptedProvider::calls(vec![ToolCall::new(
+                "call-4",
+                agent_core::ZOOM_TOOL,
+                serde_json::json!({ "address": "#5" }),
+            )]),
+            ScriptedProvider::text("TICKET TKT-4101"),
+        ]
+    };
+    let spec = || CellSpec {
+        model: DEFAULT_MODEL.into(),
+        gc: Arm::Stack.gc_mode(),
+        context_budget: fixture.context_budget,
+        prompt: vec![
+            ChatMessage::system("plumbing"),
+            ChatMessage::user("read the ticket"),
+        ],
+        guidance: cell_guidance(true),
+        full_payloads: true,
+        zoom: true,
+    };
+    let workdir = materialize_fixture(&fixture)?;
+    let memory_dir = std::env::temp_dir().join(format!("gc-behavior-mem-{}", Uuid::new_v4()));
+    fs::create_dir_all(&memory_dir)?;
+    let run = run_cell(
+        Arc::new(ScriptedProvider::new(script())),
+        None,
+        spec(),
+        &workdir,
+        &memory_dir,
+    )
+    .await?;
+
+    let metrics = metrics_from_events(&run.events, &run.content, &fixture)?;
+    assert!(metrics.success);
+    assert!(metrics.collections > 0, "the tiny budget must force GC");
+    assert_eq!(metrics.zoom_calls, 1);
+    assert_eq!(metrics.eval_calls, 3, "zoom never runs a command");
+    assert_eq!(metrics.needle_refetches, 0, "recovered without re-running");
+
+    let prompts = parent_prompts(&run.events);
+    assert_eq!(prompts.len(), 5);
+    // Before the zoom: a GC annotation (marker, frame, or ledger) names
+    // the evicted needle result by its address and offers zoom.
+    let before = prompts[3]
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .find(|content| {
+            (content.starts_with("[gc") || content.starts_with("[frame")) && content.contains("#5")
+        })
+        .unwrap_or_else(|| panic!("no annotation addresses #5: {:#?}", prompts[3]));
+    assert!(
+        before.contains("call-2") && before.contains("zoom #"),
+        "{before}"
+    );
+    // After the zoom: the result is the exact original, paged.
+    let zoomed = prompts[4]
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-4"))
+        .and_then(|message| message.content.as_deref())
+        .unwrap_or_else(|| panic!("the zoom result reaches the next turn: {:#?}", prompts[4]));
+    assert!(zoomed.starts_with("[zoom #5 page 1/"), "{zoomed}");
+    assert!(
+        zoomed.contains("#5 tool result of shell call-2:"),
+        "{zoomed}"
+    );
+    // Write-barrier: the re-injected page matched collected content.
+    let last_collect = run
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Custom { name, data, .. } if name == "gc_collect" => Some(data.clone()),
+            _ => None,
+        })
+        .expect("gc_collect events");
+    assert!(
+        last_collect["recall_hot"].as_u64().unwrap_or(0) > 0,
+        "the zoomed content is write-barrier hot: {last_collect}"
+    );
+    // A pure read: no effect event names the zoom.
+    for event in &run.events {
+        let line = serde_json::to_string(event)?;
+        if matches!(
+            event,
+            Event::EvalCall { .. } | Event::ToolCall { .. } | Event::RetrieveCall { .. }
+        ) {
+            assert!(!line.contains("\"zoom\""), "zoom ran as an effect: {line}");
+        }
+    }
+
+    // Replay determinism: the trace alone reproduces the session, zoom
+    // results and the gc stream included.
+    let replay = IrReplayTrace::from_events(&run.events)?;
+    let replayed = run_cell(
+        Arc::new(ReplayOnlyProvider),
+        Some(&replay),
+        spec(),
+        &workdir,
+        &memory_dir,
+    )
+    .await?;
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&memory_dir);
+    assert_eq!(replayed.content, run.content);
+    assert_eq!(
+        metrics_from_events(&replayed.events, &replayed.content, &fixture)?,
+        metrics
+    );
+    let replayed_prompts = parent_prompts(&replayed.events);
+    assert_eq!(
+        replayed_prompts, prompts,
+        "replayed windows are byte-identical"
+    );
+    Ok(())
+}
+
+/// The zoom-off cell program is exactly the program the whole recorded
+/// corpus ran (t-1609): its hash equals the `program_hash` every recording
+/// carries for the recording model. Zoom adds an arm only when asked.
+#[test]
+fn zoom_off_program_matches_the_recorded_corpus() -> Result<()> {
+    let path = recordings_dir()?.join("early-needle--stack--guided-s1.jsonl");
+    if !path.exists() {
+        println!("no recording at {} — skipped", path.display());
+        return Ok(());
+    }
+    let (meta, events) = load_cell_recording(&path)?;
+    let recorded = events
+        .iter()
+        .find_map(|event| {
+            serde_json::to_value(event)
+                .ok()?
+                .pointer("/effect/program_hash")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .expect("recorded effects carry the program hash");
+    let prompt = vec![ChatMessage::system(system_prompt())];
+    let off = cell_machine(
+        meta.model.clone(),
+        prompt.clone(),
+        false,
+        meta.context_budget,
+    );
+    let on = cell_machine(meta.model.clone(), prompt, true, meta.context_budget);
+    let hash = |machine: &agent_core::Machine| {
+        agent_core::program_hash(&machine.program)
+            .map(|hash| hash.0)
+            .expect("program hashes")
+    };
+    assert_eq!(hash(&off), recorded, "zoom off is the recorded program");
+    assert_ne!(hash(&on), recorded, "zoom on is a different program");
+    Ok(())
+}
+
+/// counter-drift's premise (t-1609): every run of the ticket script issues
+/// a new ticket, so re-running the early call cannot recover the first
+/// value. Runs the real script in a fresh fixture dir.
+#[test]
+fn counter_drift_reissues_on_every_run() -> Result<()> {
+    let fixture = fixtures()
+        .into_iter()
+        .find(|fixture| fixture.name == "counter-drift")
+        .expect("counter-drift fixture");
+    let dir = materialize_fixture(&fixture)?;
+    let run = || -> Result<String> {
+        let output = std::process::Command::new("/bin/sh")
+            .arg("ticket.sh")
+            .current_dir(&dir)
+            .output()?;
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    let first = run()?;
+    let second = run()?;
+    let _ = fs::remove_dir_all(&dir);
+    assert!(first.contains(FIRST_TICKET), "{first}");
+    assert!(second.contains(REISSUED_TICKETS[0]), "{second}");
+    assert!(!second.contains(FIRST_TICKET), "{second}");
+    Ok(())
+}
+
 /// The none arm never collects and the metrics say so.
 #[tokio::test]
 async fn plumbing_none_arm_never_collects() -> Result<()> {
@@ -3049,6 +3510,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
             prompt: vec![ChatMessage::system("plumbing"), ChatMessage::user("go")],
             guidance: cell_guidance(false),
             full_payloads: false,
+            zoom: false,
         },
         &workdir,
         &memory_dir,
@@ -3071,7 +3533,7 @@ async fn plumbing_none_arm_never_collects() -> Result<()> {
 #[tokio::test]
 async fn plumbing_recording_roundtrip() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("gc-behavior-rec-{}", Uuid::new_v4()));
-    let path = cell_path(&dir, "roundtrip", Arm::Stack, true, 2);
+    let path = cell_path(&dir, "roundtrip", Arm::Stack, true, 2, false);
     let meta = CellMeta {
         fixture: "roundtrip".into(),
         arm: Arm::Stack.label().into(),
@@ -3079,6 +3541,7 @@ async fn plumbing_recording_roundtrip() -> Result<()> {
         context_budget: 2000,
         guided: true,
         sample: 2,
+        zoom: false,
         wall_ms: 1234,
         final_content: "ACCESS X TOTAL 21".into(),
         recorded_at: Utc::now().to_rfc3339(),
@@ -3355,6 +3818,23 @@ fn fixture_arithmetic_is_honest() {
                     .expect("access code file");
                 assert!(code.1.contains(ACCESS_CODE));
             }
+            "counter-drift" => {
+                let total: usize = fixture
+                    .files
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("logs/"))
+                    .map(|(_, content)| content.matches("STATUS: OK").count())
+                    .sum();
+                assert_eq!(total, 21);
+                // The ticket is NOT in any file: only running the script
+                // produces it, so recall must come from the session.
+                for (_, content) in &fixture.files {
+                    assert!(!content.contains(FIRST_TICKET));
+                }
+                for rot in &fixture.rot_needles {
+                    assert!(!fixture.needles.contains(rot));
+                }
+            }
             "tangent-return" => {
                 let log = fixture
                     .files
@@ -3505,6 +3985,7 @@ async fn generational_replays_the_six_generation_corpus_with_sane_tiers() -> Res
                 prompt,
                 guidance: cell_guidance(meta.guided),
                 full_payloads: false,
+                zoom: meta.zoom,
             },
             &workdir,
             &memory_dir,
