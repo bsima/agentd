@@ -59,7 +59,8 @@ pub struct EmbeddingsEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelRegistry {
-    pub default_model: String,
+    #[serde(default)]
+    pub default_model: Option<String>,
     pub models: Vec<ModelEntry>,
     /// Serde-optional so existing models.yaml files load unchanged; absent
     /// means keyword-only memory retrieval.
@@ -100,7 +101,9 @@ impl ModelRegistry {
     }
 
     pub fn resolve(&self, requested: Option<&str>) -> Result<ResolvedModel> {
-        let alias = requested.unwrap_or(&self.default_model);
+        let alias = requested.or(self.default_model.as_deref()).ok_or_else(|| {
+            anyhow!("models.yaml has no default_model; select a model with --model")
+        })?;
         let Some(entry) = self.models.iter().find(|entry| entry.name == alias) else {
             let mut known = self
                 .models
@@ -240,6 +243,21 @@ models:
         assert_eq!(resolved.max_tokens, Some(32000));
         // Entries without the field resolve to None (provider default).
         assert_eq!(registry.resolve(Some("direct-name"))?.max_tokens, None);
+        Ok(())
+    }
+
+    #[test]
+    fn default_model_is_optional_when_model_is_explicitly_requested() -> Result<()> {
+        let registry = ModelRegistry::from_yaml_str(
+            "models:\n- name: explicit/model\n  provider: openai-compatible\n",
+        )?;
+        assert_eq!(
+            registry.resolve(Some("explicit/model"))?.api_id,
+            "explicit/model"
+        );
+        let err = registry.resolve(None).unwrap_err().to_string();
+        assert!(err.contains("no default_model"), "got: {err}");
+        assert!(err.contains("--model"), "got: {err}");
         Ok(())
     }
 

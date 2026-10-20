@@ -1491,6 +1491,14 @@ async fn resolve_model(
 /// registry's pricing table (t-1334) so cost accounting covers dynamic
 /// (tool-supplied) model ids, not just the resolved one; the no-registry
 /// fallback has no pricing (usage recorded, cost omitted).
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 fn resolve_model_from(
     registry: Result<ModelRegistry>,
     requested: Option<String>,
@@ -1509,7 +1517,7 @@ fn resolve_model_from(
                 Some(registry),
             ))
         }
-        Err(_err) if requested.is_some() => {
+        Err(err) if requested.is_some() && error_is_not_found(&err) => {
             let model = requested.expect("requested model checked above");
             Ok((
                 ResolvedModel {
@@ -3969,7 +3977,10 @@ mod tests {
     fn raw_model_is_resolved_without_model_registry() -> Result<()> {
         // Exercise the registry-missing fallback purely — no env mutation,
         // which races under parallel test execution.
-        let missing_registry = Err(anyhow!("no registry on this machine"));
+        let missing_registry = Err(anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no registry on this machine",
+        )));
 
         let (resolved, pricing, embedder, registry) =
             resolve_model_from(missing_registry, Some("openrouter/auto".into()))?;
@@ -3982,6 +3993,31 @@ mod tests {
         assert_eq!(resolved.pricing, None);
         assert!(pricing.is_empty(), "fallback has no pricing to guess from");
         Ok(())
+    }
+
+    #[test]
+    fn malformed_registry_is_not_ignored_when_model_is_requested() {
+        let malformed_registry = Err(anyhow!("loading model registry: parsing models.yaml"));
+        let Err(err) = resolve_model_from(malformed_registry, Some("configured/model".into()))
+        else {
+            panic!("an existing malformed registry must fail closed");
+        };
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("parsing models.yaml"), "got: {rendered}");
+    }
+
+    #[test]
+    fn registry_io_errors_other_than_not_found_are_not_ignored() {
+        let unreadable_registry = Err(anyhow!(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "models.yaml is not readable",
+        )));
+        let Err(err) = resolve_model_from(unreadable_registry, Some("configured/model".into()))
+        else {
+            panic!("an unreadable registry must fail closed");
+        };
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("not readable"), "got: {rendered}");
     }
 
     #[test]
