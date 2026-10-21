@@ -52,7 +52,7 @@ the wire.
 
 ## What is implemented
 
-- `initialize` — protocol v1, text and image prompts, `loadSession: true`.
+- `initialize` — protocol v1, text and image prompts, `loadSession: true`, plus `sessionCapabilities.list` and `.close`.
 - `session/new` — one fresh `Runtime` (agent loop, trace, checkpoints) per
   session. The request `cwd` becomes the shell tool's working directory and
   the system prompt's cwd line. Session state lives under
@@ -86,6 +86,13 @@ the wire.
   in-flight shell command is not killed synchronously — it runs to its
   timeout in the background (a cancel-token in agent-core is the planned
   tightening).
+- `session/list` — pages (50 at a time, newest first) over disk-backed ACP
+  checkpoints, optionally filtering by exact cwd. Titles come from the first
+  user prompt's first line (60 characters); a `session_info_update` announces
+  the title when the first prompt arrives. Listing builds no runtimes. Paseo
+  loads each listed session to collect prompt previews; `session/close` drops
+  the live actor and in-flight turn but retains the checkpoint for later load.
+  Sessions predating the cwd metadata index are not listed until loaded.
 - `session/load` — rebuilds the runtime from the session's
   `session-latest.json` checkpoint and replays the conversation as
   user/agent message chunks before responding. Text-only replay: past tool
@@ -209,5 +216,5 @@ printf '%s\n' \
 
 - Thought/plan updates (no reasoning events exist in the runtime trace).
 - Deterministic mid-effect cancellation (cancel token through agent-core).
-- `session/list` / `session/delete`, MCP server passthrough, `fs/*`
+- `session/delete`, listing agentd supervisor sessions, MCP server passthrough, `fs/*`
   client capabilities, cumulative wire-level cost reporting.

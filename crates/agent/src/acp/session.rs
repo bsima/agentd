@@ -73,12 +73,38 @@ pub(crate) async fn session_actor(
         args,
     } = ctx;
     while let Some(command) = cmd_rx.recv().await {
+        if cmd_rx.is_closed() {
+            break;
+        }
         match command {
             SessionCommand::Prompt { message, responder } => {
                 // A cancel that raced in between turns applies to nothing:
                 // observe the current generation so only cancels arriving
                 // DURING this turn fire the select arm below.
                 cancel_rx.borrow_and_update();
+                // First user prompt owns the title; persist it independently
+                // of turn completion (a cancelled first turn is still named).
+                if let Some(dir) = runtime.checkpoint_dir.as_deref() {
+                    if let Ok(mut info) = super::list::read_metadata(dir).await {
+                        if info.title.is_none() {
+                            if let Some(title) =
+                                message.content.as_deref().and_then(super::list::title)
+                            {
+                                info.title = Some(title.clone());
+                                if let Err(err) = super::list::write_metadata(dir, &info).await {
+                                    tracing::warn!(%err, "saving ACP session title");
+                                }
+                                let _ = cx.send_notification(SessionNotification::new(
+                                    session_id.clone(),
+                                    SessionUpdate::SessionInfoUpdate(
+                                        agent_client_protocol::schema::v1::SessionInfoUpdate::new()
+                                            .title(title),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
                 tokio::select! {
                     result = run_acp_turn(&mut runtime, message, &cx, &session_id) => {
                         // Turn barrier: ACP clients treat the prompt
@@ -121,6 +147,7 @@ pub(crate) async fn session_actor(
                         streamed.lock().expect("streamed text map poisoned").clear();
                         flush_updates(&update_tx).await;
                         let _ = responder.respond(PromptResponse::new(StopReason::Cancelled));
+                        if cmd_rx.is_closed() { break; }
                     }
                 }
             }

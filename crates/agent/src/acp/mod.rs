@@ -9,6 +9,7 @@
 //! `session/load` rebuilds a runtime from the session's checkpoint.
 
 mod bridge;
+mod list;
 mod registry;
 mod session;
 mod turn;
@@ -18,11 +19,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, SessionConfigOption, SessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption, SessionId,
+    SessionListCapabilities, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
 use agent_client_protocol::{
     on_receive_notification, on_receive_request, Agent, Client, ConnectionTo, Error, Stdio,
@@ -98,6 +100,13 @@ fn prompt_message(request: &PromptRequest) -> std::result::Result<ChatMessage, E
     Ok(ChatMessage::user_with_images(text, images))
 }
 
+fn close_handle(sessions: &mut HashMap<String, session::SessionHandle>, id: &str) {
+    if let Some(handle) = sessions.remove(id) {
+        handle.cancel_tx.send_modify(|generation| *generation += 1);
+        // Dropping the sender closes the mailbox; the actor drops its runtime.
+    }
+}
+
 impl AcpServer {
     /// Build a session runtime (fresh or from a checkpoint), wire the event
     /// bridge and streaming tap, spawn the actor, and register the handle.
@@ -111,6 +120,16 @@ impl AcpServer {
         cx: &ConnectionTo<Client>,
     ) -> Result<(SessionModeState, Vec<SessionConfigOption>)> {
         let checkpoint_dir = acp_session_dir(&session_id, self.args.state_dir.as_deref())?;
+        if checkpoint.is_none() {
+            list::write_metadata(
+                &checkpoint_dir,
+                &list::SessionMetadata {
+                    cwd: cwd.clone(),
+                    title: None,
+                },
+            )
+            .await?;
+        }
         let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let streamed: bridge::StreamedText = Arc::new(Mutex::new(HashMap::new()));
         let context_budget: bridge::ContextBudget = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -228,6 +247,10 @@ impl AcpServer {
         Ok((modes, config_options))
     }
 
+    fn close_session(&self, id: &str) {
+        close_handle(&mut self.sessions.lock().expect("session map poisoned"), id);
+    }
+
     async fn new_session(
         &self,
         request: NewSessionRequest,
@@ -268,6 +291,17 @@ impl AcpServer {
             cx.send_notification(SessionNotification::new(request.session_id.clone(), update))
                 .map_err(|err| anyhow!("replaying session history: {err}"))?;
         }
+        let dir = acp_session_dir(&session_id, self.args.state_dir.as_deref())?;
+        if list::read_metadata(&dir).await.is_err() {
+            list::write_metadata(
+                &dir,
+                &list::SessionMetadata {
+                    cwd: request.cwd.clone(),
+                    title: list::checkpoint_title(&checkpoint),
+                },
+            )
+            .await?;
+        }
         let (modes, config_options) = self
             .spawn_session(session_id, request.cwd, Some(checkpoint), cx)
             .await?;
@@ -295,6 +329,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let set_mode_server = server.clone();
     let set_config_server = server.clone();
     let cancel_server = server.clone();
+    let list_server = server.clone();
+    let close_server = server.clone();
 
     let result = Agent
         .builder()
@@ -306,6 +342,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         .agent_capabilities(
                             AgentCapabilities::new()
                                 .load_session(true)
+                                .session_capabilities(
+                                    SessionCapabilities::new()
+                                        .list(SessionListCapabilities::new())
+                                        .close(SessionCloseCapabilities::new()),
+                                )
                                 .prompt_capabilities(PromptCapabilities::new().image(true)),
                         )
                         .agent_info(Implementation::new("agentd", env!("CARGO_PKG_VERSION"))),
@@ -330,6 +371,26 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             {
                 Ok(response) => responder.respond(response),
                 Err(err) => responder.respond_with_error(internal_error(err)),
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ListSessionsRequest, responder, _cx| match acp_session_dir(
+                "",
+                list_server.args.state_dir.as_deref(),
+            ) {
+                Ok(root) => match list::list(&root, request).await {
+                    Ok(response) => responder.respond(response),
+                    Err(err) => responder.respond_with_error(internal_error(err)),
+                },
+                Err(err) => responder.respond_with_error(internal_error(err)),
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: CloseSessionRequest, responder, _cx| {
+                close_server.close_session(request.session_id.0.as_ref());
+                responder.respond(CloseSessionResponse::new())
             },
             on_receive_request!(),
         )
@@ -447,4 +508,25 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         otel.shutdown();
     }
     result
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    #[test]
+    fn close_cancels_and_removes_and_is_idempotent() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(0);
+        let mut sessions = HashMap::from([(
+            "session".into(),
+            session::SessionHandle { cmd_tx, cancel_tx },
+        )]);
+        close_handle(&mut sessions, "unknown");
+        assert_eq!(*cancel_rx.borrow_and_update(), 0);
+        close_handle(&mut sessions, "session");
+        assert!(sessions.is_empty());
+        assert_eq!(*cancel_rx.borrow_and_update(), 1);
+        assert!(cmd_rx.is_closed());
+        close_handle(&mut sessions, "session");
+    }
 }
