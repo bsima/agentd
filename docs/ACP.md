@@ -107,8 +107,9 @@ the wire.
   Sessions predating the cwd metadata index are not listed until loaded.
 - `session/load` — rebuilds the runtime from the session's
   `session-latest.json` checkpoint and replays the conversation as
-  user/agent message chunks before responding. Text-only replay: past tool
-  traffic is not reconstructed.
+  user/agent message chunks and tool cards in trace order before responding.
+  The trace uses the live event mapping (including zoom and resolved approval
+  cards); missing or unreadable traces fall back to text-only checkpoint history.
 - Modes — `ask` (default; approval-gated shell) and `yolo` remain built in.
   Additional modes load from `--acp-modes-dir DIR`, or from
   `$XDG_CONFIG_HOME/agent/modes` (`~/.config/agent/modes`) if it exists.

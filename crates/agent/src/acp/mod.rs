@@ -13,6 +13,7 @@ mod commands;
 mod list;
 mod profiles;
 mod registry;
+mod replay;
 mod session;
 mod turn;
 
@@ -286,18 +287,8 @@ impl AcpServer {
         let checkpoint_path = acp_session_dir(&session_id, self.args.state_dir.as_deref())?
             .join("session-latest.json");
         let checkpoint = crate::load_checkpoint(&checkpoint_path).await?;
-        // Per protocol, the conversation replays as session/update
-        // notifications before the load response. Text-only in v1: tool
-        // traffic from past turns is not reconstructed.
-        for message in &checkpoint.messages {
-            let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) else {
-                continue;
-            };
-            let update = match message.role.as_str() {
-                "user" => SessionUpdate::UserMessageChunk(bridge::text_chunk(content)),
-                "assistant" => SessionUpdate::AgentMessageChunk(bridge::text_chunk(content)),
-                _ => continue,
-            };
+        // Replay committed trace effects in order before the load response.
+        for update in replay::history_updates(&checkpoint).await {
             cx.send_notification(SessionNotification::new(request.session_id.clone(), update))
                 .map_err(|err| anyhow!("replaying session history: {err}"))?;
         }
