@@ -92,6 +92,15 @@ the wire.
   question tool, `ask_user {question, options}` (2-8 distinct non-empty
   options). CLI one-shot/FIFO/stdin sessions and the `agentd` supervisor do
   not offer it: they have no way to answer. See "Questions" below.
+- `todo` — opt in with `--todo` (also works outside ACP). The model sends
+  `{ "items": [{ "content": "...", "status": "pending" | "in_progress" | "completed" }] }`;
+  each successful call replaces the entire checklist and emits an ACP `plan`
+  update (medium priority). Paseo renders `content` and checks only completed
+  items. An empty array clears the list; blank content, invalid statuses, and
+  more than one in-progress step produce a recoverable tool error, not a pause.
+  Calls also render as ordinary completed tool cards, retaining the model's
+  action in the timeline. On `session/load`, the last successful list is
+  rebuilt from traced tool results (including a cleared list).
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already
@@ -241,7 +250,7 @@ printf '%s\n' \
 
 ## Follow-ups (not yet implemented)
 
-- Thought/plan updates (no reasoning events exist in the runtime trace).
+- Thought updates (no reasoning events exist in the runtime trace).
 - Deterministic mid-effect cancellation (cancel token through agent-core).
 - `session/delete`, listing agentd supervisor sessions, MCP server passthrough, `fs/*`
   client capabilities, cumulative wire-level cost reporting.

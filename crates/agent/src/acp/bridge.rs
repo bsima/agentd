@@ -370,9 +370,15 @@ pub(crate) fn map_event(
             if let (true, Some(answer)) = (name == agent_core::ASK_USER_TOOL, result.as_str()) {
                 fields = fields.content(vec![tool_text(answer)]);
             }
-            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            let mut updates = vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 id, fields,
-            ))]
+            ))];
+            if name == agent_core::todo::TODO_TOOL {
+                if let Some(plan) = super::todo::plan_from_result(result) {
+                    updates.push(plan);
+                }
+            }
+            updates
         }
         Event::ToolError { op_id, error, .. } => {
             let id = ids.for_result(*op_id);
@@ -777,6 +783,58 @@ mod tests {
             assert_eq!(card.kind, ToolKind::Read);
             assert_eq!(card.status, ToolCallStatus::Completed);
         }
+    }
+
+    #[test]
+    fn successful_todo_emits_completed_card_then_plan_only_on_success() {
+        let mut ids = ToolCallIds::default();
+        let mut streamed = HashMap::new();
+        let call = Event::ToolCall {
+            run_id: "r".into(),
+            op_id: 33,
+            parent_op_id: None,
+            name: "todo".into(),
+            arguments: serde_json::json!({"items": []}),
+            effect: None,
+            timestamp: Utc::now(),
+        };
+        let updates = map_event(&call, &mut ids, &mut streamed);
+        assert_eq!(update_names(&updates), ["tool_call"]);
+        let result = Event::ToolResult {
+            run_id: "r".into(),
+            op_id: 33,
+            parent_op_id: None,
+            name: "todo".into(),
+            result: serde_json::json!({"message": "Plan updated", "items": [
+                {"content": "Ship it", "status": "in_progress"}
+            ]}),
+            result_preview: String::new(),
+            duration_ms: 0,
+            timestamp: Utc::now(),
+        };
+        let updates = map_event(&result, &mut ids, &mut streamed);
+        assert_eq!(update_names(&updates), ["tool_call_update", "other"]);
+        let SessionUpdate::Plan(plan) = &updates[1] else {
+            panic!("expected plan")
+        };
+        assert_eq!(plan.entries[0].content, "Ship it");
+        assert_eq!(
+            plan.entries[0].status,
+            agent_client_protocol::schema::v1::PlanEntryStatus::InProgress
+        );
+        let error = Event::ToolError {
+            run_id: "r".into(),
+            op_id: 34,
+            parent_op_id: None,
+            name: "todo".into(),
+            error: "invalid items".into(),
+            duration_ms: 0,
+            timestamp: Utc::now(),
+        };
+        assert_eq!(
+            update_names(&map_event(&error, &mut ids, &mut streamed)),
+            ["tool_call_update"]
+        );
     }
 
     fn infer_result_event(content: &str) -> Event {

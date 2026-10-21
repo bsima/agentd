@@ -247,6 +247,9 @@ struct Args {
     /// unchanged.
     #[arg(long)]
     gc_zoom: bool,
+    /// Offer the in-process `todo` checklist tool (off by default).
+    #[arg(long)]
+    todo: bool,
     /// Accept compaction flag for agentd compatibility; compaction is not implemented yet.
     #[arg(long)]
     enable_compaction: bool,
@@ -1179,6 +1182,9 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         pricing: pricing_table,
     };
     config.guidance.infer_models = infer_registry.map(|r| (r, resolved_model.clone()));
+    if args.todo {
+        config.tools.register(agent_core::todo::todo_tool())?;
+    }
     if !config.gc.enabled() && args.gc_timing != GcTiming::Threshold {
         return Err(anyhow!(
             "--gc-timing {} requires a GC strategy; pass --gc stack, --gc ring, --gc mark-sweep, --gc semantic, or --gc generational",

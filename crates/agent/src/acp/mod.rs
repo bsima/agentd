@@ -15,6 +15,7 @@ mod profiles;
 mod registry;
 mod replay;
 mod session;
+mod todo;
 mod turn;
 
 use std::collections::HashMap;
@@ -291,6 +292,15 @@ impl AcpServer {
         for update in replay::history_updates(&checkpoint).await {
             cx.send_notification(SessionNotification::new(request.session_id.clone(), update))
                 .map_err(|err| anyhow!("replaying session history: {err}"))?;
+        }
+        // The trace records validated tool results even across GC compaction.
+        // Replay only the last successful replacement, including an empty list.
+        // A missing trace is not fatal: history replay already fell back to text.
+        if let Ok(events) = agent_core::TraceLogger::read_events(&checkpoint.trace_path).await {
+            if let Some(plan) = todo::latest_plan(&events) {
+                cx.send_notification(SessionNotification::new(request.session_id.clone(), plan))
+                    .map_err(|err| anyhow!("replaying todo plan: {err}"))?;
+            }
         }
         let dir = acp_session_dir(&session_id, self.args.state_dir.as_deref())?;
         if list::read_metadata(&dir).await.is_err() {

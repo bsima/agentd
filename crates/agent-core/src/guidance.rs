@@ -79,6 +79,10 @@ pub const ASK_USER_TOOL_DESCRIPTION: &str =
      user dismisses the question, proceed on your best judgment or stop \
      and explain.";
 
+/// Opt-in todo: operational guidance lives in the tool description, so
+/// no guidance or prompt bytes change when the flag is off.
+pub const TODO_TOOL_DESCRIPTION: &str = "Maintain a step list for multi-step work. Use it when a checklist helps track progress; skip it for simple tasks. Each call replaces the whole list: include completed, current, and pending steps, and update statuses as work progresses. Use an empty list to clear it; at most one step may be in_progress.";
+
 /// Shipped `zoom` tool description (t-1609, docs/GUIDANCE.md §4). Only
 /// offered under `--gc-zoom` with an active GC strategy.
 pub const ZOOM_TOOL_DESCRIPTION: &str =

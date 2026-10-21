@@ -782,6 +782,15 @@ sessions):
 > dismisses the question, proceed on your best judgment or stop and
 > explain.
 
+`todo` (t-1653.2 — offered only with `--todo`; constant
+`TODO_TOOL_DESCRIPTION`):
+
+> Maintain a step list for multi-step work. Use it when a checklist helps
+> track progress; skip it for simple tasks. Each call replaces the whole
+> list: include completed, current, and pending steps, and update statuses
+> as work progresses. Use an empty list to clear it; at most one step may
+> be in_progress.
+
 `zoom` (t-1609 — offered only under `--gc-zoom` with an active GC
 strategy; constant `ZOOM_TOOL_DESCRIPTION`):
 
