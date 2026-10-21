@@ -15,6 +15,7 @@ use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 
 use super::bridge::{ForwarderMsg, StreamedText};
+use super::commands;
 use super::registry;
 use super::turn::{run_acp_turn, TurnOutcome};
 use crate::{response_turn_budget_exhausted, Args, Runtime};
@@ -22,6 +23,7 @@ use crate::{response_turn_budget_exhausted, Args, Runtime};
 pub(crate) enum SessionCommand {
     Prompt {
         message: agent_core::ChatMessage,
+        command: Option<commands::Command>,
         responder: Responder<PromptResponse>,
     },
     SetMode {
@@ -79,7 +81,28 @@ pub(crate) async fn session_actor(
             break;
         }
         match command {
-            SessionCommand::Prompt { message, responder } => {
+            SessionCommand::Prompt {
+                message,
+                command,
+                responder,
+            } => {
+                if let Some(command) = command {
+                    match commands::execute(command, &runtime).await {
+                        Ok(text) => {
+                            let _ = update_tx.send(ForwarderMsg::update(
+                                SessionUpdate::AgentMessageChunk(super::bridge::text_chunk(text)),
+                            ));
+                            flush_updates(&update_tx).await;
+                            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        Err(err) => {
+                            let _ = responder.respond_with_error(
+                                agent_client_protocol::Error::new(-32603, err.to_string()),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 // A cancel that raced in between turns applies to nothing:
                 // observe the current generation so only cancels arriving
                 // DURING this turn fire the select arm below.

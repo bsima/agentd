@@ -9,6 +9,7 @@
 //! `session/load` rebuilds a runtime from the session's checkpoint.
 
 mod bridge;
+mod commands;
 mod list;
 mod profiles;
 mod registry;
@@ -269,6 +270,7 @@ impl AcpServer {
         let (modes, config_options) = self
             .spawn_session(session_id.clone(), request.cwd, None, cx)
             .await?;
+        commands::advertise(cx, SessionId::new(session_id.clone()))?;
         Ok(NewSessionResponse::new(SessionId::new(session_id))
             .modes(modes)
             .config_options(config_options))
@@ -313,6 +315,7 @@ impl AcpServer {
         let (modes, config_options) = self
             .spawn_session(session_id, request.cwd, Some(checkpoint), cx)
             .await?;
+        commands::advertise(cx, request.session_id.clone())?;
         Ok(LoadSessionResponse::new()
             .modes(modes)
             .config_options(config_options))
@@ -406,6 +409,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, _cx| {
+                let command = commands::parse(&request.prompt);
                 let message = match prompt_message(&request) {
                     Ok(text) => text,
                     Err(err) => return responder.respond_with_error(err),
@@ -420,10 +424,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if let Err(mpsc::error::SendError(session::SessionCommand::Prompt {
                     responder,
                     ..
-                })) = handle
-                    .cmd_tx
-                    .send(session::SessionCommand::Prompt { message, responder })
-                {
+                })) = handle.cmd_tx.send(session::SessionCommand::Prompt {
+                    message,
+                    command,
+                    responder,
+                }) {
                     return responder.respond_with_error(internal_error("session is gone"));
                 }
                 Ok(())

@@ -238,3 +238,78 @@ fn prompt_turn_streams_message_and_ends_turn() {
     drop(child.stdin.take());
     expect_exit(&mut child);
 }
+
+#[test]
+fn slash_commands_are_advertised_and_cost_does_not_infer() {
+    let root = std::env::temp_dir().join(format!("agent-acp-commands-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // Replay mode has no provider to call; /cost must not try to consume an
+    // InferResult (or add a user turn to the persisted conversation).
+    let replay = write_replay_fixture(&root, "provider response");
+    let mut child = spawn_acp_agent(
+        &root,
+        &[
+            "--model",
+            "test-model",
+            "--replay-trace",
+            replay.to_str().unwrap(),
+        ],
+    );
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    send_line(
+        &mut child,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+    );
+    read_until_response(&mut reader, 1);
+    send_line(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{},"mcpServers":[]}}}}"#,
+            serde_json::to_string(root.to_str().unwrap()).unwrap()
+        ),
+    );
+    let (new, updates) = read_until_response(&mut reader, 2);
+    let session = new["result"]["sessionId"].as_str().unwrap();
+    let commands = updates
+        .iter()
+        .find(|u| u["update"]["sessionUpdate"] == "available_commands_update")
+        .expect("commands arrive before session/new response");
+    let names: Vec<&str> = commands["update"]["availableCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["cost", "gc", "help"]);
+    send_line(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{session}","prompt":[{{"type":"text","text":"/cost"}}]}}}}"#
+        ),
+    );
+    let (response, updates) = read_until_response(&mut reader, 3);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["update"]["sessionUpdate"] == "agent_message_chunk"
+                && u["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no InferResult")),
+        "{updates:?}"
+    );
+    send_line(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{session}","prompt":[{{"type":"text","text":"hello"}}]}}}}"#
+        ),
+    );
+    let (response, updates) = read_until_response(&mut reader, 4);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(updates
+        .iter()
+        .any(|u| u["update"]["content"]["text"] == "provider response"));
+    drop(child.stdin.take());
+    expect_exit(&mut child);
+}

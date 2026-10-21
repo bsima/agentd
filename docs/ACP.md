@@ -70,6 +70,18 @@ the wire.
   recognized by trace lineage (`parent_op_id`); a child dispatched after
   an approval resume in the same turn has no lineage and renders as
   assistant text.
+- Slash commands — `session/new` and `session/load` immediately send
+  `available_commands_update` for `/cost`, `/gc`, and `/help`. A standalone
+  command is handled locally with an `agent_message_chunk` and `end_turn`,
+  without inference, user-history mutation, checkpoint, or trace event;
+  leaving the replay trace unchanged avoids shifting effect visits. Unknown
+  commands pass through to the model. `/cost` reads the session trace's
+  per-model cost rollups (including child infers; unpriced calls are marked),
+  rather than the live `RunUsage` which has no model breakdown on load.
+  `/gc` shows the selected strategy, threshold, latest root-context usage
+  (unknown before inference), model ceiling, and trace `gc_collect` count.
+  `/fork`, `/checkpoint`, `/replay`, `/zoom`, and per-mode commands remain
+  follow-ups.
 - `session/request_permission` — shell commands are approval-gated by
   default in ACP mode: each gated command round-trips to the client with
   allow-once / allow-always / reject-once options. A rejection is a typed
