@@ -78,6 +78,10 @@ struct Args {
     #[cfg(feature = "acp")]
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     acp_shell_approval: bool,
+    /// Directory of ACP mode profiles (Markdown with YAML frontmatter).
+    #[cfg(feature = "acp")]
+    #[arg(long, requires = "acp")]
+    acp_modes_dir: Option<PathBuf>,
     /// Read NUL-terminated session turns from this FIFO path.
     #[arg(long, env = "AGENT_FIFO")]
     fifo: Option<PathBuf>,
@@ -437,6 +441,9 @@ struct Checkpoint {
     gc: Option<GcArg>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gc_threshold: Option<f32>,
+    /// ACP mode id; absent for legacy checkpoints and non-ACP sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acp_mode: Option<String>,
 }
 
 /// A parsed session turn frame (t-1308.2; docs/SUPERVISOR.md "Turn envelope").
@@ -541,6 +548,12 @@ struct Runtime {
     /// answer a question pause set it: the ACP turn driver does; the CLI's
     /// one-shot/FIFO/stdin paths and the supervisor leave it off.
     ask_user_tool: bool,
+    #[cfg(feature = "acp")]
+    acp_mode: Option<String>,
+    #[cfg(feature = "acp")]
+    acp_mode_prompt: Option<String>,
+    #[cfg(feature = "acp")]
+    acp_shell_always: bool,
     /// Offer the GC `zoom` tool (t-1609, `--gc-zoom`). Each turn's program
     /// carries the arm only while a GC strategy is active (ACP can switch
     /// strategies between turns).
@@ -1098,6 +1111,11 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         registry
     };
     let pending_machine = params.checkpoint.as_ref().and_then(|cp| cp.machine.clone());
+    #[cfg(feature = "acp")]
+    let resumed_acp_mode = params
+        .checkpoint
+        .as_ref()
+        .and_then(|cp| cp.acp_mode.clone());
     let resumed_turn_seq = params.checkpoint.as_ref().and_then(|cp| cp.next_turn_seq);
     let resumed_visits = params
         .checkpoint
@@ -1207,6 +1225,12 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         },
         shell_requires_approval: params.require_shell_approval,
         ask_user_tool: false,
+        #[cfg(feature = "acp")]
+        acp_mode: resumed_acp_mode,
+        #[cfg(feature = "acp")]
+        acp_mode_prompt: None,
+        #[cfg(feature = "acp")]
+        acp_shell_always: false,
         gc_zoom: args.gc_zoom,
         resume_facts: ResumeFacts {
             model: resolved_model.alias.clone(),
@@ -2883,7 +2907,24 @@ fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
         tool_names: runtime.config.tools.names(),
         output_contract: runtime.output_contract.clone(),
         shell_requires_approval: runtime.shell_requires_approval,
-        infer_system_prompt: None,
+        // Profile instructions are also embedded in the program's optional
+        // child system slot, giving each profile a distinct program hash.
+        // This slot is absent on the default path.
+        infer_system_prompt: {
+            #[cfg(feature = "acp")]
+            {
+                runtime.acp_mode.as_ref().and_then(|id| {
+                    runtime
+                        .acp_mode_prompt
+                        .as_ref()
+                        .map(|text| format!("ACP mode {id}: {text}"))
+                })
+            }
+            #[cfg(not(feature = "acp"))]
+            {
+                None
+            }
+        },
         ask_user: runtime.ask_user_tool,
         zoom: (runtime.gc_zoom && runtime.config.gc.enabled())
             .then(|| agent_core::ZoomOptions::for_context_budget(runtime.config.context_budget)),
@@ -3018,6 +3059,16 @@ async fn finish_turn(
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or(prompt);
+    // ACP mode instructions belong to the current turn, not the saved
+    // conversation; remove the injected system message before checkpointing.
+    #[cfg(feature = "acp")]
+    if let Some(instructions) = runtime.acp_mode_prompt.as_deref().filter(|s| !s.is_empty()) {
+        if new_history.get(1).is_some_and(|m: &ChatMessage| {
+            m.role == "system" && m.content.as_deref() == Some(instructions)
+        }) {
+            new_history.remove(1);
+        }
+    }
     if !response.content.is_empty() || !response.tool_calls.is_empty() {
         new_history.push(ChatMessage::assistant(
             (!response.content.is_empty()).then_some(response.content.clone()),
@@ -3395,6 +3446,16 @@ fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoin
         discovered_budget: runtime.gc_state.discovered_budget,
         gc: Some(gc_choice_from_mode(&runtime.config.gc)),
         gc_threshold: Some(runtime.config.gc_threshold),
+        acp_mode: {
+            #[cfg(feature = "acp")]
+            {
+                runtime.acp_mode.clone()
+            }
+            #[cfg(not(feature = "acp"))]
+            {
+                None
+            }
+        },
         machine: runtime.pending_machine.clone(),
         pending_turn_id: runtime.pending_turn_id.clone(),
         pending_approval_id: runtime.pending_approval_id.clone(),
@@ -4205,6 +4266,7 @@ mod tests {
             discovered_budget: None,
             gc: None,
             gc_threshold: None,
+            acp_mode: None,
             machine: None,
             pending_turn_id: None,
             pending_approval_id: None,
@@ -4246,6 +4308,7 @@ mod tests {
             discovered_budget: Some(123_000),
             gc: None,
             gc_threshold: None,
+            acp_mode: None,
             machine: None,
             pending_turn_id: None,
             pending_approval_id: None,

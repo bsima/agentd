@@ -55,6 +55,7 @@ pub(crate) struct SessionContext {
     pub(crate) context_budget: super::bridge::ContextBudget,
     pub(crate) usage: Arc<std::sync::Mutex<agent_core::RunUsage>>,
     pub(crate) args: Arc<Args>,
+    pub(crate) profiles: Arc<super::profiles::Profiles>,
 }
 
 pub(crate) async fn session_actor(
@@ -71,6 +72,7 @@ pub(crate) async fn session_actor(
         context_budget,
         usage,
         args,
+        profiles,
     } = ctx;
     while let Some(command) = cmd_rx.recv().await {
         if cmd_rx.is_closed() {
@@ -152,7 +154,14 @@ pub(crate) async fn session_actor(
                 }
             }
             SessionCommand::SetMode { mode_id, responder } => {
-                runtime.shell_requires_approval = mode_id.0.as_ref() != registry::MODE_YOLO;
+                if let Err(err) = apply_mode(&mut runtime, mode_id.0.as_ref(), &profiles) {
+                    let _ = responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(serde_json::json!(err.to_string())),
+                    );
+                    continue;
+                }
+                crate::persist_session(&mut runtime).await;
                 // Announce before acking so clients that stop reading at the
                 // response still observe the mode change.
                 let _ = cx.send_notification(SessionNotification::new(
@@ -291,4 +300,84 @@ fn set_gc_threshold(runtime: &mut Runtime, value: &str) -> Result<()> {
     }
     runtime.config.gc_threshold = threshold;
     Ok(())
+}
+
+/// Apply the policy and prompt only between turns; the profile catalog is
+/// immutable for the lifetime of the ACP process.
+pub(super) fn restore_mode(
+    runtime: &mut Runtime,
+    profiles: &super::profiles::Profiles,
+) -> Result<()> {
+    if let Some(id) = runtime.acp_mode.clone() {
+        apply_mode(runtime, &id, profiles)?;
+    }
+    Ok(())
+}
+
+fn apply_mode(runtime: &mut Runtime, id: &str, profiles: &super::profiles::Profiles) -> Result<()> {
+    use super::profiles::ShellApproval;
+    runtime.acp_mode_prompt = None;
+    runtime.acp_shell_always = false;
+    match id {
+        registry::MODE_ASK => runtime.shell_requires_approval = true,
+        registry::MODE_YOLO => runtime.shell_requires_approval = false,
+        _ => {
+            let profile = profiles
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("mode profile {id:?} is unavailable"))?;
+            runtime.shell_requires_approval = profile.shell_approval != ShellApproval::Never;
+            runtime.acp_shell_always = profile.shell_approval == ShellApproval::Always;
+            runtime.acp_mode_prompt = Some(profile.instructions.clone());
+        }
+    }
+    runtime.acp_mode = Some(id.to_owned());
+    Ok(())
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::super::profiles::{Profile, Profiles, ShellApproval};
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn profile_changes_program_identity() {
+        let base = agent_core::AgentLoopOptions {
+            shell_requires_approval: true,
+            ask_user: true,
+            ..Default::default()
+        };
+        let mut research = base.clone();
+        research.infer_system_prompt = Some("ACP mode research: Read first".into());
+        let hash = |options: &agent_core::AgentLoopOptions| {
+            let machine = agent_core::agent_loop_ir_for_options(
+                agent_core::Model("m".into()),
+                vec![],
+                2,
+                options,
+            );
+            agent_core::program_hash(&machine.program).unwrap()
+        };
+        assert_ne!(hash(&base), hash(&research));
+        assert_eq!(hash(&base), hash(&base));
+    }
+
+    #[test]
+    fn profiles_are_advertised_with_metadata() {
+        let profiles = Profiles(BTreeMap::from([(
+            "research".into(),
+            Profile {
+                id: "research".into(),
+                name: "Research".into(),
+                description: Some("Investigate".into()),
+                shell_approval: ShellApproval::Always,
+                instructions: "Read first".into(),
+            },
+        )]));
+        let state = registry::session_modes(true, Some("research"), &profiles);
+        let wire = serde_json::to_value(state).unwrap();
+        assert_eq!(wire["currentModeId"], "research");
+        assert_eq!(wire["availableModes"][2]["name"], "Research");
+        assert_eq!(wire["availableModes"][2]["description"], "Investigate");
+    }
 }

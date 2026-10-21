@@ -10,6 +10,7 @@
 
 mod bridge;
 mod list;
+mod profiles;
 mod registry;
 mod session;
 mod turn;
@@ -41,6 +42,7 @@ struct AcpServer {
     args: Arc<Args>,
     otel_active: bool,
     sessions: Mutex<HashMap<String, session::SessionHandle>>,
+    profiles: Arc<profiles::Profiles>,
 }
 
 /// Session state lives beside the other agent data:
@@ -160,6 +162,7 @@ impl AcpServer {
             otel_active: self.otel_active,
         };
         let mut runtime = build_runtime(&self.args, params).await?;
+        session::restore_mode(&mut runtime, &self.profiles)?;
         // ACP clients can answer questions (session/request_permission
         // choosers), so the loop offers `ask_user` here and nowhere else.
         runtime.ask_user_tool = true;
@@ -189,7 +192,11 @@ impl AcpServer {
                 .or_default()
                 .push_str(&delta.text);
         }));
-        let modes = registry::session_modes(runtime.shell_requires_approval);
+        let modes = registry::session_modes(
+            runtime.shell_requires_approval,
+            runtime.acp_mode.as_deref(),
+            &self.profiles,
+        );
         let config_options = registry::session_config_options(
             &runtime.resume_facts.model,
             &runtime.config.gc,
@@ -236,6 +243,7 @@ impl AcpServer {
                 context_budget,
                 usage,
                 args: self.args.clone(),
+                profiles: self.profiles.clone(),
             },
         ));
         // Replacing an existing handle (re-loading a live session) closes
@@ -318,7 +326,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         args.otel_endpoint.as_deref(),
         &format!("acp-{}", Uuid::new_v4()),
     )?;
+    let profiles = Arc::new(profiles::Profiles::load(args.acp_modes_dir.as_deref())?);
     let server = Arc::new(AcpServer {
+        profiles,
         otel_active: otel.is_some(),
         args: Arc::new(args),
         sessions: Mutex::new(HashMap::new()),
@@ -422,7 +432,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
         .on_receive_request(
             async move |request: SetSessionModeRequest, responder, _cx| {
-                if !registry::is_session_mode(request.mode_id.0.as_ref()) {
+                if !registry::is_session_mode(request.mode_id.0.as_ref())
+                    && set_mode_server
+                        .profiles
+                        .get(request.mode_id.0.as_ref())
+                        .is_none()
+                {
                     return responder.respond_with_error(
                         Error::invalid_params().data(serde_json::json!("unknown session mode")),
                     );

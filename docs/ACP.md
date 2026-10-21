@@ -97,8 +97,22 @@ the wire.
   `session-latest.json` checkpoint and replays the conversation as
   user/agent message chunks before responding. Text-only replay: past tool
   traffic is not reconstructed.
-- Modes — `ask` (default; approval-gated shell) and `yolo`;
-  `session/set_mode` flips them and emits `current_mode_update`.
+- Modes — `ask` (default; approval-gated shell) and `yolo` remain built in.
+  Additional modes load from `--acp-modes-dir DIR`, or from
+  `$XDG_CONFIG_HOME/agent/modes` (`~/.config/agent/modes`) if it exists.
+  Each `.md` file has YAML frontmatter and instructions in its body; the
+  filename stem is its id. For example, `examples/modes/research.md`:
+  `name` defaults to the id, `description` is optional, and
+  `shell_approval` is `ask` (default; honors allow-always), `always`
+  (prompt for every command; never remember allow-always), or `never`
+  (ungated). `tools` is an optional list of opt-in tool names; currently
+  none are registered (future tools will extend the registry). Unknown
+  names, invalid YAML/policy, and built-in id collisions fail startup.
+  Mode instructions are turn-local system context, not saved conversation
+  history; their profile id and text also enter the loop program identity.
+  `session/set_mode` takes effect next turn, persists across `session/load`,
+  and emits `current_mode_update`. Removing an active profile prevents
+  loading that session until the profile is restored.
 - Config options — rendered by Paseo next to the mode picker, applied
   between turns via `session/set_config_option`:
   - `model`: every `models.yaml` alias; switching re-resolves the

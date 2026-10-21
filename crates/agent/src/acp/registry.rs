@@ -34,20 +34,30 @@ pub(crate) const GC_CHOICES: [(&str, &str); 6] = [
 /// collection. Discrete steps — ACP selects have no numeric input.
 pub(crate) const GC_THRESHOLD_CHOICES: [&str; 6] = ["0.5", "0.6", "0.7", "0.8", "0.85", "0.9"];
 
-pub(crate) fn session_modes(shell_requires_approval: bool) -> SessionModeState {
+pub(crate) fn session_modes(
+    shell_requires_approval: bool,
+    current_mode: Option<&str>,
+    profiles: &super::profiles::Profiles,
+) -> SessionModeState {
     let current = if shell_requires_approval {
         MODE_ASK
     } else {
         MODE_YOLO
     };
-    SessionModeState::new(
-        current,
-        vec![
-            SessionMode::new(MODE_ASK, "Ask")
-                .description("Shell commands need permission before running"),
-            SessionMode::new(MODE_YOLO, "Yolo").description("Shell commands run without asking"),
-        ],
-    )
+    let mut modes = vec![
+        SessionMode::new(MODE_ASK, "Ask")
+            .description("Shell commands need permission before running"),
+        SessionMode::new(MODE_YOLO, "Yolo").description("Shell commands run without asking"),
+    ];
+    modes.extend(profiles.0.values().map(|p| {
+        let mode = SessionMode::new(p.id.clone(), p.name.clone());
+        if let Some(description) = &p.description {
+            mode.description(description.clone())
+        } else {
+            mode
+        }
+    }));
+    SessionModeState::new(current_mode.unwrap_or(current).to_owned(), modes)
 }
 
 /// The `--gc` value id for the runtime's current GC mode.

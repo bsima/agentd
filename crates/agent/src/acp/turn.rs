@@ -45,7 +45,12 @@ pub(crate) async fn run_acp_turn(
     // would silently approve a different command without a prompt.
     runtime.config.approvals.resolutions.clear();
     runtime.history.push(message);
-    let prompt = runtime.history.clone();
+    let mut prompt = runtime.history.clone();
+    // A separate system message is turn-local: switching modes never mutates
+    // saved conversation history or accumulates stale instructions.
+    if let Some(instructions) = runtime.acp_mode_prompt.as_deref().filter(|s| !s.is_empty()) {
+        prompt.insert(1, ChatMessage::system(instructions));
+    }
     // Options are fixed for the whole turn: they shape the loop program and
     // therefore its effect ids, so approval resumes must re-enter with the
     // program identity the checkpoint was minted under.
@@ -93,8 +98,10 @@ pub(crate) async fn run_acp_turn(
                     match request_permission(cx, session_id, &pending).await? {
                         PermissionReply::AllowOnce => (ApprovalDecision::Approve, None),
                         PermissionReply::AllowAlways => {
-                            allow_all = true;
-                            runtime.shell_requires_approval = false;
+                            if !runtime.acp_shell_always {
+                                allow_all = true;
+                                runtime.shell_requires_approval = false;
+                            }
                             (ApprovalDecision::Approve, None)
                         }
                         PermissionReply::Reject => (ApprovalDecision::Deny, None),
