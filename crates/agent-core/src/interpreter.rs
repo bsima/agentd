@@ -342,6 +342,8 @@ pub struct SeqConfig {
     /// or without a tap. `None` (the default everywhere but the ACP server)
     /// calls providers non-streaming, exactly as before the field existed.
     pub on_infer_delta: Option<Arc<dyn Fn(InferDelta) + Send + Sync>>,
+    pub on_reasoning_delta: Option<Arc<dyn Fn(InferDelta) + Send + Sync>>,
+    pub inference_settings: crate::reasoning::InferenceSettings,
 }
 
 /// One streamed text fragment from a live Infer. `op_id` matches the
@@ -432,7 +434,12 @@ where
                     None => {
                         config
                             .provider
-                            .chat(&model, &config.tool_specs(), &prompt)
+                            .chat_with_settings(
+                                &model,
+                                &config.tool_specs(),
+                                &prompt,
+                                config.inference_settings,
+                            )
                             .await
                     }
                 };
@@ -1412,6 +1419,8 @@ mod tests {
     async fn gc_collects_to_threshold_budget() -> Result<()> {
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1455,6 +1464,8 @@ mod tests {
         let trace_path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1525,6 +1536,8 @@ mod tests {
     fn semantic_config(trace: TraceLogger, fail: bool) -> SeqConfig {
         SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1634,6 +1647,8 @@ mod tests {
         let trace_path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1703,6 +1718,8 @@ mod tests {
     async fn gc_collect_records_dropped_contents_for_the_write_barrier() -> Result<()> {
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -1751,6 +1768,8 @@ mod tests {
     ) -> SeqConfig {
         SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2092,6 +2111,8 @@ mod tests {
         ]));
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2151,6 +2172,8 @@ mod tests {
         ]));
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2199,6 +2222,8 @@ mod tests {
         let trace_path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2293,6 +2318,8 @@ mod tests {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2348,6 +2375,8 @@ mod tests {
         }
         let mut config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2573,6 +2602,8 @@ mod tests {
         let trace_path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             trace,
             ..seq_config_for_eval()
         };
@@ -2594,6 +2625,8 @@ mod tests {
         let replay = ReplayTrace::from_events(&events);
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             replay: Some(replay.clone()),
             ..seq_config_for_eval()
         };
@@ -2603,6 +2636,8 @@ mod tests {
         // …a different argv diverges…
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             replay: Some(replay.clone()),
             ..seq_config_for_eval()
         };
@@ -2619,6 +2654,8 @@ mod tests {
         // still diverges: the identities are distinct.
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             replay: Some(replay),
             ..seq_config_for_eval()
         };
@@ -2633,6 +2670,8 @@ mod tests {
     fn seq_config_for_eval() -> SeqConfig {
         SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2663,6 +2702,8 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![]));
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2711,6 +2752,8 @@ mod tests {
         let path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2750,6 +2793,8 @@ mod tests {
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2776,6 +2821,8 @@ mod tests {
         let replay = ReplayTrace::load(record_path).await?;
         let replay_config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2834,6 +2881,8 @@ mod tests {
         record_pricing.insert("mock", crate::cost::Pricing::from_usd_per_mtok(3.0, 15.0)?);
         let record_config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2885,6 +2934,8 @@ mod tests {
         let replay_path = replay_trace.path().clone();
         let replay_config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2943,6 +2994,8 @@ mod tests {
         let trace_path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -2987,6 +3040,8 @@ mod tests {
         let record_path = record_trace.path().clone();
         let record_config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -3027,6 +3082,8 @@ mod tests {
         let live_provider = Arc::new(MockProvider::new(vec![response("unused", vec![])]));
         let replay_config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -3067,6 +3124,8 @@ mod tests {
         let trace_path = trace.path().clone();
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),

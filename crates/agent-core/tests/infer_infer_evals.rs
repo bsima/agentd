@@ -784,6 +784,8 @@ async fn run_arm(
     let trace = TraceLogger::new(Uuid::new_v4().to_string(), trace_path.clone());
     let config = SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         approvals: Default::default(),
         guidance: Default::default(),
         tools: Default::default(),

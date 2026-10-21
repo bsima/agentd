@@ -1528,6 +1528,8 @@ mod tests {
         let trace = TraceLogger::new("golden-run", trace_path.clone());
         let config = SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             // Guidance off: the golden pins the public projection of the
             // recorded effects, and the runtime-guidance fragment (t-1359)

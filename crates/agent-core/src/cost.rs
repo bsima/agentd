@@ -72,6 +72,7 @@ fn usd_rate_to_micro(rate: f64, field: &str) -> Result<u64> {
 #[derive(Debug, Clone, Default)]
 pub struct PricingTable {
     by_model: BTreeMap<String, Pricing>,
+    fast_by_model: BTreeMap<String, Pricing>,
 }
 
 impl PricingTable {
@@ -79,6 +80,10 @@ impl PricingTable {
     /// listing the same api id under several aliases stays deterministic.
     pub fn insert(&mut self, model: impl Into<String>, pricing: Pricing) {
         self.by_model.entry(model.into()).or_insert(pricing);
+    }
+
+    pub fn insert_fast(&mut self, model: impl Into<String>, pricing: Pricing) {
+        self.fast_by_model.entry(model.into()).or_insert(pricing);
     }
 
     pub fn get(&self, model: &str) -> Option<&Pricing> {
@@ -97,7 +102,17 @@ impl PricingTable {
 /// Never call this on a replayed response: recorded costs are replay
 /// identity and must pass through verbatim.
 pub fn price_response(response: &mut crate::op::Response, table: &PricingTable, model: &str) {
-    if let Some(pricing) = table.get(model) {
+    let fast = response
+        .metadata
+        .get("speed")
+        .and_then(serde_json::Value::as_str)
+        == Some("fast");
+    let pricing = if fast {
+        table.fast_by_model.get(model)
+    } else {
+        table.get(model)
+    };
+    if let Some(pricing) = pricing {
         response.pricing = Some(*pricing);
         response.cost_micro_usd =
             Some(pricing.cost_micro_usd(response.input_tokens, response.output_tokens));
@@ -303,6 +318,31 @@ mod tests {
         assert_eq!(format_micro_usd(66), "$0.000066");
         assert_eq!(format_micro_usd(3_000_000), "$3.000000");
         assert_eq!(format_micro_usd(12_345_678), "$12.345678");
+    }
+
+    #[test]
+    fn fast_rate_uses_reported_speed_and_fails_closed_without_rate() -> Result<()> {
+        let mut table = PricingTable::default();
+        table.insert("opus", Pricing::from_usd_per_mtok(5.0, 25.0)?);
+        table.insert_fast("opus", Pricing::from_usd_per_mtok(10.0, 50.0)?);
+        let mut response = crate::op::Response {
+            content: String::new(),
+            tool_calls: vec![],
+            finish_reason: None,
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            total_tokens: 2_000_000,
+            cached_input_tokens: None,
+            cost_micro_usd: None,
+            pricing: None,
+            metadata: serde_json::Map::from_iter([("speed".into(), serde_json::json!("fast"))]),
+        };
+        price_response(&mut response, &table, "opus");
+        assert_eq!(response.cost_micro_usd, Some(60_000_000));
+        response.cost_micro_usd = None;
+        price_response(&mut response, &table, "unknown");
+        assert_eq!(response.cost_micro_usd, None);
+        Ok(())
     }
 
     #[test]

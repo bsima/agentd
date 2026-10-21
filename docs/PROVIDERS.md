@@ -277,3 +277,34 @@ The example's pattern, credential-free and offline:
 3. If you implement a sink, cover the store → retrieve → update →
    retrieve → delete cycle (the memory backend's eval does this) and, for
    `RequireApproval`, both the approve and deny arms.
+
+## Opt-in reasoning and tiers (t-1654)
+
+Registry entries may declare `thinking: true`, `efforts: [low, medium, high,
+ xhigh, max]`, an optional `effort` default from that list, and `fast: true`.
+Unknown effort names, or a default outside the allowed list, reject the
+registry. `thinking` declares capability, not an implicit request: without
+`--effort`, no reasoning parameters are sent unless `effort` is set in the
+registry. `--fast` requires `fast: true`. Neither setting changes AgentIR's
+program identity. Reasoning fragments are live-only, not trace/replay data.
+Anthropic API-key requests use adaptive thinking with summarized display and
+`output_config.effort`; fast requests use the preview beta header and speed.
+For OpenAI-compatible chat-completions, the opt-in effort parameter is
+`reasoning_effort` and fast maps to `service_tier: priority`; endpoint support
+varies. Codex OAuth sends Responses `reasoning: {effort, summary: auto}` and
+`service_tier: priority` when configured; the chatgpt.com backend has not
+been live-validated. Claude-code OAuth does not yet apply these settings.
+Anthropic signed thinking blocks are captured in the response metadata, but
+the IR loop does not yet carry them into its next tool-use request: do not
+enable thinking on native Anthropic tool loops until that handoff is completed.
+
+Fast pricing is optional inside `pricing`: `fast_input_per_mtok_usd` and
+`fast_output_per_mtok_usd` must be specified together. Cost accounting selects
+them only when the provider reports `usage.speed: fast`; without configured
+fast rates the cost is unknown rather than incorrectly charged at standard
+rates. Anthropic's output usage includes reasoning tokens; they are already
+part of `output_tokens`, not a separate additive charge.
+
+If an endpoint omits `usage.speed`, an opt-in fast request cannot be priced
+safely by its observed tier; cost accounting uses standard rates unless it
+explicitly reports `fast`. Check provider usage and billing independently.

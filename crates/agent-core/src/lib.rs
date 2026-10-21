@@ -21,6 +21,7 @@ pub mod output_contract;
 pub mod prompt_ir;
 pub mod provider;
 pub mod public_trace;
+pub mod reasoning;
 pub mod sse;
 pub mod temporal;
 pub mod todo;
@@ -98,6 +99,7 @@ pub use public_trace::{
     public_event, PublicDynamicPath, PublicEffect, PublicEffectSite, PublicEvent, PublicStatus,
     PUBLIC_SCHEMA_VERSION,
 };
+pub use reasoning::{Effort, InferenceSettings};
 pub use temporal::TemporalSource;
 pub use tool::{
     ask_user_tool_spec, AskUserRequest, NativeTool, ToolHandler, ToolRegistry, ASK_USER_TOOL,

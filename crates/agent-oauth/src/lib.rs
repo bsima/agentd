@@ -548,8 +548,15 @@ impl OAuthChatProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
     ) -> Result<Response> {
-        self.chat_codex_with_retries(token, model, tools, messages, None)
-            .await
+        self.chat_codex_with_retries(
+            token,
+            model,
+            tools,
+            messages,
+            None,
+            agent_core::InferenceSettings::default(),
+        )
+        .await
     }
 
     /// Live-streamed variant of [`Self::chat_codex`]: decodes the SSE
@@ -563,8 +570,15 @@ impl OAuthChatProvider {
         messages: &[ChatMessage],
         on_delta: &agent_core::TextDeltaFn,
     ) -> Result<Response> {
-        self.chat_codex_with_retries(token, model, tools, messages, Some(on_delta))
-            .await
+        self.chat_codex_with_retries(
+            token,
+            model,
+            tools,
+            messages,
+            Some(on_delta),
+            agent_core::InferenceSettings::default(),
+        )
+        .await
     }
 
     /// Drive Codex attempts through the shared bounded backoff, so a
@@ -578,6 +592,7 @@ impl OAuthChatProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
         on_delta: Option<&agent_core::TextDeltaFn>,
+        settings: agent_core::InferenceSettings,
     ) -> Result<Response> {
         let account_id = extract_codex_account_id(token).ok_or_else(|| {
             anyhow!("failed to extract chatgpt_account_id from OpenAI Codex token")
@@ -585,7 +600,9 @@ impl OAuthChatProvider {
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
         // Codex never yields an EmptyCompletion, so the nudge flag is unused.
         chat_with_retries(
-            |_nudge| build_codex_request(model, tools, messages),
+            |_nudge| {
+                configured_codex_request(build_codex_request(model, tools, messages), settings)
+            },
             |body| self.codex_attempt(token, &account_id, &url, body, on_delta),
         )
         .await
@@ -700,7 +717,74 @@ macro_rules! delegate_provider {
     };
 }
 
-delegate_provider!(CodexOAuthProvider);
+#[async_trait]
+impl ChatProvider for CodexOAuthProvider {
+    async fn chat(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+    ) -> Result<Response> {
+        self.inner.chat(model, tools, messages).await
+    }
+    async fn chat_streamed(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &agent_core::TextDeltaFn,
+    ) -> Result<Response> {
+        self.inner
+            .chat_streamed(model, tools, messages, on_delta)
+            .await
+    }
+    async fn chat_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        settings: agent_core::InferenceSettings,
+    ) -> Result<Response> {
+        if settings == agent_core::InferenceSettings::default() {
+            return self.chat(model, tools, messages).await;
+        }
+        let token = self.inner.access_token().await?;
+        self.inner
+            .chat_codex_with_retries(&token, model, tools, messages, None, settings)
+            .await
+    }
+    async fn chat_streamed_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &agent_core::TextDeltaFn,
+        _on_reasoning: &agent_core::TextDeltaFn,
+        settings: agent_core::InferenceSettings,
+    ) -> Result<Response> {
+        if settings == agent_core::InferenceSettings::default() {
+            return self.chat_streamed(model, tools, messages, on_delta).await;
+        }
+        let token = self.inner.access_token().await?;
+        self.inner
+            .chat_codex_with_retries(&token, model, tools, messages, Some(on_delta), settings)
+            .await
+    }
+}
+
+#[async_trait]
+impl OAuthProvider for CodexOAuthProvider {
+    async fn refresh_token(&self) -> Result<OAuthToken> {
+        self.inner.refresh_token().await
+    }
+    async fn login(&self) -> Result<OAuthToken> {
+        self.inner.login().await
+    }
+    fn token_store(&self) -> &TokenStore {
+        &self.inner.store
+    }
+}
+
 delegate_provider!(ClaudeCodeOAuthProvider);
 
 pub async fn login(provider: OAuthProviderKind) -> Result<OAuthToken> {
@@ -932,6 +1016,16 @@ fn parse_token(text: &str) -> Result<OAuthToken> {
 
 const CODEX_DEFAULT_INSTRUCTIONS: &str =
     "You are Codex, based on GPT-5. You are running as a coding agent in a CLI harness.";
+
+fn configured_codex_request(mut body: Value, settings: agent_core::InferenceSettings) -> Value {
+    if let Some(effort) = settings.effort {
+        body["reasoning"] = json!({"effort": effort.as_str(), "summary": "auto"});
+    }
+    if settings.fast {
+        body["service_tier"] = json!("priority");
+    }
+    body
+}
 
 fn build_codex_request(model: &Model, tools: &[ToolSpec], messages: &[ChatMessage]) -> Value {
     let mut input = Vec::new();
@@ -1381,6 +1475,25 @@ mod tests {
             "last_refresh": "2026-06-12T00:00:00Z",
         })
         .to_string()
+    }
+
+    #[test]
+    fn optional_codex_reasoning_and_priority_shape() {
+        let base = build_codex_request(&Model("gpt".into()), &[], &[ChatMessage::user("hi")]);
+        assert!(base.get("reasoning").is_none());
+        assert!(base.get("service_tier").is_none());
+        let configured = configured_codex_request(
+            base,
+            agent_core::InferenceSettings {
+                effort: Some(agent_core::Effort::Medium),
+                fast: true,
+            },
+        );
+        assert_eq!(
+            configured["reasoning"],
+            json!({"effort":"medium","summary":"auto"})
+        );
+        assert_eq!(configured["service_tier"], "priority");
     }
 
     #[test]

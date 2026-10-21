@@ -40,6 +40,10 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
+    effort: Option<agent_core::Effort>,
+    #[arg(long)]
+    fast: bool,
+    #[arg(long)]
     key: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
@@ -512,6 +516,7 @@ fn mint_turn_id(run_id: &str, seq: u64) -> String {
 
 struct Runtime {
     config: SeqConfig,
+    model_capabilities: (Vec<agent_core::Effort>, Option<agent_core::Effort>, bool),
     trace: TraceLogger,
     run_id: String,
     session_id: Option<Uuid>,
@@ -1020,6 +1025,12 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         Some(path) => Some(load_output_contract(path).await?),
         None => None,
     };
+    let settings = model_settings(&resolved_model, args.effort, args.fast)?;
+    let capabilities = (
+        resolved_model.efforts.clone(),
+        resolved_model.effort,
+        resolved_model.fast,
+    );
     let context_budget = resolved_model.context;
     let model = resolved_model.api_id.clone();
     let (provider, reported_provider_url) = build_provider(
@@ -1155,6 +1166,8 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         };
     let mut config = SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: settings,
         // No in-process approval hook in the CLI: gated effects pause
         // durably and resolve via `agent approvals` (t-1308.10). Resume
         // drivers load resolutions into this config before re-entering.
@@ -1205,6 +1218,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     }
     Ok(Runtime {
         config,
+        model_capabilities: capabilities,
         trace,
         run_id: run_id.clone(),
         session_id: params.session_id,
@@ -1423,11 +1437,75 @@ fn reported_provider_url(oauth_provider: Option<&str>, resolved_url: &str) -> St
         .unwrap_or_else(|| resolved_url.to_string())
 }
 
-/// Construct the chat provider for a resolved model, mirroring the CLI's
-/// conventions (flag/config overrides, then env fallbacks, then defaults).
+/// Validate a session setting before making any provider request. `None` keeps
+/// the historical wire request byte-identical, even for `thinking: true`.
+fn model_settings(
+    model: &ResolvedModel,
+    effort: Option<agent_core::Effort>,
+    fast: bool,
+) -> Result<agent_core::InferenceSettings> {
+    let effort = effort.or(model.effort);
+    if let Some(level) = effort {
+        if !model.efforts.contains(&level) {
+            return Err(anyhow!(
+                "effort {} is not supported by model {}",
+                level.as_str(),
+                model.alias
+            ));
+        }
+    }
+    if fast && !model.fast {
+        return Err(anyhow!(
+            "fast tier is not supported by model {}",
+            model.alias
+        ));
+    }
+    Ok(agent_core::InferenceSettings { effort, fast })
+}
+
+impl Runtime {
+    /// Safe between turns; ACP may call this once it exposes a config picker.
+    #[allow(dead_code)] // called by ACP config option in follow-up t-1653.7
+    fn set_inference_settings(
+        &mut self,
+        effort: Option<agent_core::Effort>,
+        fast: bool,
+    ) -> Result<()> {
+        let (allowed, default, supports_fast) = &self.model_capabilities;
+        let level = effort.or(*default);
+        if level.is_some_and(|level| !allowed.contains(&level)) {
+            return Err(anyhow!("unsupported effort for current model"));
+        }
+        if fast && !supports_fast {
+            return Err(anyhow!("fast tier is not supported by current model"));
+        }
+        self.config.inference_settings = agent_core::InferenceSettings {
+            effort: level,
+            fast,
+        };
+        Ok(())
+    }
+
+    #[allow(dead_code)] // called on ACP model switch in follow-up t-1653.7
+    fn revalidate_inference_settings(&mut self, model: &ResolvedModel) {
+        let previous = self.config.inference_settings;
+        self.model_capabilities = (model.efforts.clone(), model.effort, model.fast);
+        let effort = previous
+            .effort
+            .filter(|level| model.efforts.contains(level))
+            .or(model.effort);
+        let fast = previous.fast && model.fast;
+        if previous.effort != effort || previous.fast != fast {
+            tracing::warn!(alias = %model.alias, ?previous, ?effort, fast, "model switch reset unsupported inference settings");
+        }
+        self.config.inference_settings = agent_core::InferenceSettings { effort, fast };
+    }
+}
+
 /// Shared by the main run path and the `agent approvals` resume path
 /// (t-1308.10), which must rebuild the exact same provider after a full
 /// process restart. Returns the provider plus the reported provider URL.
+/// Construct the chat provider for a resolved model.
 fn build_provider(
     resolved: &ResolvedModel,
     url_override: Option<String>,
@@ -1567,6 +1645,9 @@ fn resolve_model_from(
                     context: 200_000,
                     max_tokens: None,
                     pricing: None,
+                    effort: None,
+                    efforts: vec![],
+                    fast: false,
                 },
                 PricingTable::default(),
                 None,
@@ -2244,6 +2325,8 @@ async fn resume_run(
         .insert(record.effect_id.clone(), resolution);
     let mut config = SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         approvals,
         // Resume with the paused run's guidance setting (t-1359): the
         // fragment never affects effect-id replay or the checkpointed

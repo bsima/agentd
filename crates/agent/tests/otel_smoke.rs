@@ -58,6 +58,8 @@ fn record_replay_fixture(path: &std::path::Path, responses: Vec<Response>) {
     responses.reverse();
     let config = SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         approvals: Default::default(),
         guidance: Default::default(),
         tools: Default::default(),

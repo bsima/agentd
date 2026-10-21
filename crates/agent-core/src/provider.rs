@@ -47,6 +47,30 @@ pub trait ChatProvider: Send + Sync {
         messages: &[ChatMessage],
     ) -> Result<Response>;
 
+    async fn chat_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        settings: crate::reasoning::InferenceSettings,
+    ) -> Result<Response> {
+        let _ = settings;
+        self.chat(model, tools, messages).await
+    }
+
+    async fn chat_streamed_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &TextDeltaFn,
+        on_reasoning: &TextDeltaFn,
+        settings: crate::reasoning::InferenceSettings,
+    ) -> Result<Response> {
+        let _ = (on_reasoning, settings);
+        self.chat_streamed(model, tools, messages, on_delta).await
+    }
+
     /// Streaming variant of [`ChatProvider::chat`]. The default falls back
     /// to `chat` and never invokes `on_delta` — callers must treat "no
     /// deltas arrived" as normal (custom providers, replay, non-streaming
@@ -184,6 +208,69 @@ impl ChatProvider for ProviderClient {
         .await
     }
 
+    async fn chat_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        settings: crate::InferenceSettings,
+    ) -> Result<Response> {
+        if settings == crate::InferenceSettings::default() {
+            return self.chat(model, tools, messages).await;
+        }
+        if crate::op::has_pending_tool_calls(messages) {
+            return Err(anyhow!("refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result"));
+        }
+        // OpenAI-compatible endpoints vary; opt-in only, never change default calls.
+        let url = format!("{}/chat/completions", self.config.url.trim_end_matches('/'));
+        chat_with_retries(
+            |nudge| configured_chat_body(build_chat_body(model, tools, messages, nudge), settings),
+            |body| { let url = url.clone(); async move { send_chat_request(&self.client, &self.config.api_key, &url, &body).await } },
+        ).await.map_err(ProviderError::into_anyhow)
+    }
+
+    async fn chat_streamed_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &TextDeltaFn,
+        _on_reasoning: &TextDeltaFn,
+        settings: crate::InferenceSettings,
+    ) -> Result<Response> {
+        if settings == crate::InferenceSettings::default() {
+            return self.chat_streamed(model, tools, messages, on_delta).await;
+        }
+        if crate::op::has_pending_tool_calls(messages) {
+            return Err(anyhow!("refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result"));
+        }
+        let url = format!("{}/chat/completions", self.config.url.trim_end_matches('/'));
+        chat_with_retries(
+            |nudge| {
+                let mut body =
+                    configured_chat_body(build_chat_body(model, tools, messages, nudge), settings);
+                body["stream"] = json!(true);
+                body["stream_options"] = json!({"include_usage": true});
+                body
+            },
+            |body| {
+                let url = url.clone();
+                async move {
+                    send_chat_request_streamed(
+                        &self.client,
+                        &self.config.api_key,
+                        &url,
+                        &body,
+                        on_delta,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .map_err(ProviderError::into_anyhow)
+    }
+
     async fn chat_streamed(
         &self,
         model: &Model,
@@ -269,6 +356,16 @@ pub async fn openai_compatible_chat_streamed(
     )
     .await
     .map_err(ProviderError::into_anyhow)
+}
+
+fn configured_chat_body(mut body: Value, settings: crate::InferenceSettings) -> Value {
+    if let Some(effort) = settings.effort {
+        body["reasoning_effort"] = json!(effort.as_str());
+    }
+    if settings.fast {
+        body["service_tier"] = json!("priority");
+    }
+    body
 }
 
 /// Build the JSON request body for an OpenAI-compatible chat completion.
@@ -929,6 +1026,22 @@ mod tests {
         ProviderError::EmptyCompletion {
             raw: r#"{"choices":[{"message":{"content":""}}]}"#.into(),
         }
+    }
+
+    #[test]
+    fn optional_chat_quality_request_shape() {
+        let base = openai_chat_body(&Model("m".into()), &[], &[ChatMessage::user("hi")]);
+        assert!(base.get("reasoning_effort").is_none());
+        assert!(base.get("service_tier").is_none());
+        let configured = configured_chat_body(
+            base,
+            crate::InferenceSettings {
+                effort: Some(crate::Effort::Low),
+                fast: true,
+            },
+        );
+        assert_eq!(configured["reasoning_effort"], "low");
+        assert_eq!(configured["service_tier"], "priority");
     }
 
     #[test]

@@ -242,3 +242,12 @@ models:
     thinking: true
     vision: true
     display: Claude Sonnet via Claude Code OAuth
+
+# Opt-in only, on a model that actually supports these API features:
+#   thinking: true
+#   efforts: [low, medium, high, xhigh]
+#   effort: medium   # optional default; omit to leave thinking off
+#   fast: true       # allow --fast; check provider/model availability
+# Fast tier pricing, when applicable (inside `pricing`):
+#   fast_input_per_mtok_usd: 10.0  # Opus 5 (Opus 5.5: 8.0)
+#   fast_output_per_mtok_usd: 50.0 # Opus 5 (Opus 5.5: 40.0)

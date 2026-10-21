@@ -382,6 +382,8 @@ async fn execute(
 
     let config = SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         provider,
         hydration,
         tools: agent.tools.clone(),

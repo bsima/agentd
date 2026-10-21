@@ -1194,6 +1194,8 @@ async fn run_cell(
     );
     let config = SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         approvals: Default::default(),
         // Per-cell (t-1364): the guided arms run the shipped fragment, the
         // unguided arms and all t-1349 legacy replays run disabled — GC

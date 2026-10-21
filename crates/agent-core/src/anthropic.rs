@@ -80,6 +80,123 @@ impl ChatProvider for AnthropicProvider {
         .map_err(ProviderError::into_anyhow)
     }
 
+    async fn chat_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        settings: crate::InferenceSettings,
+    ) -> Result<Response> {
+        if settings == crate::InferenceSettings::default() {
+            return self.chat(model, tools, messages).await;
+        }
+        if crate::op::has_pending_tool_calls(messages) {
+            return Err(anyhow::anyhow!("refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result"));
+        }
+        let url = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
+        let body = configured_body(
+            build_messages_body(
+                model,
+                tools,
+                messages,
+                self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            ),
+            settings,
+        );
+        chat_with_retries(
+            |nudge| {
+                if nudge {
+                    let mut next = messages.to_vec();
+                    next.push(ChatMessage::user(CONTINUE_NUDGE));
+                    configured_body(
+                        build_messages_body(
+                            model,
+                            tools,
+                            &next,
+                            self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+                        ),
+                        settings,
+                    )
+                } else {
+                    body.clone()
+                }
+            },
+            |body| {
+                let url = url.clone();
+                async move {
+                    self.send_messages_request_with_tier(&url, &body, settings.fast)
+                        .await
+                }
+            },
+        )
+        .await
+        .map_err(ProviderError::into_anyhow)
+    }
+
+    async fn chat_streamed_with_settings(
+        &self,
+        model: &Model,
+        tools: &[ToolSpec],
+        messages: &[ChatMessage],
+        on_delta: &TextDeltaFn,
+        on_reasoning: &TextDeltaFn,
+        settings: crate::InferenceSettings,
+    ) -> Result<Response> {
+        if settings == crate::InferenceSettings::default() {
+            return self.chat_streamed(model, tools, messages, on_delta).await;
+        }
+        if crate::op::has_pending_tool_calls(messages) {
+            return Err(anyhow::anyhow!("refusing to send malformed transcript to provider: assistant tool_call is missing a matching tool result"));
+        }
+        let url = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
+        let mut body = configured_body(
+            build_messages_body(
+                model,
+                tools,
+                messages,
+                self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            ),
+            settings,
+        );
+        body["stream"] = json!(true);
+        chat_with_retries(
+            |nudge| {
+                if nudge {
+                    let mut next = messages.to_vec();
+                    next.push(ChatMessage::user(CONTINUE_NUDGE));
+                    let mut request = configured_body(
+                        build_messages_body(
+                            model,
+                            tools,
+                            &next,
+                            self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+                        ),
+                        settings,
+                    );
+                    request["stream"] = json!(true);
+                    request
+                } else {
+                    body.clone()
+                }
+            },
+            |body| {
+                let url = url.clone();
+                async move {
+                    self.send_messages_request_streamed_with_tier(
+                        &url,
+                        &body,
+                        on_delta,
+                        on_reasoning,
+                        settings.fast,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .map_err(ProviderError::into_anyhow)
+    }
+
     async fn chat_streamed(
         &self,
         model: &Model,
@@ -120,6 +237,111 @@ impl ChatProvider for AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    async fn send_messages_request_with_tier(
+        &self,
+        url: &str,
+        body: &Value,
+        fast: bool,
+    ) -> std::result::Result<Response, ProviderError> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if fast {
+            request = request.header("anthropic-beta", "fast-mode-2026-02-01");
+        }
+        let response = request
+            .json(body)
+            .send()
+            .await
+            .map_err(ProviderError::transport)?;
+        let status = response.status();
+        let retry_after = retry_after_delay(&response);
+        let text = response
+            .text()
+            .await
+            .map_err(|source| ProviderError::Transport {
+                source,
+                context: "reading Anthropic response",
+            })?;
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status,
+                text,
+                retry_after,
+            });
+        }
+        let response = parse_messages_response(&text).map_err(ProviderError::Other)?;
+        if response.content.trim().is_empty()
+            && response.tool_calls.is_empty()
+            && !matches!(response.finish_reason.as_ref(), Some(FinishReason::Stop))
+        {
+            return Err(ProviderError::EmptyCompletion { raw: text });
+        }
+        Ok(response)
+    }
+
+    async fn send_messages_request_streamed_with_tier(
+        &self,
+        url: &str,
+        body: &Value,
+        on_delta: &TextDeltaFn,
+        on_reasoning: &TextDeltaFn,
+        fast: bool,
+    ) -> std::result::Result<Response, ProviderError> {
+        use futures::StreamExt;
+        let mut request = self
+            .client
+            .post(url)
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if fast {
+            request = request.header("anthropic-beta", "fast-mode-2026-02-01");
+        }
+        let response = request
+            .json(body)
+            .send()
+            .await
+            .map_err(ProviderError::transport)?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let retry_after = retry_after_delay(&response);
+            let text = response
+                .text()
+                .await
+                .map_err(|source| ProviderError::Transport {
+                    source,
+                    context: "reading Anthropic response",
+                })?;
+            return Err(ProviderError::Http {
+                status,
+                text,
+                retry_after,
+            });
+        }
+        let mut decoder = crate::sse::SseDecoder::new();
+        let mut accum = AnthropicStreamAccum::default();
+        let mut stream = response.bytes_stream();
+        'outer: while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| ProviderError::Transport {
+                source,
+                context: "reading Anthropic stream",
+            })?;
+            for event in decoder.feed(&chunk) {
+                let parsed: AnthropicStreamEvent = serde_json::from_str(&event.data)
+                    .context("parsing Anthropic stream event")
+                    .map_err(ProviderError::Other)?;
+                if accum.on_event_with_reasoning(parsed, on_delta, on_reasoning)? {
+                    break 'outer;
+                }
+            }
+        }
+        accum.into_response()
+    }
+
     async fn send_messages_request(
         &self,
         url: &str,
@@ -250,10 +472,28 @@ struct AnthropicStreamAccum {
     input_tokens: u32,
     output_tokens: u32,
     cached_input_tokens: Option<u32>,
+    speed: Option<String>,
+    thinking_blocks: std::collections::BTreeMap<usize, Value>,
 }
 
 impl AnthropicStreamAccum {
     /// Absorb one stream event; returns `true` on `message_stop`.
+    fn on_event_with_reasoning(
+        &mut self,
+        event: AnthropicStreamEvent,
+        on_delta: &TextDeltaFn,
+        on_reasoning: &TextDeltaFn,
+    ) -> std::result::Result<bool, ProviderError> {
+        if let AnthropicStreamEvent::ContentBlockDelta {
+            delta: AnthropicStreamDelta::ThinkingDelta { thinking },
+            ..
+        } = &event
+        {
+            on_reasoning(thinking);
+        }
+        self.on_event(event, on_delta)
+    }
+
     fn on_event(
         &mut self,
         event: AnthropicStreamEvent,
@@ -261,17 +501,28 @@ impl AnthropicStreamAccum {
     ) -> std::result::Result<bool, ProviderError> {
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
+                self.speed = message.usage.speed.filter(|speed| speed == "fast");
                 self.input_tokens = message.usage.input_tokens;
                 self.cached_input_tokens = message.usage.cache_read_input_tokens;
             }
             AnthropicStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => {
-                if let AnthropicStreamBlock::ToolUse { id, name } = content_block {
+            } => match content_block {
+                AnthropicStreamBlock::ToolUse { id, name } => {
                     self.tool_blocks.insert(index, (id, name, String::new()));
                 }
-            }
+                AnthropicStreamBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    self.thinking_blocks.insert(
+                        index,
+                        json!({"type":"thinking","thinking":thinking,"signature":signature}),
+                    );
+                }
+                AnthropicStreamBlock::Other => {}
+            },
             AnthropicStreamEvent::ContentBlockDelta { index, delta } => match delta {
                 AnthropicStreamDelta::TextDelta { text } => {
                     if !text.is_empty() {
@@ -282,6 +533,18 @@ impl AnthropicStreamAccum {
                 AnthropicStreamDelta::InputJsonDelta { partial_json } => {
                     if let Some((_, _, buffer)) = self.tool_blocks.get_mut(&index) {
                         buffer.push_str(&partial_json);
+                    }
+                }
+                AnthropicStreamDelta::ThinkingDelta { thinking } => {
+                    if let Some(block) = self.thinking_blocks.get_mut(&index) {
+                        let mut text = block["thinking"].as_str().unwrap_or_default().to_owned();
+                        text.push_str(&thinking);
+                        block["thinking"] = json!(text);
+                    }
+                }
+                AnthropicStreamDelta::SignatureDelta { _signature } => {
+                    if let Some(block) = self.thinking_blocks.get_mut(&index) {
+                        block["signature"] = json!(_signature);
                     }
                 }
                 AnthropicStreamDelta::Other => {}
@@ -350,6 +613,16 @@ impl AnthropicStreamAccum {
                 raw: "<streamed response with no content or tool_use blocks>".into(),
             });
         }
+        let mut metadata = self
+            .speed
+            .map(|speed| serde_json::Map::from_iter([("speed".into(), json!(speed))]))
+            .unwrap_or_default();
+        if !self.thinking_blocks.is_empty() {
+            metadata.insert(
+                "anthropic_thinking".into(),
+                json!(self.thinking_blocks.into_values().collect::<Vec<_>>()),
+            );
+        }
         Ok(Response {
             content: self.content,
             tool_calls,
@@ -360,7 +633,7 @@ impl AnthropicStreamAccum {
             cached_input_tokens: self.cached_input_tokens,
             cost_micro_usd: None,
             pricing: None,
-            metadata: Default::default(),
+            metadata,
         })
     }
 }
@@ -405,6 +678,12 @@ struct AnthropicStreamMessage {
 enum AnthropicStreamBlock {
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(default)]
+        signature: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -416,6 +695,13 @@ enum AnthropicStreamDelta {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta {
+        #[serde(rename = "signature")]
+        _signature: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -428,6 +714,17 @@ struct AnthropicMessageDelta {
 #[derive(Debug, Deserialize)]
 struct AnthropicDeltaUsage {
     output_tokens: u32,
+}
+
+fn configured_body(mut body: Value, settings: crate::InferenceSettings) -> Value {
+    if let Some(effort) = settings.effort {
+        body["thinking"] = json!({"type":"adaptive", "display":"summarized"});
+        body["output_config"] = json!({"effort":effort.as_str()});
+    }
+    if settings.fast {
+        body["speed"] = json!("fast");
+    }
+    body
 }
 
 fn build_messages_body(
@@ -535,14 +832,29 @@ fn parse_messages_response(text: &str) -> Result<Response> {
         serde_json::from_str(text).context("parsing Anthropic response")?;
     let mut content = String::new();
     let mut tool_calls = Vec::new();
+    let mut thinking_blocks = Vec::new();
     for block in response.content {
         match block {
             AnthropicContentBlock::Text { text } => content.push_str(&text),
             AnthropicContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall::new(id, name, input));
             }
+            AnthropicContentBlock::Thinking {
+                thinking,
+                signature,
+            } => thinking_blocks
+                .push(json!({"type":"thinking","thinking":thinking,"signature":signature})),
             AnthropicContentBlock::Other => {}
         }
+    }
+    let mut metadata = response
+        .usage
+        .speed
+        .filter(|speed| speed == "fast")
+        .map(|speed| serde_json::Map::from_iter([("speed".into(), json!(speed))]))
+        .unwrap_or_default();
+    if !thinking_blocks.is_empty() {
+        metadata.insert("anthropic_thinking".into(), json!(thinking_blocks));
     }
     Ok(Response {
         content,
@@ -561,7 +873,7 @@ fn parse_messages_response(text: &str) -> Result<Response> {
         // Cost is stamped at trace-emission time (crate::cost), not here.
         cost_micro_usd: None,
         pricing: None,
-        metadata: Default::default(),
+        metadata,
     })
 }
 
@@ -583,6 +895,8 @@ enum AnthropicContentBlock {
         name: String,
         input: Value,
     },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
     #[serde(other)]
     Other,
 }
@@ -595,12 +909,71 @@ struct AnthropicUsage {
     /// never fabricated (t-1334).
     #[serde(default)]
     cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    speed: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::{ToolFunctionSpec, ToolSpec};
+
+    #[test]
+    fn opt_in_request_shape_and_thinking_stream() {
+        let base = build_messages_body(
+            &Model("claude-opus-5".into()),
+            &[],
+            &[ChatMessage::user("hi")],
+            8192,
+        );
+        assert!(base.get("thinking").is_none());
+        assert!(base.get("output_config").is_none());
+        assert!(base.get("speed").is_none());
+        let configured = configured_body(
+            base,
+            crate::InferenceSettings {
+                effort: Some(crate::Effort::High),
+                fast: true,
+            },
+        );
+        assert_eq!(
+            configured["thinking"],
+            json!({"type":"adaptive","display":"summarized"})
+        );
+        assert_eq!(configured["output_config"]["effort"], "high");
+        assert_eq!(configured["speed"], "fast");
+        let mut accum = AnthropicStreamAccum::default();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = captured.clone();
+        let reasoning: TextDeltaFn =
+            std::sync::Arc::new(move |text| sink.lock().unwrap().push_str(text));
+        let text: TextDeltaFn = std::sync::Arc::new(|_| {});
+        let event: AnthropicStreamEvent = serde_json::from_value(json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"consider"}})).unwrap();
+        accum
+            .on_event_with_reasoning(event, &text, &reasoning)
+            .unwrap();
+        let signature: AnthropicStreamEvent = serde_json::from_value(json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed"}})).unwrap();
+        accum
+            .on_event_with_reasoning(signature, &text, &reasoning)
+            .unwrap();
+        assert_eq!(*captured.lock().unwrap(), "consider");
+        let start: AnthropicStreamEvent = serde_json::from_value(json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}})).unwrap();
+        accum
+            .on_event_with_reasoning(start, &text, &reasoning)
+            .unwrap();
+        let fragment: AnthropicStreamEvent = serde_json::from_value(json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"step"}})).unwrap();
+        accum
+            .on_event_with_reasoning(fragment, &text, &reasoning)
+            .unwrap();
+        let signed: AnthropicStreamEvent = serde_json::from_value(json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"opaque"}})).unwrap();
+        accum
+            .on_event_with_reasoning(signed, &text, &reasoning)
+            .unwrap();
+        assert_eq!(
+            accum.thinking_blocks[&1],
+            json!({"type":"thinking","thinking":"step","signature":"opaque"})
+        );
+    }
 
     #[test]
     fn parses_text_and_tool_use_response() -> Result<()> {

@@ -1,4 +1,5 @@
 use crate::cost::{Pricing, PricingTable};
+use crate::reasoning::Effort;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -10,9 +11,22 @@ use std::path::{Path, PathBuf};
 pub struct PricingEntry {
     pub input_per_mtok_usd: f64,
     pub output_per_mtok_usd: f64,
+    pub fast_input_per_mtok_usd: Option<f64>,
+    pub fast_output_per_mtok_usd: Option<f64>,
 }
 
 impl PricingEntry {
+    fn fast_pricing(&self, model: &str) -> Result<Option<Pricing>> {
+        match (self.fast_input_per_mtok_usd, self.fast_output_per_mtok_usd) {
+            (Some(input), Some(output)) => Pricing::from_usd_per_mtok(input, output)
+                .with_context(|| format!("invalid fast pricing for model {model:?}"))
+                .map(Some),
+            (None, None) => Ok(None),
+            _ => Err(anyhow!(
+                "model {model:?}: both fast pricing rates are required"
+            )),
+        }
+    }
     fn to_pricing(&self, model: &str) -> Result<Pricing> {
         Pricing::from_usd_per_mtok(self.input_per_mtok_usd, self.output_per_mtok_usd)
             .with_context(|| format!("invalid pricing for model {model:?}"))
@@ -37,6 +51,11 @@ pub struct ModelEntry {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub thinking: bool,
+    pub effort: Option<Effort>,
+    #[serde(default)]
+    pub efforts: Vec<Effort>,
+    #[serde(default)]
+    pub fast: bool,
     #[serde(default)]
     pub vision: bool,
     pub display: Option<String>,
@@ -77,6 +96,9 @@ pub struct ResolvedModel {
     pub api_key: Option<String>,
     pub context: usize,
     pub max_tokens: Option<u32>,
+    pub effort: Option<Effort>,
+    pub efforts: Vec<Effort>,
+    pub fast: bool,
     /// Registry pricing for this model, already validated/converted to the
     /// exact integer representation. None = no pricing configured.
     pub pricing: Option<Pricing>,
@@ -84,7 +106,27 @@ pub struct ResolvedModel {
 
 impl ModelRegistry {
     pub fn from_yaml_str(input: &str) -> Result<Self> {
-        serde_yaml::from_str(input).context("parsing models.yaml")
+        let registry: Self = serde_yaml::from_str(input).context("parsing models.yaml")?;
+        for entry in &registry.models {
+            if entry
+                .effort
+                .is_some_and(|effort| !entry.efforts.contains(&effort))
+            {
+                return Err(anyhow!(
+                    "model {:?}: default effort must be in efforts",
+                    entry.name
+                ));
+            }
+            if (!entry.thinking && (!entry.efforts.is_empty() || entry.effort.is_some()))
+                || (entry.thinking && entry.efforts.is_empty() && entry.effort.is_some())
+            {
+                return Err(anyhow!(
+                    "model {:?}: effort requires thinking and an allowed efforts list",
+                    entry.name
+                ));
+            }
+        }
+        Ok(registry)
     }
 
     pub async fn load_default() -> Result<Self> {
@@ -125,6 +167,9 @@ impl ModelRegistry {
             api_key: expand_api_key(entry.api_key.as_deref())?,
             context: entry.context,
             max_tokens: entry.max_tokens,
+            effort: entry.effort,
+            efforts: entry.efforts.clone(),
+            fast: entry.fast,
             pricing: entry
                 .pricing
                 .as_ref()
@@ -160,10 +205,17 @@ impl ModelRegistry {
             let Some(pricing) = entry.pricing.as_ref() else {
                 continue;
             };
+            let fast = pricing.fast_pricing(&entry.name)?;
             let pricing = pricing.to_pricing(&entry.name)?;
             table.insert(entry.name.clone(), pricing);
+            if let Some(fast) = fast {
+                table.insert_fast(entry.name.clone(), fast);
+            }
             if let Some(api_id) = entry.api_id.as_deref() {
                 table.insert(api_id.to_owned(), pricing);
+                if let Some(fast) = fast {
+                    table.insert_fast(api_id.to_owned(), fast);
+                }
             }
         }
         Ok(table)
@@ -354,6 +406,26 @@ models:
         let yaml = format!("{MODELS}\nembeddings: {{}}\n");
         assert!(ModelRegistry::from_yaml_str(&yaml).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn effort_validation() {
+        let base = "models:\n- name: m\n  provider: anthropic\n  thinking: true\n";
+        assert!(ModelRegistry::from_yaml_str(&format!(
+            "{base}  effort: turbo\n  efforts: [turbo]\n"
+        ))
+        .is_err());
+        assert!(
+            ModelRegistry::from_yaml_str(&format!("{base}  effort: high\n  efforts: [low]\n"))
+                .is_err()
+        );
+        let registry = ModelRegistry::from_yaml_str(&format!(
+            "{base}  effort: high\n  efforts: [low, high]\n  fast: true\n"
+        ))
+        .unwrap();
+        let model = registry.resolve(Some("m")).unwrap();
+        assert_eq!(model.effort, Some(Effort::High));
+        assert!(model.fast);
     }
 
     #[test]

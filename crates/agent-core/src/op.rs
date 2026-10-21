@@ -690,6 +690,8 @@ mod tests {
             std::env::temp_dir().join(format!("agent-core-op-test-{}.jsonl", Uuid::new_v4()));
         SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),
@@ -713,6 +715,8 @@ mod tests {
     fn seq_config_with_provider(provider: Arc<dyn ChatProvider>) -> SeqConfig {
         SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             provider,
             ..seq_config()
         }

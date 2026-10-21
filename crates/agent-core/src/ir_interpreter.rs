@@ -1439,33 +1439,80 @@ async fn execute_instr(
                 let call = async {
                     match ir_replay {
                         Some(replay) => replay.infer_result(&location, &model),
-                        None => match (&config.replay, &config.on_infer_delta) {
-                            (Some(replay), _) => replay.infer_result(op_id, &model),
-                            (None, Some(tap)) => {
+                        None => match (
+                            &config.replay,
+                            &config.on_infer_delta,
+                            &config.on_reasoning_delta,
+                        ) {
+                            (Some(replay), _, _) => replay.infer_result(op_id, &model),
+                            (None, Some(tap), reasoning_tap) => {
                                 let tap = tap.clone();
+                                let reasoning_tap = reasoning_tap.clone();
                                 let on_delta: crate::provider::TextDeltaFn =
                                     std::sync::Arc::new(move |text: &str| {
                                         tap(crate::interpreter::InferDelta {
                                             op_id,
                                             parent_op_id,
                                             text: text.to_owned(),
-                                        })
+                                        });
+                                    });
+                                let on_reasoning: crate::provider::TextDeltaFn =
+                                    std::sync::Arc::new(move |text: &str| {
+                                        if let Some(tap) = &reasoning_tap {
+                                            tap(crate::interpreter::InferDelta {
+                                                op_id,
+                                                parent_op_id,
+                                                text: text.to_owned(),
+                                            });
+                                        }
                                     });
                                 config
                                     .provider
-                                    .chat_streamed(
+                                    .chat_streamed_with_settings(
                                         &Model(model.clone()),
                                         &tool_specs,
                                         &prompt,
                                         &on_delta,
+                                        &on_reasoning,
+                                        config.inference_settings,
                                     )
                                     .await
                             }
-                            (None, None) => {
-                                config
-                                    .provider
-                                    .chat(&Model(model.clone()), &tool_specs, &prompt)
-                                    .await
+                            (None, None, reasoning_tap) => {
+                                if let Some(tap) = reasoning_tap {
+                                    let tap = tap.clone();
+                                    let on_delta: crate::provider::TextDeltaFn =
+                                        std::sync::Arc::new(|_| {});
+                                    let on_reasoning: crate::provider::TextDeltaFn =
+                                        std::sync::Arc::new(move |text: &str| {
+                                            tap(crate::interpreter::InferDelta {
+                                                op_id,
+                                                parent_op_id,
+                                                text: text.to_owned(),
+                                            });
+                                        });
+                                    config
+                                        .provider
+                                        .chat_streamed_with_settings(
+                                            &Model(model.clone()),
+                                            &tool_specs,
+                                            &prompt,
+                                            &on_delta,
+                                            &on_reasoning,
+                                            config.inference_settings,
+                                        )
+                                        .await
+                                } else {
+                                    config
+                                        .provider
+                                        .chat_with_settings(
+                                            &Model(model.clone()),
+                                            &tool_specs,
+                                            &prompt,
+                                            config.inference_settings,
+                                        )
+                                        .await
+                                }
                             }
                         },
                     }
@@ -3121,6 +3168,8 @@ mod tests {
     fn config_with_trace(provider: Arc<dyn ChatProvider>, trace: TraceLogger) -> SeqConfig {
         SeqConfig {
             on_infer_delta: None,
+            on_reasoning_delta: None,
+            inference_settings: Default::default(),
             approvals: Default::default(),
             guidance: Default::default(),
             tools: Default::default(),

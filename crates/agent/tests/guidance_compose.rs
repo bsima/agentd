@@ -55,6 +55,8 @@ fn config(provider: Arc<dyn ChatProvider>, guidance: RuntimeGuidance) -> SeqConf
         std::env::temp_dir().join(format!("guidance-compose-{}.jsonl", Uuid::new_v4()));
     SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         approvals: Default::default(),
         guidance,
         tools: Default::default(),

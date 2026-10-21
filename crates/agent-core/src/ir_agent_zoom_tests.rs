@@ -93,6 +93,8 @@ fn trace() -> TraceLogger {
 fn config(provider: Arc<dyn ChatProvider>, trace: TraceLogger, gc: GcMode) -> SeqConfig {
     SeqConfig {
         on_infer_delta: None,
+        on_reasoning_delta: None,
+        inference_settings: Default::default(),
         approvals: Default::default(),
         guidance: Default::default(),
         tools: Default::default(),
