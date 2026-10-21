@@ -34,15 +34,14 @@ pub(crate) struct Profile {
     pub description: Option<String>,
     pub shell_approval: ShellApproval,
     pub instructions: String,
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Profiles(pub BTreeMap<String, Profile>);
 
-// No native opt-in tools are currently available: ask_user is always on in
-// ACP, and zoom depends on the GC strategy. Extend this registry when an
-// independently switchable tool ships.
-const OPT_IN_TOOLS: &[&str] = &[];
+// ask_user is always on in ACP; zoom depends on the GC strategy.
+const OPT_IN_TOOLS: &[&str] = &[agent_core::todo::TODO_TOOL];
 
 impl Profiles {
     pub fn get(&self, id: &str) -> Option<&Profile> {
@@ -107,6 +106,7 @@ fn load_profile(file: &Path) -> Result<Profile> {
         description: meta.description,
         shell_approval: meta.shell_approval,
         instructions: body.trim().to_owned(),
+        tools: meta.tools,
     })
 }
 
@@ -124,6 +124,48 @@ fn split_frontmatter(content: &str) -> Result<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shipped_plan_profile_parses() {
+        let dir = std::env::temp_dir().join(format!("acp-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.md"),
+            include_str!("../../../../examples/modes/plan.md"),
+        )
+        .unwrap();
+        let profiles = Profiles::load(Some(&dir)).unwrap();
+        let plan = profiles.get("plan").unwrap();
+        assert_eq!(plan.tools, ["todo"]);
+        assert_eq!(plan.shell_approval, ShellApproval::Always);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plan_is_advertised_as_toggle_with_ask_as_off_mode() {
+        let dir = std::env::temp_dir().join(format!("acp-plan-wire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.md"),
+            include_str!("../../../../examples/modes/plan.md"),
+        )
+        .unwrap();
+        let profiles = Profiles::load(Some(&dir)).unwrap();
+        let initial =
+            serde_json::to_value(super::super::registry::session_modes(true, None, &profiles))
+                .unwrap();
+        assert_eq!(initial["currentModeId"], "ask");
+        assert_eq!(initial["availableModes"][0]["id"], "ask");
+        assert_eq!(initial["availableModes"][2]["id"], "plan");
+        let enabled = serde_json::to_value(super::super::registry::session_modes(
+            true,
+            Some("plan"),
+            &profiles,
+        ))
+        .unwrap();
+        assert_eq!(enabled["currentModeId"], "plan");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn parses_profiles_and_rejects_bad_policy() {
         let dir = std::env::temp_dir().join(format!("acp-modes-{}", uuid::Uuid::new_v4()));

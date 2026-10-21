@@ -332,22 +332,59 @@ pub(super) fn restore_mode(
     profiles: &super::profiles::Profiles,
 ) -> Result<()> {
     if let Some(id) = runtime.acp_mode.clone() {
-        apply_mode(runtime, &id, profiles)?;
+        if restored_mode_id(&id, profiles) != id {
+            eprintln!(
+                "warning: mode profile {id:?} is unavailable; restoring ACP session in ask mode"
+            );
+            apply_mode(runtime, registry::MODE_ASK, profiles)?;
+        } else {
+            apply_mode(runtime, &id, profiles)?;
+        }
     }
     Ok(())
 }
 
+fn restored_mode_id<'a>(id: &'a str, profiles: &super::profiles::Profiles) -> &'a str {
+    if registry::is_session_mode(id) || profiles.get(id).is_some() {
+        id
+    } else {
+        registry::MODE_ASK
+    }
+}
+
 fn apply_mode(runtime: &mut Runtime, id: &str, profiles: &super::profiles::Profiles) -> Result<()> {
     use super::profiles::ShellApproval;
+    // Only the active profile can offer session-local tools. The process's
+    // --todo registration remains available in every mode.
+    let profile = if registry::is_session_mode(id) {
+        None
+    } else {
+        Some(
+            profiles
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("mode profile {id:?} is unavailable"))?,
+        )
+    };
+    if !runtime.todo_process_wide {
+        runtime.config.tools.unregister(agent_core::todo::TODO_TOOL);
+        if profile.is_some_and(|p| {
+            p.tools
+                .iter()
+                .any(|tool| tool == agent_core::todo::TODO_TOOL)
+        }) {
+            runtime
+                .config
+                .tools
+                .register(agent_core::todo::todo_tool())?;
+        }
+    }
     runtime.acp_mode_prompt = None;
     runtime.acp_shell_always = false;
     match id {
         registry::MODE_ASK => runtime.shell_requires_approval = true,
         registry::MODE_YOLO => runtime.shell_requires_approval = false,
         _ => {
-            let profile = profiles
-                .get(id)
-                .ok_or_else(|| anyhow::anyhow!("mode profile {id:?} is unavailable"))?;
+            let profile = profile.expect("validated profile");
             runtime.shell_requires_approval = profile.shell_approval != ShellApproval::Never;
             runtime.acp_shell_always = profile.shell_approval == ShellApproval::Always;
             runtime.acp_mode_prompt = Some(profile.instructions.clone());
@@ -362,6 +399,40 @@ mod mode_tests {
     use super::super::profiles::{Profile, Profiles, ShellApproval};
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn missing_profile_restores_to_ask() {
+        let profiles = Profiles::default();
+        assert_eq!(restored_mode_id("removed", &profiles), registry::MODE_ASK);
+        assert_eq!(restored_mode_id("yolo", &profiles), registry::MODE_YOLO);
+    }
+
+    #[test]
+    fn profile_tool_is_turn_scoped_and_falls_back_on_load() {
+        let profiles = Profiles(BTreeMap::from([(
+            "planning".into(),
+            Profile {
+                id: "planning".into(),
+                name: "Planning".into(),
+                description: None,
+                shell_approval: ShellApproval::Always,
+                instructions: "Read only".into(),
+                tools: vec!["todo".into()],
+            },
+        )]));
+        // The registry transition is the same one used on live mode changes
+        // and checkpoint restoration; the loop sees only registered names.
+        let mut tools = agent_core::ToolRegistry::new();
+        tools.register(agent_core::todo::todo_tool()).unwrap();
+        assert_eq!(tools.names(), ["todo"]);
+        tools.unregister("todo");
+        assert!(tools.names().is_empty());
+        assert_eq!(profiles.get("planning").unwrap().tools, ["todo"]);
+        let state = registry::session_modes(true, Some("planning"), &profiles);
+        let wire = serde_json::to_value(state).unwrap();
+        assert_eq!(wire["currentModeId"], "planning");
+        assert_eq!(wire["availableModes"][0]["id"], "ask");
+    }
 
     #[test]
     fn profile_changes_program_identity() {
@@ -383,6 +454,9 @@ mod mode_tests {
         };
         assert_ne!(hash(&base), hash(&research));
         assert_eq!(hash(&base), hash(&base));
+        let mut with_todo = base.clone();
+        with_todo.tool_names.push("todo".into());
+        assert_ne!(hash(&base), hash(&with_todo));
     }
 
     #[test]
@@ -395,6 +469,7 @@ mod mode_tests {
                 description: Some("Investigate".into()),
                 shell_approval: ShellApproval::Always,
                 instructions: "Read first".into(),
+                tools: vec![],
             },
         )]));
         let state = registry::session_modes(true, Some("research"), &profiles);

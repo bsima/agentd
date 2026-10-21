@@ -92,7 +92,8 @@ the wire.
   question tool, `ask_user {question, options}` (2-8 distinct non-empty
   options). CLI one-shot/FIFO/stdin sessions and the `agentd` supervisor do
   not offer it: they have no way to answer. See "Questions" below.
-- `todo` — opt in with `--todo` (also works outside ACP). The model sends
+- `todo` — opt in with `--todo` (also works outside ACP), or enable it
+  per ACP session by selecting a profile with `tools: [todo]`. The model sends
   `{ "items": [{ "content": "...", "status": "pending" | "in_progress" | "completed" }] }`;
   each successful call replaces the entire checklist and emits an ACP `plan`
   update (medium priority). Paseo renders `content` and checks only completed
@@ -133,8 +134,16 @@ the wire.
   Mode instructions are turn-local system context, not saved conversation
   history; their profile id and text also enter the loop program identity.
   `session/set_mode` takes effect next turn, persists across `session/load`,
-  and emits `current_mode_update`. Removing an active profile prevents
-  loading that session until the profile is restored.
+  and emits `current_mode_update`. Loading a session whose profile was removed
+  warns on stderr and falls back to built-in `ask`.
+- Plan profile — copy `examples/modes/plan.md` to
+  `~/.config/agent/modes/plan.md` (create the directory first), then restart
+  `agent --acp`. Paseo recognizes the `plan` id as its Plan toggle; Off
+  selects `ask`. The profile offers `todo`, asks permission for every shell
+  command, and instructs read-only investigation. The model asks the user
+  whether to implement or revise; on Implement it requests a manual switch
+  to `ask` before any edits. Agent-initiated, consent-gated mode switching
+  remains a follow-up; no answer text is treated as authority to switch modes.
 - Config options — rendered by Paseo next to the mode picker, applied
   between turns via `session/set_config_option`:
   - `model`: every `models.yaml` alias; switching re-resolves the

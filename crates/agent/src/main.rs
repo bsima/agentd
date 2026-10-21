@@ -556,6 +556,10 @@ struct Runtime {
     #[cfg(feature = "acp")]
     acp_mode_prompt: Option<String>,
     #[cfg(feature = "acp")]
+    acp_mode_message_id: Option<Uuid>,
+    #[cfg(feature = "acp")]
+    todo_process_wide: bool,
+    #[cfg(feature = "acp")]
     acp_shell_always: bool,
     /// Offer the GC `zoom` tool (t-1609, `--gc-zoom`). Each turn's program
     /// carries the arm only while a GC strategy is active (ACP can switch
@@ -1235,6 +1239,10 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         acp_mode: resumed_acp_mode,
         #[cfg(feature = "acp")]
         acp_mode_prompt: None,
+        #[cfg(feature = "acp")]
+        acp_mode_message_id: None,
+        #[cfg(feature = "acp")]
+        todo_process_wide: args.todo,
         #[cfg(feature = "acp")]
         acp_shell_always: false,
         gc_zoom: args.gc_zoom,
@@ -3032,6 +3040,13 @@ async fn commit_checkpoint_bytes(
     Ok(())
 }
 
+/// Drop the turn-local ACP mode instructions (identified by message id, not
+/// position) before the history is checkpointed.
+#[cfg(feature = "acp")]
+fn strip_mode_message(history: &mut Vec<ChatMessage>, id: Uuid) {
+    history.retain(|message| message.id != id);
+}
+
 /// Post-outcome bookkeeping for a completed turn: decode the loop's value,
 /// fold the machine's history back into the runtime, close dangling tool
 /// calls, and persist the checkpoint. Shared by the CLI turn spine and the
@@ -3068,12 +3083,8 @@ async fn finish_turn(
     // ACP mode instructions belong to the current turn, not the saved
     // conversation; remove the injected system message before checkpointing.
     #[cfg(feature = "acp")]
-    if let Some(instructions) = runtime.acp_mode_prompt.as_deref().filter(|s| !s.is_empty()) {
-        if new_history.get(1).is_some_and(|m: &ChatMessage| {
-            m.role == "system" && m.content.as_deref() == Some(instructions)
-        }) {
-            new_history.remove(1);
-        }
+    if let Some(id) = runtime.acp_mode_message_id.take() {
+        strip_mode_message(&mut new_history, id);
     }
     if !response.content.is_empty() || !response.tool_calls.is_empty() {
         new_history.push(ChatMessage::assistant(

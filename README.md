@@ -99,7 +99,7 @@ printf 'run cargo test\0' > .agent.fifo
 
 # ACP server mode: any Agent Client Protocol frontend (e.g. Paseo) can
 # spawn this and drive sessions with streaming, permission prompts, and
-# session resume — see docs/ACP.md
+# session resume (including an installable Plan profile) — see docs/ACP.md
 agent --acp
 ```
 

@@ -256,6 +256,11 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Remove a session-scoped opt-in tool between turns.
+    pub fn unregister(&mut self, name: &str) -> Option<NativeTool> {
+        self.tools.remove(name)
+    }
+
     pub fn get(&self, name: &str) -> Option<&NativeTool> {
         self.tools.get(name)
     }

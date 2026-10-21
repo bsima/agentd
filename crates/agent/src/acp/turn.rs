@@ -48,8 +48,11 @@ pub(crate) async fn run_acp_turn(
     let mut prompt = runtime.history.clone();
     // A separate system message is turn-local: switching modes never mutates
     // saved conversation history or accumulates stale instructions.
+    runtime.acp_mode_message_id = None;
     if let Some(instructions) = runtime.acp_mode_prompt.as_deref().filter(|s| !s.is_empty()) {
-        prompt.insert(1, ChatMessage::system(instructions));
+        let injected = ChatMessage::system(instructions);
+        runtime.acp_mode_message_id = Some(injected.id);
+        prompt.insert(1.min(prompt.len()), injected);
     }
     // Options are fixed for the whole turn: they shape the loop program and
     // therefore its effect ids, so approval resumes must re-enter with the
@@ -286,6 +289,21 @@ mod tests {
     use agent_core::{
         effect_location, program_hash, BlockId, DynamicPath, EffectKind, EffectSite, Model,
     };
+
+    #[test]
+    fn injected_mode_message_is_removed_even_if_history_moves() {
+        let injected = ChatMessage::system("mode instructions");
+        let user_system = ChatMessage::system("mode instructions");
+        let mut history = vec![
+            ChatMessage::user("first"),
+            user_system.clone(),
+            ChatMessage::user("second"),
+            injected.clone(),
+        ];
+        crate::strip_mode_message(&mut history, injected.id);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].id, user_system.id);
+    }
 
     fn pending_question() -> (agent_core::ApprovalRequest, AskUserRequest) {
         let machine = agent_core::agent_loop_ir(Model("test-model".into()), vec![], 4);
