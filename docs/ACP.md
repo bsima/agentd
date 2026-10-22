@@ -119,7 +119,9 @@ the wire.
   `session-latest.json` checkpoint and replays the conversation as
   user/agent message chunks and tool cards in trace order before responding.
   The trace uses the live event mapping (including zoom and resolved approval
-  cards); missing or unreadable traces fall back to text-only checkpoint history.
+  cards); ACP-only turn-start markers link effects to saved prompts without
+  changing CLI traces. Missing, truncated, or unalignable traces fall back to
+  text-only checkpoint history; plans stop at the loaded checkpoint marker.
 - Modes — `ask` (default; approval-gated shell) and `yolo` remain built in.
   Additional modes load from `--acp-modes-dir DIR`, or from
   `$XDG_CONFIG_HOME/agent/modes` (`~/.config/agent/modes`) if it exists.

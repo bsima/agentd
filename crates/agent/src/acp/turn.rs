@@ -44,7 +44,20 @@ pub(crate) async fn run_acp_turn(
     // effect id its gated command had. A stale `allow-once` surviving here
     // would silently approve a different command without a prompt.
     runtime.config.approvals.resolutions.clear();
+    // ACP-only boundary: trace effects have no turn id, and checkpoints may
+    // omit old prompts after GC. The message id links each turn to retained
+    // checkpoint history without changing the default CLI trace shape.
+    let user_id = message.id;
     runtime.history.push(message);
+    runtime
+        .trace
+        .emit(&agent_core::Event::Custom {
+            run_id: runtime.run_id.clone(),
+            name: "acp_turn_start".into(),
+            data: serde_json::json!({ "user_message_id": user_id }),
+            timestamp: chrono::Utc::now(),
+        })
+        .await?;
     let mut prompt = runtime.history.clone();
     // A separate system message is turn-local: switching modes never mutates
     // saved conversation history or accumulates stale instructions.
