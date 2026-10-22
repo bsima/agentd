@@ -103,7 +103,7 @@ pub fn agent_loop_ir_for_options(
     max_turns: usize,
     options: &AgentLoopOptions,
 ) -> Machine {
-    build_agent_loop_ir(
+    let mut machine = build_agent_loop_ir(
         model,
         prompt,
         max_turns,
@@ -113,7 +113,38 @@ pub fn agent_loop_ir_for_options(
         options.infer_system_prompt.as_deref(),
         options.ask_user,
         options.zoom,
-    )
+    );
+    if options.anthropic_thinking {
+        attach_thinking_to_tool_turn(&mut machine);
+    }
+    machine
+}
+
+/// Only opt-in loops carry provider-specific signed blocks into assistant history.
+fn attach_thinking_to_tool_turn(machine: &mut Machine) {
+    let block = machine
+        .program
+        .blocks
+        .get_mut(&BlockId(2))
+        .expect("prepare_tools block");
+    let Instr::Let {
+        expr: Expr::Push { value, .. },
+        ..
+    } = &mut block.instructions[0]
+    else {
+        unreachable!("prepare_tools pushes assistant history")
+    };
+    let Expr::Object(fields) = value.as_mut() else {
+        unreachable!("prepare_tools creates assistant object")
+    };
+    fields.insert(
+        "provider_metadata".into(),
+        Expr::FieldOr {
+            base: Var("response".into()),
+            field: "metadata".into(),
+            default: Box::new(Expr::Value(serde_json::json!({}))),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)] // one parameter per program-shaping AgentLoopOptions knob
@@ -1483,6 +1514,8 @@ pub struct AgentLoopOptions {
     /// Include the model-initiated remember/recall tools (docs/MEMORY.md);
     /// see [`agent_loop_ir_with_options`].
     pub memory_tools: bool,
+    /// Carry signed Anthropic thinking through the tool loop (opt-in program shape).
+    pub anthropic_thinking: bool,
     /// Registered native tool names (t-1308.7), in registry order — pass
     /// [`crate::tool::ToolRegistry::names`] of the registry carried on the
     /// `SeqConfig`. Each name gets a dispatch arm in the loop program; see
@@ -1964,6 +1997,48 @@ mod tests {
             context_budget: 200_000,
             pricing: Default::default(),
         }
+    }
+
+    #[test]
+    fn thinking_loop_changes_only_opt_in_program_and_checkpoints_metadata() -> Result<()> {
+        let baseline = agent_loop_ir_for_options(
+            Model("claude".into()),
+            vec![],
+            2,
+            &AgentLoopOptions::default(),
+        );
+        let opted = agent_loop_ir_for_options(
+            Model("claude".into()),
+            vec![],
+            2,
+            &AgentLoopOptions {
+                anthropic_thinking: true,
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            crate::ir::program_hash(&baseline.program)?,
+            crate::ir::program_hash(&opted.program)?
+        );
+        let restored: Machine = serde_json::from_value(serde_json::to_value(&opted)?)?;
+        assert_eq!(restored.program, opted.program);
+        let mut msg = crate::op::ChatMessage::assistant(None, vec![]);
+        msg.provider_metadata.insert(
+            "anthropic_thinking".into(),
+            serde_json::json!([{"type":"thinking","thinking":"secret","signature":"signed"}]),
+        );
+        let mut checkpoint = opted;
+        checkpoint
+            .env
+            .insert(Var("history".into()), serde_json::json!([msg]));
+        let restored: Machine = serde_json::from_value(serde_json::to_value(checkpoint)?)?;
+        let messages: Vec<crate::op::ChatMessage> =
+            serde_json::from_value(restored.env[&Var("history".into())].clone())?;
+        assert_eq!(
+            messages[0].provider_metadata["anthropic_thinking"][0]["signature"],
+            "signed"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3449,6 +3524,7 @@ mod tests {
         let mut gc_state = GcState::default();
         let options = AgentLoopOptions {
             memory_tools: false,
+            anthropic_thinking: false,
             tool_names: Vec::new(),
             output_contract: contract,
             shell_requires_approval: false,
@@ -3654,6 +3730,7 @@ mod tests {
             let mut gc_state = GcState::default();
             let options = AgentLoopOptions {
                 memory_tools: false,
+                anthropic_thinking: false,
                 tool_names: Vec::new(),
                 output_contract: Some(contract_a.clone()),
                 shell_requires_approval: false,
@@ -3692,6 +3769,7 @@ mod tests {
                 let mut gc_state = GcState::default();
                 let options = AgentLoopOptions {
                     memory_tools: false,
+                    anthropic_thinking: false,
                     tool_names: Vec::new(),
                     output_contract: contract,
                     shell_requires_approval: false,

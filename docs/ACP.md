@@ -261,7 +261,8 @@ printf '%s\n' \
 
 ## Follow-ups (not yet implemented)
 
-- Thought updates (reasoning deltas are live-only; ACP wiring remains).
+- Thought updates (reasoning deltas are live-only, including Codex OAuth
+  summary/text deltas when emitted; ACP wiring remains).
 - Deterministic mid-effect cancellation (cancel token through agent-core).
 - `session/delete`, listing agentd supervisor sessions, MCP server passthrough, `fs/*`
   client capabilities, cumulative wire-level cost reporting.

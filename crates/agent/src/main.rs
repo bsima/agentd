@@ -2377,6 +2377,7 @@ async fn resume_run(
     config.guidance.infer_models = infer_registry.map(|r| (r, resolved_model.clone()));
     let options = agent_core::AgentLoopOptions {
         memory_tools: facts.memory_tools,
+        anthropic_thinking: false,
         tool_names: vec![],
         output_contract,
         shell_requires_approval: facts.shell_requires_approval,
@@ -3001,6 +3002,10 @@ fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
         .is_empty();
     agent_core::AgentLoopOptions {
         memory_tools,
+        anthropic_thinking: runtime.config.inference_settings.effort.is_some()
+            && runtime
+                .provider_url
+                .starts_with("https://api.anthropic.com/"),
         tool_names: runtime.config.tools.names(),
         output_contract: runtime.output_contract.clone(),
         shell_requires_approval: runtime.shell_requires_approval,

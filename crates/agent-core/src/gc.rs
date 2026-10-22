@@ -1973,6 +1973,7 @@ fn marker_message(id: MsgId, content: String) -> ChatMessage {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
+        provider_metadata: Default::default(),
     }
 }
 
@@ -3795,6 +3796,7 @@ fn pop_frame(messages: &mut [ChatMessage], keep: &mut [bool], frame: &Frame, sta
     let assistant = &mut messages[frame.assistant];
     assistant.content = Some(summary);
     assistant.tool_calls = None;
+    assistant.provider_metadata.clear();
     for index in &frame.results {
         keep[*index] = false;
     }
@@ -5916,6 +5918,26 @@ mod tests {
                     .as_ref()
                     .is_some_and(|calls| calls.iter().any(|call| call.id == "call-1"))
         }));
+    }
+
+    #[test]
+    fn stack_pop_discards_signed_thinking_with_tool_frame() {
+        let mut assistant = ChatMessage::assistant(None, vec![tool_call("call-1")]);
+        assistant.provider_metadata.insert(
+            "anthropic_thinking".into(),
+            serde_json::json!([{"type":"thinking","thinking":"private","signature":"sig"}]),
+        );
+        let mut messages = vec![assistant, ChatMessage::tool("call-1", "result")];
+        let frame = Frame {
+            assistant: 0,
+            results: vec![1],
+        };
+        let mut keep = vec![true; messages.len()];
+        let mut state = GcState::default();
+        pop_frame(&mut messages, &mut keep, &frame, &mut state);
+        assert!(messages[0].provider_metadata.is_empty());
+        assert!(messages[0].tool_calls.is_none());
+        assert!(!keep[1]);
     }
 
     // ---- Eviction markers (t-1360) ------------------------------------------

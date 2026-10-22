@@ -292,11 +292,19 @@ Anthropic API-key requests use adaptive thinking with summarized display and
 For OpenAI-compatible chat-completions, the opt-in effort parameter is
 `reasoning_effort` and fast maps to `service_tier: priority`; endpoint support
 varies. Codex OAuth sends Responses `reasoning: {effort, summary: auto}` and
-`service_tier: priority` when configured; the chatgpt.com backend has not
-been live-validated. Claude-code OAuth does not yet apply these settings.
-Anthropic signed thinking blocks are captured in the response metadata, but
-the IR loop does not yet carry them into its next tool-use request: do not
-enable thinking on native Anthropic tool loops until that handoff is completed.
+`service_tier: priority` when configured; both were accepted by the
+chatgpt.com backend in tiny live gpt-6-sol requests (2026-10-22). Claude-code
+OAuth does not yet apply these settings. Codex reasoning summary/text deltas
+reach the reasoning callback if emitted; the live tiny reply did not confirm
+whether reasoning events were emitted.
+Anthropic signed thinking blocks are carried on assistant tool turns in the
+opt-in IR program and checkpoint, and replayed only when the native model id
+matches the original response. Default IR programs remain unchanged. GC removes
+blocks with evicted assistant messages. GC paths that rewrite an assistant
+turn while retaining its tool-use (or retain a tool-use after evicting its
+signed thinking) could invalidate that turn; this edge has not been live-tested
+against Anthropic. Switching models intentionally drops the old signature;
+continuing a signed tool turn on a different model is likewise unvalidated.
 
 Fast pricing is optional inside `pricing`: `fast_input_per_mtok_usd` and
 `fast_output_per_mtok_usd` must be specified together. Cost accounting selects

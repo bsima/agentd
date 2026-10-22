@@ -58,6 +58,7 @@ fn write_replay_fixture(root: &std::path::Path, content: &str) -> std::path::Pat
     // whose dispatch arm is program too.
     let options = AgentLoopOptions {
         memory_tools: false,
+        anthropic_thinking: false,
         tool_names: vec![],
         output_contract: None,
         shell_requires_approval: true,

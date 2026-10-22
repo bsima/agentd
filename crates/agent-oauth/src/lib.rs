@@ -554,6 +554,7 @@ impl OAuthChatProvider {
             tools,
             messages,
             None,
+            None,
             agent_core::InferenceSettings::default(),
         )
         .await
@@ -576,6 +577,7 @@ impl OAuthChatProvider {
             tools,
             messages,
             Some(on_delta),
+            None,
             agent_core::InferenceSettings::default(),
         )
         .await
@@ -585,6 +587,7 @@ impl OAuthChatProvider {
     /// dropped connection, truncated stream, 429, or 5xx retries exactly as
     /// on the OpenAI-shaped paths instead of failing the turn (t-1583). A
     /// retried attempt may re-emit deltas; see [`agent_core::TextDeltaFn`].
+    #[allow(clippy::too_many_arguments)] // transport needs both independent streaming callbacks
     async fn chat_codex_with_retries(
         &self,
         token: &str,
@@ -592,6 +595,7 @@ impl OAuthChatProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
         on_delta: Option<&agent_core::TextDeltaFn>,
+        on_reasoning: Option<&agent_core::TextDeltaFn>,
         settings: agent_core::InferenceSettings,
     ) -> Result<Response> {
         let account_id = extract_codex_account_id(token).ok_or_else(|| {
@@ -603,7 +607,7 @@ impl OAuthChatProvider {
             |_nudge| {
                 configured_codex_request(build_codex_request(model, tools, messages), settings)
             },
-            |body| self.codex_attempt(token, &account_id, &url, body, on_delta),
+            |body| self.codex_attempt(token, &account_id, &url, body, on_delta, on_reasoning),
         )
         .await
         .map_err(ProviderError::into_anyhow)
@@ -616,6 +620,7 @@ impl OAuthChatProvider {
         url: &str,
         body: Value,
         on_delta: Option<&agent_core::TextDeltaFn>,
+        on_reasoning: Option<&agent_core::TextDeltaFn>,
     ) -> std::result::Result<Response, ProviderError> {
         use futures::StreamExt;
         let response = self
@@ -661,7 +666,7 @@ impl OAuthChatProvider {
                 // `error`/`response.failed` events are the backend's own
                 // verdict on the request, not a transport fault: terminal.
                 accum
-                    .on_event(&parsed, on_delta)
+                    .on_event_with_reasoning(&parsed, on_delta, on_reasoning)
                     .map_err(ProviderError::Other)?;
             }
         }
@@ -750,7 +755,7 @@ impl ChatProvider for CodexOAuthProvider {
         }
         let token = self.inner.access_token().await?;
         self.inner
-            .chat_codex_with_retries(&token, model, tools, messages, None, settings)
+            .chat_codex_with_retries(&token, model, tools, messages, None, None, settings)
             .await
     }
     async fn chat_streamed_with_settings(
@@ -759,7 +764,7 @@ impl ChatProvider for CodexOAuthProvider {
         tools: &[ToolSpec],
         messages: &[ChatMessage],
         on_delta: &agent_core::TextDeltaFn,
-        _on_reasoning: &agent_core::TextDeltaFn,
+        on_reasoning: &agent_core::TextDeltaFn,
         settings: agent_core::InferenceSettings,
     ) -> Result<Response> {
         if settings == agent_core::InferenceSettings::default() {
@@ -767,7 +772,15 @@ impl ChatProvider for CodexOAuthProvider {
         }
         let token = self.inner.access_token().await?;
         self.inner
-            .chat_codex_with_retries(&token, model, tools, messages, Some(on_delta), settings)
+            .chat_codex_with_retries(
+                &token,
+                model,
+                tools,
+                messages,
+                Some(on_delta),
+                Some(on_reasoning),
+                settings,
+            )
             .await
     }
 }
@@ -1173,6 +1186,25 @@ struct CodexStreamAccum {
 }
 
 impl CodexStreamAccum {
+    fn on_event_with_reasoning(
+        &mut self,
+        event: &Value,
+        on_delta: Option<&agent_core::TextDeltaFn>,
+        on_reasoning: Option<&agent_core::TextDeltaFn>,
+    ) -> Result<()> {
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta")
+        ) {
+            if let (Some(delta), Some(tap)) =
+                (event.get("delta").and_then(Value::as_str), on_reasoning)
+            {
+                tap(delta);
+            }
+        }
+        self.on_event(event, on_delta)
+    }
+
     fn on_event(
         &mut self,
         event: &Value,
@@ -1475,6 +1507,35 @@ mod tests {
             "last_refresh": "2026-06-12T00:00:00Z",
         })
         .to_string()
+    }
+
+    #[test]
+    fn codex_reasoning_deltas_use_reasoning_callback_only() {
+        let reasoning = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let reasoning_sink = reasoning.clone();
+        let text_sink = text.clone();
+        let on_reasoning: agent_core::TextDeltaFn =
+            std::sync::Arc::new(move |delta| reasoning_sink.lock().unwrap().push_str(delta));
+        let on_text: agent_core::TextDeltaFn =
+            std::sync::Arc::new(move |delta| text_sink.lock().unwrap().push_str(delta));
+        let mut accum = CodexStreamAccum::default();
+        accum
+            .on_event_with_reasoning(
+                &json!({"type":"response.reasoning_summary_text.delta","delta":"thought"}),
+                Some(&on_text),
+                Some(&on_reasoning),
+            )
+            .unwrap();
+        accum
+            .on_event_with_reasoning(
+                &json!({"type":"response.output_text.delta","delta":"ok"}),
+                Some(&on_text),
+                Some(&on_reasoning),
+            )
+            .unwrap();
+        assert_eq!(*reasoning.lock().unwrap(), "thought");
+        assert_eq!(*text.lock().unwrap(), "ok");
     }
 
     #[test]

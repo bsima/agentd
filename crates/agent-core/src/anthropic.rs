@@ -131,6 +131,10 @@ impl ChatProvider for AnthropicProvider {
         )
         .await
         .map_err(ProviderError::into_anyhow)
+        .map(|mut response| {
+            stamp_thinking_model(&mut response, model);
+            response
+        })
     }
 
     async fn chat_streamed_with_settings(
@@ -195,6 +199,10 @@ impl ChatProvider for AnthropicProvider {
         )
         .await
         .map_err(ProviderError::into_anyhow)
+        .map(|mut response| {
+            stamp_thinking_model(&mut response, model);
+            response
+        })
     }
 
     async fn chat_streamed(
@@ -716,6 +724,14 @@ struct AnthropicDeltaUsage {
     output_tokens: u32,
 }
 
+fn stamp_thinking_model(response: &mut Response, model: &Model) {
+    if response.metadata.contains_key("anthropic_thinking") {
+        response
+            .metadata
+            .insert("anthropic_model".into(), json!(model.0));
+    }
+}
+
 fn configured_body(mut body: Value, settings: crate::InferenceSettings) -> Value {
     if let Some(effort) = settings.effort {
         body["thinking"] = json!({"type":"adaptive", "display":"summarized"});
@@ -743,7 +759,7 @@ fn build_messages_body(
     let anthropic_messages: Vec<Value> = messages
         .iter()
         .filter(|message| message.role != "system")
-        .map(message_to_anthropic)
+        .map(|message| message_to_anthropic(message, model))
         .collect();
 
     let mut body = json!({
@@ -767,10 +783,31 @@ fn build_messages_body(
     body
 }
 
-fn message_to_anthropic(message: &ChatMessage) -> Value {
+fn message_to_anthropic(message: &ChatMessage, model: &Model) -> Value {
     match message.role.as_str() {
         "assistant" => {
             let mut content = Vec::new();
+            if message
+                .provider_metadata
+                .get("anthropic_model")
+                .and_then(Value::as_str)
+                == Some(&model.0)
+            {
+                if let Some(blocks) = message
+                    .provider_metadata
+                    .get("anthropic_thinking")
+                    .and_then(Value::as_array)
+                {
+                    content.extend(
+                        blocks
+                            .iter()
+                            .filter(|block| {
+                                block["type"] == "thinking" && block["signature"].is_string()
+                            })
+                            .cloned(),
+                    );
+                }
+            }
             if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
                 content.push(json!({ "type": "text", "text": text }));
             }
@@ -973,6 +1010,35 @@ mod tests {
             accum.thinking_blocks[&1],
             json!({"type":"thinking","thinking":"step","signature":"opaque"})
         );
+    }
+
+    #[test]
+    fn signed_thinking_round_trips_only_on_original_model() -> Result<()> {
+        let model = Model("claude-opus-5".into());
+        let block = json!({"type":"thinking","thinking":"private","signature":"signed"});
+        let mut response = parse_messages_response(&json!({
+            "content": [block.clone(), {"type":"tool_use","id":"call-1","name":"lookup","input":{"q":1}}],
+            "stop_reason":"tool_use", "usage":{"input_tokens":1,"output_tokens":1}
+        }).to_string())?;
+        stamp_thinking_model(&mut response, &model);
+        let mut assistant = ChatMessage::assistant(None, response.tool_calls);
+        assistant.provider_metadata = response.metadata;
+        let assistant: ChatMessage = serde_json::from_str(&serde_json::to_string(&assistant)?)?;
+        let messages = vec![
+            ChatMessage::user("lookup"),
+            assistant,
+            ChatMessage::tool("call-1", "found"),
+        ];
+        let body = build_messages_body(&model, &[], &messages, 8192);
+        assert_eq!(body["messages"][1]["content"][0], block);
+        assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        let switched = build_messages_body(&Model("claude-sonnet-5".into()), &[], &messages, 8192);
+        assert_eq!(
+            switched["messages"][1]["content"].as_array().unwrap().len(),
+            1
+        );
+        Ok(())
     }
 
     #[test]

@@ -427,6 +427,7 @@ async fn execute(
     };
     let options = AgentLoopOptions {
         memory_tools,
+        anthropic_thinking: false,
         tool_names: agent.tools.names(),
         output_contract: agent.output_contract.clone(),
         shell_requires_approval: agent.require_shell_approval,

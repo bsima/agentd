@@ -49,6 +49,9 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Opaque provider annotations, attached to the assistant turn for checkpointing.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub provider_metadata: serde_json::Map<String, Value>,
 }
 
 impl PartialEq for ChatMessage {
@@ -58,6 +61,7 @@ impl PartialEq for ChatMessage {
             && self.images == other.images
             && self.tool_call_id == other.tool_call_id
             && self.tool_calls == other.tool_calls
+            && self.provider_metadata == other.provider_metadata
     }
 }
 
@@ -85,6 +89,7 @@ impl ChatMessage {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: Default::default(),
         }
     }
 
@@ -96,6 +101,7 @@ impl ChatMessage {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: Default::default(),
         }
     }
 
@@ -107,6 +113,7 @@ impl ChatMessage {
             images,
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: Default::default(),
         }
     }
 
@@ -118,6 +125,7 @@ impl ChatMessage {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            provider_metadata: Default::default(),
         }
     }
 
@@ -129,6 +137,7 @@ impl ChatMessage {
             images: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
+            provider_metadata: Default::default(),
         }
     }
 }
@@ -428,10 +437,14 @@ pub fn agent_loop(model: Model, prompt: Prompt, max_turns: usize) -> Op<Prompt, 
         } else {
             let calls = response.tool_calls.clone();
             let mut history = prompt.clone();
-            history.push(ChatMessage::assistant(
+            let mut assistant = ChatMessage::assistant(
                 (!response.content.is_empty()).then_some(response.content.clone()),
                 response.tool_calls.clone(),
-            ));
+            );
+            if response.metadata.contains_key("anthropic_thinking") {
+                assistant.provider_metadata = response.metadata.clone();
+            }
+            history.push(assistant);
 
             let mut program = Op::pure(history);
             for call in calls {
