@@ -1040,6 +1040,11 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     } else {
         args.effort
     };
+    let requested_effort = if restore_checkpoint_config && params.checkpoint.is_some() {
+        restored_effort(&resolved_model, requested_effort)
+    } else {
+        requested_effort
+    };
     let settings = model_settings(
         &resolved_model,
         requested_effort,
@@ -1458,6 +1463,24 @@ fn reported_provider_url(oauth_provider: Option<&str>, resolved_url: &str) -> St
         .and_then(oauth_provider_base_url)
         .map(str::to_string)
         .unwrap_or_else(|| resolved_url.to_string())
+}
+
+/// Config registries may change between ACP sessions. Only restoration
+/// softens an obsolete saved effort; explicit CLI and picker values still
+/// get strict validation.
+fn restored_effort(
+    model: &ResolvedModel,
+    saved: Option<agent_core::Effort>,
+) -> Option<agent_core::Effort> {
+    if let Some(level) = saved.filter(|level| !model.efforts.contains(level)) {
+        eprintln!(
+            "warning: saved effort {} is no longer supported by model {}; using model default",
+            level.as_str(),
+            model.alias
+        );
+        return model.effort.filter(|level| model.efforts.contains(level));
+    }
+    saved
 }
 
 /// Validate a session setting before making any provider request. `None` keeps
@@ -4168,6 +4191,33 @@ mod tests {
             reported_provider_url(None, "https://api.example.test/v1"),
             "https://api.example.test/v1"
         );
+    }
+
+    #[test]
+    fn obsolete_saved_effort_falls_back_but_explicit_effort_remains_strict() {
+        let (mut model, _, _, _) = resolve_model_from(
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+            Some("test-model".into()),
+        )
+        .unwrap();
+        model.efforts = vec![agent_core::Effort::Low];
+        model.effort = Some(agent_core::Effort::Low);
+        assert!(model_settings(&model, Some(agent_core::Effort::High), false).is_err());
+        let effort = restored_effort(&model, Some(agent_core::Effort::High));
+        assert_eq!(effort, Some(agent_core::Effort::Low));
+        assert_eq!(
+            model_settings(&model, effort, false).unwrap().effort,
+            effort
+        );
+        model.efforts.clear();
+        model.effort = None;
+        assert_eq!(
+            restored_effort(&model, Some(agent_core::Effort::High)),
+            None
+        );
+        assert_eq!(model_settings(&model, None, false).unwrap().effort, None);
+        // Fast is already masked by the model capability on restore.
+        assert!(model_settings(&model, None, true).is_err());
     }
 
     #[test]

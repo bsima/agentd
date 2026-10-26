@@ -125,7 +125,11 @@ the wire.
   The trace uses the live event mapping (including zoom and resolved approval
   cards); ACP-only turn-start markers link effects to saved prompts without
   changing CLI traces. Missing, truncated, or unalignable traces fall back to
-  text-only checkpoint history; plans stop at the loaded checkpoint marker.
+  text-only checkpoint history; image-only prompts replay as `[image]`
+  without losing their associated tool cards. Loading an already-live session
+  cancels and joins its actor before reading the checkpoint, so an old turn
+  cannot overwrite the restored state. Plans stop at the loaded checkpoint
+  marker.
 - Modes — `ask` (default; approval-gated shell) and `yolo` remain built in.
   Additional modes load from `--acp-modes-dir DIR`, or from
   `$XDG_CONFIG_HOME/agent/modes` (`~/.config/agent/modes`) if it exists.

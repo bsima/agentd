@@ -300,6 +300,64 @@ fn prompt_response_reports_cumulative_token_usage_for_paseo() {
 }
 
 #[test]
+fn loading_live_session_cancels_old_turn_before_restoring_checkpoint() {
+    let root = temp_root("live-reload");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![TEXT_TURN, STALL, DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+    client.prompt(3, &session_id, "committed");
+    assert_eq!(
+        client.read_until_response(3, None).0["result"]["stopReason"],
+        "end_turn"
+    );
+    let checkpoint_path = root
+        .join(".local/share/agent/acp")
+        .join(&session_id)
+        .join("session-latest.json");
+    let before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    client.prompt(4, &session_id, "unfinished");
+    for _ in 0..200 {
+        if requests.lock().unwrap().len() == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "old turn reached provider"
+    );
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{}","mcpServers":[]}}}}"#,
+        root.display()
+    ));
+    let (loaded, updates, _) = client.read_until_response(5, None);
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    assert!(updates
+        .iter()
+        .any(|u| u["update"]["content"]["text"] == "committed"));
+    assert!(!updates
+        .iter()
+        .any(|u| u["update"]["content"]["text"] == "unfinished"));
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(before["sequence"], after["sequence"]);
+    assert_eq!(before["messages"], after["messages"]);
+    client.prompt(6, &session_id, "after load");
+    let (response, _, _) = client.read_until_response(6, None);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let final_cp: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint_path).unwrap()).unwrap();
+    let history = final_cp["messages"].to_string();
+    assert!(
+        history.contains("committed") && history.contains("after load"),
+        "{history}"
+    );
+    assert!(!history.contains("unfinished"), "{history}");
+}
+
+#[test]
 fn session_cancel_mid_turn_returns_cancelled() {
     let root = temp_root("cancel");
     let port = spawn_mock_sse_server(vec![STALL]);

@@ -49,16 +49,34 @@ fn committed_events<'a>(checkpoint: &Checkpoint, events: &'a [Event]) -> Result<
     Ok(&events[..=end])
 }
 
+fn user_update(message: &ChatMessage) -> Option<SessionUpdate> {
+    if message.role != "user" {
+        return None;
+    }
+    let text = message.content.as_deref().unwrap_or_default();
+    let image = (!message.images.is_empty()).then_some("[image]");
+    if text.is_empty() && image.is_none() {
+        return None;
+    }
+    Some(SessionUpdate::UserMessageChunk(bridge::text_chunk(
+        match image {
+            Some(image) if text.is_empty() => image.to_owned(),
+            Some(image) => format!("{text}\n{image}"),
+            None => text.to_owned(),
+        },
+    )))
+}
+
 fn text_history(messages: &[ChatMessage]) -> Vec<SessionUpdate> {
     messages
         .iter()
         .filter_map(|message| {
-            let text = message.content.as_deref().filter(|text| !text.is_empty())?;
-            match message.role.as_str() {
-                "user" => Some(SessionUpdate::UserMessageChunk(bridge::text_chunk(text))),
-                "assistant" => Some(SessionUpdate::AgentMessageChunk(bridge::text_chunk(text))),
-                _ => None,
-            }
+            user_update(message).or_else(|| {
+                (message.role == "assistant")
+                    .then(|| message.content.as_deref().filter(|s| !s.is_empty()))
+                    .flatten()
+                    .map(|text| SessionUpdate::AgentMessageChunk(bridge::text_chunk(text)))
+            })
         })
         .collect()
 }
@@ -68,8 +86,8 @@ fn trace_updates(checkpoint: &Checkpoint, events: &[Event]) -> Result<Vec<Sessio
         .messages
         .iter()
         .filter(|m| {
-            matches!(m.role.as_str(), "user" | "assistant")
-                && m.content.as_deref().is_some_and(|s| !s.is_empty())
+            user_update(m).is_some()
+                || (m.role == "assistant" && m.content.as_deref().is_some_and(|s| !s.is_empty()))
         })
         .collect();
     let mut cursor = 0;
@@ -97,9 +115,7 @@ fn trace_updates(checkpoint: &Checkpoint, events: &[Event]) -> Result<Vec<Sessio
                     return Err(anyhow!("trace turn does not match checkpoint prompt"));
                 }
                 active = true;
-                updates.push(SessionUpdate::UserMessageChunk(bridge::text_chunk(
-                    message.content.as_deref().unwrap(),
-                )));
+                updates.push(user_update(message).expect("visible user message"));
                 cursor += 1;
                 continue;
             }
@@ -171,6 +187,32 @@ mod tests {
 
     fn wire(updates: &[SessionUpdate]) -> serde_json::Value {
         serde_json::to_value(updates).unwrap()
+    }
+
+    #[test]
+    fn image_only_prompt_keeps_its_tool_card_on_replay() {
+        let image = ChatMessage::user_with_images(
+            None,
+            vec![agent_core::ImageContent::new("image/png", "aGVsbG8=")],
+        );
+        let cp = checkpoint(vec![
+            image.clone(),
+            ChatMessage::assistant(Some("seen".into()), vec![]),
+        ]);
+        let card: Event = serde_json::from_value(serde_json::json!({
+            "event":"ToolCall", "run_id":"r", "op_id":4,"name":"todo",
+            "arguments":{"items":[]},"timestamp":Utc::now()
+        }))
+        .unwrap();
+        let updates = trace_updates(&cp, &[start(&image), card, answer("seen", 5)]).unwrap();
+        let rendered = wire(&updates);
+        assert_eq!(rendered[0]["content"]["text"], "[image]");
+        assert_eq!(rendered[1]["sessionUpdate"], "tool_call");
+        assert_eq!(rendered[2]["content"]["text"], "seen");
+        assert_eq!(
+            wire(&text_history(&cp.messages))[0]["content"]["text"],
+            "[image]"
+        );
     }
 
     #[test]

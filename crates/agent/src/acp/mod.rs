@@ -46,6 +46,7 @@ struct AcpServer {
     otel_active: bool,
     sessions: Mutex<HashMap<String, session::SessionHandle>>,
     profiles: Arc<profiles::Profiles>,
+    lifecycle: tokio::sync::Mutex<()>,
 }
 
 /// Session state lives beside the other agent data:
@@ -105,11 +106,16 @@ fn prompt_message(request: &PromptRequest) -> std::result::Result<ChatMessage, E
     Ok(ChatMessage::user_with_images(text, images))
 }
 
-fn close_handle(sessions: &mut HashMap<String, session::SessionHandle>, id: &str) {
-    if let Some(handle) = sessions.remove(id) {
+fn close_handle(
+    sessions: &mut HashMap<String, session::SessionHandle>,
+    id: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    sessions.remove(id).map(|handle| {
         handle.cancel_tx.send_modify(|generation| *generation += 1);
-        // Dropping the sender closes the mailbox; the actor drops its runtime.
-    }
+        // Dropping the sender closes the mailbox; wait for the actor to
+        // release its runtime before reading its checkpoint or trace.
+        handle.actor
+    })
 }
 
 impl AcpServer {
@@ -244,7 +250,7 @@ impl AcpServer {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
-        tokio::spawn(session::session_actor(
+        let actor = tokio::spawn(session::session_actor(
             runtime,
             cmd_rx,
             session::SessionContext {
@@ -259,17 +265,27 @@ impl AcpServer {
                 profiles: self.profiles.clone(),
             },
         ));
-        // Replacing an existing handle (re-loading a live session) closes
-        // the old actor's mailbox; it winds down after any in-flight turn.
-        self.sessions
-            .lock()
-            .expect("session map poisoned")
-            .insert(session_id, session::SessionHandle { cmd_tx, cancel_tx });
+        self.sessions.lock().expect("session map poisoned").insert(
+            session_id,
+            session::SessionHandle {
+                cmd_tx,
+                cancel_tx,
+                actor,
+            },
+        );
         Ok((modes, config_options))
     }
 
-    fn close_session(&self, id: &str) {
-        close_handle(&mut self.sessions.lock().expect("session map poisoned"), id);
+    async fn close_session(&self, id: &str) {
+        let _guard = self.lifecycle.lock().await;
+        self.stop_session(id).await;
+    }
+
+    async fn stop_session(&self, id: &str) {
+        let actor = close_handle(&mut self.sessions.lock().expect("session map poisoned"), id);
+        if let Some(actor) = actor {
+            let _ = actor.await;
+        }
     }
 
     async fn new_session(
@@ -277,6 +293,7 @@ impl AcpServer {
         request: NewSessionRequest,
         cx: &ConnectionTo<Client>,
     ) -> Result<NewSessionResponse> {
+        let _guard = self.lifecycle.lock().await;
         warn_ignored_mcp_servers(request.mcp_servers.len());
         let session_id = Uuid::new_v4().to_string();
         let (modes, config_options) = self
@@ -294,7 +311,9 @@ impl AcpServer {
         cx: &ConnectionTo<Client>,
     ) -> Result<LoadSessionResponse> {
         warn_ignored_mcp_servers(request.mcp_servers.len());
+        let _guard = self.lifecycle.lock().await;
         let session_id = request.session_id.0.to_string();
+        self.stop_session(&session_id).await;
         let checkpoint_path = acp_session_dir(&session_id, self.args.state_dir.as_deref())?
             .join("session-latest.json");
         let checkpoint = crate::load_checkpoint(&checkpoint_path).await?;
@@ -337,6 +356,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         otel_active: otel.is_some(),
         args: Arc::new(args),
         sessions: Mutex::new(HashMap::new()),
+        lifecycle: tokio::sync::Mutex::new(()),
     });
     let new_session_server = server.clone();
     let load_session_server = server.clone();
@@ -404,7 +424,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
         .on_receive_request(
             async move |request: CloseSessionRequest, responder, _cx| {
-                close_server.close_session(request.session_id.0.as_ref());
+                close_server
+                    .close_session(request.session_id.0.as_ref())
+                    .await;
                 responder.respond(CloseSessionResponse::new())
             },
             on_receive_request!(),
@@ -536,19 +558,28 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod close_tests {
     use super::*;
-    #[test]
-    fn close_cancels_and_removes_and_is_idempotent() {
+    #[tokio::test]
+    async fn close_cancels_and_removes_and_is_idempotent() {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(0);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0);
+        let actor = tokio::spawn(async move {
+            let mut cancel_rx = cancel_rx;
+            cancel_rx.changed().await.unwrap();
+            // A late effect must be dropped before reloading the checkpoint.
+            tokio::task::yield_now().await;
+        });
         let mut sessions = HashMap::from([(
             "session".into(),
-            session::SessionHandle { cmd_tx, cancel_tx },
+            session::SessionHandle {
+                cmd_tx,
+                cancel_tx,
+                actor,
+            },
         )]);
         close_handle(&mut sessions, "unknown");
-        assert_eq!(*cancel_rx.borrow_and_update(), 0);
-        close_handle(&mut sessions, "session");
+        let actor = close_handle(&mut sessions, "session").unwrap();
+        actor.await.unwrap();
         assert!(sessions.is_empty());
-        assert_eq!(*cancel_rx.borrow_and_update(), 1);
         assert!(cmd_rx.is_closed());
         close_handle(&mut sessions, "session");
     }

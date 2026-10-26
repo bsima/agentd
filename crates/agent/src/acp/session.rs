@@ -46,6 +46,7 @@ pub(crate) struct SessionHandle {
     /// Bumped by the `session/cancel` handler; the actor's in-flight turn
     /// select!s on it and drops the turn future when it fires.
     pub(crate) cancel_tx: watch::Sender<u64>,
+    pub(crate) actor: tokio::task::JoinHandle<()>,
 }
 
 /// Everything the actor needs beyond the runtime and its mailbox.
