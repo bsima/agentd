@@ -509,7 +509,7 @@ impl AnthropicStreamAccum {
     ) -> std::result::Result<bool, ProviderError> {
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
-                self.speed = message.usage.speed.filter(|speed| speed == "fast");
+                self.speed = message.usage.speed;
                 self.input_tokens = message.usage.input_tokens;
                 self.cached_input_tokens = message.usage.cache_read_input_tokens;
             }
@@ -887,7 +887,6 @@ fn parse_messages_response(text: &str) -> Result<Response> {
     let mut metadata = response
         .usage
         .speed
-        .filter(|speed| speed == "fast")
         .map(|speed| serde_json::Map::from_iter([("speed".into(), json!(speed))]))
         .unwrap_or_default();
     if !thinking_blocks.is_empty() {

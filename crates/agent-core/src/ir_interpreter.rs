@@ -1603,7 +1603,12 @@ async fn execute_instr(
             // replay reproduces the original totals even if today's
             // models.yaml prices differ (t-1334).
             if live {
-                crate::cost::price_response(&mut response, &config.pricing, &model);
+                crate::cost::price_response(
+                    &mut response,
+                    &config.pricing,
+                    &model,
+                    config.inference_settings.fast,
+                );
             }
             config
                 .trace

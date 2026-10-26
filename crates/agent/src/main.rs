@@ -594,6 +594,10 @@ struct ResumeFacts {
     trace_path: PathBuf,
     max_turns: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_cost: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fast: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hydration_dir: Option<PathBuf>,
@@ -1354,6 +1358,8 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
             model: resolved_model.alias.clone(),
             trace_path: trace_path.clone(),
             max_turns: params.max_turns,
+            max_cost: args.max_cost,
+            fast: settings.fast,
             memory_dir: args.memory_dir.clone(),
             hydration_dir: args.hydration_dir.clone(),
             temporal_dir: args.temporal_dir.clone(),
@@ -2386,6 +2392,23 @@ async fn resolve_and_resume(
     resume_run(store, &record, resolution, checkpoint, facts).await
 }
 
+/// Restore the original allowance from the approval record and the recorded
+/// InferResults. A missing trace must not silently grant a fresh allowance.
+async fn restore_resume_cost(trace: &TraceLogger, facts: &ResumeFacts) -> Result<()> {
+    let events = TraceLogger::read_events(&facts.trace_path).await?;
+    trace.seed_usage(&events);
+    trace.seed_next_op_id(
+        events
+            .iter()
+            .filter_map(Event::op_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    trace.restore_cost_limit(facts.max_cost);
+    Ok(())
+}
+
 /// Re-enter a claimed checkpoint: same model resolution, provider
 /// construction, hydration registry, and eval policies as the run that
 /// paused (rebuilt from [`ResumeFacts`]; the API key comes from the
@@ -2407,6 +2430,7 @@ async fn resume_run(
     )?;
     let (provider, _provider_url) = build_provider(&resolved_model, None, None, false)?;
     let trace = TraceLogger::new(record.run_id.clone(), facts.trace_path.clone());
+    restore_resume_cost(&trace, &facts).await?;
     let hydration = {
         let mut registry = SourceRegistry::new();
         if let Some(path) = facts.hydration_dir.as_ref() {
@@ -2432,7 +2456,10 @@ async fn resume_run(
     let mut config = SeqConfig {
         on_infer_delta: None,
         on_reasoning_delta: None,
-        inference_settings: Default::default(),
+        inference_settings: agent_core::InferenceSettings {
+            fast: facts.fast,
+            ..Default::default()
+        },
         approvals,
         // Resume with the paused run's guidance setting (t-1359): the
         // fragment never affects effect-id replay or the checkpointed
@@ -4823,6 +4850,34 @@ mod cost_tests {
 
     use super::*;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn approval_resume_preserves_remaining_cost_allowance() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "agent-approval-cost-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let trace = TraceLogger::new("run", path.clone());
+        trace
+            .emit(&infer_result("run", 1, 10, 0, None, Some(9)))
+            .await?;
+        let facts: ResumeFacts = serde_json::from_value(serde_json::json!({
+            "model": "mock", "trace_path": path, "max_turns": 5,
+            "max_cost": 10, "eval_timeout_seconds": 1, "eval_env": "inherit"
+        }))?;
+        let resumed = TraceLogger::new("run", facts.trace_path.clone());
+        restore_resume_cost(&resumed, &facts).await?;
+        assert_eq!(resumed.cost_spent(), 9);
+        agent_core::cost_budget::check(&resumed, "mock", true, true).await?;
+        resumed
+            .emit(&infer_result("run", 2, 1, 0, None, Some(1)))
+            .await?;
+        assert!(agent_core::cost_budget::check(&resumed, "mock", true, true)
+            .await
+            .is_err());
+        std::fs::remove_file(&facts.trace_path)?;
+        Ok(())
+    }
 
     fn infer_call(run_id: &str, op_id: u64, model: &str) -> Event {
         Event::InferCall {

@@ -1183,6 +1183,7 @@ struct CodexStreamAccum {
     output_tokens: u32,
     total_tokens: u32,
     cached_input_tokens: Option<u32>,
+    service_tier: Option<String>,
 }
 
 impl CodexStreamAccum {
@@ -1257,6 +1258,11 @@ impl CodexStreamAccum {
             }
             Some("response.completed" | "response.done") => {
                 self.completed = true;
+                self.service_tier = event
+                    .get("response")
+                    .and_then(|r| r.get("service_tier"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 if let Some((input, output, total, cached)) = event
                     .get("response")
                     .and_then(|response| response.get("usage"))
@@ -1296,6 +1302,7 @@ impl CodexStreamAccum {
             output_tokens,
             total_tokens,
             cached_input_tokens,
+            service_tier,
         } = self;
         if !completed {
             return Err(anyhow!(
@@ -1331,7 +1338,10 @@ impl CodexStreamAccum {
             // Cost is stamped at trace-emission time (agent_core::cost).
             cost_micro_usd: None,
             pricing: None,
-            metadata: Default::default(),
+            metadata: service_tier
+                .map(|tier| ("service_tier".into(), json!(tier)))
+                .into_iter()
+                .collect(),
         })
     }
 }
@@ -1788,6 +1798,15 @@ mod tests {
             err.to_string().contains("truncated"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn codex_reported_tier_is_preserved() -> Result<()> {
+        let response = parse_codex_sse_response(
+            "data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"priority\"}}\n\n",
+        )?;
+        assert_eq!(response.metadata["service_tier"], "priority");
+        Ok(())
     }
 
     #[test]

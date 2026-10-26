@@ -491,7 +491,12 @@ where
             // replay reproduces the original totals even if today's
             // models.yaml prices differ (t-1334).
             if config.replay.is_none() {
-                crate::cost::price_response(&mut response, &config.pricing, &model.0);
+                crate::cost::price_response(
+                    &mut response,
+                    &config.pricing,
+                    &model.0,
+                    config.inference_settings.fast,
+                );
             }
             config
                 .trace

@@ -472,6 +472,7 @@ async fn send_chat_request(
         let completion: ChatCompletion = serde_json::from_str(&text)
             .context("parsing provider response")
             .map_err(ProviderError::Other)?;
+        let service_tier = completion.service_tier;
         let choice = completion
             .choices
             .into_iter()
@@ -531,7 +532,10 @@ async fn send_chat_request(
             // pricing (crate::cost); the provider layer never prices.
             cost_micro_usd: None,
             pricing: None,
-            metadata: Default::default(),
+            metadata: service_tier
+                .map(|tier| ("service_tier".into(), json!(tier)))
+                .into_iter()
+                .collect(),
         })
     }
 }
@@ -602,6 +606,7 @@ struct OpenAiStreamAccum {
     tool_calls: Vec<StreamPendingToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
+    service_tier: Option<String>,
 }
 
 #[derive(Default)]
@@ -613,6 +618,9 @@ struct StreamPendingToolCall {
 
 impl OpenAiStreamAccum {
     fn absorb(&mut self, chunk: StreamChunk, on_delta: &TextDeltaFn) {
+        if let Some(tier) = chunk.service_tier {
+            self.service_tier = Some(tier);
+        }
         if let Some(usage) = chunk.usage {
             // Usage arrives on the final chunk (stream_options.include_usage).
             self.usage = Some(usage);
@@ -707,13 +715,18 @@ impl OpenAiStreamAccum {
             cached_input_tokens,
             cost_micro_usd: None,
             pricing: None,
-            metadata: Default::default(),
+            metadata: self
+                .service_tier
+                .map(|tier| ("service_tier".into(), json!(tier)))
+                .into_iter()
+                .collect(),
         })
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
+    service_tier: Option<String>,
     #[serde(default)]
     choices: Vec<StreamChoice>,
     usage: Option<Usage>,
@@ -959,6 +972,7 @@ pub struct ToolFunctionSpec {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletion {
+    service_tier: Option<String>,
     choices: Vec<Choice>,
     usage: Option<Usage>,
 }
@@ -1042,6 +1056,21 @@ mod tests {
         );
         assert_eq!(configured["reasoning_effort"], "low");
         assert_eq!(configured["service_tier"], "priority");
+    }
+
+    #[test]
+    fn openai_reported_tier_is_preserved_in_buffered_and_streamed_responses() {
+        let completion: ChatCompletion = serde_json::from_str(
+            r#"{"service_tier":"default","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        ).unwrap();
+        assert_eq!(completion.service_tier.as_deref(), Some("default"));
+        let mut accum = OpenAiStreamAccum::default();
+        let on_delta: TextDeltaFn = std::sync::Arc::new(|_| {});
+        accum.absorb(serde_json::from_str(r#"{"service_tier":"priority","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#).unwrap(), &on_delta);
+        assert_eq!(
+            accum.into_response().unwrap().metadata["service_tier"],
+            "priority"
+        );
     }
 
     #[test]

@@ -109,12 +109,27 @@ impl PricingTable {
 ///
 /// Never call this on a replayed response: recorded costs are replay
 /// identity and must pass through verbatim.
-pub fn price_response(response: &mut crate::op::Response, table: &PricingTable, model: &str) {
-    let fast = response
+pub fn price_response(
+    response: &mut crate::op::Response,
+    table: &PricingTable,
+    model: &str,
+    request_fast: bool,
+) {
+    let reported = response
         .metadata
         .get("speed")
         .and_then(serde_json::Value::as_str)
-        == Some("fast");
+        .or_else(|| {
+            response
+                .metadata
+                .get("service_tier")
+                .and_then(serde_json::Value::as_str)
+        });
+    let fast = match reported {
+        Some("fast" | "priority") => true,
+        Some("standard" | "default" | "auto" | "flex") => false,
+        _ => request_fast,
+    };
     let pricing = if fast {
         table.fast_by_model.get(model)
     } else {
@@ -345,10 +360,20 @@ mod tests {
             pricing: None,
             metadata: serde_json::Map::from_iter([("speed".into(), serde_json::json!("fast"))]),
         };
-        price_response(&mut response, &table, "opus");
+        price_response(&mut response, &table, "opus", false);
         assert_eq!(response.cost_micro_usd, Some(60_000_000));
         response.cost_micro_usd = None;
-        price_response(&mut response, &table, "unknown");
+        response.metadata.clear();
+        price_response(&mut response, &table, "opus", true);
+        assert_eq!(response.cost_micro_usd, Some(60_000_000));
+        response
+            .metadata
+            .insert("service_tier".into(), serde_json::json!("default"));
+        price_response(&mut response, &table, "opus", true);
+        assert_eq!(response.cost_micro_usd, Some(30_000_000));
+        response.cost_micro_usd = None;
+        response.pricing = None;
+        price_response(&mut response, &table, "unknown", false);
         assert_eq!(response.cost_micro_usd, None);
         Ok(())
     }
@@ -371,14 +396,14 @@ mod tests {
         };
         let mut unpriced = response.clone();
 
-        price_response(&mut response, &table, "priced");
+        price_response(&mut response, &table, "priced", false);
         assert_eq!(response.cost_micro_usd, Some(66));
         assert_eq!(
             response.pricing,
             Some(Pricing::from_usd_per_mtok(3.0, 15.0)?)
         );
 
-        price_response(&mut unpriced, &table, "unknown-model");
+        price_response(&mut unpriced, &table, "unknown-model", false);
         assert_eq!(unpriced.cost_micro_usd, None, "never guess, never zero");
         assert_eq!(unpriced.pricing, None);
         Ok(())

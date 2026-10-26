@@ -273,6 +273,54 @@ async fn flush_updates(update_tx: &mpsc::UnboundedSender<ForwarderMsg>) {
     }
 }
 
+/// Fast mode after switching models (the same revalidation used by Runtime).
+fn revalidated_fast(current_fast: bool, model_supports_fast: bool) -> bool {
+    current_fast && model_supports_fast
+}
+
+fn check_switch_pricing(
+    pricing: &agent_core::PricingTable,
+    model: &str,
+    fast: bool,
+    capped: bool,
+    alias: &str,
+) -> Result<()> {
+    if capped && !pricing.has_pricing(model, fast) {
+        return Err(anyhow::anyhow!(
+            "--max-cost requires pricing for model {:?} in models.yaml",
+            alias
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pricing_switch_tests {
+    use super::*;
+
+    #[test]
+    fn capped_switch_requires_fast_price_when_fast_is_retained() {
+        let mut pricing = agent_core::PricingTable::default();
+        pricing.insert(
+            "next",
+            agent_core::Pricing::from_usd_per_mtok(1.0, 2.0).unwrap(),
+        );
+        assert!(
+            check_switch_pricing(&pricing, "next", revalidated_fast(true, true), true, "next")
+                .is_err()
+        );
+        assert!(check_switch_pricing(
+            &pricing,
+            "next",
+            revalidated_fast(true, false),
+            true,
+            "next"
+        )
+        .is_ok());
+        assert!(check_switch_pricing(&pricing, "next", true, false, "next").is_ok());
+    }
+}
+
 /// Re-resolve the model alias against the registry and swap the runtime's
 /// provider, context budget, and pricing in place — the same helpers the
 /// approvals-resume path already drives, so this is pure plumbing.
@@ -296,18 +344,14 @@ async fn set_model(
         args.key.clone().or(provider_file.api_key),
         runtime.ir_replay.is_some(),
     )?;
-    if args.max_cost.is_some()
-        && runtime.ir_replay.is_none()
-        && !pricing.has_pricing(
-            &resolved.api_id,
-            runtime.config.inference_settings.fast && resolved.fast,
-        )
-    {
-        return Err(anyhow::anyhow!(
-            "--max-cost requires pricing for model {:?} in models.yaml",
-            alias
-        ));
-    }
+    let next_fast = revalidated_fast(runtime.config.inference_settings.fast, resolved.fast);
+    check_switch_pricing(
+        &pricing,
+        &resolved.api_id,
+        next_fast,
+        args.max_cost.is_some() && runtime.ir_replay.is_none(),
+        alias,
+    )?;
     runtime.revalidate_inference_settings(&resolved);
     runtime.config.provider = provider;
     // Learned overflow ceilings are specific to the old provider/model.

@@ -1312,6 +1312,13 @@ impl TraceLogger {
         *self.cost_limit.lock().unwrap() = cap;
     }
 
+    /// Resume a paused run with its original allowance, not a fresh baseline.
+    pub fn restore_cost_limit(&self, cap: Option<u64>) {
+        *self.cost_baseline.lock().unwrap() = 0;
+        *self.uncosted_baseline.lock().unwrap() = 0;
+        *self.cost_limit.lock().unwrap() = cap;
+    }
+
     pub fn cost_limit(&self) -> Option<u64> {
         *self.cost_limit.lock().unwrap()
     }

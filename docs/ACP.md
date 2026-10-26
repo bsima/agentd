@@ -114,8 +114,12 @@ the wire.
   the next prompt ends with an agent explanation and `max_turn_requests`;
   the session survives and subsequent prompts end the same way. A single
   request may overshoot because its cost is known only after completion.
-  With a cap, fast-tier calls require fast pricing rates; an unknown response
-  cost blocks further dispatch rather than counting as free. Loaded sessions start a fresh process allowance; replay ignores the cap.
+  With a cap, fast-tier calls require fast pricing rates; pricing uses the
+  requested tier unless the provider reports the tier actually used. An unknown
+  response cost blocks further dispatch rather than counting as free. Loaded
+  sessions start a fresh process allowance; replay ignores the cap. Outside
+  ACP, standalone `agent approvals --approve/--deny` restores the original
+  one-shot cap and prior trace spend (no new allowance on resume).
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already
