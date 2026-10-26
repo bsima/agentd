@@ -102,6 +102,10 @@ the wire.
   Calls also render as ordinary completed tool cards, retaining the model's
   action in the timeline. On `session/load`, the last successful list is
   rebuilt from traced tool results (including a cleared list).
+- Reasoning deltas — root Infer reasoning streams live as
+  `agent_thought_chunk` (Paseo reasoning timeline). Child Infer reasoning
+  stays in its tool card; no reasoning is saved in traces/checkpoints or
+  replayed by `session/load`.
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already
@@ -149,7 +153,14 @@ the wire.
 - Config options — rendered by Paseo next to the mode picker, applied
   between turns via `session/set_config_option`:
   - `model`: every `models.yaml` alias; switching re-resolves the
-    provider, context budget, and pricing in place.
+    provider, context budget, and pricing in place, revalidates effort and
+    fast-tier settings, and emits `config_option_update` with the refreshed
+    effort choices.
+  - `thought_level`: available only when the selected model declares
+    `efforts` in `models.yaml`. Its choices are those allowed levels, with
+    the runtime effort (or model default) selected. Changes take effect on
+    the next turn and persist across `session/load`. `--fast` remains a
+    process-level default, not a picker.
   - `gc`: the context-GC strategy (`none`/`ring`/`mark-sweep`/`stack`/
     `semantic`/`generational`), defaulting to the `--gc` flag. Safe to
     switch mid-session — GC is not part of program identity, and the
@@ -261,8 +272,6 @@ printf '%s\n' \
 
 ## Follow-ups (not yet implemented)
 
-- Thought updates (reasoning deltas are live-only, including Codex OAuth
-  summary/text deltas when emitted; ACP wiring remains).
 - Deterministic mid-effect cancellation (cancel token through agent-core).
 - `session/delete`, listing agentd supervisor sessions, MCP server passthrough, `fs/*`
   client capabilities, cumulative wire-level cost reporting.

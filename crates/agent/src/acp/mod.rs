@@ -195,6 +195,14 @@ impl AcpServer {
                 .or_default()
                 .push_str(&delta.text);
         }));
+        let reasoning_tx = update_tx.clone();
+        runtime.config.on_reasoning_delta = Some(Arc::new(move |delta: agent_core::InferDelta| {
+            if delta.parent_op_id.is_none() {
+                let _ = reasoning_tx.send(bridge::ForwarderMsg::update(
+                    SessionUpdate::AgentThoughtChunk(bridge::text_chunk(delta.text)),
+                ));
+            }
+        }));
         let modes = registry::session_modes(
             runtime.shell_requires_approval,
             runtime.acp_mode.as_deref(),
@@ -204,6 +212,8 @@ impl AcpServer {
             &runtime.resume_facts.model,
             &runtime.config.gc,
             runtime.config.gc_threshold,
+            &runtime.model_capabilities.0,
+            runtime.config.inference_settings.effort,
         )
         .await;
 
@@ -466,6 +476,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if !matches!(
                     config_id.as_str(),
                     registry::MODEL_CONFIG_ID
+                        | registry::THOUGHT_CONFIG_ID
                         | registry::GC_CONFIG_ID
                         | registry::GC_THRESHOLD_CONFIG_ID
                 ) {

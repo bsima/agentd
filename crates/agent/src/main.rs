@@ -448,6 +448,9 @@ struct Checkpoint {
     gc: Option<GcArg>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gc_threshold: Option<f32>,
+    /// Selected inference effort; absent in checkpoints before ACP exposed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<agent_core::Effort>,
     /// ACP mode id; absent for legacy checkpoints and non-ACP sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acp_mode: Option<String>,
@@ -1025,7 +1028,27 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         Some(path) => Some(load_output_contract(path).await?),
         None => None,
     };
-    let settings = model_settings(&resolved_model, args.effort, args.fast)?;
+    let requested_effort = if restore_checkpoint_config {
+        params.checkpoint.as_ref().map_or(args.effort, |cp| {
+            cp.effort.or_else(|| {
+                // Legacy checkpoints used the process flag; switched models with no
+                // effort support must not inherit an incompatible process default.
+                args.effort
+                    .filter(|level| resolved_model.efforts.contains(level))
+            })
+        })
+    } else {
+        args.effort
+    };
+    let settings = model_settings(
+        &resolved_model,
+        requested_effort,
+        if restore_checkpoint_config {
+            args.fast && resolved_model.fast
+        } else {
+            args.fast
+        },
+    )?;
     let capabilities = (
         resolved_model.efforts.clone(),
         resolved_model.effort,
@@ -1465,7 +1488,6 @@ fn model_settings(
 
 impl Runtime {
     /// Safe between turns; ACP may call this once it exposes a config picker.
-    #[allow(dead_code)] // called by ACP config option in follow-up t-1653.7
     fn set_inference_settings(
         &mut self,
         effort: Option<agent_core::Effort>,
@@ -1486,7 +1508,6 @@ impl Runtime {
         Ok(())
     }
 
-    #[allow(dead_code)] // called on ACP model switch in follow-up t-1653.7
     fn revalidate_inference_settings(&mut self, model: &ResolvedModel) {
         let previous = self.config.inference_settings;
         self.model_capabilities = (model.efforts.clone(), model.effort, model.fast);
@@ -3551,6 +3572,16 @@ fn checkpoint_from_runtime(runtime: &Runtime, sequence: u64) -> Option<Checkpoin
         discovered_budget: runtime.gc_state.discovered_budget,
         gc: Some(gc_choice_from_mode(&runtime.config.gc)),
         gc_threshold: Some(runtime.config.gc_threshold),
+        effort: {
+            #[cfg(feature = "acp")]
+            {
+                runtime.config.inference_settings.effort
+            }
+            #[cfg(not(feature = "acp"))]
+            {
+                None
+            }
+        },
         acp_mode: {
             #[cfg(feature = "acp")]
             {
@@ -4371,6 +4402,7 @@ mod tests {
             discovered_budget: None,
             gc: None,
             gc_threshold: None,
+            effort: None,
             acp_mode: None,
             machine: None,
             pending_turn_id: None,
@@ -4413,6 +4445,7 @@ mod tests {
             discovered_budget: Some(123_000),
             gc: None,
             gc_threshold: None,
+            effort: None,
             acp_mode: None,
             machine: None,
             pending_turn_id: None,

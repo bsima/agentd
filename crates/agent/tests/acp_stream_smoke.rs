@@ -115,9 +115,13 @@ fn spawn_recording_mock_sse_server(bodies: Vec<&'static str>) -> (u16, RecordedR
 }
 
 fn spawn_acp_agent(root: &std::path::Path, port: u16) -> Child {
+    spawn_acp_agent_with_model(root, port, "test-model")
+}
+
+fn spawn_acp_agent_with_model(root: &std::path::Path, port: u16, model: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_agent"))
         .arg("--acp")
-        .args(["--model", "test-model"])
+        .args(["--model", model])
         .args(["--provider", &format!("http://127.0.0.1:{port}/v1")])
         .args(["--key", "test-key"])
         .env("HOME", root)
@@ -136,7 +140,10 @@ struct AcpClient {
 
 impl AcpClient {
     fn start(root: &std::path::Path, port: u16) -> Self {
-        let mut child = spawn_acp_agent(root, port);
+        Self::from_child(spawn_acp_agent(root, port))
+    }
+
+    fn from_child(mut child: Child) -> Self {
         let stdout = child.stdout.take().expect("child stdout");
         Self {
             child,
@@ -958,4 +965,140 @@ fn ask_user_cancelled_permission_cancels_the_turn() {
         1,
         "a cancelled question never resumes the loop"
     );
+}
+
+#[test]
+fn thought_level_switches_request_shape_and_model_choices() {
+    let root = temp_root("thought-config");
+    let config = root.join("config/agent");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("models.yaml"),
+        r#"default_model: test-model
+models:
+  - name: test-model
+    provider: openai-compatible
+    api_id: test-model
+    context: 10000
+    thinking: true
+    efforts: [low, high]
+    effort: low
+  - name: second-model
+    provider: openai-compatible
+    api_id: second-model
+    context: 10000
+    thinking: true
+    efforts: [medium, max]
+    effort: medium
+  - name: plain-model
+    provider: openai-compatible
+    api_id: plain-model
+    context: 10000
+"#,
+    )
+    .unwrap();
+    let (port, requests) = spawn_recording_mock_sse_server(vec![TEXT_TURN, TEXT_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    client.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#);
+    client.read_until_response(1, None);
+    client.send(&format!(r#"{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#, root.display()));
+    let (new, _, _) = client.read_until_response(2, None);
+    let sid = new["result"]["sessionId"].as_str().unwrap();
+    let opts = new["result"]["configOptions"].as_array().unwrap();
+    let thought = opts.iter().find(|o| o["id"] == "thought_level").unwrap();
+    assert_eq!(thought["category"], "thought_level");
+    assert_eq!(thought["currentValue"], "low");
+    assert_eq!(thought["options"].as_array().unwrap().len(), 2);
+    let sid = sid.to_owned();
+    let set = |client: &mut AcpClient, id, config_id: &str, value: &str| {
+        client.send(&format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"session/set_config_option","params":{{"sessionId":"{sid}","configId":"{config_id}","value":"{value}"}}}}"#));
+        client.read_until_response(id, None).0
+    };
+    let response = set(&mut client, 3, "thought_level", "high");
+    assert_eq!(
+        response["result"]["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .unwrap()["currentValue"],
+        "high"
+    );
+    client.prompt(4, &sid, "hello");
+    assert_eq!(
+        client.read_until_response(4, None).0["result"]["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&requests.lock().unwrap()[0]).unwrap()
+            ["reasoning_effort"],
+        "high"
+    );
+    let response = set(&mut client, 5, "model", "second-model");
+    let thought = response["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "thought_level")
+        .unwrap();
+    assert_eq!(thought["currentValue"], "medium");
+    assert_eq!(thought["options"].as_array().unwrap().len(), 2);
+    client.prompt(6, &sid, "again");
+    client.read_until_response(6, None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&requests.lock().unwrap()[1]).unwrap()
+            ["reasoning_effort"],
+        "medium"
+    );
+    // The selection is checkpointed even without another provider turn.
+    drop(client);
+    let mut client = AcpClient::start(&root, port);
+    client.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#);
+    client.read_until_response(1, None);
+    client.send(&format!(r#"{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{sid}","cwd":"{}","mcpServers":[]}}}}"#, root.display()));
+    let (loaded, _, _) = client.read_until_response(2, None);
+    assert_eq!(
+        loaded["result"]["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .unwrap()["currentValue"],
+        "medium",
+        "{loaded}"
+    );
+    let response = set(&mut client, 7, "model", "plain-model");
+    assert!(response["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|o| o["id"] != "thought_level"));
+}
+
+#[test]
+fn native_reasoning_deltas_arrive_as_thought_chunks() {
+    const ANTHROPIC_TURN: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"consider\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let root = temp_root("reasoning");
+    let config = root.join("config/agent");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("models.yaml"), "default_model: test-model\nmodels:\n  - name: test-model\n    provider: anthropic\n    api_id: test-model\n    context: 10000\n    thinking: true\n    efforts: [low, high]\n    effort: low\n").unwrap();
+    let port = spawn_mock_sse_server(vec![ANTHROPIC_TURN]);
+    let mut client = AcpClient::from_child(spawn_acp_agent_with_model(&root, port, "test-model"));
+    let sid = client.handshake_and_new_session(root.to_str().unwrap());
+    client.prompt(3, &sid, "reason");
+    let (response, updates, _) = client.read_until_response(3, None);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["update"]["sessionUpdate"] == "agent_thought_chunk"
+                && u["update"]["content"]["text"] == "consider"),
+        "{updates:?}"
+    );
+    assert!(chunk_texts(&updates).contains(&"done"));
 }

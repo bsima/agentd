@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    CurrentModeUpdate, PromptResponse, SessionId, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionResponse, SetSessionModeResponse, StopReason, Usage,
+    ConfigOptionUpdate, CurrentModeUpdate, PromptResponse, SessionId, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionResponse, SetSessionModeResponse,
+    StopReason, Usage,
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
 use anyhow::Result;
@@ -202,6 +203,15 @@ pub(crate) async fn session_actor(
                     registry::MODEL_CONFIG_ID => {
                         set_model(&mut runtime, &args, &value, &context_budget).await
                     }
+                    registry::THOUGHT_CONFIG_ID => value
+                        .parse::<agent_core::Effort>()
+                        .map_err(|_| anyhow::anyhow!("unknown effort level: {value}"))
+                        .and_then(|effort| {
+                            runtime.set_inference_settings(
+                                Some(effort),
+                                runtime.config.inference_settings.fast,
+                            )
+                        }),
                     registry::GC_CONFIG_ID => set_gc(&mut runtime, &args, &value).await,
                     registry::GC_THRESHOLD_CONFIG_ID => set_gc_threshold(&mut runtime, &value),
                     other => Err(anyhow::anyhow!("unknown config option: {other}")),
@@ -216,8 +226,18 @@ pub(crate) async fn session_actor(
                             &runtime.resume_facts.model,
                             &runtime.config.gc,
                             runtime.config.gc_threshold,
+                            &runtime.model_capabilities.0,
+                            runtime.config.inference_settings.effort,
                         )
                         .await;
+                        if config_id == registry::MODEL_CONFIG_ID {
+                            let _ = cx.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                                    config_options.clone(),
+                                )),
+                            ));
+                        }
                         let _ =
                             responder.respond(SetSessionConfigOptionResponse::new(config_options));
                     }
@@ -267,6 +287,7 @@ async fn set_model(
         args.key.clone().or(provider_file.api_key),
         runtime.ir_replay.is_some(),
     )?;
+    runtime.revalidate_inference_settings(&resolved);
     runtime.config.provider = provider;
     // Learned overflow ceilings are specific to the old provider/model.
     // Preserve the rest of GcState (lifecycles, frames, hot-set history).

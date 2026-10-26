@@ -8,7 +8,7 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
     SessionModeState,
 };
-use agent_core::{GcMode, ModelRegistry};
+use agent_core::{Effort, GcMode, ModelRegistry};
 
 pub(crate) const MODE_ASK: &str = "ask";
 pub(crate) const MODE_YOLO: &str = "yolo";
@@ -17,6 +17,7 @@ pub(crate) fn is_session_mode(id: &str) -> bool {
     matches!(id, MODE_ASK | MODE_YOLO)
 }
 pub(crate) const MODEL_CONFIG_ID: &str = "model";
+pub(crate) const THOUGHT_CONFIG_ID: &str = "thought_level";
 pub(crate) const GC_CONFIG_ID: &str = "gc";
 pub(crate) const GC_THRESHOLD_CONFIG_ID: &str = "gc-threshold";
 
@@ -79,12 +80,33 @@ pub(crate) async fn session_config_options(
     model_alias: &str,
     gc: &GcMode,
     gc_threshold: f32,
+    efforts: &[Effort],
+    effort: Option<Effort>,
 ) -> Vec<SessionConfigOption> {
-    vec![
+    let mut options = vec![
         model_option(model_alias).await,
         gc_option(gc),
         gc_threshold_option(gc_threshold),
-    ]
+    ];
+    if let Some(thought) = thought_option(efforts, effort) {
+        options.push(thought);
+    }
+    options
+}
+
+fn thought_option(efforts: &[Effort], current: Option<Effort>) -> Option<SessionConfigOption> {
+    let current = current.or_else(|| efforts.first().copied())?;
+    let options: Vec<_> = efforts
+        .iter()
+        .map(|level| {
+            let id = level.as_str();
+            SessionConfigSelectOption::new(id, id)
+        })
+        .collect();
+    Some(
+        SessionConfigOption::select(THOUGHT_CONFIG_ID, "Thinking", current.as_str(), options)
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+    )
 }
 
 /// The model picker: every models.yaml alias, with the session's current
@@ -161,9 +183,19 @@ mod tests {
 
     #[tokio::test]
     async fn config_options_cover_model_gc_and_threshold() {
-        let options = session_config_options("some/model", &GcMode::None, 0.85).await;
+        let options = session_config_options("some/model", &GcMode::None, 0.85, &[], None).await;
         let ids: Vec<&str> = options.iter().map(|o| o.id.0.as_ref()).collect();
         assert_eq!(ids, [MODEL_CONFIG_ID, GC_CONFIG_ID, GC_THRESHOLD_CONFIG_ID]);
+    }
+
+    #[test]
+    fn thought_option_only_for_supported_models() {
+        assert!(thought_option(&[], None).is_none());
+        let option = thought_option(&[Effort::Low, Effort::High], Some(Effort::High)).unwrap();
+        let value = serde_json::to_value(option).unwrap();
+        assert_eq!(value["category"], "thought_level");
+        assert_eq!(value["currentValue"], "high");
+        assert_eq!(value["options"].as_array().unwrap().len(), 2);
     }
 
     #[test]
