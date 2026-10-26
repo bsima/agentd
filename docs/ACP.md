@@ -5,7 +5,8 @@ over stdio: newline-delimited JSON-RPC, stdout reserved for protocol frames,
 diagnostics on stderr. Any ACP client can spawn the binary and drive
 sessions; [Paseo](https://github.com/getpaseo/paseo) is the primary target —
 its desktop and mobile apps give agentd sessions a UI (including phone
-access) without agentd growing a server, port, or dashboard.
+access) without agentd growing a server, port, or dashboard. Paseo behavior
+below is checked against 0.12.0 source (`068f272`), not a local UI run.
 
 ## Paseo setup
 
@@ -31,7 +32,9 @@ Add agentd as a custom provider in `~/.paseo/config.json`:
 `params.supportsMcpServers: false` stops Paseo injecting its internal MCP
 server into agentd sessions (see Paseo's `docs/custom-providers.md`) —
 agentd does not consume MCP servers yet, so without it Paseo's shared
-tools would be offered and silently dropped.
+tools would be offered and silently dropped. Paseo 0.12 renamed the key to
+`options` but still accepts `params` as a deprecated alias; older Paseo
+(e.g. 0.2.3) only reads `params`, so `params` works for both.
 
 Process-level flags become per-session defaults, so variants like
 `["agent", "--acp", "--model", "opus", "--memory-dir", "/home/you/notes"]`
@@ -80,8 +83,8 @@ the wire.
   rather than the live `RunUsage` which has no model breakdown on load.
   `/gc` shows the selected strategy, threshold, latest root-context usage
   (unknown before inference), model ceiling, and trace `gc_collect` count.
-  `/fork`, `/checkpoint`, `/replay`, `/zoom`, and per-mode commands remain
-  follow-ups.
+  `/fork`, `/checkpoint`, `/replay`, `/zoom`, and per-mode commands are
+  not available yet.
 - `session/request_permission` — shell commands are approval-gated by
   default in ACP mode: each gated command round-trips to the client with
   allow-once / allow-always / reject-once options. A rejection is a typed
@@ -138,8 +141,8 @@ the wire.
   `name` defaults to the id, `description` is optional, and
   `shell_approval` is `ask` (default; honors allow-always), `always`
   (prompt for every command; never remember allow-always), or `never`
-  (ungated). `tools` is an optional list of opt-in tool names; currently
-  none are registered (future tools will extend the registry). Unknown
+  (ungated). `tools` is an optional list of opt-in tool names (`todo` is
+  registered). Unknown
   names, invalid YAML/policy, and built-in id collisions fail startup.
   Mode instructions are turn-local system context, not saved conversation
   history; their profile id and text also enter the loop program identity.
@@ -154,8 +157,10 @@ the wire.
   whether to implement or revise; on Implement it requests a manual switch
   to `ask` before any edits. Agent-initiated, consent-gated mode switching
   remains a follow-up; no answer text is treated as authority to switch modes.
-- Config options — rendered by Paseo next to the mode picker, applied
-  between turns via `session/set_config_option`:
+- Config options — applied between turns via `session/set_config_option`.
+  Paseo 0.12 uses categorized `select` options for its model picker and
+  thinking control; it does **not** render arbitrary generic ACP options
+  next to the mode picker:
   - `model`: every `models.yaml` alias; switching re-resolves the
     provider, context budget, and pricing in place, revalidates effort and
     fast-tier settings, and emits `config_option_update` with the refreshed
@@ -174,6 +179,12 @@ the wire.
   - `gc-threshold`: the collection trigger as a fraction of the context
     budget (discrete steps; defaults to `--gc-threshold`).
 
+  `gc` and `gc-threshold` have no category and are **not visible in Paseo
+  0.12**. They remain usable by ACP clients that render generic config
+  options. Paseo requires provider-specific `configFeatureOptions` to expose
+  extra controls; its generic ACP provider supplies none. A Paseo plugin is
+  planned (t-1656). See [GC](GC.md) for strategy details.
+
 ## Questions (`ask_user`)
 
 The model calls `ask_user` when a decision needs the user. The runtime
@@ -190,7 +201,7 @@ On the wire, the pause becomes:
   (`optionId` = the answer's index, `name` = its text) plus one
   `reject_once` option, `dismiss`.
 
-Paseo (verified against 0.9.2) treats a request with two or more
+Paseo 0.12.0 (`068f272`) treats a request with two or more
 same-kind allow options as a chooser: it renders the tool call's text
 content as the prompt, one button per answer, and the reject option as a
 deny button. Paseo never auto-accepts a chooser, so the question always
@@ -237,34 +248,34 @@ Context-window usage is reported through ACP `usage_update` notifications. The
 `used` value is the assembled root context (provider-reported input plus output
 once available, with the runtime estimator reported at dispatch) and `size` is the
 selected model's context ceiling. Model switches update the ceiling immediately.
-Paseo's ACP adapter (inspected in 0.2.3 and 0.9.2) ignores `usage_update`
-notifications, so its context gauge does **not** respond to these values.
-As a compatibility path, completed `session/prompt` responses also include
-ACP's optional (unstable) cumulative token usage (`inputTokens`, `outputTokens`,
-`totalTokens`, and `cachedReadTokens` when available); Paseo consumes those
-for its token totals. Paseo's ACP adapter does not map response usage to its
-context-window fields, so this cannot restore the gauge in that version.
-Cumulative usage/cost totals remain in the trace (`agent cost`); ACP's
-optional cost field is not emitted yet.
+Paseo 0.12.0 (`068f272`) consumes valid `size`/`used` notifications to
+update its context gauge. It ignores cost in `usage_update` on the generic
+ACP path. Completed `session/prompt` responses also include ACP's optional
+(unstable) cumulative token usage (`inputTokens`, `outputTokens`, `totalTokens`,
+and `cachedReadTokens` when available); Paseo maps this to token totals, not
+the context gauge. Cumulative usage/cost totals remain in the trace
+(`agent cost`); ACP wire-level cost is not emitted yet.
 
-## Manual smoke test
+## Manual smoke test (Paseo 0.12.0; not run here)
 
 1. `cargo build --release -p agent` and put `target/release/agent` on PATH
-   (or use an absolute path in the Paseo config above).
-2. For subscription auth: `agent auth login claude-code` (or `codex`).
-3. Start Paseo, pick the `agentd` provider, create a session, and verify:
-   - assistant text streams incrementally;
-   - a prompt like "run ls" raises a permission prompt; allow → the
-     command runs and its output renders; reject → the agent explains and
-     continues;
-   - "allow always" stops further prompts; the `yolo` mode does the same;
-   - a prompt like "ask me which of two databases to use" raises a
-     chooser with one button per answer; picking one feeds the answer
-     back, and the agent continues with it;
-   - cancel mid-turn returns the session to idle;
-   - restarting Paseo and reopening the session replays the conversation;
-   - the model picker lists your `models.yaml` aliases and switching one
-     takes effect on the next turn.
+   (or use an absolute path in the Paseo config above). For subscription
+   auth, run `agent auth login claude-code` (or `codex`). To test Plan, copy
+   `examples/modes/plan.md` to `~/.config/agent/modes/plan.md` and restart
+   `agent --acp`.
+2. In Paseo, create an `agentd` session. Check streaming text and reasoning,
+   the context gauge, model and thinking controls; confirm GC options are
+   *not* shown in the generic provider UI.
+3. Request a shell command: allow/reject the permission prompt, then check
+   allow-always and `yolo`. Ask the model to call `ask_user` with two choices;
+   choosing one should resume the turn. Cancel a turn and check the session
+   remains usable.
+4. Select `plan` via the Plan toggle; request a checklist and check the
+   `todo` timeline updates as steps complete. Toggle Off (`ask`). Try `/help`,
+   `/gc`, and `/cost`; each should answer without a model turn.
+5. Create a session with a tool call. Reopen it to check text, tool cards,
+   and checklist replay. In the Import picker, check the session title and
+   prompt preview; import it and check its tool cards and continued prompts.
 
 Protocol-level debugging without Paseo:
 
