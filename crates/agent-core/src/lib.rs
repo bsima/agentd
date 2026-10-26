@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod approval;
 pub mod chat_history;
 pub mod cost;
+pub mod cost_budget;
 pub mod embedding;
 pub mod gc;
 pub mod guidance;

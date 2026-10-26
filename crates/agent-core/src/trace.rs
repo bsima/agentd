@@ -1234,6 +1234,8 @@ pub struct TraceLogger {
     /// recorded per-event values, so replayed runs (which re-emit the
     /// recorded usage/cost) reproduce the original rollup exactly.
     usage: Arc<Mutex<crate::cost::RunUsage>>,
+    cost_limit: Arc<Mutex<Option<u64>>>,
+    cost_baseline: Arc<Mutex<u64>>,
 }
 
 impl TraceLogger {
@@ -1264,6 +1266,8 @@ impl TraceLogger {
             sinks: Arc::new(sinks),
             context_env,
             usage: Arc::new(Mutex::new(crate::cost::RunUsage::default())),
+            cost_limit: Arc::new(Mutex::new(None)),
+            cost_baseline: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -1297,6 +1301,25 @@ impl TraceLogger {
     /// Seed a resumed trace above every op id already recorded in its file.
     pub fn seed_next_op_id(&self, next: u64) {
         self.next_op_id.fetch_max(next.max(1), Ordering::Relaxed);
+    }
+
+    pub fn set_cost_limit(&self, cap: Option<u64>) {
+        *self.cost_baseline.lock().unwrap() =
+            self.usage.lock().unwrap().cost_micro_usd.unwrap_or(0);
+        *self.cost_limit.lock().unwrap() = cap;
+    }
+
+    pub fn cost_limit(&self) -> Option<u64> {
+        *self.cost_limit.lock().unwrap()
+    }
+
+    pub fn cost_spent(&self) -> u64 {
+        self.usage
+            .lock()
+            .unwrap()
+            .cost_micro_usd
+            .unwrap_or(0)
+            .saturating_sub(*self.cost_baseline.lock().unwrap())
     }
 
     /// Restore usage from committed trace events on a mid-turn resume.

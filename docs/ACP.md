@@ -109,6 +109,12 @@ the wire.
   `agent_thought_chunk` (Paseo reasoning timeline). Child Infer reasoning
   stays in its tool card; no reasoning is saved in traces/checkpoints or
   replayed by `session/load`.
+- Cost ceiling — `--max-cost USD` / `AGENT_MAX_COST` applies independently to
+  each live ACP session (including child infers). Once spent reaches the cap,
+  the next prompt ends with an agent explanation and `max_turn_requests`;
+  the session survives and subsequent prompts end the same way. A single
+  request may overshoot because its cost is known only after completion.
+  Loaded sessions start a fresh process allowance; replay ignores the cap.
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already

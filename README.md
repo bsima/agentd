@@ -199,7 +199,7 @@ system_prompt: ./system.md
 Inspect this repo and summarize it.
 ```
 
-`system_prompt` may be inline text or a path resolved relative to the markdown file. `max_iterations` caps agent turns per session turn; `--max-turns` / `AGENT_MAX_TURNS` override it. With none of them set there is no turn ceiling.
+`system_prompt` may be inline text or a path resolved relative to the markdown file. `max_iterations` caps agent turns per session turn; `--max-turns` / `AGENT_MAX_TURNS` override it. With none of them set there is no turn ceiling. `--max-cost USD` / `AGENT_MAX_COST` sets a per-process (per ACP session) inference dispatch ceiling in dollars, requiring pricing for every live model in `models.yaml`. Child infers count; a single call can overshoot because usage is known only after it returns. Resumed/forked processes start a fresh allowance; replay does not spend or enforce the cap. One-shot exhaustion exits 3 (ordinary failures exit 1).
 
 You can also skip the registry and pass a raw model id.
 Then the CLI uses `OPENROUTER_BASE_URL` or `https://openrouter.ai/api/v1`, and `AGENT_API_KEY` or `OPENROUTER_API_KEY`.

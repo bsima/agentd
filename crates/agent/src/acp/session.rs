@@ -156,6 +156,14 @@ pub(crate) async fn session_actor(
                                 let _ = responder
                                     .respond(PromptResponse::new(StopReason::Cancelled));
                             }
+                            Err(err) if err.downcast_ref::<agent_core::cost_budget::CostBudgetExhausted>().is_some() => {
+                                eprintln!("{err:#}");
+                                let _ = update_tx.send(ForwarderMsg::update(
+                                    SessionUpdate::AgentMessageChunk(super::bridge::text_chunk(err.to_string())),
+                                ));
+                                flush_updates(&update_tx).await;
+                                let _ = responder.respond(PromptResponse::new(cost_exhaustion_stop_reason()));
+                            }
                             Err(err) => {
                                 let _ = responder.respond_with_error(
                                     agent_client_protocol::Error::new(-32603, err.to_string()),
@@ -288,6 +296,15 @@ async fn set_model(
         args.key.clone().or(provider_file.api_key),
         runtime.ir_replay.is_some(),
     )?;
+    if args.max_cost.is_some()
+        && runtime.ir_replay.is_none()
+        && pricing.get(&resolved.api_id).is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "--max-cost requires pricing for model {:?} in models.yaml",
+            alias
+        ));
+    }
     runtime.revalidate_inference_settings(&resolved);
     runtime.config.provider = provider;
     // Learned overflow ceilings are specific to the old provider/model.
@@ -499,5 +516,22 @@ mod mode_tests {
         assert_eq!(wire["currentModeId"], "research");
         assert_eq!(wire["availableModes"][2]["name"], "Research");
         assert_eq!(wire["availableModes"][2]["description"], "Investigate");
+    }
+}
+
+// ACP has no cost-specific stop reason; max_turn_requests conveys the
+// resource ceiling while the accompanying message names the actual budget.
+fn cost_exhaustion_stop_reason() -> StopReason {
+    StopReason::MaxTurnRequests
+}
+
+#[cfg(test)]
+mod cost_tests {
+    #[test]
+    fn exhausted_cost_ends_prompt_as_resource_limit() {
+        assert_eq!(
+            super::cost_exhaustion_stop_reason(),
+            super::StopReason::MaxTurnRequests
+        );
     }
 }

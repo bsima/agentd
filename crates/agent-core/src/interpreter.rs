@@ -404,6 +404,13 @@ where
             prompt,
             next,
         } => {
+            crate::cost_budget::check(
+                &config.trace,
+                &model.0,
+                config.pricing.get(&model.0).is_some(),
+                config.replay.is_none(),
+            )
+            .await?;
             let prompt = hydrate_infer_prompt(config, &state, prompt).await?;
             let mut prompt = maybe_collect_prompt(config, prompt, gc_state).await?;
             let op_id = config.trace.next_op_id();

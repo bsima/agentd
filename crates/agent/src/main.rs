@@ -127,6 +127,9 @@ struct Args {
     /// over prompt frontmatter `max_iterations`.
     #[arg(long, env = "AGENT_MAX_TURNS")]
     max_turns: Option<usize>,
+    /// Per-process dispatch ceiling in USD; a call can overshoot when its bill arrives.
+    #[arg(long, env = "AGENT_MAX_COST", value_parser = parse_max_cost)]
+    max_cost: Option<u64>,
     /// Store full PromptIR section content in traces instead of previews/hashes only.
     #[arg(long, env = "AGENT_TRACE_FULL_PROMPT_IR")]
     trace_full_prompt_ir: bool,
@@ -624,8 +627,53 @@ fn default_runtime_guidance() -> bool {
     true
 }
 
+fn parse_max_cost(value: &str) -> std::result::Result<u64, String> {
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|c| c.is_ascii_digit())
+        || fractional.len() > 6
+        || !fractional.bytes().all(|c| c.is_ascii_digit())
+    {
+        return Err(
+            "--max-cost must be a positive decimal USD amount with at most six fractional digits"
+                .into(),
+        );
+    }
+    let dollars: u64 = whole.parse().map_err(|_| "--max-cost exceeds u64 range")?;
+    let fraction: u64 = if fractional.is_empty() {
+        0
+    } else {
+        fractional
+            .parse::<u64>()
+            .map_err(|_| "invalid --max-cost fraction")?
+            * 10_u64.pow(6 - fractional.len() as u32)
+    };
+    let micro = dollars
+        .checked_mul(1_000_000)
+        .and_then(|v| v.checked_add(fraction))
+        .ok_or("--max-cost exceeds u64 range")?;
+    if micro == 0 {
+        return Err("--max-cost must be positive".into());
+    }
+    Ok(micro)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    match run_main().await {
+        Err(err)
+            if err
+                .downcast_ref::<agent_core::cost_budget::CostBudgetExhausted>()
+                .is_some() =>
+        {
+            eprintln!("{err:#}");
+            std::process::exit(3);
+        }
+        other => other,
+    }
+}
+
+async fn run_main() -> Result<()> {
     let mut args = Args::parse();
     if args.signal_deadline.is_some() && args.replay_trace.is_some() && !args.replay_live_eval {
         return Err(anyhow!("strict replay cannot be suspended"));
@@ -993,6 +1041,15 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
     };
     let (resolved_model, pricing_table, embedder, infer_registry) =
         resolve_model(requested_model, provider_file.model.clone()).await?;
+    if args.max_cost.is_some()
+        && args.replay_trace.is_none()
+        && pricing_table.get(&resolved_model.api_id).is_none()
+    {
+        return Err(anyhow!(
+            "--max-cost requires pricing for model {:?} in models.yaml",
+            resolved_model.alias
+        ));
+    }
     let eval_cwd = params.cwd.clone().or_else(|| args.eval_cwd.clone());
     let eval_config = EvalConfig {
         cwd: eval_cwd.clone(),
@@ -1139,6 +1196,11 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         trace.seed_next_op_id(next);
         trace.seed_usage(&events);
     }
+    trace.set_cost_limit(if args.replay_trace.is_some() {
+        None
+    } else {
+        args.max_cost
+    });
     let hydration = {
         let mut registry = SourceRegistry::new();
         if let Some(path) = args.hydration_dir.as_ref() {
@@ -4741,6 +4803,24 @@ mod gc_stats_tests {
 
 #[cfg(test)]
 mod cost_tests {
+    #[test]
+    fn max_cost_flag_parses_exact_micro_dollars() {
+        use super::Args;
+        use clap::Parser;
+        assert_eq!(
+            Args::try_parse_from(["agent", "--max-cost", "0.50", "hello"])
+                .unwrap()
+                .max_cost,
+            Some(500_000)
+        );
+        for bad in ["0", "0.000000", "-1", "NaN", "inf", "0.0000001", "1e2"] {
+            assert!(
+                Args::try_parse_from(["agent", "--max-cost", bad, "hello"]).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     use super::*;
     use chrono::Utc;
 

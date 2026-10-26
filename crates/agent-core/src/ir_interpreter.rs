@@ -1381,6 +1381,27 @@ async fn execute_instr(
                     .filter(|spec| names.contains(&spec.function.name))
                     .collect(),
             };
+            // Pre-dispatch check precedes hydration and InferCall: no provider
+            // request (or dangling trace call) is made at the ceiling.
+            if let Err(err) = crate::cost_budget::check(
+                &config.trace,
+                &model,
+                config.pricing.get(&model).is_some(),
+                ir_replay.is_none() && config.replay.is_none(),
+            )
+            .await
+            {
+                if policy.tools.is_some()
+                    && err
+                        .downcast_ref::<crate::cost_budget::CostBudgetExhausted>()
+                        .is_none()
+                    && policy.on_error == EffectErrorMode::Bind
+                {
+                    machine.env.insert(out, effect_error_value(&err));
+                    return Ok(None);
+                }
+                return Err(err);
+            }
             let prompt_is_var = matches!(prompt, PromptRef::Var(_));
             let prompt = resolve_prompt(config, &machine.env, prompt)?;
             // GC zoom (t-1609): when this call offers `zoom`, record each
@@ -5855,6 +5876,118 @@ models:
             continuation_stack: vec![],
             budgets: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn child_infer_spend_is_shared_with_root_and_unpriced_child_binds() -> Result<()> {
+        let child_machine = || {
+            let mut machine = infer_then_infer_machine();
+            let instructions = &mut machine
+                .program
+                .blocks
+                .get_mut(&BlockId(0))
+                .unwrap()
+                .instructions;
+            if let Instr::Infer { policy, .. } = &mut instructions[0] {
+                policy.tools = Some(vec![]);
+                policy.on_error = EffectErrorMode::Bind;
+            }
+            machine
+        };
+        let provider = Arc::new(MockProvider::new(vec![response("child"), response("root")]));
+        let mut priced_config = config(provider.clone());
+        priced_config.trace.set_cost_limit(Some(1));
+        priced_config
+            .pricing
+            .insert("mock", crate::cost::Pricing::from_usd_per_mtok(0.0, 1.0)?);
+        let err = run_ir_sequential(&priced_config, child_machine())
+            .await
+            .unwrap_err();
+        assert!(err
+            .downcast_ref::<crate::cost_budget::CostBudgetExhausted>()
+            .is_some());
+        assert_eq!(provider.prompt_count(), 1);
+        let provider = Arc::new(MockProvider::new(vec![response("unused")]));
+        let config = config(provider.clone());
+        config.trace.set_cost_limit(Some(10));
+        let mut machine = child_machine();
+        machine
+            .program
+            .blocks
+            .get_mut(&BlockId(0))
+            .unwrap()
+            .instructions
+            .truncate(1);
+        machine
+            .program
+            .blocks
+            .get_mut(&BlockId(0))
+            .unwrap()
+            .terminator = Terminator::Return {
+            value: Expr::Var(Var("a".into())),
+        };
+        let (value, _) = run_ir_sequential(&config, machine).await?;
+        assert_eq!(value["ok"], false);
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires pricing"));
+        assert_eq!(provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cost_limit_stops_second_infer_before_provider_dispatch() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![
+            response("first"),
+            response("second"),
+        ]));
+        let config = config(provider.clone());
+        config.trace.set_cost_limit(Some(1));
+        let mut config = config;
+        config
+            .pricing
+            .insert("mock", crate::cost::Pricing::from_usd_per_mtok(0.0, 1.0)?);
+        let mut store = InMemoryStore::new();
+        let err = run_ir_steps_with_gc(
+            &config,
+            infer_then_infer_machine(),
+            &mut store,
+            None,
+            None,
+            &mut GcState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::cost_budget::CostBudgetExhausted>()
+                .is_some(),
+            "{err:#}"
+        );
+        assert_eq!(provider.prompt_count(), 1);
+        assert_eq!(config.trace.cost_spent(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cost_limit_rejects_unpriced_model_without_provider_call() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("unused")]));
+        let config = config(provider.clone());
+        config.trace.set_cost_limit(Some(1));
+        let mut store = InMemoryStore::new();
+        let err = run_ir_steps_with_gc(
+            &config,
+            infer_then_infer_machine(),
+            &mut store,
+            None,
+            None,
+            &mut GcState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("requires pricing"), "{err:#}");
+        assert_eq!(provider.prompt_count(), 0);
+        Ok(())
     }
 
     #[tokio::test]
