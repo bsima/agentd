@@ -1386,7 +1386,9 @@ async fn execute_instr(
             if let Err(err) = crate::cost_budget::check(
                 &config.trace,
                 &model,
-                config.pricing.get(&model).is_some(),
+                config
+                    .pricing
+                    .has_pricing(&model, config.inference_settings.fast),
                 ir_replay.is_none() && config.replay.is_none(),
             )
             .await
@@ -5987,6 +5989,59 @@ models:
         .unwrap_err();
         assert!(err.to_string().contains("requires pricing"), "{err:#}");
         assert_eq!(provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_without_fast_rates_is_unpriced_under_cap() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(vec![response("unused")]));
+        let mut config = config(provider.clone());
+        config.trace.set_cost_limit(Some(1));
+        config
+            .pricing
+            .insert("mock", crate::cost::Pricing::from_usd_per_mtok(1.0, 1.0)?);
+        config.inference_settings.fast = true;
+        let mut store = InMemoryStore::new();
+        let err = run_ir_steps_with_gc(
+            &config,
+            infer_then_infer_machine(),
+            &mut store,
+            None,
+            None,
+            &mut GcState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("requires pricing"), "{err:#}");
+        assert_eq!(provider.prompt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_response_cost_blocks_next_dispatch_under_cap() -> Result<()> {
+        let mut unknown = response("first");
+        unknown
+            .metadata
+            .insert("speed".into(), serde_json::json!("fast"));
+        let provider = Arc::new(MockProvider::new(vec![unknown, response("second")]));
+        let mut config = config(provider.clone());
+        config.trace.set_cost_limit(Some(10));
+        config
+            .pricing
+            .insert("mock", crate::cost::Pricing::from_usd_per_mtok(1.0, 1.0)?);
+        let mut store = InMemoryStore::new();
+        let err = run_ir_steps_with_gc(
+            &config,
+            infer_then_infer_machine(),
+            &mut store,
+            None,
+            None,
+            &mut GcState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown cost"), "{err:#}");
+        assert_eq!(provider.prompt_count(), 1);
         Ok(())
     }
 

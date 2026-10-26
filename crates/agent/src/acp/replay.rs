@@ -96,22 +96,28 @@ fn trace_updates(checkpoint: &Checkpoint, events: &[Event]) -> Result<Vec<Sessio
     let mut streamed = HashMap::new();
     let mut active = false;
     let mut saw_boundary = false;
+    let retained_ids: std::collections::HashSet<_> = visible
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.id.to_string())
+        .collect();
     for event in events {
         if let Event::Custom { name, data, .. } = event {
             if name == "acp_turn_start" {
                 saw_boundary = true;
-                // An unmatched turn may have been compacted away by GC,
-                // or the trace may be truncated. Either way, its effects
-                // cannot safely be assigned to the next retained prompt.
+                let marker_id = data
+                    .get("user_message_id")
+                    .and_then(serde_json::Value::as_str);
+                if !marker_id.is_some_and(|id| retained_ids.contains(id)) {
+                    // GC-evicted or cancelled turns own all effects up to the
+                    // next boundary. Do not assign their cards to a later turn.
+                    active = false;
+                    continue;
+                }
                 let Some(message) = visible.get(cursor) else {
-                    return Err(anyhow!("trace has a turn absent from checkpoint"));
+                    return Err(anyhow!("trace turn is out of checkpoint order"));
                 };
-                if message.role != "user"
-                    || data
-                        .get("user_message_id")
-                        .and_then(serde_json::Value::as_str)
-                        != Some(message.id.to_string().as_str())
-                {
+                if message.role != "user" || marker_id != Some(message.id.to_string().as_str()) {
                     return Err(anyhow!("trace turn does not match checkpoint prompt"));
                 }
                 active = true;
@@ -228,8 +234,21 @@ mod tests {
             "arguments":{"command":"old"},"timestamp":Utc::now()
         }))
         .unwrap();
-        let events = [start(&old), card, start(&later), answer("reply", 5)];
-        assert!(trace_updates(&cp, &events).is_err());
+        let later_card: Event = serde_json::from_value(serde_json::json!({
+            "event":"ToolCall", "run_id":"r", "op_id":6,"name":"shell",
+            "arguments":{"command":"retained"},"timestamp":Utc::now()
+        }))
+        .unwrap();
+        let events = [
+            start(&old),
+            card,
+            start(&later),
+            later_card,
+            answer("reply", 5),
+        ];
+        let updates = wire(&trace_updates(&cp, &events).unwrap());
+        assert_eq!(updates.as_array().unwrap().len(), 3);
+        assert_eq!(updates[1]["rawInput"]["command"], "retained");
         assert_eq!(
             wire(&text_history(&cp.messages))[0]["content"]["text"],
             "retained"
@@ -272,6 +291,35 @@ mod tests {
         assert_eq!(wire[2]["content"]["text"], "completed");
         assert_eq!(wire[3]["rawInput"]["command"], "completed tool");
         assert_eq!(wire[4]["content"]["text"], "done");
+    }
+
+    #[test]
+    fn cancelled_live_load_turn_does_not_hide_later_cards() {
+        let cancelled = ChatMessage::user("cancelled by load");
+        let completed = ChatMessage::user("completed");
+        let cp = checkpoint(vec![
+            completed.clone(),
+            ChatMessage::assistant(Some("done".into()), vec![]),
+        ]);
+        let card: Event = serde_json::from_value(serde_json::json!({
+            "event":"ToolCall", "run_id":"r", "op_id":3,"name":"shell",
+            "arguments":{"command":"completed tool"},"timestamp":Utc::now()
+        }))
+        .unwrap();
+        let updates = wire(
+            &trace_updates(
+                &cp,
+                &[
+                    start(&cancelled),
+                    start(&completed),
+                    card,
+                    answer("done", 2),
+                ],
+            )
+            .unwrap(),
+        );
+        assert_eq!(updates.as_array().unwrap().len(), 3);
+        assert_eq!(updates[1]["rawInput"]["command"], "completed tool");
     }
 
     #[test]

@@ -114,7 +114,8 @@ the wire.
   the next prompt ends with an agent explanation and `max_turn_requests`;
   the session survives and subsequent prompts end the same way. A single
   request may overshoot because its cost is known only after completion.
-  Loaded sessions start a fresh process allowance; replay ignores the cap.
+  With a cap, fast-tier calls require fast pricing rates; an unknown response
+  cost blocks further dispatch rather than counting as free. Loaded sessions start a fresh process allowance; replay ignores the cap.
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already
@@ -136,9 +137,11 @@ the wire.
   changing CLI traces. Missing, truncated, or unalignable traces fall back to
   text-only checkpoint history; image-only prompts replay as `[image]`
   without losing their associated tool cards. Loading an already-live session
-  cancels and joins its actor before reading the checkpoint, so an old turn
-  cannot overwrite the restored state. Plans stop at the loaded checkpoint
-  marker.
+  validates the checkpoint before stopping the actor, then joins it and
+  re-reads the latest committed checkpoint so an old turn cannot overwrite
+  restored state. Unmatched trace turns (GC-evicted or cancelled by load)
+  are skipped without losing later retained tool cards. Plans stop at the
+  loaded checkpoint marker.
 - Modes — `ask` (default; approval-gated shell) and `yolo` remain built in.
   Additional modes load from `--acp-modes-dir DIR`, or from
   `$XDG_CONFIG_HOME/agent/modes` (`~/.config/agent/modes`) if it exists.

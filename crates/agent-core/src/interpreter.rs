@@ -407,7 +407,9 @@ where
             crate::cost_budget::check(
                 &config.trace,
                 &model.0,
-                config.pricing.get(&model.0).is_some(),
+                config
+                    .pricing
+                    .has_pricing(&model.0, config.inference_settings.fast),
                 config.replay.is_none(),
             )
             .await?;

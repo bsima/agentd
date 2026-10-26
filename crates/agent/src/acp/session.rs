@@ -298,7 +298,10 @@ async fn set_model(
     )?;
     if args.max_cost.is_some()
         && runtime.ir_replay.is_none()
-        && pricing.get(&resolved.api_id).is_none()
+        && !pricing.has_pricing(
+            &resolved.api_id,
+            runtime.config.inference_settings.fast && resolved.fast,
+        )
     {
         return Err(anyhow::anyhow!(
             "--max-cost requires pricing for model {:?} in models.yaml",

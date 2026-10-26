@@ -28,6 +28,11 @@ pub async fn check(trace: &TraceLogger, model: &str, priced: bool, live: bool) -
     let Some(cap) = trace.cost_limit() else {
         return Ok(());
     };
+    if trace.has_uncosted_spend() {
+        return Err(anyhow!(
+            "cost budget cannot continue: a response had unknown cost"
+        ));
+    }
     let spent = trace.cost_spent();
     if spent >= cap {
         trace

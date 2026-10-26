@@ -313,9 +313,12 @@ impl AcpServer {
         warn_ignored_mcp_servers(request.mcp_servers.len());
         let _guard = self.lifecycle.lock().await;
         let session_id = request.session_id.0.to_string();
-        self.stop_session(&session_id).await;
         let checkpoint_path = acp_session_dir(&session_id, self.args.state_dir.as_deref())?
             .join("session-latest.json");
+        // Validate without changing the live actor. It may commit a newer
+        // checkpoint while we wait for it to stop, so read again afterward.
+        crate::load_checkpoint_with_repair(&checkpoint_path, false).await?;
+        self.stop_session(&session_id).await;
         let checkpoint = crate::load_checkpoint(&checkpoint_path).await?;
         let (history, plan) = replay::load_updates(&checkpoint).await;
         for update in history.into_iter().chain(plan) {

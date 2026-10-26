@@ -1236,6 +1236,7 @@ pub struct TraceLogger {
     usage: Arc<Mutex<crate::cost::RunUsage>>,
     cost_limit: Arc<Mutex<Option<u64>>>,
     cost_baseline: Arc<Mutex<u64>>,
+    uncosted_baseline: Arc<Mutex<u64>>,
 }
 
 impl TraceLogger {
@@ -1268,6 +1269,7 @@ impl TraceLogger {
             usage: Arc::new(Mutex::new(crate::cost::RunUsage::default())),
             cost_limit: Arc::new(Mutex::new(None)),
             cost_baseline: Arc::new(Mutex::new(0)),
+            uncosted_baseline: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -1304,6 +1306,7 @@ impl TraceLogger {
     }
 
     pub fn set_cost_limit(&self, cap: Option<u64>) {
+        *self.uncosted_baseline.lock().unwrap() = self.usage.lock().unwrap().uncosted_infer_calls;
         *self.cost_baseline.lock().unwrap() =
             self.usage.lock().unwrap().cost_micro_usd.unwrap_or(0);
         *self.cost_limit.lock().unwrap() = cap;
@@ -1311,6 +1314,10 @@ impl TraceLogger {
 
     pub fn cost_limit(&self) -> Option<u64> {
         *self.cost_limit.lock().unwrap()
+    }
+
+    pub fn has_uncosted_spend(&self) -> bool {
+        self.usage.lock().unwrap().uncosted_infer_calls > *self.uncosted_baseline.lock().unwrap()
     }
 
     pub fn cost_spent(&self) -> u64 {

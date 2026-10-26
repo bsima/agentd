@@ -86,6 +86,14 @@ impl PricingTable {
         self.fast_by_model.entry(model.into()).or_insert(pricing);
     }
 
+    pub fn has_pricing(&self, model: &str, fast: bool) -> bool {
+        if fast {
+            self.fast_by_model.contains_key(model)
+        } else {
+            self.by_model.contains_key(model)
+        }
+    }
+
     pub fn get(&self, model: &str) -> Option<&Pricing> {
         self.by_model.get(model)
     }

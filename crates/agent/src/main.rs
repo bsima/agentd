@@ -1043,7 +1043,7 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
         resolve_model(requested_model, provider_file.model.clone()).await?;
     if args.max_cost.is_some()
         && args.replay_trace.is_none()
-        && pricing_table.get(&resolved_model.api_id).is_none()
+        && !pricing_table.has_pricing(&resolved_model.api_id, args.fast && resolved_model.fast)
     {
         return Err(anyhow!(
             "--max-cost requires pricing for model {:?} in models.yaml",

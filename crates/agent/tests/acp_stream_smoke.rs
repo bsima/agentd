@@ -300,6 +300,22 @@ fn prompt_response_reports_cumulative_token_usage_for_paseo() {
 }
 
 #[test]
+fn load_without_checkpoint_leaves_live_session_usable() {
+    let root = temp_root("load-before-checkpoint");
+    let port = spawn_mock_sse_server(vec![TEXT_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let session_id = client.handshake_and_new_session(root.to_str().unwrap());
+    client.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"{}","mcpServers":[]}}}}"#,
+        root.display()
+    ));
+    assert!(client.read_until_response(3, None).0.get("error").is_some());
+    client.prompt(4, &session_id, "still here");
+    let (response, _, _) = client.read_until_response(4, None);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+}
+
+#[test]
 fn loading_live_session_cancels_old_turn_before_restoring_checkpoint() {
     let root = temp_root("live-reload");
     let (port, requests) = spawn_recording_mock_sse_server(vec![TEXT_TURN, STALL, DONE_TURN]);
