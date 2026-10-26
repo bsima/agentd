@@ -598,6 +598,12 @@ struct ResumeFacts {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     fast: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<agent_core::Effort>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    todo: bool,
+    #[serde(default)]
+    provider_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hydration_dir: Option<PathBuf>,
@@ -605,8 +611,6 @@ struct ResumeFacts {
     temporal_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_schema: Option<PathBuf>,
-    #[serde(default)]
-    memory_tools: bool,
     #[serde(default)]
     shell_requires_approval: bool,
     /// Whether the paused run had runtime guidance on (t-1359); serde
@@ -1360,11 +1364,13 @@ async fn build_runtime(args: &Args, params: SessionParams) -> Result<Runtime> {
             max_turns: params.max_turns,
             max_cost: args.max_cost,
             fast: settings.fast,
+            effort: settings.effort,
+            todo: args.todo,
+            provider_url: reported_provider_url.clone(),
             memory_dir: args.memory_dir.clone(),
             hydration_dir: args.hydration_dir.clone(),
             temporal_dir: args.temporal_dir.clone(),
             output_schema: args.output_schema.clone(),
-            memory_tools: args.memory_dir.is_some(),
             shell_requires_approval: params.require_shell_approval,
             runtime_guidance: !args.no_runtime_guidance,
             eval_timeout_seconds: args.eval_timeout_seconds,
@@ -2458,7 +2464,7 @@ async fn resume_run(
         on_reasoning_delta: None,
         inference_settings: agent_core::InferenceSettings {
             fast: facts.fast,
-            ..Default::default()
+            effort: facts.effort,
         },
         approvals,
         // Resume with the paused run's guidance setting (t-1359): the
@@ -2508,21 +2514,20 @@ async fn resume_run(
         pricing: pricing_table,
     };
     config.guidance.infer_models = infer_registry.map(|r| (r, resolved_model.clone()));
-    let options = agent_core::AgentLoopOptions {
-        memory_tools: facts.memory_tools,
-        anthropic_thinking: false,
-        tool_names: vec![],
+    restore_opt_in_tools(&mut config, &facts)?;
+    let options = agent_loop_options_from_config(
+        &config,
+        if facts.provider_url.is_empty() {
+            _provider_url.as_str()
+        } else {
+            &facts.provider_url
+        },
         output_contract,
-        shell_requires_approval: facts.shell_requires_approval,
-        infer_system_prompt: None,
-        ask_user: false,
-        // The resumed program comes from the checkpointed machine; these
-        // options rebuild it only for an output-contract repair, which
-        // must keep the paused run's zoom arm.
-        zoom: facts
-            .gc_zoom
-            .then(|| agent_core::ZoomOptions::for_context_budget(resolved_model.context)),
-    };
+        facts.shell_requires_approval,
+        false,
+        None,
+        facts.gc_zoom,
+    );
     let mut ir_store = checkpoint.store.clone();
     let mut gc_state = agent_core::GcState::default();
     eprintln!(
@@ -3126,43 +3131,63 @@ async fn run_turn(
 /// The loop options a turn runs with, derived from the runtime's current
 /// configuration. Shared by the CLI turn spine and the ACP turn driver.
 fn agent_loop_options(runtime: &Runtime) -> agent_core::AgentLoopOptions {
-    // The remember/recall tools ride with the memory backend (settled
-    // question 6): registering --memory-dir changes the loop program.
-    let memory_tools = !runtime
-        .config
-        .hydration
-        .sinks_of_kind(agent_core::SourceKind::Semantic)
-        .is_empty();
+    let mode_prompt = {
+        #[cfg(feature = "acp")]
+        {
+            runtime.acp_mode.as_ref().and_then(|id| {
+                runtime
+                    .acp_mode_prompt
+                    .as_ref()
+                    .map(|text| format!("ACP mode {id}: {text}"))
+            })
+        }
+        #[cfg(not(feature = "acp"))]
+        {
+            None
+        }
+    };
+    agent_loop_options_from_config(
+        &runtime.config,
+        &runtime.provider_url,
+        runtime.output_contract.clone(),
+        runtime.shell_requires_approval,
+        runtime.ask_user_tool,
+        mode_prompt,
+        runtime.gc_zoom,
+    )
+}
+
+fn restore_opt_in_tools(config: &mut SeqConfig, facts: &ResumeFacts) -> Result<()> {
+    if facts.todo {
+        config.tools.register(agent_core::todo::todo_tool())?;
+    }
+    Ok(())
+}
+
+/// All loop-program knobs come from the same config on live and approval-resumed turns.
+fn agent_loop_options_from_config(
+    config: &SeqConfig,
+    provider_url: &str,
+    output_contract: Option<agent_core::OutputContract>,
+    shell_requires_approval: bool,
+    ask_user: bool,
+    infer_system_prompt: Option<String>,
+    gc_zoom: bool,
+) -> agent_core::AgentLoopOptions {
     agent_core::AgentLoopOptions {
-        memory_tools,
-        anthropic_thinking: runtime.config.inference_settings.effort.is_some()
-            && runtime
-                .provider_url
-                .starts_with("https://api.anthropic.com/"),
-        tool_names: runtime.config.tools.names(),
-        output_contract: runtime.output_contract.clone(),
-        shell_requires_approval: runtime.shell_requires_approval,
-        // Profile instructions are also embedded in the program's optional
-        // child system slot, giving each profile a distinct program hash.
-        // This slot is absent on the default path.
-        infer_system_prompt: {
-            #[cfg(feature = "acp")]
-            {
-                runtime.acp_mode.as_ref().and_then(|id| {
-                    runtime
-                        .acp_mode_prompt
-                        .as_ref()
-                        .map(|text| format!("ACP mode {id}: {text}"))
-                })
-            }
-            #[cfg(not(feature = "acp"))]
-            {
-                None
-            }
-        },
-        ask_user: runtime.ask_user_tool,
-        zoom: (runtime.gc_zoom && runtime.config.gc.enabled())
-            .then(|| agent_core::ZoomOptions::for_context_budget(runtime.config.context_budget)),
+        memory_tools: !config
+            .hydration
+            .sinks_of_kind(agent_core::SourceKind::Semantic)
+            .is_empty(),
+        anthropic_thinking: config.inference_settings.effort.is_some()
+            && provider_url.starts_with("https://api.anthropic.com/"),
+        tool_names: config.tools.names(),
+        output_contract,
+        shell_requires_approval,
+        infer_system_prompt,
+        ask_user,
+        zoom: (gc_zoom && config.gc.enabled())
+            .then(|| agent_core::ZoomOptions::for_context_budget(config.context_budget)),
     }
 }
 
@@ -4280,6 +4305,87 @@ mod tests {
             reported_provider_url(None, "https://api.example.test/v1"),
             "https://api.example.test/v1"
         );
+    }
+
+    #[tokio::test]
+    async fn approval_facts_restore_effort_tools_and_program_identity() -> Result<()> {
+        let args = Args::try_parse_from([
+            "agent",
+            "--model",
+            "openai/gpt-5.5",
+            "--key",
+            "test-key",
+            "--todo",
+            "--require-shell-approval",
+            "hello",
+        ])?;
+        let mut runtime = build_runtime(
+            &args,
+            SessionParams {
+                requested_model: Some("openai/gpt-5.5".into()),
+                requested_provider: None,
+                max_turns: 4,
+                system_prompt_override: None,
+                cwd: None,
+                checkpoint_dir: None,
+                checkpoint: None,
+                fork_source_run_id: None,
+                restore_checkpoint_config: false,
+                run_id: format!("approval-test-{}", Uuid::new_v4()),
+                session_id: None,
+                parent_session_id: None,
+                require_shell_approval: true,
+                trace_sinks_extra: vec![],
+                otel_active: false,
+                suspend: None,
+            },
+        )
+        .await?;
+        // Simulate a configured effort model without requiring a registry or network.
+        runtime.config.inference_settings.effort = Some(agent_core::Effort::High);
+        runtime.provider_url = "https://api.anthropic.com/v1".into();
+        runtime.resume_facts.effort = runtime.config.inference_settings.effort;
+        runtime.resume_facts.provider_url = runtime.provider_url.clone();
+        let paused_options = agent_loop_options(&runtime);
+        let facts: ResumeFacts =
+            serde_json::from_value(serde_json::to_value(&runtime.resume_facts)?)?;
+        let mut resumed_config = runtime.config;
+        resumed_config.inference_settings = agent_core::InferenceSettings {
+            effort: facts.effort,
+            fast: facts.fast,
+        };
+        resumed_config.tools = Default::default();
+        restore_opt_in_tools(&mut resumed_config, &facts)?;
+        let resumed_options = agent_loop_options_from_config(
+            &resumed_config,
+            &facts.provider_url,
+            None,
+            facts.shell_requires_approval,
+            false,
+            None,
+            facts.gc_zoom,
+        );
+        assert_eq!(
+            resumed_config.inference_settings.effort,
+            Some(agent_core::Effort::High)
+        );
+        assert!(resumed_options.anthropic_thinking);
+        assert_eq!(resumed_options.tool_names, vec!["todo"]);
+        assert_eq!(resumed_config.tools.names(), vec!["todo"]);
+        let program = |options: &agent_core::AgentLoopOptions| {
+            agent_core::agent_loop_ir_for_options(
+                runtime.model.clone(),
+                vec![ChatMessage::user("hello")],
+                4,
+                options,
+            )
+            .program
+        };
+        assert_eq!(
+            agent_core::program_hash(&program(&paused_options))?,
+            agent_core::program_hash(&program(&resumed_options))?
+        );
+        Ok(())
     }
 
     #[test]

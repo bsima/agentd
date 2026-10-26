@@ -119,7 +119,8 @@ the wire.
   response cost blocks further dispatch rather than counting as free. Loaded
   sessions start a fresh process allowance; replay ignores the cap. Outside
   ACP, standalone `agent approvals --approve/--deny` restores the original
-  one-shot cap and prior trace spend (no new allowance on resume).
+  one-shot cap and prior trace spend (no new allowance on resume). Approval
+  resumes also restore effort, opt-in tools, and loop program identity.
 - `session/cancel` — drops the in-flight turn (closing any provider
   stream) and answers the prompt with `stopReason: "cancelled"`. The
   session survives; history keeps the user message. Note: an already
@@ -144,8 +145,9 @@ the wire.
   validates the checkpoint before stopping the actor, then joins it and
   re-reads the latest committed checkpoint so an old turn cannot overwrite
   restored state. Unmatched trace turns (GC-evicted or cancelled by load)
-  are skipped without losing later retained tool cards. Plans stop at the
-  loaded checkpoint marker.
+  are skipped without losing later retained tool cards. GC-rewritten assistant
+  text does not affect user-marker alignment: replay renders the live trace
+  text and cards for retained turns. Plans stop at the loaded checkpoint marker.
 - Modes — `ask` (default; approval-gated shell) and `yolo` remain built in.
   Additional modes load from `--acp-modes-dir DIR`, or from
   `$XDG_CONFIG_HOME/agent/modes` (`~/.config/agent/modes`) if it exists.

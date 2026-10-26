@@ -85,10 +85,7 @@ fn trace_updates(checkpoint: &Checkpoint, events: &[Event]) -> Result<Vec<Sessio
     let visible: Vec<&ChatMessage> = checkpoint
         .messages
         .iter()
-        .filter(|m| {
-            user_update(m).is_some()
-                || (m.role == "assistant" && m.content.as_deref().is_some_and(|s| !s.is_empty()))
-        })
+        .filter(|m| user_update(m).is_some())
         .collect();
     let mut cursor = 0;
     let mut updates = Vec::new();
@@ -129,25 +126,7 @@ fn trace_updates(checkpoint: &Checkpoint, events: &[Event]) -> Result<Vec<Sessio
         if !active {
             continue;
         }
-        for update in bridge::map_event(event, &mut ids, &mut streamed) {
-            if let SessionUpdate::AgentMessageChunk(chunk) = &update {
-                let agent_client_protocol::schema::v1::ContentBlock::Text(text) = &chunk.content
-                else {
-                    return Err(anyhow!("non-text assistant chunk"));
-                };
-                // Intermediate inference text need not survive the agent
-                // loop's saved history; only emit it if it matches the next
-                // retained assistant message.
-                if visible.get(cursor).is_some_and(|m| {
-                    m.role == "assistant" && m.content.as_deref() == Some(text.text.as_str())
-                }) {
-                    cursor += 1;
-                } else {
-                    continue;
-                }
-            }
-            updates.push(update);
-        }
+        updates.extend(bridge::map_event(event, &mut ids, &mut streamed));
     }
     if !saw_boundary || cursor != visible.len() {
         return Err(anyhow!(
@@ -219,6 +198,25 @@ mod tests {
             wire(&text_history(&cp.messages))[0]["content"]["text"],
             "[image]"
         );
+    }
+
+    #[test]
+    fn gc_rewritten_assistant_keeps_live_trace_text_and_cards() {
+        let user = ChatMessage::user("inspect");
+        let cp = checkpoint(vec![
+            user.clone(),
+            ChatMessage::assistant(Some("summary after GC".into()), vec![]),
+        ]);
+        let card: Event = serde_json::from_value(serde_json::json!({
+            "event":"ToolCall", "run_id":"r", "op_id":4,"name":"shell",
+            "arguments":{"command":"pwd"},"timestamp":Utc::now()
+        }))
+        .unwrap();
+        let updates = wire(
+            &trace_updates(&cp, &[start(&user), card, answer("original live text", 5)]).unwrap(),
+        );
+        assert_eq!(updates[1]["sessionUpdate"], "tool_call");
+        assert_eq!(updates[2]["content"]["text"], "original live text");
     }
 
     #[test]
