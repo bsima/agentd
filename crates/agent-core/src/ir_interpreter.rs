@@ -2111,34 +2111,47 @@ async fn execute_instr(
                     Err(err) => host_answer = Some(Err(err)),
                 }
             }
-            // A mode switch validates through its registered handler BEFORE
-            // asking for consent. The handler has no side effects; the ACP
-            // driver applies the approved mode only after the turn completes.
-            if name == "switch_mode" {
-                let validated = match config.tools.get(&name) {
-                    Some(tool) => tool.handler.call(arguments.clone()).await,
-                    None => Err(anyhow!("switch_mode is not available in this mode")),
+            // Only an explicitly registered mode tool requests consent. Its
+            // pure validator builds the preview before the gate; the handler
+            // executes once, after approval (never during validation).
+            if let Some(validator) = config
+                .tools
+                .get(&name)
+                .and_then(|tool| tool.mode_consent.as_ref())
+            {
+                // A resumed effect was validated before its pause; the gate
+                // uses the saved resolution, not this request preview.
+                let request = if config
+                    .approvals
+                    .resolutions
+                    .contains_key(&location.effect_id.0)
+                {
+                    Ok(Value::Null)
+                } else {
+                    validator(&arguments)
                 };
-                if let Ok(result) = &validated {
-                    match approval_gate(
-                        config,
-                        ir_replay,
-                        &location,
-                        crate::approval::ApprovalKind::Mode,
-                        result.clone(),
-                        true,
-                    )
-                    .await?
-                    {
-                        GateOutcome::Proceed => {}
-                        GateOutcome::Deny(denial) => {
-                            machine.env.insert(out, denial);
-                            return Ok(None);
+                match request {
+                    Ok(request) => {
+                        match approval_gate(
+                            config,
+                            ir_replay,
+                            &location,
+                            crate::approval::ApprovalKind::Mode,
+                            request,
+                            true,
+                        )
+                        .await?
+                        {
+                            GateOutcome::Proceed => {}
+                            GateOutcome::Deny(denial) => {
+                                machine.env.insert(out, denial);
+                                return Ok(None);
+                            }
+                            GateOutcome::Pause(pending) => return Ok(Some(pending)),
                         }
-                        GateOutcome::Pause(pending) => return Ok(Some(pending)),
                     }
+                    Err(err) => host_answer = Some(Err(err)),
                 }
-                host_answer = Some(validated);
             }
             let op_id = config.trace.next_op_id();
             config

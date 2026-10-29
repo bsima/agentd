@@ -3143,6 +3143,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_mode_name_is_an_ordinary_native_tool_without_explicit_consent() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let tool = crate::tool::NativeTool::from_fn(
+            "switch_mode",
+            "host tool",
+            serde_json::json!({"type":"object"}),
+            move |_| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({"host":"ok"}))
+                }
+            },
+        );
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "switch_mode",
+                    serde_json::json!({}),
+                )],
+            ),
+            response("done", vec![]),
+        ]));
+        let trace = test_trace();
+        let path = trace.path().clone();
+        let config = native_tool_config(provider, trace, tool);
+        let machine = agent_loop_ir_with_tools(
+            Model("mock".into()),
+            vec![ChatMessage::user("go")],
+            4,
+            false,
+            &["switch_mode".into()],
+        );
+        let _ = crate::ir_interpreter::run_ir_sequential(&config, machine).await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!TraceLogger::read_events(&path)
+            .await?
+            .iter()
+            .any(|event| matches!(event, Event::ApprovalRequested { .. })));
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_mode_consent_validates_once_and_executes_once_after_approval() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let validations = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut tool = crate::tool::NativeTool::from_fn(
+            "switch_mode",
+            "ACP tool",
+            serde_json::json!({"type":"object"}),
+            move |_| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({"mode":"ask"}))
+                }
+            },
+        );
+        let validated = validations.clone();
+        tool.mode_consent = Some(Arc::new(move |_| {
+            validated.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"mode":"ask", "name":"Ask", "current":"work"}))
+        }));
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "switch_mode",
+                    serde_json::json!({"mode":"ask"}),
+                )],
+            ),
+            response("done", vec![]),
+        ]));
+        let mut config = native_tool_config(provider, test_trace(), tool);
+        let options = AgentLoopOptions {
+            tool_names: vec!["switch_mode".into()],
+            ..Default::default()
+        };
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let mut gc = GcState::default();
+        let outcome = run_agent_loop_outcome(
+            &config,
+            &mut store,
+            None,
+            &mut gc,
+            Model("mock".into()),
+            vec![ChatMessage::user("go")],
+            4,
+            &options,
+            BTreeMap::new(),
+        )
+        .await?;
+        let AgentLoopOutcome::AwaitingApproval {
+            checkpoint,
+            pending,
+        } = outcome
+        else {
+            panic!("expected mode consent")
+        };
+        assert_eq!(pending.kind, crate::approval::ApprovalKind::Mode);
+        assert_eq!(pending.request["name"], "Ask");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        config.approvals.resolutions.insert(
+            pending.effect.effect_id.0,
+            crate::approval::ApprovalResolution {
+                decision: crate::approval::ApprovalDecision::Approve,
+                resolved_by: Some("test".into()),
+                reason: None,
+                answer: None,
+            },
+        );
+        store = checkpoint.store;
+        let outcome = resume_agent_loop_outcome(
+            &config,
+            &mut store,
+            &mut gc,
+            Model("mock".into()),
+            4,
+            &options,
+            checkpoint.machine,
+        )
+        .await?;
+        assert!(matches!(outcome, AgentLoopOutcome::Complete { .. }));
+        assert_eq!(
+            validations.load(Ordering::SeqCst),
+            1,
+            "validation runs once before the pause"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn agent_loop_ir_native_tool_replays_by_effect_id_without_invoking_handler() -> Result<()>
     {
         // Record a run with a live handler...

@@ -260,7 +260,11 @@ allow-always. A pending ACP `tool_call` of kind `switch_mode` titled "Switch to
 permission kind `mode`. Approval returns a tool result saying the switch takes
 effect after this turn; the actor then applies the same policy, persistence,
 and `current_mode_update` as `session/set_mode`. Rejection is a typed denial
-and the turn continues; cancellation ends the turn. The trace records the
+and the turn continues; a rejection clears any earlier approved switch in
+the same turn, while a later approval replaces it. Cancellation ends the turn.
+Only the ACP-registered tool is consent-gated (not other native tools with the
+same name); pure validation happens once before consent and its handler runs
+once after approval. The trace records the
 approval request/resolution and tool result: IR replay does not prompt, and
 `session/load` renders the resolved card through the live bridge.
 

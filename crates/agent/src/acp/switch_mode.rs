@@ -1,5 +1,5 @@
-//! Profile-scoped mode switch: validation is a native tool handler, but the
-//! interpreter gates its validated result before returning it to the model.
+//! Profile-scoped mode switch: pure validation builds the consent request;
+//! the native handler runs once after approval.
 use agent_core::NativeTool;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -31,14 +31,16 @@ pub(super) fn target(arguments: &Value, current: &str, profiles: &Profiles) -> R
 
 pub(super) fn tool(current: &str, profiles: &Profiles) -> NativeTool {
     let current = current.to_owned();
-    let modes = profiles.0.clone();
-    NativeTool::from_fn(
+    let profiles = profiles.0.clone();
+    let validate_current = current.clone();
+    let validate_profiles = profiles.clone();
+    let mut tool = NativeTool::from_fn(
         TOOL,
         agent_core::guidance::SWITCH_MODE_TOOL_DESCRIPTION,
         json!({"type":"object", "properties":{"mode":{"type":"string", "description":"id of an advertised mode"}}, "required":["mode"]}),
         move |arguments| {
             let current = current.clone();
-            let profiles = Profiles(modes.clone());
+            let profiles = Profiles(profiles.clone());
             async move {
                 let request = target(&arguments, &current, &profiles)?;
                 Ok(
@@ -46,7 +48,15 @@ pub(super) fn tool(current: &str, profiles: &Profiles) -> NativeTool {
                 )
             }
         },
-    )
+    );
+    tool.mode_consent = Some(std::sync::Arc::new(move |arguments| {
+        target(
+            arguments,
+            &validate_current,
+            &Profiles(validate_profiles.clone()),
+        )
+    }));
+    tool
 }
 
 #[cfg(test)]

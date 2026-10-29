@@ -159,6 +159,9 @@ where
     }
 }
 
+/// Pure request validation for a consent-gated mode tool.
+pub type ModeConsentValidator = Arc<dyn Fn(&Value) -> Result<Value> + Send + Sync>;
+
 /// A registered native tool: the spec advertised to the model plus the
 /// handler the interpreter dispatches to. Cloning shares the handler.
 #[derive(Clone)]
@@ -169,6 +172,9 @@ pub struct NativeTool {
     /// `parameters` object).
     pub parameters: Value,
     pub handler: Arc<dyn ToolHandler>,
+    /// Pure request builder for an explicitly consent-gated mode tool.
+    /// Ordinary native tools (regardless of name) have no mode gate.
+    pub mode_consent: Option<ModeConsentValidator>,
 }
 
 impl std::fmt::Debug for NativeTool {
@@ -177,6 +183,7 @@ impl std::fmt::Debug for NativeTool {
             .field("name", &self.name)
             .field("description", &self.description)
             .field("parameters", &self.parameters)
+            .field("mode_consent", &self.mode_consent.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -193,6 +200,7 @@ impl NativeTool {
             description: description.into(),
             parameters,
             handler,
+            mode_consent: None,
         }
     }
 

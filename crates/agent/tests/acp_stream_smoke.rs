@@ -46,6 +46,7 @@ data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
 data: [DONE]\n\n";
 
 const MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_mode\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"ask\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+const YOLO_MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_yolo\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"yolo\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
 const CURRENT_MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_mode\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"work\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
 const UNKNOWN_MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_mode\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"absent\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
 
@@ -1277,6 +1278,56 @@ fn switch_mode_rejection_and_invalid_target_do_not_change_mode() {
                 "{result}"
             );
         }
+    }
+}
+
+#[test]
+fn latest_mode_decision_wins_within_a_turn() {
+    for (second, expected) in [("reject-once", "work"), ("allow-once", "yolo")] {
+        let root = temp_root("switch-latest");
+        mode_profile(&root, "switch_mode");
+        let port = spawn_mock_sse_server(vec![MODE_TURN, YOLO_MODE_TURN, DONE_TURN]);
+        let mut client = AcpClient::start(&root, port);
+        let sid = client.handshake_and_new_session(root.to_str().unwrap());
+        select_mode(&mut client, &sid);
+        client.prompt(4, &sid, "choose");
+        let mut updates = Vec::new();
+        let mut count = 0;
+        loop {
+            let mut line = String::new();
+            assert!(client.reader.read_line(&mut line).unwrap() > 0);
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match frame["method"].as_str() {
+                Some("session/update") => updates.push(frame["params"].clone()),
+                Some("session/request_permission") => {
+                    let option = if count == 0 { "allow-once" } else { second };
+                    count += 1;
+                    client.send(&format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"outcome":{{"outcome":"selected","optionId":"{option}"}}}}}}"#, frame["id"]));
+                }
+                _ if frame["id"] == 4 => {
+                    assert_eq!(frame["result"]["stopReason"], "end_turn");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(count, 2);
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| u["update"]["sessionUpdate"] == "current_mode_update")
+                .count(),
+            usize::from(expected == "yolo")
+        );
+        // The turn's final mode is independently observable through session/load.
+        drop(client);
+        let port = spawn_mock_sse_server(vec![]);
+        let mut client = AcpClient::start(&root, port);
+        client.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#);
+        client.read_until_response(1, None);
+        client.send(&format!(r#"{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{sid}","cwd":"{}","mcpServers":[]}}}}"#, root.display()));
+        let (loaded, _, _) = client.read_until_response(2, None);
+        assert_eq!(loaded["result"]["modes"]["currentModeId"], expected);
     }
 }
 

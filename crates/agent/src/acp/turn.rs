@@ -115,6 +115,7 @@ pub(crate) async fn run_acp_turn(
                             (ApprovalDecision::Approve, None)
                         }
                         PermissionReply::Reject | PermissionReply::AllowAlways => {
+                            approved_mode = None;
                             (ApprovalDecision::Deny, None)
                         }
                         PermissionReply::Cancelled => return Ok(TurnOutcome::Cancelled),
