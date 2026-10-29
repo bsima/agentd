@@ -782,6 +782,11 @@ sessions):
 > dismisses the question, proceed on your best judgment or stop and
 > explain.
 
+`switch_mode` (t-1653.10 — offered only by an ACP profile with
+`tools: [switch_mode]`; constant `SWITCH_MODE_TOOL_DESCRIPTION`):
+
+> Request the user’s consent to switch to another advertised mode. Use it when work needs a different mode; the permission prompt is the consent, so do not ask separately. If approved, the switch takes effect after this turn: end your turn without acting under the new mode. If denied, respect the decision and do not retry.
+
 `todo` (t-1653.2 — offered only with `--todo`; constant
 `TODO_TOOL_DESCRIPTION`):
 

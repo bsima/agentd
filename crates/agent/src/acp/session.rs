@@ -139,7 +139,18 @@ pub(crate) async fn session_actor(
                         // turn enqueued must reach the connection first.
                         flush_updates(&update_tx).await;
                         match result {
-                            Ok(TurnOutcome::Done(response)) => {
+                            Ok(TurnOutcome::Done(response, approved_mode)) => {
+                                if let Some(id) = approved_mode {
+                                    if let Err(err) = apply_mode(&mut runtime, &id, &profiles) {
+                                        tracing::error!(%err, "applying approved ACP mode");
+                                    } else {
+                                        crate::persist_session(&mut runtime).await;
+                                        let _ = cx.send_notification(SessionNotification::new(
+                                            session_id.clone(),
+                                            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::new(id))),
+                                        ));
+                                    }
+                                }
                                 let stop_reason = if response_turn_budget_exhausted(&response) {
                                     StopReason::MaxTurnRequests
                                 } else {
@@ -463,6 +474,13 @@ fn apply_mode(runtime: &mut Runtime, id: &str, profiles: &super::profiles::Profi
                 .tools
                 .register(agent_core::todo::todo_tool())?;
         }
+    }
+    runtime.config.tools.unregister(super::switch_mode::TOOL);
+    if profile.is_some_and(|p| p.tools.iter().any(|tool| tool == super::switch_mode::TOOL)) {
+        runtime
+            .config
+            .tools
+            .register(super::switch_mode::tool(id, profiles))?;
     }
     runtime.acp_mode_prompt = None;
     runtime.acp_shell_always = false;

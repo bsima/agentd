@@ -2111,6 +2111,35 @@ async fn execute_instr(
                     Err(err) => host_answer = Some(Err(err)),
                 }
             }
+            // A mode switch validates through its registered handler BEFORE
+            // asking for consent. The handler has no side effects; the ACP
+            // driver applies the approved mode only after the turn completes.
+            if name == "switch_mode" {
+                let validated = match config.tools.get(&name) {
+                    Some(tool) => tool.handler.call(arguments.clone()).await,
+                    None => Err(anyhow!("switch_mode is not available in this mode")),
+                };
+                if let Ok(result) = &validated {
+                    match approval_gate(
+                        config,
+                        ir_replay,
+                        &location,
+                        crate::approval::ApprovalKind::Mode,
+                        result.clone(),
+                        true,
+                    )
+                    .await?
+                    {
+                        GateOutcome::Proceed => {}
+                        GateOutcome::Deny(denial) => {
+                            machine.env.insert(out, denial);
+                            return Ok(None);
+                        }
+                        GateOutcome::Pause(pending) => return Ok(Some(pending)),
+                    }
+                }
+                host_answer = Some(validated);
+            }
             let op_id = config.trace.next_op_id();
             config
                 .trace
@@ -2373,11 +2402,12 @@ async fn approval_gate(
     };
     // A question needs an answer, which the hook's approve/deny verdict
     // cannot carry: questions always pause for a host that can ask.
-    let hook = config
-        .approvals
-        .hook
-        .as_ref()
-        .filter(|_| kind != crate::approval::ApprovalKind::Question);
+    let hook = config.approvals.hook.as_ref().filter(|_| {
+        !matches!(
+            kind,
+            crate::approval::ApprovalKind::Question | crate::approval::ApprovalKind::Mode
+        )
+    });
     if let Some(hook) = hook {
         let decision = hook(&pending);
         config

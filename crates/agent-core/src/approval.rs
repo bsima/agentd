@@ -58,6 +58,8 @@ pub enum ApprovalKind {
     /// of the options), `Deny` means "dismissed". The in-process hook is
     /// never consulted — it can approve or deny but cannot answer.
     Question,
+    /// Consent to a mode change; never satisfied by an approval hook.
+    Mode,
 }
 
 impl ApprovalKind {
@@ -66,6 +68,7 @@ impl ApprovalKind {
             Self::Eval => "eval",
             Self::Store => "store",
             Self::Question => "question",
+            Self::Mode => "mode",
         }
     }
 }
@@ -256,7 +259,9 @@ pub(crate) fn denied_value_for(
 ) -> Value {
     match kind {
         ApprovalKind::Question => dismissal_value(pending_id, resolved_by),
-        ApprovalKind::Eval | ApprovalKind::Store => denial_value(pending_id, resolved_by, reason),
+        ApprovalKind::Eval | ApprovalKind::Store | ApprovalKind::Mode => {
+            denial_value(pending_id, resolved_by, reason)
+        }
     }
 }
 

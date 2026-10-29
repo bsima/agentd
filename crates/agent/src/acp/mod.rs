@@ -15,6 +15,7 @@ mod profiles;
 mod registry;
 mod replay;
 mod session;
+mod switch_mode;
 mod todo;
 mod turn;
 

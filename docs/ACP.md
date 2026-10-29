@@ -156,7 +156,7 @@ the wire.
   `name` defaults to the id, `description` is optional, and
   `shell_approval` is `ask` (default; honors allow-always), `always`
   (prompt for every command; never remember allow-always), or `never`
-  (ungated). `tools` is an optional list of opt-in tool names (`todo` is
+  (ungated). `tools` is an optional list of opt-in tool names (`todo` and `switch_mode` are
   registered). Unknown
   names, invalid YAML/policy, and built-in id collisions fail startup.
   Mode instructions are turn-local system context, not saved conversation
@@ -167,11 +167,10 @@ the wire.
 - Plan profile — copy `examples/modes/plan.md` to
   `~/.config/agent/modes/plan.md` (create the directory first), then restart
   `agent --acp`. Paseo recognizes the `plan` id as its Plan toggle; Off
-  selects `ask`. The profile offers `todo`, asks permission for every shell
-  command, and instructs read-only investigation. The model asks the user
-  whether to implement or revise; on Implement it requests a manual switch
-  to `ask` before any edits. Agent-initiated, consent-gated mode switching
-  remains a follow-up; no answer text is treated as authority to switch modes.
+  selects `ask`. The profile offers `todo` and `switch_mode`, asks permission
+  for every shell command, and instructs read-only investigation. Once ready
+  to proceed, the model requests a consent-gated switch to `ask`; edits wait
+  until the next turn.
 - Config options — applied between turns via `session/set_config_option`.
   Paseo 0.12 uses categorized `select` options for its model picker and
   thinking control; it does **not** render arbitrary generic ACP options
@@ -244,6 +243,26 @@ IR replay of that trace reproduces an answered turn without asking again
 (pinned by agent-core's `ask_user_turn_replays_from_the_trace`).
 Offering the tool adds a dispatch arm to the loop program, so ACP turns
 hash differently from CLI turns; the CLI's program is unchanged.
+
+## Mode switches (`switch_mode`)
+
+Profiles opt in with `tools: [switch_mode]`; built-in modes and profiles that
+omit it do not offer the tool. `switch_mode {"mode":"<id>"}` accepts any
+advertised mode other than the current one. Unknown or current ids produce a
+recoverable tool error without prompting. CLI/FIFO/supervisor runs never offer
+it. The tool description tells the model when to switch, to end its turn after
+approval, and to respect a rejection.
+
+Every valid call pauses for explicit consent, even in `yolo` or after shell
+allow-always. A pending ACP `tool_call` of kind `switch_mode` titled "Switch to
+<name> mode" precedes `session/request_permission` with "Switch to <name>"
+(`allow_once`) and "Stay in <current>" (`reject_once`). Paseo maps this to
+permission kind `mode`. Approval returns a tool result saying the switch takes
+effect after this turn; the actor then applies the same policy, persistence,
+and `current_mode_update` as `session/set_mode`. Rejection is a typed denial
+and the turn continues; cancellation ends the turn. The trace records the
+approval request/resolution and tool result: IR replay does not prompt, and
+`session/load` renders the resolved card through the live bridge.
 
 ## Streaming
 

@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 use crate::{agent_loop_options, finish_turn, Runtime};
 
 pub(crate) enum TurnOutcome {
-    Done(Box<agent_core::Response>),
+    Done(Box<agent_core::Response>, Option<String>),
     /// The client answered a permission request with `cancelled` (part of
     /// the session/cancel contract): the turn ends with no response.
     Cancelled,
@@ -74,6 +74,7 @@ pub(crate) async fn run_acp_turn(
     // `allow always` stops gating future turns (program-level) AND skips
     // further prompts within this turn's already-gated program.
     let mut allow_all = false;
+    let mut approved_mode = None;
     let mut outcome = agent_core::run_agent_loop_outcome(
         &runtime.config,
         &mut runtime.ir_store,
@@ -92,9 +93,10 @@ pub(crate) async fn run_acp_turn(
                 return Err(anyhow::anyhow!("ACP does not support signal suspension"));
             }
             agent_core::AgentLoopOutcome::Complete { value, machine } => {
-                return Ok(TurnOutcome::Done(Box::new(
-                    finish_turn(runtime, value, machine, prompt).await?,
-                )));
+                return Ok(TurnOutcome::Done(
+                    Box::new(finish_turn(runtime, value, machine, prompt).await?),
+                    approved_mode,
+                ));
             }
             agent_core::AgentLoopOutcome::AwaitingApproval {
                 checkpoint,
@@ -102,7 +104,22 @@ pub(crate) async fn run_acp_turn(
             } => {
                 // A question always reaches the user: `allow always` is a
                 // verdict on shell commands and cannot pick an answer.
-                let (decision, answer) = if pending.kind == ApprovalKind::Question {
+                let (decision, answer) = if pending.kind == ApprovalKind::Mode {
+                    match request_mode_permission(cx, session_id, &pending).await? {
+                        PermissionReply::AllowOnce => {
+                            approved_mode = pending
+                                .request
+                                .get("mode")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned);
+                            (ApprovalDecision::Approve, None)
+                        }
+                        PermissionReply::Reject | PermissionReply::AllowAlways => {
+                            (ApprovalDecision::Deny, None)
+                        }
+                        PermissionReply::Cancelled => return Ok(TurnOutcome::Cancelled),
+                    }
+                } else if pending.kind == ApprovalKind::Question {
                     match ask_question(cx, session_id, &pending).await? {
                         QuestionReply::Answer(answer) => (ApprovalDecision::Approve, Some(answer)),
                         QuestionReply::Dismissed => (ApprovalDecision::Deny, None),
@@ -205,6 +222,61 @@ async fn request_permission(
         },
         RequestPermissionOutcome::Cancelled => PermissionReply::Cancelled,
         // Non-exhaustive enum: any future outcome fails safe.
+        _ => PermissionReply::Reject,
+    })
+}
+
+/// A single allow_once option avoids Paseo's chooser semantics and never
+/// inherits shell's allow-always or yolo bypass.
+fn mode_permission_request(
+    session_id: &SessionId,
+    pending: &agent_core::ApprovalRequest,
+) -> RequestPermissionRequest {
+    let name = pending.request["name"].as_str().unwrap_or("requested");
+    let current = pending.request["current"].as_str().unwrap_or("current");
+    let title = format!("Switch to {name} mode");
+    RequestPermissionRequest::new(
+        session_id.clone(),
+        ToolCallUpdate::new(
+            ToolCallId::new(pending.effect.effect_id.0.clone()),
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::SwitchMode)
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .raw_input(pending.request.clone()),
+        ),
+        vec![
+            PermissionOption::new(
+                "allow-once",
+                format!("Switch to {name}"),
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                "reject-once",
+                format!("Stay in {current}"),
+                PermissionOptionKind::RejectOnce,
+            ),
+        ],
+    )
+}
+
+async fn request_mode_permission(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    pending: &agent_core::ApprovalRequest,
+) -> Result<PermissionReply> {
+    let response = cx
+        .send_request(mode_permission_request(session_id, pending))
+        .block_task()
+        .await
+        .map_err(|err| anyhow!("session/request_permission failed: {err}"))?;
+    Ok(match response.outcome {
+        RequestPermissionOutcome::Selected(selected)
+            if selected.option_id.0.as_ref() == "allow-once" =>
+        {
+            PermissionReply::AllowOnce
+        }
+        RequestPermissionOutcome::Cancelled => PermissionReply::Cancelled,
         _ => PermissionReply::Reject,
     })
 }

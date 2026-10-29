@@ -41,7 +41,7 @@ pub(crate) struct Profile {
 pub(crate) struct Profiles(pub BTreeMap<String, Profile>);
 
 // ask_user is always on in ACP; zoom depends on the GC strategy.
-const OPT_IN_TOOLS: &[&str] = &[agent_core::todo::TODO_TOOL];
+const OPT_IN_TOOLS: &[&str] = &[agent_core::todo::TODO_TOOL, super::switch_mode::TOOL];
 
 impl Profiles {
     pub fn get(&self, id: &str) -> Option<&Profile> {
@@ -135,7 +135,7 @@ mod tests {
         .unwrap();
         let profiles = Profiles::load(Some(&dir)).unwrap();
         let plan = profiles.get("plan").unwrap();
-        assert_eq!(plan.tools, ["todo"]);
+        assert_eq!(plan.tools, ["todo", "switch_mode"]);
         assert_eq!(plan.shell_approval, ShellApproval::Always);
         std::fs::remove_dir_all(dir).unwrap();
     }

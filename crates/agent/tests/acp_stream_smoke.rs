@@ -45,6 +45,10 @@ const ASK_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
 data: [DONE]\n\n";
 
+const MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_mode\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"ask\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+const CURRENT_MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_mode\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"work\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+const UNKNOWN_MODE_TURN: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_mode\",\"function\":{\"name\":\"switch_mode\",\"arguments\":\"{\\\"mode\\\":\\\"absent\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
 /// Permission-option marker: answer the request with the `cancelled`
 /// outcome instead of selecting an option.
 const CANCEL_PERMISSION: &str = "<cancelled>";
@@ -1175,4 +1179,121 @@ fn native_reasoning_deltas_arrive_as_thought_chunks() {
         "{updates:?}"
     );
     assert!(chunk_texts(&updates).contains(&"done"));
+}
+
+fn mode_profile(root: &std::path::Path, tools: &str) {
+    let dir = root.join("config/agent/modes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("work.md"),
+        format!("---\nname: Work\nshell_approval: never\ntools: [{tools}]\n---\nWork."),
+    )
+    .unwrap();
+}
+
+fn select_mode(client: &mut AcpClient, sid: &str) {
+    client.send(&format!(r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{{"sessionId":"{sid}","modeId":"work"}}}}"#));
+    let (response, _, _) = client.read_until_response(3, None);
+    assert!(response.get("result").is_some(), "{response}");
+}
+
+#[test]
+fn switch_mode_requires_consent_then_applies_after_turn_and_survives_load() {
+    let root = temp_root("switch-mode");
+    mode_profile(&root, "switch_mode");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![MODE_TURN, DONE_TURN]);
+    let sid;
+    {
+        let mut client = AcpClient::start(&root, port);
+        sid = client.handshake_and_new_session(root.to_str().unwrap());
+        select_mode(&mut client, &sid);
+        client.prompt(4, &sid, "proceed");
+        let (response, updates, permissions) = client.read_until_response(4, Some("allow-once"));
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        assert_eq!(permissions.len(), 1, "ungated shell mode must still ask");
+        assert_eq!(permissions[0]["toolCall"]["kind"], "switch_mode");
+        assert_eq!(permissions[0]["options"][0]["kind"], "allow_once");
+        assert_eq!(permissions[0]["options"][1]["kind"], "reject_once");
+        let position = |kind: &str| {
+            updates
+                .iter()
+                .position(|u| u["update"]["sessionUpdate"] == kind)
+                .unwrap()
+        };
+        assert!(position("tool_call") < position("current_mode_update"));
+        assert!(requests.lock().unwrap()[1].contains("switch_mode"));
+    }
+    let port = spawn_mock_sse_server(vec![DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    client.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#);
+    client.read_until_response(1, None);
+    client.send(&format!(r#"{{"jsonrpc":"2.0","id":2,"method":"session/load","params":{{"sessionId":"{sid}","cwd":"{}","mcpServers":[]}}}}"#, root.display()));
+    let (loaded, updates, _) = client.read_until_response(2, None);
+    assert_eq!(loaded["result"]["modes"]["currentModeId"], "ask");
+    assert!(updates.iter().any(
+        |u| u["update"]["sessionUpdate"] == "tool_call" && u["update"]["kind"] == "switch_mode"
+    ));
+    client.prompt(3, &sid, "continue");
+    let (response, _, _) = client.read_until_response(3, None);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+}
+
+#[test]
+fn switch_mode_rejection_and_invalid_target_do_not_change_mode() {
+    for (body, option, expected_prompts) in [
+        (MODE_TURN, "reject-once", 1),
+        (UNKNOWN_MODE_TURN, "reject-once", 0),
+        (CURRENT_MODE_TURN, "reject-once", 0),
+    ] {
+        let root = temp_root("switch-reject");
+        mode_profile(&root, "switch_mode");
+        let (port, requests) = spawn_recording_mock_sse_server(vec![body, DONE_TURN]);
+        let mut client = AcpClient::start(&root, port);
+        let sid = client.handshake_and_new_session(root.to_str().unwrap());
+        select_mode(&mut client, &sid);
+        client.prompt(4, &sid, "proceed");
+        let (response, updates, permissions) = client.read_until_response(4, Some(option));
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        assert_eq!(permissions.len(), expected_prompts);
+        assert!(!updates
+            .iter()
+            .any(|u| u["update"]["sessionUpdate"] == "current_mode_update"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let body: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[1]).unwrap();
+        let result = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tool_call_id"] == "call_mode")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        if expected_prompts == 1 {
+            assert!(result.contains("denied"), "{result}");
+        } else {
+            assert!(
+                result.contains("error")
+                    && (result.contains("unknown") || result.contains("already")),
+                "{result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn switch_mode_is_not_offered_without_profile_opt_in() {
+    let root = temp_root("switch-unoffered");
+    mode_profile(&root, "");
+    let (port, requests) = spawn_recording_mock_sse_server(vec![DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let sid = client.handshake_and_new_session(root.to_str().unwrap());
+    select_mode(&mut client, &sid);
+    client.prompt(4, &sid, "hello");
+    client.read_until_response(4, None);
+    let body: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
+    assert!(!body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "switch_mode"));
 }

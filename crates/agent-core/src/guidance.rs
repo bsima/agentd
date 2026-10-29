@@ -542,6 +542,9 @@ pub fn runtime_guidance_section(content: String) -> crate::prompt_ir::Section {
     )
 }
 
+/// Opt-in ACP mode switching: consent is required even in yolo mode.
+pub const SWITCH_MODE_TOOL_DESCRIPTION: &str = "Request the user’s consent to switch to another advertised mode. Use it when work needs a different mode; the permission prompt is the consent, so do not ask separately. If approved, the switch takes effect after this turn: end your turn without acting under the new mode. If denied, respect the decision and do not retry.";
+
 #[cfg(test)]
 mod tests {
     use super::*;

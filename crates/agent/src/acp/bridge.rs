@@ -77,6 +77,7 @@ fn effect_id(effect: &Option<Box<agent_core::EffectLocation>>) -> Option<&str> {
 fn tool_kind(name: &str) -> ToolKind {
     match name {
         "recall" => ToolKind::Search,
+        "switch_mode" => ToolKind::SwitchMode,
         _ => ToolKind::Other,
     }
 }
@@ -346,6 +347,14 @@ pub(crate) fn map_event(
                     .get("question")
                     .and_then(|value| value.as_str())
                     .map_or_else(|| name.clone(), |question| question.trim().to_owned())
+            } else if name == "switch_mode" {
+                format!(
+                    "Switch to {} mode",
+                    arguments
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("requested")
+                )
             } else {
                 name.clone()
             };
@@ -367,6 +376,11 @@ pub(crate) fn map_event(
                 .status(ToolCallStatus::Completed)
                 .raw_output(result.clone());
             // Show the user's chosen answer under the question.
+            if name == "switch_mode" {
+                if let Some(message) = result.get("message").and_then(|v| v.as_str()) {
+                    fields = fields.content(vec![tool_text(message)]);
+                }
+            }
             if let (true, Some(answer)) = (name == agent_core::ASK_USER_TOOL, result.as_str()) {
                 fields = fields.content(vec![tool_text(answer)]);
             }
@@ -478,6 +492,18 @@ pub(crate) fn map_event(
                         .raw_input(request.clone()),
                 )];
             }
+            if kind == "mode" {
+                let name = request
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("requested");
+                return vec![SessionUpdate::ToolCall(
+                    ToolCall::new(id, format!("Switch to {name} mode"))
+                        .kind(ToolKind::SwitchMode)
+                        .status(ToolCallStatus::Pending)
+                        .raw_input(request.clone()),
+                )];
+            }
             let title = request
                 .get("command")
                 .and_then(|value| value.as_str())
@@ -504,6 +530,9 @@ pub(crate) fn map_event(
                 fields = fields.status(ToolCallStatus::InProgress);
             } else {
                 fields = fields.status(ToolCallStatus::Failed);
+                if kind == "mode" {
+                    fields = fields.content(vec![tool_text("Mode switch rejected")]);
+                }
                 if kind == "question" {
                     fields = fields.content(vec![tool_text("Dismissed")]);
                 }
