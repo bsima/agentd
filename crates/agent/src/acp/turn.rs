@@ -223,6 +223,11 @@ fn approved_mode_for_turn(
             };
             if agent_core::is_denial_value(&result) {
                 target = None;
+            } else if result.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                // A structured tool error (unknown or current mode) never
+                // reached the gate; like a plain-text error it does not
+                // decide the mode or clear an earlier approval.
+                continue;
             } else if result.get("mode").and_then(|mode| mode.as_str()) == Some(requested)
                 && replay.map_or_else(
                     || live_approvals.contains(*requested),
@@ -512,6 +517,27 @@ mod tests {
         add(&mut history, "yolo", "third", true);
         assert_eq!(
             approved_mode_for_turn(&machine(&history), user.id, &live, None)
+                .unwrap()
+                .as_deref(),
+            Some("yolo")
+        );
+        // A later invalid call returns a structured tool error; it must not
+        // discard the earlier approved target.
+        let mut with_invalid = history.clone();
+        with_invalid.push(ChatMessage::assistant(
+            None,
+            vec![agent_core::ToolCall::new(
+                "fourth",
+                "switch_mode",
+                serde_json::json!({"mode":"nope"}),
+            )],
+        ));
+        with_invalid.push(ChatMessage::tool(
+            "fourth",
+            serde_json::json!({"ok": false, "error": "unknown mode \"nope\""}).to_string(),
+        ));
+        assert_eq!(
+            approved_mode_for_turn(&machine(&with_invalid), user.id, &live, None)
                 .unwrap()
                 .as_deref(),
             Some("yolo")
