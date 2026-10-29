@@ -3276,10 +3276,110 @@ mod tests {
         assert!(matches!(outcome, AgentLoopOutcome::Complete { .. }));
         assert_eq!(
             validations.load(Ordering::SeqCst),
-            1,
-            "validation runs once before the pause"
+            2,
+            "validation runs again on resume to preserve the approval request"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approved_mode_turn_replays_from_the_trace_without_prompt() -> Result<()> {
+        let trace = test_trace();
+        let path = trace.path().clone();
+        let tool = || {
+            let mut tool = crate::tool::NativeTool::from_fn(
+                "switch_mode",
+                "ACP tool",
+                serde_json::json!({"type":"object"}),
+                |_| async { Ok(serde_json::json!({"mode":"ask", "name":"Ask", "current":"work"})) },
+            );
+            tool.mode_consent = Some(Arc::new(|_| {
+                Ok(serde_json::json!({"mode":"ask", "name":"Ask", "current":"work"}))
+            }));
+            tool
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            response(
+                "",
+                vec![ToolCall::new(
+                    "call-mode",
+                    "switch_mode",
+                    serde_json::json!({"mode":"ask"}),
+                )],
+            ),
+            response("done", vec![]),
+        ]));
+        let mut config = native_tool_config(provider, trace, tool());
+        let options = AgentLoopOptions {
+            tool_names: vec!["switch_mode".into()],
+            ..Default::default()
+        };
+        let mut store = crate::ir_interpreter::InMemoryStore::new();
+        let mut gc = GcState::default();
+        let outcome = run_agent_loop_outcome(
+            &config,
+            &mut store,
+            None,
+            &mut gc,
+            Model("mock".into()),
+            vec![ChatMessage::user("go")],
+            4,
+            &options,
+            BTreeMap::new(),
+        )
+        .await?;
+        let AgentLoopOutcome::AwaitingApproval {
+            checkpoint,
+            pending,
+        } = outcome
+        else {
+            panic!("expected mode consent, got {outcome:?}");
+        };
+        config.approvals.resolutions.insert(
+            pending.effect.effect_id.0,
+            crate::approval::ApprovalResolution {
+                decision: crate::approval::ApprovalDecision::Approve,
+                resolved_by: Some("test".into()),
+                reason: None,
+                answer: None,
+            },
+        );
+        store = checkpoint.store;
+        let resumed = resume_agent_loop_outcome(
+            &config,
+            &mut store,
+            &mut gc,
+            Model("mock".into()),
+            4,
+            &options,
+            checkpoint.machine,
+        )
+        .await?;
+        let AgentLoopOutcome::Complete {
+            value: recorded, ..
+        } = resumed
+        else {
+            panic!("expected completion, got {resumed:?}");
+        };
+        let replay = IrReplayTrace::load(&path).await?;
+        let replay_provider = Arc::new(MockProvider::new(vec![]));
+        let replay_config = native_tool_config(replay_provider.clone(), test_trace(), tool());
+        let (replayed, _) = run_agent_loop(
+            &replay_config,
+            &mut crate::ir_interpreter::InMemoryStore::new(),
+            Some(&replay),
+            &mut GcState::default(),
+            Model("mock".into()),
+            vec![ChatMessage::user("go")],
+            4,
+            &options,
+            BTreeMap::new(),
+        )
+        .await?;
+        assert_eq!(replayed, recorded);
+        assert!(replay_provider.prompts().is_empty(), "replay never prompts");
+        std::fs::remove_file(path)?;
         Ok(())
     }
 

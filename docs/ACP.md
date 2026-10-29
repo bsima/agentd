@@ -266,7 +266,9 @@ Only the ACP-registered tool is consent-gated (not other native tools with the
 same name); pure validation happens once before consent and its handler runs
 once after approval. The trace records the
 approval request/resolution and tool result: IR replay does not prompt, and
-`session/load` renders the resolved card through the live bridge.
+`session/load` renders the resolved card through the live bridge. At the turn
+boundary, the last resolved mode decision and its recorded tool result determine
+the new mode in both live and IR-replayed turns (a later denial clears it).
 
 ## Streaming
 

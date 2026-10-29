@@ -1240,6 +1240,56 @@ fn switch_mode_requires_consent_then_applies_after_turn_and_survives_load() {
 }
 
 #[test]
+fn replayed_approved_mode_switch_applies_at_turn_boundary_without_permission() {
+    let root = temp_root("switch-replay");
+    mode_profile(&root, "switch_mode");
+    let port = spawn_mock_sse_server(vec![MODE_TURN, DONE_TURN]);
+    let mut live = AcpClient::start(&root, port);
+    let sid = live.handshake_and_new_session(root.to_str().unwrap());
+    select_mode(&mut live, &sid);
+    live.prompt(4, &sid, "proceed");
+    let (result, _, permissions) = live.read_until_response(4, Some("allow-once"));
+    assert_eq!(result["result"]["stopReason"], "end_turn");
+    assert_eq!(permissions.len(), 1);
+    drop(live);
+
+    let trace = root
+        .join(".local/share/agent/traces")
+        .join(format!("{sid}.jsonl"));
+    assert!(
+        trace.exists(),
+        "recorded trace missing: {}",
+        trace.display()
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_agent"))
+        .arg("--acp")
+        .args(["--model", "test-model"])
+        .arg("--replay-trace")
+        .arg(&trace)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut replay = AcpClient::from_child(child);
+    let sid = replay.handshake_and_new_session(root.to_str().unwrap());
+    select_mode(&mut replay, &sid);
+    replay.prompt(4, &sid, "proceed");
+    let (result, updates, permissions) = replay.read_until_response(4, None);
+    assert_eq!(result["result"]["stopReason"], "end_turn", "{result}");
+    assert!(permissions.is_empty(), "replay must not ask the user");
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["update"]["sessionUpdate"] == "current_mode_update"
+                && u["update"]["currentModeId"] == "ask"),
+        "{updates:?}"
+    );
+}
+
+#[test]
 fn switch_mode_rejection_and_invalid_target_do_not_change_mode() {
     for (body, option, expected_prompts) in [
         (MODE_TURN, "reject-once", 1),

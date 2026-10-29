@@ -74,7 +74,6 @@ pub(crate) async fn run_acp_turn(
     // `allow always` stops gating future turns (program-level) AND skips
     // further prompts within this turn's already-gated program.
     let mut allow_all = false;
-    let mut approved_mode = None;
     let mut outcome = agent_core::run_agent_loop_outcome(
         &runtime.config,
         &mut runtime.ir_store,
@@ -93,10 +92,10 @@ pub(crate) async fn run_acp_turn(
                 return Err(anyhow::anyhow!("ACP does not support signal suspension"));
             }
             agent_core::AgentLoopOutcome::Complete { value, machine } => {
-                return Ok(TurnOutcome::Done(
-                    Box::new(finish_turn(runtime, value, machine, prompt).await?),
-                    approved_mode,
-                ));
+                let response = finish_turn(runtime, value, machine, prompt).await?;
+                let events = agent_core::TraceLogger::read_events(&runtime.trace_path).await?;
+                let approved_mode = approved_mode_for_turn(&events, user_id);
+                return Ok(TurnOutcome::Done(Box::new(response), approved_mode));
             }
             agent_core::AgentLoopOutcome::AwaitingApproval {
                 checkpoint,
@@ -106,16 +105,8 @@ pub(crate) async fn run_acp_turn(
                 // verdict on shell commands and cannot pick an answer.
                 let (decision, answer) = if pending.kind == ApprovalKind::Mode {
                     match request_mode_permission(cx, session_id, &pending).await? {
-                        PermissionReply::AllowOnce => {
-                            approved_mode = pending
-                                .request
-                                .get("mode")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_owned);
-                            (ApprovalDecision::Approve, None)
-                        }
+                        PermissionReply::AllowOnce => (ApprovalDecision::Approve, None),
                         PermissionReply::Reject | PermissionReply::AllowAlways => {
-                            approved_mode = None;
                             (ApprovalDecision::Deny, None)
                         }
                         PermissionReply::Cancelled => return Ok(TurnOutcome::Cancelled),
@@ -165,6 +156,65 @@ pub(crate) async fn run_acp_turn(
             }
         }
     }
+}
+
+/// Use the resolved gate and its recorded tool result as the turn's authority.
+/// A later denial clears an earlier approval; an invalid call does not decide.
+fn approved_mode_for_turn(events: &[agent_core::Event], user_id: uuid::Uuid) -> Option<String> {
+    use agent_core::Event;
+    use std::collections::{HashMap, HashSet};
+
+    let start = events.iter().rposition(|event| {
+        matches!(event,
+            Event::Custom { name, data, .. }
+                if name == "acp_turn_start" && data["user_message_id"] == user_id.to_string()
+        )
+    })?;
+    let mut mode_effects = HashSet::new();
+    let mut approved = HashSet::new();
+    let mut calls = HashMap::new();
+    let mut target = None;
+    for event in &events[start + 1..] {
+        match event {
+            Event::ApprovalRequested { kind, effect, .. } if kind == "mode" => {
+                mode_effects.insert(effect.effect_id.0.clone());
+            }
+            Event::ApprovalResolved {
+                kind,
+                effect_id,
+                decision,
+                ..
+            } if kind == "mode" && mode_effects.contains(effect_id) => {
+                target = None;
+                if decision == "approved" {
+                    approved.insert(effect_id.clone());
+                }
+            }
+            Event::ToolCall {
+                name,
+                op_id,
+                effect: Some(effect),
+                ..
+            } if name == "switch_mode" => {
+                calls.insert(*op_id, effect.effect_id.0.clone());
+            }
+            Event::ToolResult {
+                name,
+                op_id,
+                result,
+                ..
+            } if name == "switch_mode" => {
+                if calls.get(op_id).is_some_and(|id| approved.contains(id)) {
+                    target = result
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                }
+            }
+            _ => {}
+        }
+    }
+    target
 }
 
 enum PermissionReply {
@@ -389,6 +439,85 @@ mod tests {
         crate::strip_mode_message(&mut history, injected.id);
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].id, user_system.id);
+    }
+
+    #[test]
+    fn recorded_mode_results_apply_only_latest_resolved_decision() {
+        use agent_core::Event;
+        let user = ChatMessage::user("go");
+        let mut events = vec![Event::Custom {
+            run_id: "run".into(),
+            name: "acp_turn_start".into(),
+            data: serde_json::json!({"user_message_id": user.id}),
+            timestamp: chrono::Utc::now(),
+        }];
+        let mode_event = |id: &str, approved: bool, op_id: u64, mode: &str| {
+            let machine = agent_core::agent_loop_ir(Model("test-model".into()), vec![], 4);
+            let hash = program_hash(&machine.program).unwrap();
+            let site = EffectSite {
+                block: BlockId(0),
+                instruction_index: 0,
+            };
+            let mut effect =
+                effect_location(hash, EffectKind::Tool, site, DynamicPath::at_entry(0)).unwrap();
+            effect.effect_id.0 = id.into();
+            let now = chrono::Utc::now();
+            vec![
+                Event::ApprovalRequested {
+                    run_id: "run".into(),
+                    pending_id: id.into(),
+                    kind: "mode".into(),
+                    request: serde_json::json!({"mode": mode}),
+                    effect: Box::new(effect.clone()),
+                    timestamp: now,
+                },
+                Event::ApprovalResolved {
+                    run_id: "run".into(),
+                    pending_id: id.into(),
+                    effect_id: id.into(),
+                    kind: "mode".into(),
+                    decision: if approved { "approved" } else { "denied" }.into(),
+                    resolved_by: None,
+                    reason: None,
+                    timestamp: now,
+                },
+                Event::ToolCall {
+                    run_id: "run".into(),
+                    op_id,
+                    parent_op_id: None,
+                    name: "switch_mode".into(),
+                    arguments: serde_json::json!({"mode": mode}),
+                    effect: Some(Box::new(effect)),
+                    timestamp: now,
+                },
+                Event::ToolResult {
+                    run_id: "run".into(),
+                    op_id,
+                    parent_op_id: None,
+                    name: "switch_mode".into(),
+                    result: serde_json::json!({"mode": mode}),
+                    result_preview: String::new(),
+                    duration_ms: 0,
+                    timestamp: now,
+                },
+            ]
+        };
+        events.extend(mode_event("first", true, 1, "ask"));
+        assert_eq!(
+            approved_mode_for_turn(&events, user.id).as_deref(),
+            Some("ask")
+        );
+        events.extend(mode_event("second", false, 2, "yolo"));
+        assert_eq!(approved_mode_for_turn(&events, user.id), None);
+        events.extend(mode_event("third", true, 3, "yolo"));
+        assert_eq!(
+            approved_mode_for_turn(&events, user.id).as_deref(),
+            Some("yolo")
+        );
+        assert_eq!(
+            approved_mode_for_turn(&events, ChatMessage::user("other").id),
+            None
+        );
     }
 
     fn pending_question() -> (agent_core::ApprovalRequest, AskUserRequest) {

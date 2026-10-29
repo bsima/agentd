@@ -2119,17 +2119,7 @@ async fn execute_instr(
                 .get(&name)
                 .and_then(|tool| tool.mode_consent.as_ref())
             {
-                // A resumed effect was validated before its pause; the gate
-                // uses the saved resolution, not this request preview.
-                let request = if config
-                    .approvals
-                    .resolutions
-                    .contains_key(&location.effect_id.0)
-                {
-                    Ok(Value::Null)
-                } else {
-                    validator(&arguments)
-                };
+                let request = validator(&arguments);
                 match request {
                     Ok(request) => {
                         match approval_gate(
