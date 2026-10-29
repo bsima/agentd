@@ -267,8 +267,10 @@ same name); pure validation happens once before consent and its handler runs
 once after approval. The trace records the
 approval request/resolution and tool result: IR replay does not prompt, and
 `session/load` renders the resolved card through the live bridge. At the turn
-boundary, the last resolved mode decision and its recorded tool result determine
-the new mode in both live and IR-replayed turns (a later denial clears it).
+boundary, the last resolved mode decision and its tool result in the returned
+machine history determine the new mode in both live and IR-replayed turns (a
+later denial clears it). The boundary does not reread the trace file: even a
+malformed historical line cannot turn a checkpointed prompt into an error.
 
 ## Streaming
 

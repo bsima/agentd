@@ -150,6 +150,22 @@ impl IrReplayTrace {
         self.live_approval
     }
 
+    /// Whether a recorded mode gate approved this target. The caller must
+    /// also verify the tool result in the completed machine history.
+    pub fn approved_mode_target(&self, mode: &str) -> bool {
+        self.approval_requests.iter().any(|(effect_id, request)| {
+            request.kind == "mode"
+                && request.request.get("mode").and_then(Value::as_str) == Some(mode)
+                && self
+                    .approval_resolutions
+                    .get(effect_id)
+                    .is_some_and(|resolution| {
+                        resolution.pending_id == request.pending_id
+                            && resolution.decision == "approved"
+                    })
+        })
+    }
+
     pub async fn load(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let events = crate::trace::TraceLogger::read_events(path).await?;
         Self::from_events(&events)

@@ -1240,6 +1240,36 @@ fn switch_mode_requires_consent_then_applies_after_turn_and_survives_load() {
 }
 
 #[test]
+fn malformed_historical_trace_line_does_not_block_completed_mode_switch() {
+    let root = temp_root("switch-corrupt-trace");
+    mode_profile(&root, "switch_mode");
+    let port = spawn_mock_sse_server(vec![MODE_TURN, DONE_TURN, DONE_TURN]);
+    let mut client = AcpClient::start(&root, port);
+    let sid = client.handshake_and_new_session(root.to_str().unwrap());
+    select_mode(&mut client, &sid);
+    let trace = root
+        .join(".local/share/agent/traces")
+        .join(format!("{sid}.jsonl"));
+    // A prior interrupted write must not be parsed at the turn boundary.
+    std::fs::create_dir_all(trace.parent().unwrap()).unwrap();
+    std::fs::write(&trace, "{incomplete historical json\n").unwrap();
+    client.prompt(4, &sid, "proceed");
+    let (response, updates, permissions) = client.read_until_response(4, Some("allow-once"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(permissions.len(), 1);
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["update"]["sessionUpdate"] == "current_mode_update"
+                && u["update"]["currentModeId"] == "ask"),
+        "{updates:?}"
+    );
+    client.prompt(5, &sid, "continue");
+    let (response, _, _) = client.read_until_response(5, None);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+}
+
+#[test]
 fn replayed_approved_mode_switch_applies_at_turn_boundary_without_permission() {
     let root = temp_root("switch-replay");
     mode_profile(&root, "switch_mode");

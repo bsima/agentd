@@ -48,6 +48,7 @@ pub(crate) async fn run_acp_turn(
     // omit old prompts after GC. The message id links each turn to retained
     // checkpoint history without changing the default CLI trace shape.
     let user_id = message.id;
+    let mut live_approvals = std::collections::HashSet::new();
     runtime.history.push(message);
     runtime
         .trace
@@ -92,9 +93,19 @@ pub(crate) async fn run_acp_turn(
                 return Err(anyhow::anyhow!("ACP does not support signal suspension"));
             }
             agent_core::AgentLoopOutcome::Complete { value, machine } => {
+                let approved_mode = match approved_mode_for_turn(
+                    &machine,
+                    user_id,
+                    &live_approvals,
+                    runtime.ir_replay.as_ref(),
+                ) {
+                    Ok(mode) => mode,
+                    Err(err) => {
+                        tracing::warn!(%err, "deriving approved ACP mode from completed turn");
+                        None
+                    }
+                };
                 let response = finish_turn(runtime, value, machine, prompt).await?;
-                let events = agent_core::TraceLogger::read_events(&runtime.trace_path).await?;
-                let approved_mode = approved_mode_for_turn(&events, user_id);
                 return Ok(TurnOutcome::Done(Box::new(response), approved_mode));
             }
             agent_core::AgentLoopOutcome::AwaitingApproval {
@@ -133,6 +144,11 @@ pub(crate) async fn run_acp_turn(
                         PermissionReply::Cancelled => return Ok(TurnOutcome::Cancelled),
                     }
                 };
+                if pending.kind == ApprovalKind::Mode && decision == ApprovalDecision::Approve {
+                    if let Some(mode) = pending.request.get("mode").and_then(|v| v.as_str()) {
+                        live_approvals.insert(mode.to_owned());
+                    }
+                }
                 runtime.config.approvals.resolutions.insert(
                     pending.effect.effect_id.0.clone(),
                     ApprovalResolution {
@@ -158,63 +174,70 @@ pub(crate) async fn run_acp_turn(
     }
 }
 
-/// Use the resolved gate and its recorded tool result as the turn's authority.
-/// A later denial clears an earlier approval; an invalid call does not decide.
-fn approved_mode_for_turn(events: &[agent_core::Event], user_id: uuid::Uuid) -> Option<String> {
-    use agent_core::Event;
-    use std::collections::{HashMap, HashSet};
-
-    let start = events.iter().rposition(|event| {
-        matches!(event,
-            Event::Custom { name, data, .. }
-                if name == "acp_turn_start" && data["user_message_id"] == user_id.to_string()
-        )
-    })?;
-    let mut mode_effects = HashSet::new();
-    let mut approved = HashSet::new();
-    let mut calls = HashMap::new();
+/// Interpret only the returned machine's history for this turn. Denials are
+/// typed tool results and clear an earlier approval; successful results must
+/// match a mode gate approved live or in the in-memory replay index.
+fn approved_mode_for_turn(
+    machine: &agent_core::Machine,
+    user_id: uuid::Uuid,
+    live_approvals: &std::collections::HashSet<String>,
+    replay: Option<&agent_core::IrReplayTrace>,
+) -> Result<Option<String>> {
+    let history: Vec<ChatMessage> = serde_json::from_value(
+        machine
+            .env
+            .get(&agent_core::Var("history".into()))
+            .cloned()
+            .ok_or_else(|| anyhow!("completed machine has no history"))?,
+    )?;
+    let start = history
+        .iter()
+        .rposition(|message| message.id == user_id && message.role == "user")
+        .ok_or_else(|| anyhow!("completed machine lost its user message"))?;
+    let mut calls = std::collections::HashMap::new();
     let mut target = None;
-    for event in &events[start + 1..] {
-        match event {
-            Event::ApprovalRequested { kind, effect, .. } if kind == "mode" => {
-                mode_effects.insert(effect.effect_id.0.clone());
+    for message in &history[start + 1..] {
+        if message.role == "assistant" {
+            for call in message
+                .tool_calls
+                .iter()
+                .flatten()
+                .filter(|call| call.name == super::switch_mode::TOOL)
+            {
+                calls.insert(
+                    &call.id,
+                    call.arguments.get("mode").and_then(|mode| mode.as_str()),
+                );
             }
-            Event::ApprovalResolved {
-                kind,
-                effect_id,
-                decision,
-                ..
-            } if kind == "mode" && mode_effects.contains(effect_id) => {
+        } else if message.role == "tool" {
+            let Some(Some(requested)) = message.tool_call_id.as_ref().and_then(|id| calls.get(id))
+            else {
+                continue;
+            };
+            let Ok(result) = serde_json::from_str::<serde_json::Value>(
+                message.content.as_deref().unwrap_or_default(),
+            ) else {
+                // An invalid call returns a plain-text tool error; it does
+                // not decide the mode or clear an earlier approval.
+                continue;
+            };
+            if agent_core::is_denial_value(&result) {
                 target = None;
-                if decision == "approved" {
-                    approved.insert(effect_id.clone());
-                }
+            } else if result.get("mode").and_then(|mode| mode.as_str()) == Some(requested)
+                && replay.map_or_else(
+                    || live_approvals.contains(*requested),
+                    |record| record.approved_mode_target(requested),
+                )
+            {
+                target = Some((*requested).to_owned());
+            } else {
+                return Err(anyhow!(
+                    "switch_mode result lacks a matching approved mode gate"
+                ));
             }
-            Event::ToolCall {
-                name,
-                op_id,
-                effect: Some(effect),
-                ..
-            } if name == "switch_mode" => {
-                calls.insert(*op_id, effect.effect_id.0.clone());
-            }
-            Event::ToolResult {
-                name,
-                op_id,
-                result,
-                ..
-            } if name == "switch_mode" => {
-                if calls.get(op_id).is_some_and(|id| approved.contains(id)) {
-                    target = result
-                        .get("mode")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned);
-                }
-            }
-            _ => {}
         }
     }
-    target
+    Ok(target)
 }
 
 enum PermissionReply {
@@ -442,81 +465,110 @@ mod tests {
     }
 
     #[test]
-    fn recorded_mode_results_apply_only_latest_resolved_decision() {
-        use agent_core::Event;
+    fn machine_history_uses_latest_decision_and_replayed_gate() {
+        use agent_core::{Event, IrReplayTrace};
         let user = ChatMessage::user("go");
-        let mut events = vec![Event::Custom {
-            run_id: "run".into(),
-            name: "acp_turn_start".into(),
-            data: serde_json::json!({"user_message_id": user.id}),
-            timestamp: chrono::Utc::now(),
-        }];
-        let mode_event = |id: &str, approved: bool, op_id: u64, mode: &str| {
-            let machine = agent_core::agent_loop_ir(Model("test-model".into()), vec![], 4);
-            let hash = program_hash(&machine.program).unwrap();
-            let site = EffectSite {
-                block: BlockId(0),
-                instruction_index: 0,
-            };
-            let mut effect =
-                effect_location(hash, EffectKind::Tool, site, DynamicPath::at_entry(0)).unwrap();
-            effect.effect_id.0 = id.into();
-            let now = chrono::Utc::now();
-            vec![
-                Event::ApprovalRequested {
-                    run_id: "run".into(),
-                    pending_id: id.into(),
-                    kind: "mode".into(),
-                    request: serde_json::json!({"mode": mode}),
-                    effect: Box::new(effect.clone()),
-                    timestamp: now,
+        let mut history = vec![user.clone()];
+        let mut events = Vec::new();
+        let add = |history: &mut Vec<ChatMessage>, mode: &str, id: &str, approved: bool| {
+            history.push(ChatMessage::assistant(
+                None,
+                vec![agent_core::ToolCall::new(
+                    id,
+                    "switch_mode",
+                    serde_json::json!({"mode":mode}),
+                )],
+            ));
+            history.push(ChatMessage::tool(
+                id,
+                if approved {
+                    serde_json::json!({"mode":mode}).to_string()
+                } else {
+                    agent_core::denial_value(id, None, None).to_string()
                 },
-                Event::ApprovalResolved {
-                    run_id: "run".into(),
-                    pending_id: id.into(),
-                    effect_id: id.into(),
-                    kind: "mode".into(),
-                    decision: if approved { "approved" } else { "denied" }.into(),
-                    resolved_by: None,
-                    reason: None,
-                    timestamp: now,
-                },
-                Event::ToolCall {
-                    run_id: "run".into(),
-                    op_id,
-                    parent_op_id: None,
-                    name: "switch_mode".into(),
-                    arguments: serde_json::json!({"mode": mode}),
-                    effect: Some(Box::new(effect)),
-                    timestamp: now,
-                },
-                Event::ToolResult {
-                    run_id: "run".into(),
-                    op_id,
-                    parent_op_id: None,
-                    name: "switch_mode".into(),
-                    result: serde_json::json!({"mode": mode}),
-                    result_preview: String::new(),
-                    duration_ms: 0,
-                    timestamp: now,
-                },
-            ]
+            ));
         };
-        events.extend(mode_event("first", true, 1, "ask"));
+        add(&mut history, "ask", "first", true);
+        let machine = |history: &[ChatMessage]| {
+            let mut machine = agent_core::agent_loop_ir(Model("m".into()), vec![], 4);
+            machine.env.insert(
+                agent_core::Var("history".into()),
+                serde_json::to_value(history).unwrap(),
+            );
+            machine
+        };
+        let live = std::collections::HashSet::from(["ask".to_owned(), "yolo".to_owned()]);
         assert_eq!(
-            approved_mode_for_turn(&events, user.id).as_deref(),
+            approved_mode_for_turn(&machine(&history), user.id, &live, None)
+                .unwrap()
+                .as_deref(),
             Some("ask")
         );
-        events.extend(mode_event("second", false, 2, "yolo"));
-        assert_eq!(approved_mode_for_turn(&events, user.id), None);
-        events.extend(mode_event("third", true, 3, "yolo"));
+        add(&mut history, "yolo", "second", false);
         assert_eq!(
-            approved_mode_for_turn(&events, user.id).as_deref(),
+            approved_mode_for_turn(&machine(&history), user.id, &live, None).unwrap(),
+            None
+        );
+        add(&mut history, "yolo", "third", true);
+        assert_eq!(
+            approved_mode_for_turn(&machine(&history), user.id, &live, None)
+                .unwrap()
+                .as_deref(),
             Some("yolo")
         );
+
+        let effect = |id: &str| {
+            let mut effect = effect_location(
+                program_hash(&machine(&history).program).unwrap(),
+                EffectKind::Tool,
+                EffectSite {
+                    block: BlockId(0),
+                    instruction_index: 0,
+                },
+                DynamicPath::at_entry(0),
+            )
+            .unwrap();
+            effect.effect_id.0 = id.into();
+            effect
+        };
+        let now = chrono::Utc::now();
+        events.push(Event::ApprovalRequested {
+            run_id: "r".into(),
+            pending_id: "third".into(),
+            kind: "mode".into(),
+            request: serde_json::json!({"mode":"yolo"}),
+            effect: Box::new(effect("third")),
+            timestamp: now,
+        });
+        events.push(Event::ApprovalResolved {
+            run_id: "r".into(),
+            pending_id: "third".into(),
+            effect_id: "third".into(),
+            kind: "mode".into(),
+            decision: "approved".into(),
+            resolved_by: None,
+            reason: None,
+            timestamp: now,
+        });
+        let replay = IrReplayTrace::from_events(&events).unwrap();
+        let replay_history = vec![
+            user.clone(),
+            history[history.len() - 2].clone(),
+            history[history.len() - 1].clone(),
+        ];
         assert_eq!(
-            approved_mode_for_turn(&events, ChatMessage::user("other").id),
-            None
+            approved_mode_for_turn(
+                &machine(&replay_history),
+                user.id,
+                &Default::default(),
+                Some(&replay)
+            )
+            .unwrap()
+            .as_deref(),
+            Some("yolo")
+        );
+        assert!(
+            approved_mode_for_turn(&machine(&history), user.id, &Default::default(), None).is_err()
         );
     }
 
