@@ -90,7 +90,7 @@ pub use prompt_ir::{
     collect_prompt_ir_sections, compile_prompt_ir, BudgetAllocation, CompositionMode, ContentHash,
     ContextRequest, ContextStrategy, Observation, Priority, PromptIR, PromptIRTrace, PromptId,
     RetrievalMode, RetrievalTiming, Section, SectionId, SectionOrigin, SectionRole, SectionSource,
-    SectionSummary, TokenBudget, TokenEstimate, ToolDef,
+    SectionSummary, StateAuthority, TokenBudget, TokenEstimate, ToolDef,
 };
 pub use provider::{
     is_context_overflow_anyhow, is_context_overflow_message, ChatProvider, ContextOverflowError,

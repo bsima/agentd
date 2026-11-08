@@ -92,7 +92,7 @@ pub enum SectionOrigin {
         key: Option<String>,
         score: Option<f32>,
     },
-    State { key: String },
+    State { key: String, authority: StateAuthority },
     User,
     ToolResult,
 }
@@ -103,6 +103,18 @@ A backend can support temporal lookup, semantic lookup, or both. For example, a 
 Workspace, knowledge, docs, issue trackers, and long-term memory should not become top-level source kinds. They are backend names or metadata on `SectionOrigin::Retrieval`.
 
 `SourceResult -> Section` should be the main adapter between current hydration and PromptIR. The source registry remains the backend boundary.
+
+## Authority rule
+
+Instruction roles (`System` and `Developer`) are accepted only from static
+operator configuration (`Static`) or explicitly operator-authored state
+(`State { authority: Operator, .. }`). State authority is `Operator`, `Agent`,
+or `External`; legacy serialized state without an authority deserializes as
+`Agent`, the safe default. Agent/external state, retrieval results, tool
+results, and user content are data and must use a non-instruction role. PromptIR
+construction rejects violations rather than silently promoting or downgrading
+them, preventing untrusted context from rendering as instructions or becoming
+pinned by an instruction role.
 
 ## Section role and composition
 

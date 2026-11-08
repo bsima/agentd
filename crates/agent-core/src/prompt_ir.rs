@@ -107,9 +107,26 @@ pub enum SectionOrigin {
     },
     State {
         key: String,
+        /// Authority of the principal that wrote this state value. Missing
+        /// values in legacy traces/checkpoints default to Agent, which cannot
+        /// acquire instruction authority.
+        #[serde(default)]
+        authority: StateAuthority,
     },
     User,
     ToolResult,
+}
+
+/// The principal responsible for a state-backed section.
+///
+/// This is deliberately not inferred from the state key: authority must cross
+/// the PromptIR boundary explicitly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateAuthority {
+    Operator,
+    #[default]
+    Agent,
+    External,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -225,6 +242,10 @@ impl Default for ContextStrategy {
 
 impl PromptIR {
     pub fn new(base_messages: Prompt, sections: Vec<Section>) -> Result<Self> {
+        for section in &sections {
+            section.validate_authority()?;
+        }
+
         let total_tokens = TokenEstimate(
             sections
                 .iter()
@@ -279,6 +300,32 @@ impl PromptIR {
 }
 
 impl Section {
+    /// Reject sections whose claimed chat role exceeds their source's
+    /// authority. Retrieved or agent-authored data cannot become provider
+    /// instructions merely because a caller selected an instruction role.
+    fn validate_authority(&self) -> Result<()> {
+        if !matches!(self.role, SectionRole::System | SectionRole::Developer) {
+            return Ok(());
+        }
+
+        let authorized = matches!(
+            &self.source.origin,
+            SectionOrigin::Static { .. }
+                | SectionOrigin::State {
+                    authority: StateAuthority::Operator,
+                    ..
+                }
+        );
+        anyhow::ensure!(
+            authorized,
+            "PromptIR authority violation: section {:?} with origin {:?} cannot use instruction role {:?}",
+            self.id,
+            self.source.origin,
+            self.role
+        );
+        Ok(())
+    }
+
     pub fn passive_temporal(
         id: impl Into<String>,
         label: impl Into<String>,
@@ -535,6 +582,118 @@ fn preview(content: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authority_section(origin: SectionOrigin, role: SectionRole) -> Section {
+        Section::new(
+            "authority-test",
+            "Authority test",
+            SectionSource {
+                origin,
+                timing: RetrievalTiming::Passive,
+                metadata: Value::Null,
+            },
+            role,
+            "content".into(),
+            Priority::Critical,
+            CompositionMode::Constraint,
+            None,
+            Value::Null,
+        )
+    }
+
+    fn rejects_instruction_origin(origin: SectionOrigin, role: SectionRole) {
+        let err = PromptIR::new(vec![], vec![authority_section(origin, role)]).unwrap_err();
+        assert!(err.to_string().contains("PromptIR authority violation"));
+    }
+
+    #[test]
+    fn retrieval_developer_is_rejected() {
+        rejects_instruction_origin(
+            SectionOrigin::Retrieval {
+                backend: "memory".into(),
+                mode: RetrievalMode::Semantic,
+                query: Some("charter".into()),
+                key: None,
+                score: Some(1.0),
+            },
+            SectionRole::Developer,
+        );
+    }
+
+    #[test]
+    fn tool_result_system_is_rejected() {
+        rejects_instruction_origin(SectionOrigin::ToolResult, SectionRole::System);
+    }
+
+    #[test]
+    fn user_developer_is_rejected() {
+        rejects_instruction_origin(SectionOrigin::User, SectionRole::Developer);
+    }
+
+    #[test]
+    fn agent_state_developer_is_rejected() {
+        rejects_instruction_origin(
+            SectionOrigin::State {
+                key: "current_state".into(),
+                authority: StateAuthority::Agent,
+            },
+            SectionRole::Developer,
+        );
+    }
+
+    #[test]
+    fn external_state_system_is_rejected() {
+        rejects_instruction_origin(
+            SectionOrigin::State {
+                key: "imported_state".into(),
+                authority: StateAuthority::External,
+            },
+            SectionRole::System,
+        );
+    }
+
+    #[test]
+    fn operator_state_developer_is_accepted() -> Result<()> {
+        PromptIR::new(
+            vec![],
+            vec![authority_section(
+                SectionOrigin::State {
+                    key: "thread_charter".into(),
+                    authority: StateAuthority::Operator,
+                },
+                SectionRole::Developer,
+            )],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn static_developer_is_accepted() -> Result<()> {
+        PromptIR::new(
+            vec![],
+            vec![authority_section(
+                SectionOrigin::Static {
+                    name: "runtime-guidance".into(),
+                },
+                SectionRole::Developer,
+            )],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_state_origin_defaults_to_agent_authority() -> Result<()> {
+        let origin: SectionOrigin = serde_json::from_str(r#"{"State":{"key":"current_state"}}"#)?;
+        assert_eq!(
+            origin,
+            SectionOrigin::State {
+                key: "current_state".into(),
+                authority: StateAuthority::Agent,
+            }
+        );
+        rejects_instruction_origin(origin, SectionRole::Developer);
+        Ok(())
+    }
 
     #[test]
     fn prompt_ir_round_trips_through_json() -> Result<()> {
